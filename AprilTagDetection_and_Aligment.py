@@ -146,15 +146,16 @@ centers = None
 
 
 validPoints = {}
+aprilTagPoints = None
 
 # Draw bounding boxes around the detected tags
 
 for detection in detections:
-    # print("TagID: ", detection.tag_id)
-    # print("Center: ", detection.center)
     proj = cameraMatrix @ detection.pose_t
-    # print("Reproject: ", proj.T/proj[2],"\n")
-    # print("3d: ", detection.pose_t, "\n")
+    if aprilTagPoints is None:
+        aprilTagPoints = detection.pose_t
+    else:
+        aprilTagPoints = np.append(aprilTagPoints, detection.pose_t, axis=1)
 
     pixCenter = (int(detection.center[0]), int(detection.center[1]))
 
@@ -189,7 +190,10 @@ objectPoints = np.zeros((imagePoints.shape[0], 3))
 for idx, valID in enumerate(validPoints.keys()):
     objectPoints[idx,:] = truthPoints[str(valID)]
 
-print('OP: \n', objectPoints)
+np.set_printoptions(suppress=True)
+
+print('OP: \n', objectPoints.T)
+print('Ap Points: \n', aprilTagPoints)
 print('IP: \n', centers)
 print('CM: \n', cameraMatrix)
 print('DP: \n', distCoeffs)
@@ -197,7 +201,9 @@ print('DP: \n', distCoeffs)
 ret, rvec, tvec = cv2.solvePnP(objectPoints=objectPoints, imagePoints=centers, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs, flags=cv2.SOLVEPNP_ITERATIVE)
 
 print('\nRvec: \n', rvec)
+print('Rvec as DCM: \n', cv2.Rodrigues(rvec)[0])
 print('Tvec: \n', tvec)
+print('T-norm: \n', la.norm(tvec))
 
 projectedPoints_orig, _ = cv2.projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
 

@@ -645,8 +645,8 @@ class FrontEndGui(ctk.CTk):
         self.protectRotateCCW()
         self.protectRotateCW()
 
-        print(len(self.imageConfigWindowObjects))
-        print(len(self.imageConfig.imgCollection))
+        # print(len(self.imageConfigWindowObjects))
+        # print(len(self.imageConfig.imgCollection))
 
         self.imageConfigWindowObjects = []
         rowID = 0
@@ -654,7 +654,7 @@ class FrontEndGui(ctk.CTk):
         while len(self.imageConfigWindowObjects) < len(self.imageConfig.imgCollection):
             self.createNewRow(rowID)
             rowID += 1
-        self.imageConfigWindowObjects[0][0].select()
+
 
     def createNewRow(self, rowID):
         imgIncludeCheckbox = ctk.CTkCheckBox(master=self.subImageFrame, text='')
@@ -693,8 +693,8 @@ class FrontEndGui(ctk.CTk):
 
     def updateImageFrame(self):
 
-        print('Rows: ', len(self.imageConfigWindowObjects))
-        print('Imgs: ', len(self.imageConfig.imgCollection), '\n')
+        # print('Rows: ', len(self.imageConfigWindowObjects))
+        # print('Imgs: ', len(self.imageConfig.imgCollection), '\n')
 
         while len(self.imageConfigWindowObjects) > len(self.imageConfig.imgCollection):
             for item in self.imageConfigWindowObjects[-1]:
@@ -828,54 +828,86 @@ class FrontEndGui(ctk.CTk):
                 checkbox.deselect()
 
     def unprotectInvert(self):
-        imgInvrtTitleButton = ctk.CTkButton(master=self.imageFrame, text='Invert All', command=self.invertAll)
-        imgInvrtTitleButton.grid(row=1, column=5, padx=5, pady=5)
-        self.after(2000,imgInvrtTitleButton.grid_forget)
+        self.imgInvertProtectedButton.configure(command=self.invertAll, fg_color='green', hover_color='dark green')
+        self.imgInvertProtectedButton.update()
         self.after(2000, self.protectInvert)
-        self.after(2000, imgInvrtTitleButton.grid_forget)
 
     def unprotectAllGrayscale(self):
-        imgGrayTitleButton = ctk.CTkButton(master=self.imageFrame, text='Grayscale All', command=self.grayscaleAll)
-        imgGrayTitleButton.grid(row=1, column=6, padx=5, pady=5)
-        self.after(2000,imgGrayTitleButton.grid_forget)
+        self.imgGrayProtectedButton.configure(command=self.grayscaleAll, fg_color='green', hover_color='dark green')
+        self.imgGrayProtectedButton.update()
         self.after(2000, self.protectAllGrayscale)
-        self.after(2000, imgGrayTitleButton.grid_forget)
 
     def unprotectRotateCCW(self):
-        self.imgRotateCCWProtectedButton.grid_forget()
-        imgRotateTitleButton = ctk.CTkButton(master=self.imageFrame, text='Rotate All', command=self.rotateAllCCW)
-        imgRotateTitleButton.grid(row=1, column=7, padx=5, pady=5)
-        self.after(2000,imgRotateTitleButton.grid_forget)
+        self.imgRotateCCWProtectedButton.configure(command=self.rotateAllCCW, fg_color='green', hover_color='dark green')
+        self.imgRotateCCWProtectedButton.update()
         self.after(2000, self.protectRotateCCW)
-        self.after(2000, imgRotateTitleButton.grid_forget)
 
     def unprotectRotateCW(self):
-        self.imgRotateCWProtectedButton.grid_forget()
-        imgRotateTitleButton = ctk.CTkButton(master=self.imageFrame, text='Rotate All', command=self.rotateAllCW)
-        imgRotateTitleButton.grid(row=1, column=8, padx=5, pady=5)
-        self.after(2000,imgRotateTitleButton.grid_forget)
+        self.imgRotateCWProtectedButton.configure(command=self.rotateAllCW, fg_color='green', hover_color='dark green')
+        self.imgRotateCWProtectedButton.update()
         self.after(2000, self.protectRotateCW)
-        self.after(2000, imgRotateTitleButton.grid_forget)
 
     def protectInvert(self, row=1):
-        self.imgInvertProtectedButton.grid(row=row, column=5, padx=5, pady=5, sticky='ew')
+        self.imgInvertProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectInvert)
+        if not self.imgInvertProtectedButton.winfo_ismapped():
+            self.imgInvertProtectedButton.grid(row=row, column=5, padx=5, pady=5, sticky='ew')
 
     def protectAllGrayscale(self, row=1):
-        self.imgGrayProtectedButton.grid(row=row, column=6, padx=5, pady=5, sticky='ew')
+        self.imgGrayProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectAllGrayscale)
+        if not self.imgGrayProtectedButton.winfo_ismapped():
+            self.imgGrayProtectedButton.grid(row=row, column=6, padx=5, pady=5, sticky='ew')
 
     def protectRotateCCW(self, row=1):
-        self.imgRotateCCWProtectedButton.grid(row=row, column=7, padx=5, pady=5, sticky='ew')
+        self.imgRotateCCWProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectRotateCCW)
+        if not self.imgRotateCCWProtectedButton.winfo_ismapped():
+            self.imgRotateCCWProtectedButton.grid(row=row, column=7, padx=5, pady=5, sticky='ew')
 
     def protectRotateCW(self, row=1):
-        self.imgRotateCWProtectedButton.grid(row=row, column=8, padx=5, pady=5, sticky='ew')
+        self.imgRotateCWProtectedButton.configure(fg_color='blue', hover_color='cyan4',
+                                                   command=self.unprotectRotateCW)
+        if not self.imgRotateCWProtectedButton.winfo_ismapped():
+            self.imgRotateCWProtectedButton.grid(row=row, column=8, padx=5, pady=5, sticky='ew')
+
+    def invertAll(self):
+        self.imgInvertProtectedButton.configure(fg_color='black')
+        self.imgInvertProtectedButton.update()
+        for imgClass in self.imageConfig.imgCollection:
+            self.invertIndividualImage(imgClass)
+        self.protectInvert()
+
+    def grayscaleAll(self):
+        self.imgGrayProtectedButton.configure(fg_color='black')
+        self.imgGrayProtectedButton.update()
+        for imgClass in self.imageConfig.imgCollection:
+            self.grayscaleIndividualImage(imgClass)
+        self.protectAllGrayscale()
 
     def rotateAllCW(self):
+        self.imgRotateCWProtectedButton.configure(fg_color='black')
+        self.imgRotateCWProtectedButton.update()
         for imgClass in self.imageConfig.imgCollection:
             self.rotateCWIndividualImage(imgClass)
+        self.protectRotateCW()
 
     def rotateAllCCW(self):
+        self.imgRotateCCWProtectedButton.configure(fg_color='black')
+        self.imgRotateCCWProtectedButton.update()
         for imgClass in self.imageConfig.imgCollection:
             self.rotateCCWIndividualImage(imgClass)
+        self.protectRotateCCW()
+
+    def invertIndividualImage(self, imgClass):
+        filepath = self.filepath + '\\' + imgClass.imageName
+        img = cv2.imread(filepath)
+        invt_img = cv2.bitwise_not(img)
+        cv2.imwrite(filepath, invt_img)
+
+    def grayscaleIndividualImage(self, imgClass):
+        self.copyToRemovedFolder(imgClass)
+        filepath = self.filepath + '\\' + imgClass.imageName
+        img = cv2.imread(filepath)
+        gray_img = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        cv2.imwrite(filepath, gray_img)
 
     def rotateCWIndividualImage(self, imgClass):
         filepath = self.filepath + '\\' + imgClass.imageName
@@ -928,36 +960,6 @@ class FrontEndGui(ctk.CTk):
         self.imageConfig.imgCollection[idx].include = not self.imageConfig.imgCollection[idx].include
         self.saveToCache()
 
-    def invertAll(self):
-        for imgClass in self.imageConfig.imgCollection:
-            self.invertIndividualImage(imgClass)
-
-    def invertIndividualImage(self, imgClass):
-        filepath = self.filepath + '\\' + imgClass.imageName
-        img = cv2.imread(filepath)
-        invt_img = cv2.bitwise_not(img)
-        cv2.imwrite(filepath, invt_img)
-
-    def grayscaleAll(self):
-        for imgClass in self.imageConfig.imgCollection:
-            self.grayscaleIndividualImage(imgClass)
-
-    def grayscaleIndividualImage(self, imgClass):
-        self.copyToRemovedFolder(imgClass)
-        filepath = self.filepath + '\\' + imgClass.imageName
-        img = cv2.imread(filepath)
-        gray_img = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(filepath, gray_img)
-
-    def restoreFromWindowState(self):
-        self.imageConfig.invertImage = self.invertImagesCheckbox.get()
-        self.imageConfig.numInnerCornersW = int(self.widthComboEntry.get())
-        self.imageConfig.numInnerCornersH = int(self.heightComboEntry.get())
-        self.imageConfig.SUBnumInnerCornersW = int(self.SUBwidthComboEntry.get())
-        self.imageConfig.SUBnumInnerCornersH = int(self.SUBheightComboEntry.get())
-        self.imageConfig.img_type = self.selectImgTypeCombo.get()
-        self.imageConfig.calMode = self.selectModeCombo.get()
-
     def restoreFromImageConfig(self):
         if self.imageConfig.invertImage:
             self.invertImagesCheckbox.select()
@@ -970,6 +972,15 @@ class FrontEndGui(ctk.CTk):
         self.folderLabel.configure(text="../" + os.path.basename(os.path.normpath(self.filepath)))
         self.selectImgTypeCombo.set(self.imageConfig.img_type)
         self.selectModeCombo.set(self.imageConfig.calMode)
+
+    def restoreFromWindowState(self):
+        self.imageConfig.invertImage = self.invertImagesCheckbox.get()
+        self.imageConfig.numInnerCornersW = int(self.widthComboEntry.get())
+        self.imageConfig.numInnerCornersH = int(self.heightComboEntry.get())
+        self.imageConfig.SUBnumInnerCornersW = int(self.SUBwidthComboEntry.get())
+        self.imageConfig.SUBnumInnerCornersH = int(self.SUBheightComboEntry.get())
+        self.imageConfig.img_type = self.selectImgTypeCombo.get()
+        self.imageConfig.calMode = self.selectModeCombo.get()
 
     def saveToCache(self):
 
@@ -1136,7 +1147,7 @@ class FrontEndGui(ctk.CTk):
             high_x = max(x, first_x)
             high_y = max(y, first_y)
 
-            print(img.shape)
+            # print(img.shape)
             new_img = copy.copy(img)
             new_img[:,:low_x] = np.zeros(new_img[:,:low_x].shape)
             new_img[:low_y] = np.zeros(new_img[:low_y].shape)

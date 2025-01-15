@@ -127,6 +127,8 @@ class CameraConfig():
 class Camera():
     def __init__(self, gui):
         self.gui = gui
+        self.detectIDS = None
+        self.projectProbe = None
         self.calibration = None
         self.centers = None
         self.calibFile = ''
@@ -153,10 +155,9 @@ class Camera():
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select AprilTag Img', command=self.selectSingleImage)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
         self.loadFromCache()
-        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
-        self.vc.set(cv2.CAP_PROP_FPS, 60)
+        self.vc = None
         # self.vc.setExceptionMode(True)
-        self.detector = Detector()
+        self.detector = Detector(refine_edges=1, decode_sharpening=0.0)
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
@@ -224,8 +225,6 @@ class Camera():
                 test = pickle.load(f)
                 self.lidarTruthPoints.copy(test)
 
-
-
     def ingestCalibration(self):
         try:
             with open(self.calibFile, 'rb') as f:
@@ -235,8 +234,12 @@ class Camera():
                 self.selectCalibLabel.configure(text='No Calibration Found')
                 return
 
+        scale = 1.0
 
-        scale = 2848.0 / 1424
+        # Note: this line exists because our aprilTag image was taken at 2848x2848, while calibration images
+        # were 1424x1424. Thus, the camera calibration matrix is incorrect for this specific file.
+        if self.calibFile == 'C:/repos/aburn/usr/24WintCalspanFltTest/Alvium_LJ_Calib_2DecSIFTED/calibration.pkl':
+            scale = 2848.0/1424.0
 
         self.calibration.fx = scale * self.calibration.fx
         self.calibration.fy = scale * self.calibration.fy
@@ -307,6 +310,9 @@ class Camera():
 
     def setupFrame(self):
         rowID = 0
+
+        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
+        self.vc.set(cv2.CAP_PROP_FPS, 60)
 
         self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=['Camera Stream', 'Static Image'], command=self.sourceUpdate)
         self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5)
@@ -394,10 +400,15 @@ class Camera():
         self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
-        goBackButton = ctk.CTkButton(self.cam_frame, text="Return to Main", command=self.gui.returnToMain)
+        goBackButton = ctk.CTkButton(self.cam_frame, text="Return to Main", command=self.releaseCamReturnToMain)
         goBackButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
 
         self.cam_frame.pack()
+
+    def releaseCamReturnToMain(self):
+        self.startStreamOff()
+        self.vc.release()
+        self.gui.returnToMain()
 
     def setAprilTagSize(self):
 
@@ -459,7 +470,7 @@ class Camera():
 
     def toggleDetectTags(self):
         if self.detector is None:
-            self.detector = Detector()
+            self.detector = Detector(quad_decimate=1.5, quad_sigma =1.0, decode_sharpening=0.75)
         else:
             self.detector = None
         self.saveToCache()
@@ -512,22 +523,28 @@ class Camera():
         self.startStreamOff()
 
     def detectAprilTagsAndPrint(self, frame):
+
         if self.calibration is not None and self.camConfig.undistort:
             frame = cv2.undistort(frame, cameraMatrix=self.calibration.getCameraMatrix(),
                                   distCoeffs=self.calibration.getDistortion())
 
         webGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        scale = 1.0
+        if not self.camConfig.useCameraAsSource and self.camConfig.singleImageFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/AlviumLJAprilTags/1.bmp':
+            scale = 2848.0 / 1424.0
+
         if self.calibration is not None:
             K = self.calibration.getCameraMatrix()
-            cx = int(self.calibration.cx)
-            cy = int(self.calibration.cy)
+            cx = int(scale * (self.calibration.cx + 0.5) - 0.5)
+            cy = int(scale * (self.calibration.cy + 0.5) - 0.5)
         else:
             cx = int(frame.shape[1] / 2)
             cy = int(frame.shape[0] / 2)
 
         crosshairsH = np.array([[cx + 10, cy], [cx - 10, cy]])
         crosshairsV = np.array([[cx, cy + 10], [cx, cy - 10]])
+
         cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), 2)
         cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), 2)
 
@@ -538,6 +555,7 @@ class Camera():
         if self.calibration is None:
             detections = self.detector.detect(webGray)
             self.centers = None
+            self.detectIDS = []
             for detection in detections:
                 pixCenter = (int(detection.center[0]), int(detection.center[1]))
                 cv2.polylines(frame, [detection.corners.astype(int)], True, (0, 255, 0), 2)
@@ -545,6 +563,8 @@ class Camera():
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
                 cv2.putText(frame, str(detection.tag_id), pixCenter,
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+
+                self.detectIDS.append(detection.tag_id)
 
                 if self.centers is None:
                     self.centers = np.array(pixCenter)
@@ -560,8 +580,12 @@ class Camera():
                                           camera_params=([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]),
                                           tag_size=self.camConfig.aprilTagSize)
         self.centers = None
+        self.detectIDS = []
 
         for detection in detections:
+
+            self.detectIDS.append(detection.tag_id)
+
             pixCenter = (int(detection.center[0]), int(detection.center[1]))
             cv2.circle(frame, pixCenter, 3, (0,255,0), 3)
             cv2.polylines(frame, [detection.corners.astype(int)], True, (0, 255, 0), 2)
@@ -602,6 +626,11 @@ class Camera():
         if self.camConfig.projectLidarPoints and self.detector is not None:
             frame = self.projectLidarPoints(frame)
 
+        if self.projectProbe is not None and self.camConfig.projectLidarPoints:
+            cv2.circle(frame, self.projectProbe[0,0,:].astype(int), 6, (255, 0, 0), 6)
+            cv2.putText(frame, "Probe Tip", self.projectProbe[0,0,:].astype(int) - [50, 50],
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
+
         self.potentialResize()
         cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))
 
@@ -618,12 +647,20 @@ class Camera():
         else:
             distParams = self.calibration.getDistortion()
 
-        if len(self.centers) >= 4:
-            ret, rvec, tvec = cv2.solvePnP(objectPoints=self.lidarTruthPoints.getTruthPointsNumpy(),
+        if self.centers is not None and len(self.centers) >= 6:
+            truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
+            points = []
+            for detectID in self.detectIDS:
+                points.append(truthPoints[str(detectID)])
+            points = np.array(points)
+
+            ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
                                        imagePoints=self.centers,
                                        cameraMatrix=self.calibration.getCameraMatrix(),
                                        distCoeffs=distParams,
                                        flags=cv2.SOLVEPNP_ITERATIVE)
+            probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
+            self.projectProbe, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=self.calibration.getCameraMatrix(), distCoeffs=distParams)
         else:
             ret = False
 

@@ -1052,6 +1052,7 @@ class FrontEndGui(ctk.CTk):
         self.loadFromCache(False)
         self.loadImages()
         self.folderLabel.configure(text=os.path.basename(self.filepath))
+        self.saveToCache()
 
     def natural_sort(self, l):
         convert = lambda text: int(text) if text.isdigit() else text.lower()

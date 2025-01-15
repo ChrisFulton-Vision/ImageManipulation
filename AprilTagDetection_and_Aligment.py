@@ -8,6 +8,13 @@ import pickle
 import copy
 from superCalibrateCamera import TruthPoints
 
+tag_size=0.168
+scale = 2848.0 / 1424
+aprilImage = "C:\\repos\\aburn\\usr\\24WintCalspanFltTest\\AlviumLJAprilTags\\1.bmp"
+
+paramsOnCalibration = True
+paramsOnDistortion = True
+applyDistortion = True
 
 sss = np.zeros((3,3,3)) # Create basis function for skew symmetric matrices
 sss[0,1,2] = 1
@@ -79,14 +86,6 @@ def project(rvec, tvec, objectPoints, cameraMatrix, distCoeffs):
                                                 distCoeffs=distCoeffs)
     return projectedPoints
 
-tag_size=0.168
-scale = 2848.0 / 1424
-aprilImage = "C:\\repos\\aburn\\usr\\24WintCalspanFltTest\\AlviumLJAprilTags\\1.bmp"
-
-
-paramsOnCalibration = True
-paramsOnDistortion = True
-applyDistortion = True
 
 #Camera matrix
 if paramsOnCalibration:

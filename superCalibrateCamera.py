@@ -27,37 +27,37 @@ class TruthPoints():
 
     def selectTruthPoints(self):
         # 0
-        self.truthPoints['0'] = np.array([9.95743, -1.17852, -1.30208])
+        self.truthPoints['0'] = np.array([5.25967, 2.52404, -1.01714])
         # 1
-        self.truthPoints['1'] = np.array([7.63673, -.732, -.85845])
+        self.truthPoints['1'] = np.array([2.90982, 2.45965, -0.60117])
         # 4
-        self.truthPoints['4'] = np.array([5.2572, -2.81513, -1.29637])
+        self.truthPoints['4'] = np.array([1.02611, -0.09072, -1.04306])
         # 5
-        self.truthPoints['5'] = np.array([5.84086, -3.35247, -.91818])
+        self.truthPoints['5'] = np.array([1.71335, -0.48700, -0.66432])
         # 6
-        self.truthPoints['6'] = np.array([5.23601, -1.07118, -.90861])
+        self.truthPoints['6'] = np.array([0.62843, 1.60848, -0.65310])
         # 7
-        self.truthPoints['7'] = np.array([8.4014, -.10626, -1.05846])
+        self.truthPoints['7'] = np.array([3.51041, 3.23543, -0.80128])
         # 8
-        self.truthPoints['8'] = np.array([9.03127, -.0561, -.50734])
+        self.truthPoints['8'] = np.array([4.11462, 3.41798, -0.24962])
         # 9
-        self.truthPoints['9'] = np.array([3.83315, -2.74696, -.90198])
+        self.truthPoints['9'] = np.array([-0.37882, -0.33134, -0.64973])
         # 10
-        self.truthPoints['10'] = np.array([5.73997, -2.3464, -.8862])
+        self.truthPoints['10'] = np.array([1.38713, 0.46928, -0.63064])
         # 12
-        self.truthPoints['12'] = np.array([7.79781, .81792, -.84915])
+        self.truthPoints['12'] = np.array([2.72211, 4.00315, -0.59416])
         # 17
-        self.truthPoints['17'] = np.array([5.37848, -3.76637, -.67129])
+        self.truthPoints['17'] = np.array([1.35135, -0.99257, -0.41729])
         # 18
-        self.truthPoints['18'] = np.array([9.05368, .56085, -.17019])
+        self.truthPoints['18'] = np.array([4.00388, 4.02418, 0.08610])
         # 19
-        self.truthPoints['19'] = np.array([5.62043, -1.7569, -.98166])
+        self.truthPoints['19'] = np.array([1.15202, 1.01983, -0.72926])
         # 21
-        self.truthPoints['21'] = np.array([8.61416, -1.87028, -.84081])
+        self.truthPoints['21'] = np.array([4.09984, 1.55906, -0.58504])
         # 22
-        self.truthPoints['22'] = np.array([7.11942, -1.35599, -1.23372])
+        self.truthPoints['22'] = np.array([2.52925, 1.73592, -0.97918])
         # 23
-        self.truthPoints['23'] = np.array([7.03449, .00338, -.98724])
+        self.truthPoints['23'] = np.array([2.15135, 3.04855, -0.73227])
 
     def getTruthPointsDict(self):
         return self.truthPoints
@@ -157,7 +157,12 @@ class Camera():
         self.loadFromCache()
         self.vc = None
         # self.vc.setExceptionMode(True)
-        self.detector = Detector(refine_edges=1, decode_sharpening=0.0)
+        # self.detector = Detector(refine_edges=1, decode_sharpening=0.0)
+
+        self.detector = None
+        self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+        self.arucoParams = cv2.aruco.DetectorParameters()
+
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
@@ -470,7 +475,8 @@ class Camera():
 
     def toggleDetectTags(self):
         if self.detector is None:
-            self.detector = Detector(quad_decimate=1.5, quad_sigma =1.0, decode_sharpening=0.75)
+            # self.detector = Detector(quad_decimate=1.5, quad_sigma =1.0, decode_sharpening=0.75)
+            self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
         else:
             self.detector = None
         self.saveToCache()
@@ -508,6 +514,8 @@ class Camera():
                 self.lastWidth = frame.shape[1]
         else:
             frame = cv2.imread(self.camConfig.singleImageFilepath)
+            self.lastHeight = frame.shape[0]
+            self.lastWidth = frame.shape[1]
             if frame:
                 rval = True
 
@@ -515,7 +523,7 @@ class Camera():
             rval, frame = self.vc.read()
             self.detectAprilTagsAndPrint(frame)
 
-            key = cv2.waitKey(20)
+            key = cv2.waitKey(1)
             if key == 27:  # exit on ESC
                 self.startStreamOff()
                 break
@@ -553,18 +561,18 @@ class Camera():
             return
 
         if self.calibration is None:
-            detections = self.detector.detect(webGray)
+            corners, ids, rejected = self.detector.detectMarkers(webGray)
             self.centers = None
             self.detectIDS = []
-            for detection in detections:
-                pixCenter = (int(detection.center[0]), int(detection.center[1]))
-                cv2.polylines(frame, [detection.corners.astype(int)], True, (0, 255, 0), 2)
-                cv2.putText(frame, str(detection.tag_id), pixCenter,
+            for corner, id in zip(corners, ids):
+                pixCenter = (int(corner[0]), int(corner[1]))
+                cv2.polylines(frame, pixCenter, True, (0, 255, 0), 2)
+                cv2.putText(frame, str(id), pixCenter,
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
-                cv2.putText(frame, str(detection.tag_id), pixCenter,
+                cv2.putText(frame, str(id), pixCenter,
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
 
-                self.detectIDS.append(detection.tag_id)
+                self.detectIDS.append(id)
 
                 if self.centers is None:
                     self.centers = np.array(pixCenter)
@@ -576,46 +584,46 @@ class Camera():
 
 
         K = self.calibration.getCameraMatrix()
-        detections = self.detector.detect(img=webGray, estimate_tag_pose=True,
-                                          camera_params=([K[0, 0], K[1, 1], K[0, 2], K[1, 2]]),
-                                          tag_size=self.camConfig.aprilTagSize)
+
+        corners, ids, rejected = self.detector.detectMarkers(webGray)
         self.centers = None
         self.detectIDS = []
 
-        for detection in detections:
+        if ids is not None:
+            for four_corners, id in zip(corners, ids):
 
-            self.detectIDS.append(detection.tag_id)
+                self.detectIDS.append(id)
+                center = np.array([np.mean(four_corners[0][:,0]),np.mean(four_corners[0][:,1])]).astype(int)
 
-            pixCenter = (int(detection.center[0]), int(detection.center[1]))
-            cv2.circle(frame, pixCenter, 3, (0,255,0), 3)
-            cv2.polylines(frame, [detection.corners.astype(int)], True, (0, 255, 0), 2)
-            cv2.putText(frame, str(detection.tag_id), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
-            cv2.putText(frame, str(detection.tag_id), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+                cv2.circle(frame, center, 3, (0,255,0), 3)
+                cv2.polylines(frame, four_corners.astype(int), True, (0, 255, 0), 2)
+                cv2.putText(frame, str(id)[1:-1], center,
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
+                cv2.putText(frame, str(id)[1:-1], center,
+                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
 
-            loc = np.round(detection.pose_t, 3)
-            loc_x_str = f'x: {loc[0]}'
-            loc_y_str = f'y: {loc[1]}'
-            loc_z_str = f'z: {loc[2]}'
-            cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-            cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-            if self.centers is None:
-                self.centers = np.array(pixCenter)
-            else:
-                self.centers = np.vstack((self.centers, np.array(pixCenter)))
-
+                # loc = np.round(detection.pose_t, 3)
+                # loc_x_str = f'x: {loc[0]}'
+                # loc_y_str = f'y: {loc[1]}'
+                # loc_z_str = f'z: {loc[2]}'
+                # cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                # cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                # cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
+                # cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                # cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                #
+                # if self.centers is None:
+                #     self.centers = np.array(pixCenter)
+                # else:
+                #     self.centers = np.vstack((self.centers, np.array(pixCenter)))
+                # print(f'ID: {detection.tag_id}, Center: {detection.pose_t[0]} {detection.pose_t[1]} {detection.pose_t[2]}')
         self.run_cleanup(frame)
 
 

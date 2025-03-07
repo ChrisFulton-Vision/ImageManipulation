@@ -1075,6 +1075,12 @@ class FrontEndGui(ctk.CTk):
         imgs = glob.glob(os.path.join(self.filepath, '*.' + self.imageConfig.img_type))
 
         for img in imgs:
+            if self.filepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/DT3_Test2':
+                print(img)
+                imgData = cv2.imread(img)
+                imgData = cv2.resize(imgData, (864, 864))
+                cv2.imwrite(img, imgData)
+                print('Resized: ', imgData.shape)
             img = os.path.basename(img)
             isAlreadyPresent = False
             for existingImgClass in self.imageConfig.imgCollection:
@@ -1111,7 +1117,31 @@ class FrontEndGui(ctk.CTk):
 
         cv2.namedWindow(imgClass.imageName)
 
+        kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
+        sharpened_image = cv2.filter2D(dispImg, -1, kernel)
+
+        gray = cv2.cvtColor(dispImg, cv2.COLOR_BGR2GRAY)
+        _laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        _sharpness = _laplacian.var()
+
+        _contrast = gray.std()
+
+        _clarity = _sharpness * _contrast
+
+        _sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+        _sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+        _sobel = np.sqrt(_sobel_x ** 2 + _sobel_y ** 2)
+        _resolution = np.mean(_sobel)
+
+        # print(f'Laplacian: {_laplacian}')
+        print(f'Sharpness: {_sharpness}')
+        print(f'Contrast: {_contrast}')
+        print(f'Clarity: {_clarity}')
+        print(f'Resolution: {_resolution}')
+
+
         cv2.imshow(imgClass.imageName, dispImg)
+        cv2.imshow('Sharper? ', sharpened_image)
 
         self.currImgClass = imgClass
         self.currImg = copy.copy(dispImg)
@@ -1241,10 +1271,10 @@ class FrontEndGui(ctk.CTk):
 
                 x = int(np.average(imgClass.imgPts[:, 0, 0]))
                 y = int(np.average(imgClass.imgPts[:, 0, 1]))
-                min_X = max(int(np.min(imgClass.imgPts[:, 0, 0])), 0)
-                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0])), img.shape[0])
-                min_Y = max(int(np.min(imgClass.imgPts[:, 0, 1])), 0)
-                max_Y = min(int(np.max(imgClass.imgPts[:, 0,  1])), img.shape[1])
+                min_X = max(int(np.min(imgClass.imgPts[:, 0, 0])), 0)*2.0
+                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0])), img.shape[0])*2.0
+                min_Y = max(int(np.min(imgClass.imgPts[:, 0, 1])), 0)*2.0
+                max_Y = min(int(np.max(imgClass.imgPts[:, 0,  1])), img.shape[1])*2.0
                 dist_x = int(np.max(np.array([[max_X - x], [x - min_X]])))
                 dist_y = int(np.max(np.array([[max_Y - y], [y - min_Y]])))
 

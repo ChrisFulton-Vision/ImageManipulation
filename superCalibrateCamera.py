@@ -598,9 +598,9 @@ class Camera():
                 cv2.circle(frame, center, 3, (0,255,0), 3)
                 cv2.polylines(frame, four_corners.astype(int), True, (0, 255, 0), 2)
                 cv2.putText(frame, str(id)[1:-1], center,
-                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 6)
                 cv2.putText(frame, str(id)[1:-1], center,
-                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
 
                 # loc = np.round(detection.pose_t, 3)
                 # loc_x_str = f'x: {loc[0]}'

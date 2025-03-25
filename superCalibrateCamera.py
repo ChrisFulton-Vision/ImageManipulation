@@ -2,7 +2,6 @@ import ctypes
 
 import cv2
 import numpy as np
-from pupil_apriltags import Detector
 import customtkinter as ctk
 from tkinter import filedialog
 import time
@@ -12,12 +11,16 @@ from cv2_enumerate_cameras import enumerate_cameras
 import os
 import pickle
 import copy
-import superCalibrate as superCal
+import yolo
+
+# import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
 #or
 #pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
-class TruthPoints():
+yoloSession = yolo.YOLO()
+
+class TruthPoints:
     def __init__(self):
         self.truthPoints = {}
 
@@ -110,12 +113,14 @@ class thread_with_exception(Thread):
 class CameraConfig():
     def __init__(self):
         self.cam_index = 0
+        self.detectTags = False
+        self.undistort = False
         self.projectLidarPoints = False
+        self.yoloInference = False
         self.secondsBetweenImages = 1.0
         self.recording = False
         self.indexDict = {}
         self.aprilTagSize = 0.168
-        self.undistort = False
         self.useCameraAsSource = True
         self.singleImageFilepath = None
         self.lidarFilepath = None
@@ -154,6 +159,13 @@ class Camera():
         self.undistortCheckbox = None
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select AprilTag Img', command=self.selectSingleImage)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
+        self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
+        self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider, from_=0.15)
+        self.confSliderBar.set(0.75)
+        self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
+        self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
+        self.iouSliderBar.set(1.00)
+
         self.loadFromCache()
         self.vc = None
         # self.vc.setExceptionMode(True)
@@ -166,7 +178,7 @@ class Camera():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x420'
+        self.camFrameGeometry = '455x520'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -229,6 +241,14 @@ class Camera():
             with open(self.camConfig.lidarFilepath, 'rb') as f:
                 test = pickle.load(f)
                 self.lidarTruthPoints.copy(test)
+
+    def confSlider(self, confValue):
+        yoloSession.conf = confValue
+        self.confSliderLabel.configure(text='Conf: ' + f'{confValue:.2f}')
+
+    def iouSlider(self, iouValue):
+        yoloSession.iou = iouValue
+        self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
 
     def ingestCalibration(self):
         try:
@@ -356,11 +376,20 @@ class Camera():
         self.selectTruthPointsLabel.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
+        self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
+        self.confSliderBar.grid(row=rowID, column=1, padx=5, pady=5)
+        rowID += 1
+
+        self.iouSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
+        self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5)
+        rowID += 1
+
         detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
-        if self.detector is None:
+        if self.camConfig.detectTags is False:
             detectAprilTagsCheckbox.deselect()
         else:
             detectAprilTagsCheckbox.select()
+            self.createDetector()
         detectAprilTagsCheckbox.configure(command=self.toggleDetectTags)
         detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
 
@@ -383,7 +412,16 @@ class Camera():
         else:
             projectLidarPoints.select()
         projectLidarPoints.configure(command=self.toggleLidarPoints)
-        projectLidarPoints.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+        projectLidarPoints.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+
+        yoloInference = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image')
+        if self.camConfig.yoloInference is False:
+            yoloInference.deselect()
+        else:
+            yoloInference.select()
+        yoloInference.configure(command=self.toggleYoloInference)
+        yoloInference.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+
         rowID += 1
 
         aprilTagSizeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
@@ -473,12 +511,21 @@ class Camera():
         self.camConfig.projectLidarPoints = not self.camConfig.projectLidarPoints
         self.saveToCache()
 
+    def toggleYoloInference(self):
+        self.camConfig.yoloInference = not self.camConfig.yoloInference
+        self.saveToCache()
+
+    def createDetector(self):
+        self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
+
     def toggleDetectTags(self):
         if self.detector is None:
             # self.detector = Detector(quad_decimate=1.5, quad_sigma =1.0, decode_sharpening=0.75)
-            self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
+            self.createDetector()
+            self.camConfig.detectTags = True
         else:
             self.detector = None
+            self.camConfig.detectTags = False
         self.saveToCache()
 
     def toggleUndistort(self):
@@ -564,6 +611,7 @@ class Camera():
             corners, ids, rejected = self.detector.detectMarkers(webGray)
             self.centers = None
             self.detectIDS = []
+
             for corner, id in zip(corners, ids):
                 pixCenter = (int(corner[0]), int(corner[1]))
                 cv2.polylines(frame, pixCenter, True, (0, 255, 0), 2)
@@ -592,7 +640,7 @@ class Camera():
         if ids is not None:
             for four_corners, id in zip(corners, ids):
 
-                self.detectIDS.append(id)
+                self.detectIDS.append(id[0])
                 center = np.array([np.mean(four_corners[0][:,0]),np.mean(four_corners[0][:,1])]).astype(int)
 
                 cv2.circle(frame, center, 3, (0,255,0), 3)
@@ -619,10 +667,10 @@ class Camera():
                 # cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
                 #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                 #
-                # if self.centers is None:
-                #     self.centers = np.array(pixCenter)
-                # else:
-                #     self.centers = np.vstack((self.centers, np.array(pixCenter)))
+                if self.centers is None:
+                    self.centers = np.array(center)
+                else:
+                    self.centers = np.vstack((self.centers, np.array(center)))
                 # print(f'ID: {detection.tag_id}, Center: {detection.pose_t[0]} {detection.pose_t[1]} {detection.pose_t[2]}')
         self.run_cleanup(frame)
 
@@ -638,6 +686,9 @@ class Camera():
             cv2.circle(frame, self.projectProbe[0,0,:].astype(int), 6, (255, 0, 0), 6)
             cv2.putText(frame, "Probe Tip", self.projectProbe[0,0,:].astype(int) - [50, 50],
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
+
+        if self.camConfig.yoloInference:
+            frame, output = yoloSession.inferOnImage(frame)
 
         self.potentialResize()
         cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))
@@ -662,12 +713,21 @@ class Camera():
                 points.append(truthPoints[str(detectID)])
             points = np.array(points)
 
+            print(points)
+            print()
+            print(self.centers)
+            print()
+            print(self.calibration.getCameraMatrix())
+            print()
+            print(distParams)
+
             ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
                                        imagePoints=self.centers,
                                        cameraMatrix=self.calibration.getCameraMatrix(),
                                        distCoeffs=distParams,
                                        flags=cv2.SOLVEPNP_ITERATIVE)
-            probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
+            # probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
+            probeTip_3d = np.array([[0.0], [0.0], [0.0]])
             self.projectProbe, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=self.calibration.getCameraMatrix(), distCoeffs=distParams)
         else:
             ret = False

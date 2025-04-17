@@ -1046,7 +1046,7 @@ class FrontEndGui(ctk.CTk):
         self.saveToCache()
 
     def selectFolder(self):
-        self.filepath = filedialog.askdirectory(initialdir=self.filepath + "/..", mustexist=True, title="Select Imagery Folder")
+        self.filepath = filedialog.askopenfile(initialdir=self.filepath + "/..", mustexist=True, title="Select Imagery Folder")
         self.imageConfig.imgCollection = []
         self.imageConfig.camCal.calStr = None
         self.loadFromCache(False)

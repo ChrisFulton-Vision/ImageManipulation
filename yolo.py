@@ -1,55 +1,48 @@
 import cv2
 import numpy as np
-# import torch
 import onnxruntime as ort
 import os
 import glob
 import datetime
-import threading
-import copy
-import sys
 from metaYoloReader import MetaYoloReader
 
 
 # ort.preload_dlls()
+# ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
 ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
 
-
 class YOLO:
-    def __init__(self, conf: float = 0.65, iou: float = 0.99, yoloSize=(864, 864),
-                 model_path="YOLOModels/PROBE_BothContext_01062024_0_3M/",
-                              # "YOLOModels/PROBE_BothContext_01062024_0_3M/PROBEic.onnx",
-                              # "YOLOModels/Aligned_Drogue_65_inandoutofcontext/AlignedDrogue_inandoutofcontext.onnx"],
-                 # model_paths=['YOLOModels/cats_v_dogs.onnx'],
+    def __init__(self, conf: float = 0.75, iou: float = 0.99, yoloSize=(864, 864),
+                 model_path="YOLOModels/GIII_01172025_10_100M_MoreFeatures/",
                  numClasses: int = 94):
         self.conf = conf
         self.iou = iou
+        self.pixel_buffer = 10
 
-        model = glob.glob(os.path.join(model_path, f'*.onnx'))
-        metaYolo = glob.glob(os.path.join(model_path, f'*.csv'))
-        self.modelPath = model[0]
-        self.reader = MetaYoloReader(metaYolo[0])
-
+        self.modelPath = None
+        self.reader = None
         self.provider = ['CUDAExecutionProvider', 'CPUExecutionProvider']
         self.output = []
         self.boxes, self.scores, self.class_ids = [], [], []
         self.session = None
-        self.reinitSession()
 
         self.class_names = range(numClasses)
         self.yoloSize = yoloSize
 
-    def updateModelPath(self, newPath: str):
-        self.modelPath = newPath
+        self.setNewFolder(model_path)
+
+    def setNewFolder(self, directory):
+        self.modelPath = glob.glob(os.path.join(directory, f'*.onnx'))[0]
+        self.reader = MetaYoloReader(glob.glob(os.path.join(directory, f'*.csv'))[0])
         self.reinitSession()
 
     def reinitSession(self):
         sess_options = ort.SessionOptions()
-        sess_options.intra_op_num_threads = 1
-        sess_options.inter_op_num_threads = 1
-        # sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
+        # sess_options.intra_op_num_threads = 1
+        # sess_options.inter_op_num_threads = 1
+        # sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
+        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
     def inferOnImage(self, image):
@@ -73,7 +66,10 @@ class YOLO:
 
     def runOneSession(self, yoloImage):
         startTime = datetime.datetime.now()
-        output = self.session.run(None, {self.session.get_inputs()[0].name: yoloImage})
+        if self.session is not None:
+            output = self.session.run(None, {self.session.get_inputs()[0].name: yoloImage})
+        else:
+            output = None
         endTime = datetime.datetime.now()
         centers, boxes, scores, class_ids = self.interpretOutput(output)
         return centers, boxes, scores, class_ids, (endTime - startTime).total_seconds()
@@ -81,7 +77,10 @@ class YOLO:
     def interpretOutput(self, output):
 
         centers, boxes, scores, class_ids = [], [], [], []
-        predictions = np.squeeze(output[0])
+        if output is not None:
+            predictions = np.squeeze(output[0])
+        else:
+            predictions = []
 
         for idx, detection in enumerate(predictions):
 
@@ -94,11 +93,13 @@ class YOLO:
                 x2 = int(x + w_box / 2)
                 y2 = int(y + h_box / 2)
 
-                if x1 > 10 and x2 < self.yoloSize[0] - 10 and y1 > 10 and y2 < self.yoloSize[1] - 10:
-                    centers.append([x,y])
-                    boxes.append([x1, y1, x2, y2])
-                    scores.append(float(confidence))
-                    class_ids.append(np.argmax(class_probs))
+                # if (x1 > self.pixel_buffer and x2 < self.yoloSize[0] - self.pixel_buffer
+                #         and y1 > self.pixel_buffer and y2 < self.yoloSize[1] - self.pixel_buffer):
+
+                centers.append([x,y])
+                boxes.append([x1, y1, x2, y2])
+                scores.append(float(confidence))
+                class_ids.append(np.argmax(class_probs))
 
         return centers, boxes, scores, class_ids
 
@@ -120,6 +121,8 @@ class YOLO:
                 newBoxes.append(boxes[i])
                 newClass_ids.append(class_ids[i])
                 newScores.append(scores[i])
+                if class_ids[i] == 92:
+                    print(boxes[i])
 
             image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores, color)
             if len(indices) > 5:
@@ -142,9 +145,11 @@ class YOLO:
             y2 = int(h / y_h * y2)
 
             label = f"{class_id}: {score:.2f}"
-            # cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
             cv2.putText(image, f"{class_id}", (x,y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+            cv2.putText(image, 'Direct Inference', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75, color, 1)
 
         return image
 
@@ -160,15 +165,20 @@ class YOLO:
         np.set_printoptions(suppress=True, precision=4)
         object_points = []
         image_points = []
-        badList = [63, 72, 19, 92, 78, 77, 12, 22]
+        badList = []
         for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id not in badList:
+            if y_class_id not in badList and y_class_id <= len(self.reader.idsNamesLocs):
                 x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
                 object_points.append([x, y, z])
                 image_points.append(y_centers[idx])
+            else:
+                print(f'Future Debug here:')
 
         object_points = np.array(object_points)
         image_points = np.array(image_points)
+
+        if len(object_points) < 6:
+            return
 
         ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
                                        imagePoints=image_points,
@@ -177,16 +187,25 @@ class YOLO:
                                        # flags=cv2.SOLVEPNP_ITERATIVE)
 
         for y_class_id in y_class_ids:
-            # for idNameLoc in reader.idsNamesLocs:
-            id = self.reader.idsNamesLocs[y_class_id][0]
-            xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
-            projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
-                                                  cameraMatrix=calibration, distCoeffs=np.zeros((5,)))
-            x, y = np.squeeze(projectedPixel)
-            x = int(w / y_w * x)
-            y = int(h / y_h * y)
-            cv2.putText(image, str(id), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75, (50, 255, 255), 1)
+            if y_class_id <= len(self.reader.idsNamesLocs):
+                # for idNameLoc in reader.idsNamesLocs:
+                id = self.reader.idsNamesLocs[y_class_id][0]
+                xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
+                projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
+                                                      cameraMatrix=calibration, distCoeffs=np.zeros((5,)))
+                x, y = np.squeeze(projectedPixel)
+                x = int(w / y_w * x)
+                y = int(h / y_h * y)
+                cv2.putText(image, str(id), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, (50, 255, 255), 1)
+
+                cv2.putText(image, 'SolvePnP Solution', (25, w - 25), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, (50, 255, 255), 1)
+
+                # image[0:self.pixel_buffer, :] = np.array([0, 0, 0.0])
+                # image[h - self.pixel_buffer:h, :] = np.array([0, 0, 0.0])
+                # image[:, 0:self.pixel_buffer] = np.array([0, 0, 0.0])
+                # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
 
 
 

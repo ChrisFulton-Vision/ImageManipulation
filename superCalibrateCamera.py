@@ -18,8 +18,6 @@ import yolo
 #or
 #pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
-yoloSession = yolo.YOLO()
-
 class TruthPoints:
     def __init__(self):
         self.truthPoints = {}
@@ -124,6 +122,7 @@ class CameraConfig():
         self.useCameraAsSource = True
         self.singleImageFilepath = None
         self.lidarFilepath = None
+        self.yoloFilepath = None
 
     def copy(self, configToCopy):
         self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
@@ -132,6 +131,7 @@ class CameraConfig():
 class Camera():
     def __init__(self, gui):
         self.gui = gui
+        self.yoloSession = yolo.YOLO()
         self.detectIDS = None
         self.projectProbe = None
         self.calibration = None
@@ -141,6 +141,7 @@ class Camera():
         self.scanForCameras()
         self.windowName =  'webcam'
         self.filepath = ''
+        self.yoloFilepath = ''
         self.cam_frame = ctk.CTkFrame(master=self.gui)
         self.showWindow = False
         self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=['Camera Stream', 'Static Image'], command=self.sourceUpdate)
@@ -155,6 +156,9 @@ class Camera():
         else:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
         self.lidarTruthPoints = TruthPoints()
+        self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color='green', hover_color='navy', command=self.selectYoloFolder)
+        self.selectYOLO_folderLabel = ctk.CTkLabel(self.cam_frame,
+                                                   text='../' + os.path.basename(os.path.normpath(self.yoloFilepath)))
         self.selectCalibLabel = None
         self.undistortCheckbox = None
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select AprilTag Img', command=self.selectSingleImage)
@@ -232,6 +236,16 @@ class Camera():
         self.loadTruthPoints()
         self.saveToCache()
 
+    def selectYoloFolder(self):
+        if self.camConfig.yoloFilepath is None:
+            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=self.filepath + '/..',
+                                                                  title='Select YOLO Folder')
+        else:
+            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
+                                                                  title='Select YOLO Folder')
+
+        self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+
     def updateLidarLabel(self):
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel.configure(text=os.path.basename(self.camConfig.lidarFilepath))
@@ -243,11 +257,11 @@ class Camera():
                 self.lidarTruthPoints.copy(test)
 
     def confSlider(self, confValue):
-        yoloSession.conf = confValue
+        self.yoloSession.conf = confValue
         self.confSliderLabel.configure(text='Conf: ' + f'{confValue:.2f}')
 
     def iouSlider(self, iouValue):
-        yoloSession.iou = iouValue
+        self.yoloSession.iou = iouValue
         self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
 
     def ingestCalibration(self):
@@ -374,6 +388,10 @@ class Camera():
 
         self.selectTruthPointsButton.grid(row=rowID, column=0, padx=5, pady=5)
         self.selectTruthPointsLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        rowID += 1
+
+        self.selectYOLO_folderButton.grid(row=rowID, column=0, padx=5, pady=5)
+        self.selectYOLO_folderLabel.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
         self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
@@ -688,7 +706,7 @@ class Camera():
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
 
         if self.camConfig.yoloInference:
-            frame, output = yoloSession.inferOnImage(frame)
+            frame, output = self.yoloSession.inferOnImage(frame)
 
         self.potentialResize()
         cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))

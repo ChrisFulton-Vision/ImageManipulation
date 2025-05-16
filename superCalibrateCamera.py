@@ -1,85 +1,103 @@
 import ctypes
 
-import cv2
 import numpy as np
 import customtkinter as ctk
 from tkinter import filedialog
-import time
-import threading
 from threading import Thread
 from cv2_enumerate_cameras import enumerate_cameras
-import os
-import pickle
-import copy
-import yolo
+from Calibration import Calibration
+from LidarTruth import TruthPoints
+import pickle, copy, os, time, threading, cv2, glob, re, yolo
+from enum import Enum, auto
+from os.path import join
+from PIL import Image, ImageTk
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
 #or
 #pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
-class TruthPoints:
-    def __init__(self):
-        self.truthPoints = {}
+GREEN = '#2FA572'
+class video_player():
+    def __init__(self, img_filepaths:list):
+        self.img_id = 0
+        self.play_speed = 1
+        self.pause = False
+        self.temp_unpause = False
+        self.quit_now = False
+        self.thread = thread_with_exception(1, self.run_new_menu)
+        self.pop_up = None
+        self.play_pause_button = None
+        self.exit_player_button = None
+        self.imageList = natural_sort(img_filepaths)
+        self.thread.start()
 
-        self.selectTruthPoints()
+    def run_new_menu(self):
+        if self.pop_up is None:
+            self.pop_up = ctk.CTkToplevel()
+            self.pop_up.title('Video Controls')
+            self.pop_up.geometry('600x250+300+300')
+            self.pop_up.grid_columnconfigure(0, weight=1, uniform='equal')
+            self.pop_up.grid_columnconfigure(1, weight=1, uniform='equal')
+            self.pop_up.grid_columnconfigure(2, weight=1, uniform='equal')
+        if self.play_pause_button is None:
+            self.play_pause_button = ctk.CTkButton(master=self.pop_up, text="Pause", command=self.play_pause)
+            self.play_pause_button.grid(row=0, column=1, sticky='nsew')
+        if self.exit_player_button is None:
+            self.exit_player_button = ctk.CTkButton(master=self.pop_up, text='Quit', command=self.exit_player)
+            self.exit_player_button.grid(row=1, column=1, sticky='nsew')
 
-        self.saveToCache()
+    def play_pause(self):
+        self.pause = not self.pause
 
-    def selectTruthPoints(self):
-        # 0
-        self.truthPoints['0'] = np.array([5.25967, 2.52404, -1.01714])
-        # 1
-        self.truthPoints['1'] = np.array([2.90982, 2.45965, -0.60117])
-        # 4
-        self.truthPoints['4'] = np.array([1.02611, -0.09072, -1.04306])
-        # 5
-        self.truthPoints['5'] = np.array([1.71335, -0.48700, -0.66432])
-        # 6
-        self.truthPoints['6'] = np.array([0.62843, 1.60848, -0.65310])
-        # 7
-        self.truthPoints['7'] = np.array([3.51041, 3.23543, -0.80128])
-        # 8
-        self.truthPoints['8'] = np.array([4.11462, 3.41798, -0.24962])
-        # 9
-        self.truthPoints['9'] = np.array([-0.37882, -0.33134, -0.64973])
-        # 10
-        self.truthPoints['10'] = np.array([1.38713, 0.46928, -0.63064])
-        # 12
-        self.truthPoints['12'] = np.array([2.72211, 4.00315, -0.59416])
-        # 17
-        self.truthPoints['17'] = np.array([1.35135, -0.99257, -0.41729])
-        # 18
-        self.truthPoints['18'] = np.array([4.00388, 4.02418, 0.08610])
-        # 19
-        self.truthPoints['19'] = np.array([1.15202, 1.01983, -0.72926])
-        # 21
-        self.truthPoints['21'] = np.array([4.09984, 1.55906, -0.58504])
-        # 22
-        self.truthPoints['22'] = np.array([2.52925, 1.73592, -0.97918])
-        # 23
-        self.truthPoints['23'] = np.array([2.15135, 3.04855, -0.73227])
+    def exit_player(self):
+        self.quit_now = True
+        self.close()
 
-    def getTruthPointsDict(self):
-        return self.truthPoints
+    def close(self):
+        self.pop_up.destroy()
+        self.thread.raise_exception()
+        self.thread.join()
+        del self
 
-    def getTruthPointsNumpy(self):
-        truthPointsArray = None
+    def next_frame(self)->np.array:
 
-        for truthPoint in self.truthPoints.values():
-            if truthPointsArray is None:
-                truthPointsArray = truthPoint
-            else:
-                truthPointsArray = np.vstack((truthPointsArray, truthPoint))
+        key = cv2.waitKey(1)
 
-        return truthPointsArray
+        if key == 99:
+            self.img_id += 1
+            self.play_speed = 0
+            self.temp_unpause = True
+            self.pause = True
+        if key == 122:
+            self.img_id -= 1
+            self.play_speed = 0
+            self.temp_unpause = True
+            self.pause = True
 
-    def saveToCache(self):
-        with open('LIDAR_Truth_Points.pkl', 'wb') as f:
-            pickle.dump(self, f)
+        if key == 32:
+            self.play_speed = 0
+            if not self.pause:
+                self.pause = not self.pause
+                self.play_speed = 1
+        if key == 100:
+            self.play_speed += 1
+            self.pause = False
+        if key == 97:
+            self.play_speed -= 1
+            self.pause = False
 
-    def copy(self, classToCopy):
-        self.__dict__.update(copy.deepcopy(classToCopy.__dict__))
+        if key == 27:
+            self.quit_now = True
+
+        frame = None
+
+        if not self.pause or self.temp_unpause:
+            self.temp_unpause = False
+            self.img_id = (self.img_id + self.play_speed) % len(self.imageList)
+            frame = cv2.imread(self.imageList[self.img_id])
+
+        return frame, self.quit_now
 
 class thread_with_exception(Thread):
     def __init__(self, name, func):
@@ -92,7 +110,7 @@ class thread_with_exception(Thread):
             while True:
                 self.func()
         finally:
-            print('Window Closed')
+            pass
 
     def get_id(self):
         if hasattr(self,'_thread_id'):
@@ -108,6 +126,12 @@ class thread_with_exception(Thread):
             ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
             print('Exception Raise Failure')
 
+class ImageSource(Enum):
+    Camera_Stream = 'Camera Stream'
+    Static_Image = 'Static Image'
+    Stream_from_Folder = 'Stream from Folder'
+
+
 class CameraConfig():
     def __init__(self):
         self.cam_index = 0
@@ -117,12 +141,11 @@ class CameraConfig():
         self.yoloInference = False
         self.secondsBetweenImages = 1.0
         self.recording = False
-        self.indexDict = {}
         self.aprilTagSize = 0.168
-        self.useCameraAsSource = True
-        self.singleImageFilepath = None
+        self.imageSource = ImageSource.Camera_Stream
+        self.imageFilepath = None
         self.lidarFilepath = None
-        self.yoloFilepath = None
+        self.yoloFilepath = ''
 
     def copy(self, configToCopy):
         self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
@@ -134,35 +157,42 @@ class Camera():
         self.yoloSession = yolo.YOLO()
         self.detectIDS = None
         self.projectProbe = None
-        self.calibration = None
+        self.calibration = Calibration()
         self.centers = None
         self.calibFile = ''
         self.camConfig = CameraConfig()
+        self.indexDict = {}
         self.scanForCameras()
         self.windowName =  'webcam'
         self.filepath = ''
-        self.yoloFilepath = ''
         self.cam_frame = ctk.CTkFrame(master=self.gui)
         self.showWindow = False
-        self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=['Camera Stream', 'Static Image'], command=self.sourceUpdate)
+
+        self.available_sources = [source.value for source in ImageSource]
+
+        self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=self.available_sources, command=self.sourceUpdate)
         self.startStreamButton = ctk.CTkButton(master=self.cam_frame, text='Start Stream', fg_color='red', hover_color='blue')
         self.recordButton = ctk.CTkButton(master=self.cam_frame,text='Saving Imagery', fg_color='green', hover_color='navy', command=self.recordOff)
-        self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.camConfig.indexDict.keys()),
+        self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                                          command=self.selectCamera)
         self.selectFolderLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(os.path.normpath(self.filepath)))
         self.selectTruthPointsButton = ctk.CTkButton(master=self.cam_frame, text='Select LIDAR Points', hover_color='blue', command=self.selectLidarFile)
+
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(os.path.normpath(self.camConfig.lidarFilepath)))
         else:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
+
         self.lidarTruthPoints = TruthPoints()
-        self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color='green', hover_color='navy', command=self.selectYoloFolder)
+        self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=GREEN,command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = ctk.CTkLabel(self.cam_frame,
-                                                   text='../' + os.path.basename(os.path.normpath(self.yoloFilepath)))
+                                                   text='../' + os.path.basename(os.path.normpath(self.camConfig.yoloFilepath)))
         self.selectCalibLabel = None
         self.undistortCheckbox = None
-        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select AprilTag Img', command=self.selectSingleImage)
+        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectSingleImage)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
+        self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder', command=self.selectSingleImage)
+        self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
         self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
         self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider, from_=0.15)
         self.confSliderBar.set(0.75)
@@ -208,6 +238,8 @@ class Camera():
         self.ingestCalibration()
 
         self.updateLidarLabel()
+        self.updateYOLOLabel()
+        self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
         self.loadTruthPoints()
 
     def saveToCache(self):
@@ -238,17 +270,22 @@ class Camera():
 
     def selectYoloFolder(self):
         if self.camConfig.yoloFilepath is None:
-            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=self.filepath + '/..',
+            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=os.getcwd() + '/..',
                                                                   title='Select YOLO Folder')
         else:
             self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
                                                                   title='Select YOLO Folder')
-
+        self.updateYOLOLabel()
         self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+        self.saveToCache()
 
     def updateLidarLabel(self):
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel.configure(text=os.path.basename(self.camConfig.lidarFilepath))
+
+    def updateYOLOLabel(self):
+        if self.camConfig.yoloFilepath is not None:
+            self.selectYOLO_folderLabel.configure(text=os.path.basename(self.camConfig.yoloFilepath))
 
     def loadTruthPoints(self):
         if self.camConfig.lidarFilepath is not None:
@@ -265,87 +302,108 @@ class Camera():
         self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
 
     def ingestCalibration(self):
-        try:
-            with open(self.calibFile, 'rb') as f:
-                self.calibration = pickle.load(f)
-        except FileNotFoundError:
-            if self.selectCalibLabel is not None:
-                self.selectCalibLabel.configure(text='No Calibration Found')
+
+        if not self.calibration.fromBinFile(self.calibFile):
+            if not self.calibration.fromFile(self.calibFile):
+                if self.selectCalibLabel is not None:
+                    self.selectCalibLabel.configure(text='No Calibration Found')
+                    self.gui.after(100,self.gui.update())
                 return
 
-        scale = 1.0
+        if not self.calibration.validCal:
+            return
 
         # Note: this line exists because our aprilTag image was taken at 2848x2848, while calibration images
         # were 1424x1424. Thus, the camera calibration matrix is incorrect for this specific file.
         if self.calibFile == 'C:/repos/aburn/usr/24WintCalspanFltTest/Alvium_LJ_Calib_2DecSIFTED/calibration.pkl':
-            scale = 2848.0/1424.0
-
-        self.calibration.fx = scale * self.calibration.fx
-        self.calibration.fy = scale * self.calibration.fy
-        self.calibration.cx = scale * (self.calibration.cx + 0.5) - 0.5
-        self.calibration.cy = scale * (self.calibration.cy + 0.5) - 0.5
-
+            self.calibration.scaleCalibration(2848)
 
         if self.selectCalibLabel is not None:
-            self.selectCalibLabel.configure(text=os.path.basename(os.path.normpath(self.calibFile)))
+            self.selectCalibLabel.configure(text=os.path.basename(os.path.normpath(self.calibFile)),
+                                            bg_color=self.selectCalibLabel.cget("bg_color"))
+            self.cam_frame.update()
+            self.gui.update()
+            self.selectCalibLabel.update()
+            self.cam_frame.update()
+            self.gui.update()
 
         if self.undistortCheckbox is not None:
             self.undistortCheckbox.configure(state='normal')
         self.saveToCache()
 
     def scanForCameras(self):
-        self.camConfig.indexDict = {}
+        self.indexDict = {}
         for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
-            self.camConfig.indexDict[camera_info.name] = camera_info.index
+            self.indexDict[camera_info.name] = camera_info.index
 
     def selectCamera(self, key):
-        self.cam_index = self.camConfig.indexDict[key]
+        self.cam_index = self.indexDict[key]
         self.vc.release()
         self.vc = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
 
 
     def sourceUpdate(self, source):
-        if source == 'Camera Stream':
-            self.camConfig.useCameraAsSource = True
-        else:
-            self.camConfig.useCameraAsSource = False
+
+        self.camConfig.imageSource = ImageSource(source)
 
         self.updateSingleOrStream(rowID=1)
+
     def updateSingleOrStream(self, rowID):
-        if self.camConfig.useCameraAsSource:
+        if not self.camConfig.imageSource == ImageSource.Camera_Stream:
+            if self.selectCameraCombo.grid_info():
+                self.selectCameraCombo.grid_forget()
+            if self.startStreamButton.grid_info():
+                self.startStreamButton.grid_forget()
 
-            self.startStreamOff()
-
+        if not self.camConfig.imageSource == ImageSource.Static_Image:
             if self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid_forget()
             if self.singleImageTextButton.grid_info():
                 self.singleImageTextButton.grid_forget()
 
-            self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5)
+        if not self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+            if self.multiImageTextButton.grid_info():
+                self.multiImageTextButton.grid_forget()
+            if self.multiImageFolderSelect.grid_info():
+                self.multiImageFolderSelect.grid_forget()
+
+
+        if self.camConfig.imageSource == ImageSource.Camera_Stream:
+
+            self.startStreamOff()
+            if not self.startStreamButton.grid_info():
+                self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5)
             if not self.selectCameraCombo.grid_info():
                 self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5)
 
-        else:
-            if self.selectCameraCombo.grid_info():
-                self.selectCameraCombo.grid_forget()
-            if self.startStreamButton.grid_info():
-                self.startStreamButton.grid_forget()
+        elif self.camConfig.imageSource == ImageSource.Static_Image:
 
             if not self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5)
             if not self.singleImageTextButton.grid_info():
                 self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5)
 
+        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+
+            if not self.multiImageFolderSelect.grid_info():
+                self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5)
+            if not self.multiImageTextButton.grid_info():
+                self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5)
+
+        else:
+            raise ValueError(f'Unknown Image selection mode: {self.camConfig.imageSource}')
+
         self.saveToCache()
 
     def selectSingleImage(self):
-        if self.camConfig.singleImageFilepath is None:
+        if self.camConfig.imageFilepath is None:
             initDir = self.filepath + '/..'
         else:
-            initDir = os.path.normpath(self.camConfig.singleImageFilepath)
+            initDir = os.path.normpath(self.camConfig.imageFilepath)
 
-        self.camConfig.singleImageFilepath = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
-        self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.singleImageFilepath))
+        self.camConfig.imageFilepath = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
+        self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
+        self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
 
     def setupFrame(self):
         rowID = 0
@@ -353,22 +411,22 @@ class Camera():
         self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
         self.vc.set(cv2.CAP_PROP_FPS, 60)
 
-        self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=['Camera Stream', 'Static Image'], command=self.sourceUpdate)
+        self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame, values=['Camera Stream', 'Static Image', 'Stream from Folder'], command=self.sourceUpdate)
         self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5)
         rowID += 1
 
         self.startStreamOff()
 
         self.singleImageTextButton.configure(command=self.detectSingleImage)
-        if self.camConfig.singleImageFilepath is not None:
-            self.singleImageTextButton.configure(text = os.path.basename(self.camConfig.singleImageFilepath))
+        if self.camConfig.imageFilepath is not None:
+            self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
 
-        if self.camConfig.useCameraAsSource:
-            self.streamOrImgCombo.set('Camera Stream')
-            self.sourceUpdate('Camera Stream')
-        else:
-            self.streamOrImgCombo.set('Static Image')
-            self.sourceUpdate('Static Image')
+        self.multiImageTextButton.configure(command=self.startStreamOn)
+        if self.camConfig.imageFilepath is not None:
+            self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
+
+        self.streamOrImgCombo.set(self.camConfig.imageSource.value)
+        self.sourceUpdate(self.camConfig.imageSource.value)
 
         rowID += 1
 
@@ -412,10 +470,10 @@ class Camera():
         detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
 
         self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
-        if self.calibration is None:
+        if not self.calibration.validCal:
             self.undistortCheckbox.configure(state='disabled')
 
-        if self.camConfig.undistort is False or self.calibration is None:
+        if self.camConfig.undistort is False:
             self.undistortCheckbox.deselect()
         else:
             self.undistortCheckbox.select()
@@ -466,6 +524,10 @@ class Camera():
 
         self.cam_frame.pack()
 
+    def shutdown(self):
+        self.recordOff()
+        self.startStreamOff()
+
     def releaseCamReturnToMain(self):
         self.startStreamOff()
         self.vc.release()
@@ -494,7 +556,8 @@ class Camera():
 
     def startStreamOn(self):
         self.showWindow = True
-        self.startStreamButton.configure(command=self.startStreamOff, text='Stop Streaming', fg_color='green', hover_color='navy')
+        self.startStreamButton.configure(command=self.startStreamOff, text='Stop Streaming', fg_color=GREEN, hover_color='navy')
+        self.multiImageTextButton.configure(command=self.startStreamOff, fg_color=GREEN, hover_color='navy')
 
         self.selectCameraCombo.configure(state='disabled')
 
@@ -506,6 +569,7 @@ class Camera():
 
     def startStreamOff(self):
         self.startStreamButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
+        self.multiImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
 
         self.selectCameraCombo.configure(state='normal')
         self.startStreamButton.configure(text='Start Stream')
@@ -547,7 +611,7 @@ class Camera():
         self.saveToCache()
 
     def toggleUndistort(self):
-        if self.calibration is None:
+        if not self.calibration.validCal:
             self.camConfig.undistort = False
             return
 
@@ -559,30 +623,33 @@ class Camera():
 
     def detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        frame = cv2.imread(self.camConfig.singleImageFilepath)
+        frame = cv2.imread(self.camConfig.imageFilepath)
         self.detectAprilTagsAndPrint(frame)
 
         key = cv2.waitKey(0)
         if key == 27:
             cv2.destroyAllWindows()
 
+    @staticmethod
+    def convert_cv_to_pil(img):
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
     def run(self):
 
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        rval = False
-        if self.camConfig.useCameraAsSource:
-            rval, frame = self.vc.read()
-            if rval:
-                self.aspectRatio = float(frame.shape[1]) / float(frame.shape[0])
-                cv2.resizeWindow(self.windowName, frame.shape[1], frame.shape[0])
-                self.lastHeight = frame.shape[0]
-                self.lastWidth = frame.shape[1]
+        if self.camConfig.imageSource == ImageSource.Camera_Stream:
+            self.run_video_stream()
         else:
-            frame = cv2.imread(self.camConfig.singleImageFilepath)
+            self.run_folder_reader()
+
+    def run_video_stream(self):
+        cv2.destroyAllWindows()
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+        rval, frame = self.vc.read()
+        if rval:
+            self.aspectRatio = float(frame.shape[1]) / float(frame.shape[0])
+            cv2.resizeWindow(self.windowName, frame.shape[1], frame.shape[0])
             self.lastHeight = frame.shape[0]
             self.lastWidth = frame.shape[1]
-            if frame:
-                rval = True
 
         while rval and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
             rval, frame = self.vc.read()
@@ -593,105 +660,97 @@ class Camera():
                 self.startStreamOff()
                 break
 
+    def run_folder_reader(self):
+        cv2.destroyAllWindows()
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+        imageList = glob.glob(os.path.join(os.path.dirname(self.camConfig.imageFilepath), '*.bmp'))
+        imageList = natural_sort(imageList)
+
+        img_id = 0
+        play_speed = 1
+        pause = False
+        temp_unpause = False
+
+        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+
+            if not pause or temp_unpause:
+                temp_unpause = False
+                img_id = (img_id + play_speed) % len(imageList)
+                frame = cv2.imread(imageList[img_id])
+                self.detectAprilTagsAndPrint(frame)
+
+            key = cv2.waitKey(1)
+
+            if key == 99:
+                img_id += 1
+                play_speed = 0
+                temp_unpause = True
+                pause = True
+
+            if key == 122:
+                img_id -= 1
+                play_speed = 0
+                temp_unpause = True
+                pause = True
+
+            if key == 32:
+                pause = not pause
+                play_speed = 0
+                if not pause:
+                    play_speed = 1
+            if key == 100:
+                play_speed += 1
+                pause = False
+            if key == 97:
+                play_speed -= 1
+                pause = False
+
+            if key == 27:
+                break
+
         self.startStreamOff()
 
-    def detectAprilTagsAndPrint(self, frame):
 
-        if self.calibration is not None and self.camConfig.undistort:
+
+
+    def detectAprilTagsAndPrint(self, frame):
+        if self.calibration.validCal and self.camConfig.undistort:
             frame = cv2.undistort(frame, cameraMatrix=self.calibration.getCameraMatrix(),
                                   distCoeffs=self.calibration.getDistortion())
 
+        if self.detector is not None:
+            self.detect_and_markup(frame)
+
+        self.run_cleanup(frame)
+
+    def detect_and_markup(self, frame):
         webGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        scale = 1.0
-        if not self.camConfig.useCameraAsSource and self.camConfig.singleImageFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/AlviumLJAprilTags/1.bmp':
-            scale = 2848.0 / 1424.0
-
-        if self.calibration is not None:
-            K = self.calibration.getCameraMatrix()
-            cx = int(scale * (self.calibration.cx + 0.5) - 0.5)
-            cy = int(scale * (self.calibration.cy + 0.5) - 0.5)
-        else:
-            cx = int(frame.shape[1] / 2)
-            cy = int(frame.shape[0] / 2)
-
-        crosshairsH = np.array([[cx + 10, cy], [cx - 10, cy]])
-        crosshairsV = np.array([[cx, cy + 10], [cx, cy - 10]])
-
-        cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), 2)
-        cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), 2)
-
-        if self.detector is None:
-            self.run_cleanup(frame)
-            return
-
-        if self.calibration is None:
-            corners, ids, rejected = self.detector.detectMarkers(webGray)
-            self.centers = None
-            self.detectIDS = []
-
-            for corner, id in zip(corners, ids):
-                pixCenter = (int(corner[0]), int(corner[1]))
-                cv2.polylines(frame, pixCenter, True, (0, 255, 0), 2)
-                cv2.putText(frame, str(id), pixCenter,
-                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 6)
-                cv2.putText(frame, str(id), pixCenter,
-                            cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
-
-                self.detectIDS.append(id)
-
-                if self.centers is None:
-                    self.centers = np.array(pixCenter)
-                else:
-                    self.centers = np.vstack((self.centers, np.array(pixCenter)))
-
-                self.run_cleanup(frame)
-                return
-
-
-        K = self.calibration.getCameraMatrix()
-
         corners, ids, rejected = self.detector.detectMarkers(webGray)
         self.centers = None
         self.detectIDS = []
 
-        if ids is not None:
-            for four_corners, id in zip(corners, ids):
+        if corners is None or ids is None:
+            self.run_cleanup(frame)
+            return
 
-                self.detectIDS.append(id[0])
-                center = np.array([np.mean(four_corners[0][:,0]),np.mean(four_corners[0][:,1])]).astype(int)
+        for corners, id in zip(corners, ids):
+            corners = np.squeeze(np.array(corners))
+            polyline = [np.array(corners, np.int32).reshape((-1, 1, 2))]
+            pixCenter = np.mean(corners, axis=0).astype(np.int32)
+            cv2.polylines(frame, polyline, True, (0, 255, 0), 4, lineType=cv2.FILLED)
+            cv2.putText(frame, str(id[0]), pixCenter,
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+            cv2.putText(frame, str(id[0]), pixCenter,
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1)
 
-                cv2.circle(frame, center, 3, (0,255,0), 3)
-                cv2.polylines(frame, four_corners.astype(int), True, (0, 255, 0), 2)
-                cv2.putText(frame, str(id)[1:-1], center,
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 6)
-                cv2.putText(frame, str(id)[1:-1], center,
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
+            self.detectIDS.append(id)
 
-                # loc = np.round(detection.pose_t, 3)
-                # loc_x_str = f'x: {loc[0]}'
-                # loc_y_str = f'y: {loc[1]}'
-                # loc_z_str = f'z: {loc[2]}'
-                # cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                # cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                # cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3)
-                # cv2.putText(frame, loc_x_str, (int(detection.center[0]), int(detection.center[1] + 25)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                # cv2.putText(frame, loc_y_str, (int(detection.center[0]), int(detection.center[1] + 50)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                # cv2.putText(frame, loc_z_str, (int(detection.center[0]), int(detection.center[1] + 75)),
-                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                #
-                if self.centers is None:
-                    self.centers = np.array(center)
-                else:
-                    self.centers = np.vstack((self.centers, np.array(center)))
-                # print(f'ID: {detection.tag_id}, Center: {detection.pose_t[0]} {detection.pose_t[1]} {detection.pose_t[2]}')
+        if self.centers is None:
+            self.centers = np.array(pixCenter)
+        else:
+            self.centers = np.vstack((self.centers, np.array(pixCenter)))
+
         self.run_cleanup(frame)
-
 
     def run_cleanup(self, frame):
         if self.centers is not None:
@@ -708,7 +767,26 @@ class Camera():
         if self.camConfig.yoloInference:
             frame, output = self.yoloSession.inferOnImage(frame)
 
+        scale = 1.0
+        if self.camConfig.imageSource == ImageSource.Static_Image and self.camConfig.imageFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/AlviumLJAprilTags/1.bmp':
+            scale = 2848.0 / 1424.0
+
+        if self.calibration.validCal:
+            K = self.calibration.getCameraMatrix()
+            cx = int(scale * (self.calibration.cx + 0.5) - 0.5)
+            cy = int(scale * (self.calibration.cy + 0.5) - 0.5)
+        else:
+            cx = int(frame.shape[1] / 2)
+            cy = int(frame.shape[0] / 2)
+
+        crosshairsH = np.array([[cx + 10, cy], [cx - 10, cy]])
+        crosshairsV = np.array([[cx, cy + 10], [cx, cy - 10]])
+
+        cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), 2)
+        cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), 2)
+
         self.potentialResize()
+
         cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))
 
         if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
@@ -730,14 +808,6 @@ class Camera():
             for detectID in self.detectIDS:
                 points.append(truthPoints[str(detectID)])
             points = np.array(points)
-
-            print(points)
-            print()
-            print(self.centers)
-            print()
-            print(self.calibration.getCameraMatrix())
-            print()
-            print(distParams)
 
             ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
                                        imagePoints=self.centers,
@@ -773,12 +843,16 @@ class Camera():
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
 
-        if not self.lastHeight == height:
+        if not self.lastHeight == height and height != 0:
             cv2.resizeWindow(self.windowName, int(height * self.aspectRatio), height)
             self.lastHeight = height
             self.lastWidth = int(height * self.aspectRatio)
-        elif not self.lastWidth == width:
+        elif not self.lastWidth == width and width != 0:
             cv2.resizeWindow(self.windowName, width, int(width / self.aspectRatio))
             self.lastWidth = width
             self.lastHeight = int(width / self.aspectRatio)
 
+def natural_sort(l):
+    convert = lambda text: int(text) if text.isdigit() else text.lower()
+    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+    return sorted(l, key=alphanum_key)

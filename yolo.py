@@ -32,9 +32,14 @@ class YOLO:
         self.setNewFolder(model_path)
 
     def setNewFolder(self, directory):
-        self.modelPath = glob.glob(os.path.join(directory, f'*.onnx'))[0]
-        self.reader = MetaYoloReader(glob.glob(os.path.join(directory, f'*.csv'))[0])
-        self.reinitSession()
+        if len(glob.glob(os.path.join(directory, f'*.onnx'))) > 0 and len(glob.glob(os.path.join(directory, f'*.csv'))) > 0:
+            self.modelPath = glob.glob(os.path.join(directory, f'*.onnx'))[0]
+            self.reader = MetaYoloReader(glob.glob(os.path.join(directory, f'*.csv'))[0])
+            if isinstance(self.reader.imageSize, int):
+                self.yoloSize = (self.reader.imageSize, self.reader.imageSize)
+            else:
+                self.yoloSize = self.reader.imageSize
+            self.reinitSession()
 
     def reinitSession(self):
         sess_options = ort.SessionOptions()

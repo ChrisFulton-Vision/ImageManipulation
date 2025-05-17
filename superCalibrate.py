@@ -1121,8 +1121,8 @@ class FrontEndGui(ctk.CTk):
 
     def findChessboardCorners(self, imgClass, showImage = True, updateImageFrame = False):
 
-        if imgClass.imgPts is not None:
-            return  # Already have points for this image
+        # if imgClass.imgPts is not None:
+        #     return  # Already have points for this image
 
         img = cv2.imread(join(self.filepath, imgClass.imageName))
 
@@ -1167,13 +1167,6 @@ class FrontEndGui(ctk.CTk):
 
         elif self.imageConfig.calMode == 'Circles':
 
-            # params = cv2.SimpleBlobDetector_Params()
-            #
-            # params.filterByArea = True
-            # params.minArea = 50
-            # blob = cv2.SimpleBlobDetector_create(params)
-
-
             ret, corners = cv2.findCirclesGrid(gray,
                                          (self.imageConfig.numInnerCornersW,
                                           self.imageConfig.numInnerCornersH),
@@ -1210,21 +1203,14 @@ class FrontEndGui(ctk.CTk):
                                             (self.imageConfig.numInnerCornersW, self.imageConfig.numInnerCornersH),
                                             imgClass.imgPts, True)
 
-                x = int(np.average(imgClass.imgPts[:, 0, 0]))
-                y = int(np.average(imgClass.imgPts[:, 0, 1]))
-                min_X = max(int(np.min(imgClass.imgPts[:, 0, 0])), 0)*2.0
-                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0])), img.shape[0])*2.0
-                min_Y = max(int(np.min(imgClass.imgPts[:, 0, 1])), 0)*2.0
-                max_Y = min(int(np.max(imgClass.imgPts[:, 0,  1])), img.shape[1])*2.0
-                dist_x = int(np.max(np.array([[max_X - x], [x - min_X]])))
-                dist_y = int(np.max(np.array([[max_Y - y], [y - min_Y]])))
+                min_X = max(int(np.min(imgClass.imgPts[:, 0, 0])-100), 0)
+                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0]+100)), img.shape[0])
+                min_Y = max(int(np.min(imgClass.imgPts[:, :, 1]-100)), 0)
+                max_Y = min(int(np.max(imgClass.imgPts[:, :,  1]+100)), img.shape[1])
 
-                roi = cv2.getRectSubPix(img, (2*dist_x, 2*dist_y), (x, y))
+                roi = img[min_Y:max_Y, min_X:max_X, :]
 
-                h, w, chan = roi.shape
-                dispImg = cv2.resize(roi, (int(w * self.scale), int(h * self.scale)))
-
-                cv2.imshow('Chessboard Corners Detected', dispImg)
+                cv2.imshow('Chessboard Corners Detected', roi)
                 cv2.waitKey(0)
             else:
                 imgClass.imgPts = None

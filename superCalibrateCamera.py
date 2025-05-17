@@ -131,6 +131,11 @@ class ImageSource(Enum):
     Static_Image = 'Static Image'
     Stream_from_Folder = 'Stream from Folder'
 
+class ImageKernels(Enum):
+    Unchanged = 'Unchanged'  #None
+    Sharpen = 'Sharpen'    #np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
+    GaussBlur = 'GaussBlur'  #np.array([[1, 4, 6, 4, 1],[4, 16, 24, 16, 4], [6, 24, 36, 24, 6], [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]]) / 256.0
+    EdgeDetect = 'EdgeDetect' #np.array([[-1, -1, -1],[-1, 8, -1], [-1, -1, -1]])
 
 class CameraConfig():
     def __init__(self):
@@ -146,6 +151,8 @@ class CameraConfig():
         self.imageFilepath = None
         self.lidarFilepath = None
         self.yoloFilepath = ''
+        self.detect_corners = False
+        self.processingKernel = ImageKernels.Unchanged
 
     def copy(self, configToCopy):
         self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
@@ -155,12 +162,12 @@ class Camera():
     def __init__(self, gui):
         self.gui = gui
         self.yoloSession = yolo.YOLO()
+        self.camConfig = CameraConfig()
+        self.calibration = Calibration()
         self.detectIDS = None
         self.projectProbe = None
-        self.calibration = Calibration()
         self.centers = None
         self.calibFile = ''
-        self.camConfig = CameraConfig()
         self.indexDict = {}
         self.scanForCameras()
         self.windowName =  'webcam'
@@ -189,6 +196,7 @@ class Camera():
                                                    text='../' + os.path.basename(os.path.normpath(self.camConfig.yoloFilepath)))
         self.selectCalibLabel = None
         self.undistortCheckbox = None
+
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectSingleImage)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
         self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder', command=self.selectSingleImage)
@@ -212,14 +220,13 @@ class Camera():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x520'
+        self.camFrameGeometry = '455x570'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
         self.aspectRatio = 1.0
         self.lastWidth = 1
         self.lastHeight = 1
-        self.setupFrame()
         self.saveToCache()
 
     def loadFromCache(self):
@@ -499,6 +506,19 @@ class Camera():
         yoloInference.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
 
         rowID += 1
+        detectCornersCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Corners')
+        if self.camConfig.detect_corners is False:
+            detectCornersCheckbox.deselect()
+        else:
+            detectCornersCheckbox.select()
+        detectCornersCheckbox.configure(command=self.toggleDetectCorners)
+        detectCornersCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        imageProcessingKernelCombobox = ctk.CTkComboBox(self.cam_frame, values=list(ImageKernels.__members__.keys()))
+        imageProcessingKernelCombobox.set(self.camConfig.processingKernel.name)
+        imageProcessingKernelCombobox.configure(command=self.updateImageProcessingKernel)
+        imageProcessingKernelCombobox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+        rowID += 1
 
         aprilTagSizeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
                                           command=self.setAprilTagSize)
@@ -597,6 +617,14 @@ class Camera():
         self.camConfig.yoloInference = not self.camConfig.yoloInference
         self.saveToCache()
 
+    def toggleDetectCorners(self):
+        self.camConfig.detect_corners = not self.camConfig.detect_corners
+        self.saveToCache()
+
+    def updateImageProcessingKernel(self, newValue):
+        self.camConfig.processingKernel = ImageKernels(newValue)
+        self.saveToCache()
+
     def createDetector(self):
         self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
@@ -656,9 +684,10 @@ class Camera():
             self.analyze_image(frame)
 
             key = cv2.waitKey(1)
-            if key == 27:  # exit on ESC
+            if key == 27 or cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) < 1:  # exit on ESC
                 self.startStreamOff()
                 break
+
 
     def run_folder_reader(self):
         cv2.destroyAllWindows()
@@ -712,8 +741,11 @@ class Camera():
 
     def analyze_image(self, frame):
         frame = self.undistort(frame)
+        frame = self.applyKernel(frame)
         self.detectAprilTags(frame)
         self.projectLidarPoints(frame)
+        self.corner_detection(frame)
+        frame = self.run_yolo(frame)
         self.run_yolo_and_cleanup(frame)
 
 
@@ -790,20 +822,47 @@ class Camera():
 
         return frame
 
-    def run_yolo_and_cleanup(self, frame):
+    def corner_detection(self, frame):
+        if self.camConfig.detect_corners:
+            harris_corners = cv2.cornerHarris(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 3, 3, 0.05)
 
+            frame[harris_corners > 0.025 * harris_corners.max()] = [255, 127, 127]
+
+    def applyKernel(self, frame):
+        if self.camConfig.processingKernel == ImageKernels.Unchanged:
+            return frame
+        match self.camConfig.processingKernel:
+            case ImageKernels.Sharpen:
+                kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
+            case ImageKernels.GaussBlur:
+                kernel = np.array([[1, 4, 6, 4, 1],[4, 16, 24, 16, 4], [6, 24, 36, 24, 6], [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]]) / 256.0
+            case ImageKernels.EdgeDetect:
+                kernel = np.array([[-1, -1, -1],[-1, 8, -1], [-1, -1, -1]])
+            case _:
+                return frame
+
+        return cv2.filter2D(frame, -1, kernel)
+
+    def run_yolo(self, frame):
         if self.camConfig.yoloInference:
             frame, output = self.yoloSession.inferOnImage(frame)
+        return frame
 
-        cx = int(self.calibration.cx)
-        cy = int(self.calibration.cy)
+    def run_yolo_and_cleanup(self, frame):
+
+        if self.calibration.validCal:
+            cx = int(self.calibration.cx)
+            cy = int(self.calibration.cy)
+        else:
+            cx = int(frame.shape[0] / 2)
+            cy = int(frame.shape[1] / 2)
 
         width = frame.shape[0]
         height = frame.shape[1]
-        thickness = max(int(width/500),1)
+        thickness = max(int(width/250),1)
 
-        crosshairsH = np.array([[cx + max(int(width/100),10), cy], [cx - max(int(width/100),10), cy]])
-        crosshairsV = np.array([[cx, cy + max(int(height/100),10)], [cx, cy - max(int(height/100),10)]])
+        crosshairsH = np.array([[cx + max(int(width/50),10), cy], [cx - max(int(width/50),10), cy]])
+        crosshairsV = np.array([[cx, cy + max(int(height/50),10)], [cx, cy - max(int(height/50),10)]])
 
         cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), thickness)
         cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), thickness)

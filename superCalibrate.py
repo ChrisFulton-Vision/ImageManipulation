@@ -928,8 +928,8 @@ class FrontEndGui(ctk.CTk):
                 self.imageConfig.copy(pickle.load(imageConfigOpen))
         else:
             self.imageConfig = ImageryConfig()
-            if not self.imageConfig.camCal.fromFile():
-                self.imageConfig.camCal.fromBinFile()
+            if not self.imageConfig.camCal.fromFile(self.filepath):
+                self.imageConfig.camCal.fromBinFile(self.filepath)
 
         self.restoreFromImageConfig()
         self.loadImages()

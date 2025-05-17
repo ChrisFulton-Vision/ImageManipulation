@@ -624,7 +624,7 @@ class Camera():
     def detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         frame = cv2.imread(self.camConfig.imageFilepath)
-        self.detectAprilTagsAndPrint(frame)
+        self.analyze_image(frame)
 
         key = cv2.waitKey(0)
         if key == 27:
@@ -653,7 +653,7 @@ class Camera():
 
         while rval and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
             rval, frame = self.vc.read()
-            self.detectAprilTagsAndPrint(frame)
+            self.analyze_image(frame)
 
             key = cv2.waitKey(1)
             if key == 27:  # exit on ESC
@@ -677,7 +677,7 @@ class Camera():
                 temp_unpause = False
                 img_id = (img_id + play_speed) % len(imageList)
                 frame = cv2.imread(imageList[img_id])
-                self.detectAprilTagsAndPrint(frame)
+                self.analyze_image(frame)
 
             key = cv2.waitKey(1)
 
@@ -710,27 +710,29 @@ class Camera():
 
         self.startStreamOff()
 
+    def analyze_image(self, frame):
+        frame = self.undistort(frame)
+        self.detectAprilTags(frame)
+        self.projectLidarPoints(frame)
+        self.run_yolo_and_cleanup(frame)
 
 
-
-    def detectAprilTagsAndPrint(self, frame):
+    def undistort(self, frame):
         if self.calibration.validCal and self.camConfig.undistort:
-            frame = cv2.undistort(frame, cameraMatrix=self.calibration.getCameraMatrix(),
+            return cv2.undistort(frame, cameraMatrix=self.calibration.getCameraMatrix(),
                                   distCoeffs=self.calibration.getDistortion())
+        return frame
 
-        if self.detector is not None:
-            self.detect_and_markup(frame)
+    def detectAprilTags(self, frame):
+        if self.detector is None:
+            return
 
-        self.run_cleanup(frame)
-
-    def detect_and_markup(self, frame):
         webGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, rejected = self.detector.detectMarkers(webGray)
         self.centers = None
         self.detectIDS = []
 
         if corners is None or ids is None:
-            self.run_cleanup(frame)
             return
 
         for corners, id in zip(corners, ids):
@@ -745,68 +747,22 @@ class Camera():
 
             self.detectIDS.append(id)
 
-        if self.centers is None:
-            self.centers = np.array(pixCenter)
-        else:
-            self.centers = np.vstack((self.centers, np.array(pixCenter)))
-
-        self.run_cleanup(frame)
-
-    def run_cleanup(self, frame):
-        if self.centers is not None:
-            self.centers = self.centers.astype('float32')
-
-        if self.camConfig.projectLidarPoints and self.detector is not None:
-            frame = self.projectLidarPoints(frame)
-
-        if self.projectProbe is not None and self.camConfig.projectLidarPoints:
-            cv2.circle(frame, self.projectProbe[0,0,:].astype(int), 6, (255, 0, 0), 6)
-            cv2.putText(frame, "Probe Tip", self.projectProbe[0,0,:].astype(int) - [50, 50],
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
-
-        if self.camConfig.yoloInference:
-            frame, output = self.yoloSession.inferOnImage(frame)
-
-        scale = 1.0
-        if self.camConfig.imageSource == ImageSource.Static_Image and self.camConfig.imageFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/AlviumLJAprilTags/1.bmp':
-            scale = 2848.0 / 1424.0
-
-        if self.calibration.validCal:
-            K = self.calibration.getCameraMatrix()
-            cx = int(scale * (self.calibration.cx + 0.5) - 0.5)
-            cy = int(scale * (self.calibration.cy + 0.5) - 0.5)
-        else:
-            cx = int(frame.shape[1] / 2)
-            cy = int(frame.shape[0] / 2)
-
-        crosshairsH = np.array([[cx + 10, cy], [cx - 10, cy]])
-        crosshairsV = np.array([[cx, cy + 10], [cx, cy - 10]])
-
-        cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), 2)
-        cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), 2)
-
-        self.potentialResize()
-
-        cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))
-
-        if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
-            cv2.imwrite(self.filepath + '\\' + str(self.img_idx) + '.png', frame)
-            self.img_idx += 1
-            self.lastImageTime = time.time()
-            self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
+            if self.centers is None:
+                self.centers = np.array(pixCenter).astype('float32')
+            else:
+                self.centers = np.vstack((self.centers, np.array(pixCenter).astype('float32')))
 
     def projectLidarPoints(self, frame):
+        if not self.camConfig.projectLidarPoints or self.detector is None:
+            return
 
-        if self.camConfig.undistort:
-            distParams = np.zeros((5,))
-        else:
-            distParams = self.calibration.getDistortion()
-
+        ret = False
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
             points = []
+            distParams = np.zeros((5,)) # use image undistort instead
             for detectID in self.detectIDS:
-                points.append(truthPoints[str(detectID)])
+                points.append(truthPoints[str(detectID[0])])
             points = np.array(points)
 
             ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
@@ -814,11 +770,13 @@ class Camera():
                                        cameraMatrix=self.calibration.getCameraMatrix(),
                                        distCoeffs=distParams,
                                        flags=cv2.SOLVEPNP_ITERATIVE)
-            # probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
             probeTip_3d = np.array([[0.0], [0.0], [0.0]])
             self.projectProbe, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=self.calibration.getCameraMatrix(), distCoeffs=distParams)
-        else:
-            ret = False
+
+        if self.projectProbe is not None and self.camConfig.projectLidarPoints:
+            cv2.circle(frame, self.projectProbe[0,0,:].astype(int), 6, (255, 0, 0), 6)
+            cv2.putText(frame, "Probe Tip", self.projectProbe[0,0,:].astype(int) - [50, 50],
+                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
 
         if ret:
             projectedPoints_orig, _ = cv2.projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
@@ -831,6 +789,34 @@ class Camera():
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
         return frame
+
+    def run_yolo_and_cleanup(self, frame):
+
+        if self.camConfig.yoloInference:
+            frame, output = self.yoloSession.inferOnImage(frame)
+
+        cx = int(self.calibration.cx)
+        cy = int(self.calibration.cy)
+
+        width = frame.shape[0]
+        height = frame.shape[1]
+        thickness = max(int(width/500),1)
+
+        crosshairsH = np.array([[cx + max(int(width/100),10), cy], [cx - max(int(width/100),10), cy]])
+        crosshairsV = np.array([[cx, cy + max(int(height/100),10)], [cx, cy - max(int(height/100),10)]])
+
+        cv2.polylines(frame, [crosshairsH], True, (0, 255, 0), thickness)
+        cv2.polylines(frame, [crosshairsV], True, (0, 255, 0), thickness)
+
+        self.potentialResize()
+
+        cv2.imshow(self.windowName, cv2.resize(frame, (self.lastWidth, self.lastHeight)))
+
+        if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
+            cv2.imwrite(self.filepath + '\\' + str(self.img_idx) + '.png', frame)
+            self.img_idx += 1
+            self.lastImageTime = time.time()
+            self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
 
     def plotOnImg(self, img, points, names, color):
         for idx, pxPt in enumerate(points):

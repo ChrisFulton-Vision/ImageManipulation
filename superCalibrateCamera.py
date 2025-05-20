@@ -1,4 +1,5 @@
 import ctypes
+import datetime
 
 import numpy as np
 import customtkinter as ctk
@@ -11,6 +12,7 @@ import pickle, copy, os, time, threading, cv2, glob, re, yolo
 from enum import Enum, auto
 from os.path import join
 from PIL import Image, ImageTk
+from FG_DrogueOnly import FactorGraph
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
@@ -126,6 +128,97 @@ class thread_with_exception(Thread):
             ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
             print('Exception Raise Failure')
 
+class Gabor:
+    def __init__(self):
+        self.pop_up = ctk.CTkToplevel()
+        self.pop_up.focus_force()
+        self.ksize = (31, 31)
+        self.sigma = 3.0
+        self.theta = 0.0
+        self.lambd = 10.0
+        self.gamma = 0.63
+        self.psi = 0.0
+
+        self.sigma_label = None
+        self.theta_label = None
+        self.lambd_label = None
+        self.gamma_label = None
+
+        self.pop_up.geometry('200x500')
+        self.pop_up.grid_columnconfigure([0, 1], weight=1)
+        self.configure_pop_up()
+
+    def configure_pop_up(self):
+
+        rowID = 0
+        self.sigma_label = ctk.CTkLabel(self.pop_up, text=f'Sigma: {self.sigma:.2f}')
+        self.sigma_label.grid(row=rowID, column=0, padx=5, pady=5)
+        rowID += 1
+        sigma_slider = ctk.CTkSlider(self.pop_up, from_=0.01, to=10.0, command=self.update_sigma)
+        sigma_slider.set(self.sigma)
+        sigma_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        rowID += 1
+
+        self.theta_label = ctk.CTkLabel(self.pop_up, text=f'Theta: {np.rad2deg(self.theta):.2f}')
+        self.theta_label.grid(row=rowID, column=0, padx=5, pady=5)
+        rowID += 1
+        theta_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=np.pi*2.0, command=self.update_theta)
+        theta_slider.set(self.theta)
+        theta_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        rowID += 1
+
+        self.lambd_label = ctk.CTkLabel(self.pop_up, text=f'Lambda: {self.lambd:.2f}')
+        self.lambd_label.grid(row=rowID, column=0, padx=5, pady=5)
+        rowID += 1
+        lambd_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=10.0, command=self.update_lambd)
+        lambd_slider.set(self.lambd)
+        lambd_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        rowID += 1
+
+        self.gamma_label = ctk.CTkLabel(self.pop_up, text=f'Gamma: {self.gamma:.2f}')
+        self.gamma_label.grid(row=rowID, column=0, padx=5, pady=5)
+        rowID += 1
+        gamma_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=1.0, command=self.update_gamma)
+        gamma_slider.set(self.gamma)
+        gamma_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        rowID += 1
+
+    def update_sigma(self, slider_value):
+        self.sigma = slider_value
+        self.sigma_label.configure(text=f'Sigma: {self.sigma:.2f}')
+
+    def update_theta(self, slider_value):
+        self.theta = slider_value
+        self.theta_label.configure(text=f'Theta: {np.rad2deg(self.theta):.2f}')
+
+    def update_lambd(self, slider_value):
+        self.lambd = slider_value
+        self.lambd_label.configure(text=f'Lambda: {self.lambd:.2f}')
+
+    def update_gamma(self, slider_value):
+        self.gamma = slider_value
+        self.gamma_label.configure(text=f'Gamma: {self.gamma:.2f}')
+
+    def filter_kernel(self):
+        if not self.pop_up.winfo_exists():
+            self.pop_up = ctk.CTkToplevel()
+            self.pop_up.focus_force()
+            self.pop_up.geometry('200x500')
+            self.pop_up.grid_columnconfigure([0, 1], weight=1)
+            self.configure_pop_up()
+
+        return cv2.getGaborKernel(self.ksize,
+                                  self.sigma,
+                                  self.theta,
+                                  self.lambd,
+                                  self.gamma,
+                                  self.psi)
+
+    def close(self):
+        self.pop_up.destroy()
+        self.pop_up.update()
+
+
 class ImageSource(Enum):
     Camera_Stream = 'Camera Stream'
     Static_Image = 'Static Image'
@@ -136,6 +229,16 @@ class ImageKernels(Enum):
     Sharpen = 'Sharpen'    #np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
     GaussBlur = 'GaussBlur'  #np.array([[1, 4, 6, 4, 1],[4, 16, 24, 16, 4], [6, 24, 36, 24, 6], [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]]) / 256.0
     EdgeDetect = 'EdgeDetect' #np.array([[-1, -1, -1],[-1, 8, -1], [-1, -1, -1]])
+    HorizontalEdgeDetect = 'HorizontalEdgeDetect'
+    VerticalEdgeDetect = 'VerticalEdgeDetect'
+    BoxBlur = 'BoxBlur'
+    SobelEdgeDetectHorizontal = 'SobelEdgeDetectHorizontal'
+    SobelEdgeDetectVertical = 'SobelEdgeDetectVertical'
+    LaplaceEdgeDetect = 'LaplaceEdgeDetect'
+    Gabor = 'Gabor'
+    ScharrEdgeDetectHorizontal = 'ScharrEdgeDetectHorizontal'
+    ScharrEdgeDetectVertical = 'ScharrEdgeDetectVertical'
+    Unsharp = 'Unsharp'
 
 class CameraConfig():
     def __init__(self):
@@ -153,6 +256,7 @@ class CameraConfig():
         self.yoloFilepath = ''
         self.detect_corners = False
         self.processingKernel = ImageKernels.Unchanged
+
 
     def copy(self, configToCopy):
         self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
@@ -174,6 +278,12 @@ class Camera():
         self.filepath = ''
         self.cam_frame = ctk.CTkFrame(master=self.gui)
         self.showWindow = False
+        self.GaborFilter = None
+        self.radius = 800
+        self.last_bounding_box_size = (800, 800)
+        self.last_yolo_center = (400, 400)
+        self.current_center_est = (400, 400)
+        self.FG = FactorGraph()
 
         self.available_sources = [source.value for source in ImageSource]
 
@@ -424,7 +534,7 @@ class Camera():
 
         self.startStreamOff()
 
-        self.singleImageTextButton.configure(command=self.detectSingleImage)
+        self.singleImageTextButton.configure(command=self.startStreamOn)
         if self.camConfig.imageFilepath is not None:
             self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
 
@@ -649,14 +759,17 @@ class Camera():
             self.camConfig.undistort = False
         self.saveToCache()
 
-    def detectSingleImage(self):
+    def run_detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        frame = cv2.imread(self.camConfig.imageFilepath)
-        self.analyze_image(frame)
+        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+            frame = cv2.imread(self.camConfig.imageFilepath)
+            self.analyze_image(frame)
 
-        key = cv2.waitKey(0)
-        if key == 27:
-            cv2.destroyAllWindows()
+            key = cv2.waitKey(1)
+            if key == 27:
+                cv2.destroyAllWindows()
+                break
+        self.startStreamOff()
 
     @staticmethod
     def convert_cv_to_pil(img):
@@ -666,8 +779,10 @@ class Camera():
 
         if self.camConfig.imageSource == ImageSource.Camera_Stream:
             self.run_video_stream()
-        else:
+        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             self.run_folder_reader()
+        elif self.camConfig.imageSource == ImageSource.Static_Image:
+            self.run_detectSingleImage()
 
     def run_video_stream(self):
         cv2.destroyAllWindows()
@@ -742,11 +857,22 @@ class Camera():
     def analyze_image(self, frame):
         frame = self.undistort(frame)
         frame = self.applyKernel(frame)
+        self.corner_detection(frame)
         self.detectAprilTags(frame)
         self.projectLidarPoints(frame)
-        self.corner_detection(frame)
+
+        if self.last_bounding_box_size is not None:
+            self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1] + self.radius*4.0) / 5.0
+        else:
+            self.radius += 12
+            self.radius = min(800, self.radius)
+            self.yoloSession.conf = (0.9-0.6)*self.radius/800.0+0.6
+            self.confSlider(self.yoloSession.conf)
+
+        frame = dim_except_circle(frame, self.current_center_est, 1.5 * self.radius, 0.10)
+        frame = dim_except_circle(frame, self.current_center_est, 3.0 * self.radius, 0.00)
         frame = self.run_yolo(frame)
-        self.run_yolo_and_cleanup(frame)
+        self.cleanup(frame)
 
 
     def undistort(self, frame):
@@ -826,11 +952,16 @@ class Camera():
         if self.camConfig.detect_corners:
             harris_corners = cv2.cornerHarris(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 3, 3, 0.05)
 
-            frame[harris_corners > 0.025 * harris_corners.max()] = [255, 127, 127]
+            frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
 
     def applyKernel(self, frame):
+        if self.camConfig.processingKernel != ImageKernels.Gabor and self.GaborFilter is not None:
+            self.GaborFilter.close()
+            self.GaborFilter = None
+
         if self.camConfig.processingKernel == ImageKernels.Unchanged:
             return frame
+
         match self.camConfig.processingKernel:
             case ImageKernels.Sharpen:
                 kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
@@ -838,17 +969,72 @@ class Camera():
                 kernel = np.array([[1, 4, 6, 4, 1],[4, 16, 24, 16, 4], [6, 24, 36, 24, 6], [4, 16, 24, 16, 4], [1, 4, 6, 4, 1]]) / 256.0
             case ImageKernels.EdgeDetect:
                 kernel = np.array([[-1, -1, -1],[-1, 8, -1], [-1, -1, -1]])
+            case ImageKernels.HorizontalEdgeDetect:
+                kernel = np.array([[-1, -1, -1], [0, 0, 0], [1, 1, 1]])
+            case ImageKernels.VerticalEdgeDetect:
+                kernel = np.array([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]])
+            case ImageKernels.BoxBlur:
+                kernel = np.ones((5,5))/25.0
+            case ImageKernels.SobelEdgeDetectHorizontal:
+                kernel = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+            case ImageKernels.SobelEdgeDetectVertical:
+                kernel = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+            case ImageKernels.LaplaceEdgeDetect:
+                kernel = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]])
+            case ImageKernels.Gabor:
+                if self.GaborFilter is None:
+                    self.GaborFilter = Gabor()
+                kernel = self.GaborFilter.filter_kernel()
+            case ImageKernels.ScharrEdgeDetectHorizontal:
+                kernel = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]])
+            case ImageKernels.ScharrEdgeDetectVertical:
+                kernel = np.array([[3, 0, -3], [10, 0, -10], [3, 0, -3]])
+            case ImageKernels.Unsharp:
+                gaussian_3 = cv2.GaussianBlur(frame, (0,0), 2.0)
+                return cv2.addWeighted(frame, 2.0, gaussian_3, -1.0, 0)
             case _:
                 return frame
 
-        return cv2.filter2D(frame, -1, kernel)
+        frame = cv2.filter2D(frame, -1, kernel)
+        return frame
 
     def run_yolo(self, frame):
         if self.camConfig.yoloInference:
             frame, output = self.yoloSession.inferOnImage(frame)
+            centers, boxes, scores, class_ids, time = output
+            if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
+                best_idx = scores.index(max(scores))
+                self.last_bounding_box_size = (boxes[best_idx][2] - boxes[best_idx][0],
+                                               boxes[best_idx][3] - boxes[best_idx][1])
+                self.last_yolo_center = centers[best_idx]
+                self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
+                                         (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
+
+
+                K = self.calibration.getCameraMatrix()
+                d = self.calibration.getDistortion()
+                twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
+                dist_est = 2.0 / (self.last_bounding_box_size[0] / frame.shape[0] + self.last_bounding_box_size[1] /
+                            frame.shape[1])
+                threeD_points = np.linalg.inv(K).dot(twoD_points) * dist_est
+                np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
+                print(f'2d: {twoD_points}')
+                print(f'dist: {dist_est}')
+                print(f'3d: {threeD_points}')
+                print(f'BB Size: {self.last_bounding_box_size[0], self.last_bounding_box_size[1]}')
+
+                dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
+                print(dist_est)
+                print()
+                if dist_est < 100.0:
+                    return frame
+
+        self.last_bounding_box_size = None
+        self.last_yolo_center = None
+
         return frame
 
-    def run_yolo_and_cleanup(self, frame):
+    def cleanup(self, frame):
 
         if self.calibration.validCal:
             cx = int(self.calibration.cx)
@@ -896,6 +1082,39 @@ class Camera():
             cv2.resizeWindow(self.windowName, width, int(width / self.aspectRatio))
             self.lastWidth = width
             self.lastHeight = int(width / self.aspectRatio)
+
+
+def dim_except_circle(frame, center, radius, dim_factor=0.5):
+    """
+    Dims an image everywhere except inside a circle.
+
+    Args:
+        image_path (np.array): the image
+        center (tuple): (x, y) coordinates of the circle's center.
+        radius (int): Radius of the circle.
+        dim_factor (float): Dimming factor (0 to 1, 0 for black, 1 for no dimming).
+    """
+
+    # 1. Create a mask
+    mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
+    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+
+    # 2. Dim the entire image
+    dimmed_img = (frame * dim_factor).astype("uint8")
+
+    # 3. Copy the original circle area back to the dimmed image
+    masked_circle = cv2.bitwise_and(frame, frame, mask=mask)
+
+    # Invert the mask to select the area outside the circle
+    inverted_mask = cv2.bitwise_not(mask)
+
+    # Apply the mask to the dimmed image
+    masked_dimmed = cv2.bitwise_and(dimmed_img, dimmed_img, mask=inverted_mask)
+
+    # Add the original circle back
+    frame = cv2.add(masked_circle, masked_dimmed)
+
+    return frame
 
 def natural_sort(l):
     convert = lambda text: int(text) if text.isdigit() else text.lower()

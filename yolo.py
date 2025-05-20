@@ -6,12 +6,16 @@ import glob
 import datetime
 from metaYoloReader import MetaYoloReader
 
-
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
 ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
 
+
 class YOLO:
+    '''
+    This class will perform a YOLO inference on a provided image.
+    '''
+
     def __init__(self, conf: float = 0.75, iou: float = 0.99, yoloSize=(864, 864),
                  model_path="YOLOModels/GIII_01172025_10_100M_MoreFeatures/",
                  numClasses: int = 94):
@@ -31,8 +35,16 @@ class YOLO:
 
         self.setNewFolder(model_path)
 
-    def setNewFolder(self, directory):
-        if len(glob.glob(os.path.join(directory, f'*.onnx'))) > 0 and len(glob.glob(os.path.join(directory, f'*.csv'))) > 0:
+    def setNewFolder(self, directory: str) -> None:
+        '''
+        This function changes all the necessary settings for selecting a new YOLO folder. The folder should have
+        ONE .onnx file and ONE .csv file. The onnx file should be the yolo model. The csv file should be the
+        yolo meta_data.
+        :param directory: As a string, the location of the intended directory.
+        :return: Nothing
+        '''
+        if len(glob.glob(os.path.join(directory, f'*.onnx'))) > 0 and len(
+                glob.glob(os.path.join(directory, f'*.csv'))) > 0:
             self.modelPath = glob.glob(os.path.join(directory, f'*.onnx'))[0]
             self.reader = MetaYoloReader(glob.glob(os.path.join(directory, f'*.csv'))[0])
             if isinstance(self.reader.imageSize, int):
@@ -41,7 +53,12 @@ class YOLO:
                 self.yoloSize = self.reader.imageSize
             self.reinitSession()
 
-    def reinitSession(self):
+    def reinitSession(self) -> None:
+        '''
+        When yolo parameters change, this creates a new session with those parameters. Must be called when
+        something changes.
+        :return nothing:
+        '''
         sess_options = ort.SessionOptions()
         # sess_options.intra_op_num_threads = 1
         # sess_options.inter_op_num_threads = 1
@@ -50,12 +67,25 @@ class YOLO:
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
-    def inferOnImage(self, image):
+    def inferOnImage(self, image: np.array) -> (np.array, np.array):
+        '''
+        Runs the sub-methods necessary to process an image with YOLO
+        :param image: np.array from OpenCV
+        :return: Marked-up image post-yolo inference
+        '''
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
         return self.markUpImage(image, output), output
 
-    def preprocessImage(self, image):
+    def preprocessImage(self, image: np.array) -> np.array:
+        '''
+        This preprocessing:
+            Fixes the image to the YOLO network's size
+            Transposes the image so that it matches onnxruntime's input format
+            Adds a dimension to match onnxruntime's input format
+        :param image: np.array from OpenCV
+        :return: preprocessed image
+        '''
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
             image = cv2.resize(image, self.yoloSize)
@@ -64,12 +94,22 @@ class YOLO:
         image = image.astype(np.float32) / 255.0
         return image
 
-    def processImage(self, yoloImage):
+    def processImage(self, yoloImage: np.array) -> np.array:
+        '''
+        Clears the 'cache' for previous YOLO solutions, then calls the yolo inference method
+        :param yoloImage: np.array that has completed preprocessing
+        :return: onnxruntime output
+        '''
         self.boxes, self.scores, self.class_ids = [], [], []
         output = self.runOneSession(yoloImage)
         return output
 
-    def runOneSession(self, yoloImage):
+    def runOneSession(self, yoloImage: np.array) -> np.array:
+        '''
+        Records time before and after a yolo infernce for time differencing. Runs the YOLO session
+        :param yoloImage: image that has been through preprocessImage
+        :return: outputs from onnxruntime session. Labeled output for clarity.
+        '''
         startTime = datetime.datetime.now()
         if self.session is not None:
             output = self.session.run(None, {self.session.get_inputs()[0].name: yoloImage})
@@ -79,7 +119,12 @@ class YOLO:
         centers, boxes, scores, class_ids = self.interpretOutput(output)
         return centers, boxes, scores, class_ids, (endTime - startTime).total_seconds()
 
-    def interpretOutput(self, output):
+    def interpretOutput(self, output: np.array) -> (list, list, list, list):
+        '''
+        Takes outputs from onnxruntime and processes them
+        :param output:  onnxruntime session outputs
+        :return: cleaner outputs for interpretation
+        '''
 
         centers, boxes, scores, class_ids = [], [], [], []
         if output is not None:
@@ -88,31 +133,36 @@ class YOLO:
             predictions = []
 
         for idx, detection in enumerate(predictions):
-
             x, y, w_box, h_box, confidence = detection[:5]
             class_probs = detection[5:]
 
             if confidence > self.conf:
-                x1 = int(x - w_box / 2)
-                y1 = int(y - h_box / 2)
-                x2 = int(x + w_box / 2)
-                y2 = int(y + h_box / 2)
+                x1 = (x - w_box / 2)
+                y1 = (y - h_box / 2)
+                x2 = (x + w_box / 2)
+                y2 = (y + h_box / 2)
 
                 # if (x1 > self.pixel_buffer and x2 < self.yoloSize[0] - self.pixel_buffer
                 #         and y1 > self.pixel_buffer and y2 < self.yoloSize[1] - self.pixel_buffer):
 
-                centers.append([x,y])
+                centers.append([x, y])
                 boxes.append([x1, y1, x2, y2])
                 scores.append(float(confidence))
                 class_ids.append(np.argmax(class_probs))
 
         return centers, boxes, scores, class_ids
 
-    def markUpImage(self, image, output):
+    def markUpImage(self, image: np.array, output: (list, list, list, list)) -> np.array:
+        '''
+        Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
+        up the image with a PnP solution as well.
+        :param image: Original OpenCV style np.array
+        :param output: processed onnxruntime sessions
+        :return: marked-up image
+        '''
         h, w, _ = image.shape
 
         centers, boxes, scores, class_ids, time = output
-
         color = (255, 255, 0)
 
         text = f'Inference time: {time:.3f}s'
@@ -120,7 +170,7 @@ class YOLO:
 
         if len(class_ids) > 0:
             indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
-            newCenters, newBoxes, newClass_ids, newScores = [],[],[],[]
+            newCenters, newBoxes, newClass_ids, newScores = [], [], [], []
             for i in indices:
                 newCenters.append(centers[i])
                 newBoxes.append(boxes[i])
@@ -135,7 +185,18 @@ class YOLO:
 
         return image
 
-    def drawBoxes(self, image, newCenters, newBoxes, newClass_ids, newScores, color):
+    def drawBoxes(self, image: np.array, newCenters: list, newBoxes: list,
+                  newClass_ids: list, newScores: list, color: (int, int, int)) -> np.array:
+        '''
+        Draws yolo boxes
+        :param image: Original OpenCV image
+        :param newCenters: center of bounding box
+        :param newBoxes: onnxruntime box
+        :param newClass_ids: onnxruntime id
+        :param newScores: onnxruntime confidence
+        :param color: color of box
+        :return:
+        '''
         h, w, _ = image.shape
         y_h, y_w = self.yoloSize
 
@@ -152,14 +213,22 @@ class YOLO:
             label = f"{class_id}: {score:.2f}"
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-            cv2.putText(image, f"{class_id}", (x,y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
             cv2.putText(image, 'Direct Inference', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
                         0.75, color, 1)
 
         return image
 
-    def drawPnP(self, image, y_class_ids, y_centers):
-
+    def drawPnP(self, image:np.array, y_class_ids:list, y_centers:list)-> None:
+        '''
+        If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
+        onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
+        the original image is directly modified.
+        :param image: OpenCV marked-up image
+        :param y_class_ids: list of class ids for the solution
+        :param y_centers: list of center pixels for the solution
+        :return: Nothing
+        '''
         h, w, _ = image.shape
         y_h, y_w = self.yoloSize
 
@@ -172,7 +241,7 @@ class YOLO:
         image_points = []
         badList = []
         for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id not in badList and y_class_id <= len(self.reader.idsNamesLocs):
+            if y_class_id not in badList and y_class_id < len(self.reader.idsNamesLocs):
                 x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
                 object_points.append([x, y, z])
                 image_points.append(y_centers[idx])
@@ -186,10 +255,10 @@ class YOLO:
             return
 
         ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
-                                       imagePoints=image_points,
-                                       cameraMatrix=calibration,
-                                       distCoeffs=np.zeros((5,)))
-                                       # flags=cv2.SOLVEPNP_ITERATIVE)
+                                                      imagePoints=image_points,
+                                                      cameraMatrix=calibration,
+                                                      distCoeffs=np.zeros((5,)))
+        # flags=cv2.SOLVEPNP_ITERATIVE)
 
         for y_class_id in y_class_ids:
             if y_class_id <= len(self.reader.idsNamesLocs):
@@ -213,12 +282,9 @@ class YOLO:
                 # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
 
 
-
 if __name__ == '__main__':
     yolo = YOLO()
 
-    scale = 864.0 / 1424.0
-    calibration = np.array([[scale * 1548.7213762786, 0, scale * (911.2923662427 + 0.5) - 0.5],[0.0, scale * 1550.6128070942, scale * (828.3494658126 + 0.5) - 0.5],[0.0, 0.0, 1.0]])
     np.set_printoptions(suppress=True)
 
     # testImage = cv2.imread('BoundingBoxCandidates/13608.bmp')
@@ -231,32 +297,3 @@ if __name__ == '__main__':
         cv2.imshow('YOLO', newImg)
         cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
         cv2.waitKey(1)
-
-
-    #
-    # y_centers, boxes, scores, y_class_ids, time = sol
-    # # print(reader.idsNamesLocs)
-    # # t_class_ids, oid, xs, ys, zs = reader.idsNamesLocs
-    # object_points = []
-    # for y_class_id in y_class_ids:
-    #     x,y,z = reader.idsNamesLocs[y_class_id][2:]
-    #     object_points.append([x, y, z])
-    # object_points = np.array(object_points)
-    # y_centers = np.array(y_centers)
-    #
-    # ret, rvec, tvec = cv2.solvePnP(objectPoints=object_points,
-    #                                imagePoints=y_centers,
-    #                                cameraMatrix=calibration,
-    #                                distCoeffs=np.zeros((5,)),
-    #                                flags=cv2.SOLVEPNP_ITERATIVE)
-    #
-    # for y_class_id in y_class_ids:
-    # # for idNameLoc in reader.idsNamesLocs:
-    #     id = reader.idsNamesLocs[y_class_id][0]
-    #     xyz = np.array(reader.idsNamesLocs[y_class_id][2:])
-    #     projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
-    #                                           cameraMatrix=calibration, distCoeffs=np.zeros((5,)))
-    #     cv2.putText(testImage, str(id), tuple(np.squeeze(projectedPixel).astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,255), 1)
-
-    # cv2.imshow('Test', testImage)
-    # cv2.waitKey(0)

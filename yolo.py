@@ -1,9 +1,7 @@
 import cv2
 import numpy as np
 import onnxruntime as ort
-import os
-import glob
-import datetime
+import os, glob, re, datetime
 from metaYoloReader import MetaYoloReader
 
 # ort.preload_dlls()
@@ -67,7 +65,7 @@ class YOLO:
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
-    def inferOnImage(self, image: np.array) -> (np.array, np.array):
+    def inferOnImage(self, image: np.array, markup_image:np.array) -> (np.array, np.array):
         '''
         Runs the sub-methods necessary to process an image with YOLO
         :param image: np.array from OpenCV
@@ -75,7 +73,7 @@ class YOLO:
         '''
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
-        return self.markUpImage(image, output), output
+        return self.markUpImage(markup_image, output), output
 
     def preprocessImage(self, image: np.array) -> np.array:
         '''
@@ -101,8 +99,7 @@ class YOLO:
         :return: onnxruntime output
         '''
         self.boxes, self.scores, self.class_ids = [], [], []
-        output = self.runOneSession(yoloImage)
-        return output
+        return self.runOneSession(yoloImage)
 
     def runOneSession(self, yoloImage: np.array) -> np.array:
         '''
@@ -172,15 +169,14 @@ class YOLO:
             indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
             newCenters, newBoxes, newClass_ids, newScores = [], [], [], []
             for i in indices:
+            # for i in range(len(centers)):
                 newCenters.append(centers[i])
                 newBoxes.append(boxes[i])
                 newClass_ids.append(class_ids[i])
                 newScores.append(scores[i])
-                if class_ids[i] == 92:
-                    print(boxes[i])
 
             image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores, color)
-            if len(indices) > 5:
+            if len(set(indices)) > 5:
                 self.drawPnP(image, newClass_ids, newCenters)
 
         return image
@@ -268,6 +264,8 @@ class YOLO:
                 projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=calibration, distCoeffs=np.zeros((5,)))
                 x, y = np.squeeze(projectedPixel)
+                if np.isnan(x) or np.isnan(y):
+                    return
                 x = int(w / y_w * x)
                 y = int(h / y_h * y)
                 cv2.putText(image, str(id), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
@@ -282,18 +280,36 @@ class YOLO:
                 # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
 
 
+def natural_sort(l):
+    convert = lambda text: int(text) if text.isdigit() else text.lower()
+    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+    return sorted(l, key=alphanum_key)
+
 if __name__ == '__main__':
-    yolo = YOLO()
+    yolo = YOLO(conf = 0.75, iou = 0.99, yoloSize=(864, 864),
+                 model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
+                 numClasses = 1)
 
     np.set_printoptions(suppress=True)
 
     # testImage = cv2.imread('BoundingBoxCandidates/13608.bmp')
     # testImage, sol = yolo.inferOnImage(testImage)
 
-    allImages = glob.glob(os.path.join('BoundingBoxCandidates', f'*.bmp'))
+    allImages = glob.glob(os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
+
+    allImages = natural_sort(allImages)
 
     for imgFP in allImages:
         newImg, sol = yolo.inferOnImage(cv2.imread(imgFP))
         cv2.imshow('YOLO', newImg)
-        cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
-        cv2.waitKey(1)
+        # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
+        key = cv2.waitKey(0)
+        if key == 121:
+            print('you hit yes')
+            with open("test.txt", "w") as f:
+                f.write("string")
+        if key == 110:
+            print('you hit no')
+            os.remove(imgFP)
+        if key == 27:
+            break

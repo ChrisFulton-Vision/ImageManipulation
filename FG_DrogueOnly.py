@@ -70,9 +70,12 @@ class FactorGraph:
         self.init_residual = np.zeros((1,))
         self.num_iters = 0
 
-        self.cam_cov = np.array([0.6, 5.0, 5.0]) * 4.0 ** 2   # .6 5 5  4
-        self.V_cov = np.array([1.0, 1.0, 1.0]) * 2.0 ** 2         # I 2.0
-        self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * 1.0 ** 2      # I 1.0
+        # self.cam_cov = np.array([0.6, 5.0, 5.0]) * 4.0 ** 2
+        # self.V_cov = np.array([1.0, 1.0, 1.0]) * 2.0 ** 2
+        # self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * 1.0 ** 2
+        self.cam_cov = np.array([0.6, 5.0, 5.0]) * (4.0 ** 2) / 20.0
+        self.V_cov = np.array([1.0, 1.0, 1.0]) * (2.0 ** 2) / 20.0
+        self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * (2.0 ** 2) / 20.0
 
         self.numMeas = 0
 
@@ -209,6 +212,23 @@ class FactorGraph:
 
         return y
 
+    def popOldestMeas(self):
+        self.optComplete = False
+
+        if self.numMeas > 0:
+            self.numMeas -= 1
+
+            self.time_log = self.time_log[1:]
+            self.meas = self.meas[1:]
+
+            self.r_T_d = self.r_T_d[1:]
+            self.r_V_d = self.r_V_d[1:]
+
+        if self.numMeas == 0:
+            self.r_T_d = np.zeros((1,3))
+            self.r_V_d = np.zeros((1,3))
+            self.time_log = np.zeros((1,))
+
     def stateFromTimestep(self, meas_idx):
         # s: r_T_d, r_V_d
         return slice(meas_idx * 6 + 0, meas_idx * 6 + 3), \
@@ -285,6 +305,10 @@ class FactorGraph:
         # [r_T_d, r_V_d]
         return [r_T_d, r_V_d]
 
+    def reset(self):
+        while self.numMeas > 0:
+            self.popOldestMeas()
+
     def opt(self, func=None):
 
         self.num_iters = 0
@@ -308,11 +332,17 @@ class FactorGraph:
             # Q = np.eye(len(y), len(y))
 
             startRes = la.norm(Qy)
-            print(f'Start-||y||: {startRes:.3f}')
+            # print(f'Start-||y||: {startRes:.3f}')
 
             startInvTime = datetime.datetime.now()
-            delta_x = la.pinv(QL).dot(Qy)
-            print(f'Norm delX: {np.linalg.norm(delta_x)}')
+            try:
+                delta_x = la.pinv(QL).dot(Qy)
+            except np.linalg.LinAlgError as e:
+                print(f'SVD did not converge. Error Message: \n{e}')
+                self.reset()
+                return
+
+            # print(f'Norm delX: {np.linalg.norm(delta_x)}')
             endInvTime = datetime.datetime.now()
 
             prev_ratio = np.inf
@@ -333,10 +363,10 @@ class FactorGraph:
                 else:
                     ratio = 1.0
 
-                print(f'Old y_mag: {np.linalg.norm(Qy):.4f}, New y_mag {np.linalg.norm(new_Qy):.4f}, Pred y_mag {np.linalg.norm(pred_Qy)}')
+                # print(f'Old y_mag: {np.linalg.norm(Qy):.4f}, New y_mag {np.linalg.norm(new_Qy):.4f}, Pred y_mag {np.linalg.norm(pred_Qy)}')
 
                 if .2 < ratio < 5.0:
-                    print(f'Scale: {scale}, ratio: {ratio})')
+                    # print(f'Scale: {scale}, ratio: {ratio})')
                     is_scale_good = True
                     self.update_states(next_states)
                     self.y = self.create_y()
@@ -360,23 +390,23 @@ class FactorGraph:
             # keep_going = False # Linear; achieve immediate convergence
             if func is not None:
                 func(f'Optimize Data \nCurrent Residual: {la.norm(Q.dot(self.y)):.3f}')
-            print(f'Start Residual: {startRes:.3f}')
-            print(f'End Residual: {la.norm(Q.dot(self.y)):.3f}')
-            print(f'ShouldBeEnd Residual: {la.norm(new_Qy):.3f}')
+            # print(f'Start Residual: {startRes:.3f}')
+            # print(f'End Residual: {la.norm(Q.dot(self.y)):.3f}')
+            # print(f'ShouldBeEnd Residual: {la.norm(new_Qy):.3f}')
 
-            print(f'Iteration: {self.num_iters}')
-            print(f'Size of del_x: {la.norm(delta_x * scale):.3f}')
-            print(f"Scale: 2^{np.log2(scale)}")
-            print(f'Time for Moore-Penrose Inversion: {(endInvTime - startInvTime).total_seconds():.3f}')
-            print(f'Time for processing total: {(startInvTime - startProcTime).total_seconds()}')
-            if self.numMeas > 2:
+            # print(f'Iteration: {self.num_iters}')
+            # print(f'Size of del_x: {la.norm(delta_x * scale):.3f}')
+            # print(f"Scale: 2^{np.log2(scale)}")
+            # print(f'Time for Moore-Penrose Inversion: {(endInvTime - startInvTime).total_seconds():.3f}')
+            # print(f'Time for processing total: {(startInvTime - startProcTime).total_seconds()}')
+            # if self.numMeas > 2:
                 # std = np.sqrt(np.diag(la.inv(L.T.dot(L))))
                 # if self.haveAtLeastOneRecvMeas and self.haveAtLeastOneTankMeas:
                 #     print(f"Std of RCam Location: {std[-6:-3]}")
                 # else:
                 #     print(f"Std of Cam Location: {std[-3:]}")
-                print("Size of L: ", QL.shape)
-            print("__________________________________________")
+                # print("Size of L: ", QL.shape)
+            # print("__________________________________________")
             # plt.spy(L)
             # plt.show()
         self.solution = SolutionData(self.numMeas)
@@ -409,6 +439,14 @@ class FactorGraph:
                 r_V_d_cov.append(cov[r_V_d_slice])
 
         return [r_T_d_cov, r_V_d_cov]
+
+    def last_pos_covariance(self):
+        small_Q = self.create_Q()[-6:,-6:]
+        small_L = self.create_L()[-6:,-6:]
+        small_QL = small_Q.dot(small_L)
+        cov = np.sqrt(np.diag(la.inv(small_QL.T.dot(small_QL))))
+        return cov
+
 
     def graphResults(self, gps=False, tspiFilename=None, tspiStartTime=None, tspiEndTime=None, true_r_V_d=None):
 

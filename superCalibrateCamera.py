@@ -5,6 +5,8 @@ import numpy as np
 import customtkinter as ctk
 from tkinter import filedialog
 from threading import Thread
+
+import vmbpy.c_binding
 from cv2_enumerate_cameras import enumerate_cameras
 from Calibration import Calibration
 from LidarTruth import TruthPoints
@@ -13,6 +15,8 @@ from enum import Enum, auto
 from os.path import join
 from PIL import Image, ImageTk
 from FG_DrogueOnly import FactorGraph
+from ImageTimeReader import ImageTimeReader
+from vmbpy import *
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
@@ -287,8 +291,11 @@ class Camera():
         self.showWindow = False
         self.GaborFilter = None
         self.radius = 800
+        self.ellipse_x_axis = 800
+        self.ellipse_y_axis = 800
         self.last_bounding_box_size = (800, 800)
         self.last_yolo_center = (400, 400)
+        self.last_yolo_3d_estimate = (10, 0, 0)
         self.current_center_est = (400, 400)
         self.FG = FactorGraph()
         self.curr_frame = None
@@ -297,6 +304,13 @@ class Camera():
         self.horizon_line = None
         self.hor_last_midpoint = 868 / 2
         self.hor_last_slope = 0.0
+        self.ImageTimeReader = ImageTimeReader()
+        self.last_time_update = 0.0
+        self.min_radius = 200
+        self.curr_FG_pixel = (400, 400)
+        self.current_var_x = 10.0
+        self.current_var_y = 10.0
+        self.current_var_z = 10.0
 
         self.available_sources = [source.value for source in ImageSource]
 
@@ -326,7 +340,12 @@ class Camera():
                                                    text='../' + os.path.basename(
                                                        os.path.normpath(self.camConfig.yoloFilepath)))
         self.selectCalibLabel = None
-        self.undistortCheckbox = None
+        self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
+        self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
+        self.detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
+        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image', command=self.toggleYoloInference)
+        self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
+        self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
 
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectSingleImage)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
@@ -339,6 +358,7 @@ class Camera():
         self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
         self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
         self.iouSliderBar.set(1.00)
+
 
         self.loadFromCache()
         self.vc = None
@@ -356,7 +376,6 @@ class Camera():
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
-        self.aspectRatio = 1.0
         self.lastWidth = 1
         self.lastHeight = 1
         self.saveToCache()
@@ -468,14 +487,41 @@ class Camera():
             self.cam_frame.update()
             self.gui.update()
 
-        if self.undistortCheckbox is not None:
-            self.undistortCheckbox.configure(state='normal')
+        self.undistortCheckbox.configure(state='normal')
         self.saveToCache()
 
     def scanForCameras(self):
         self.indexDict = {}
         for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
             self.indexDict[camera_info.name] = camera_info.index
+        with VmbSystem.get_instance() as vmb:
+            cams = vmb.get_all_cameras()
+            print(cams)
+            if cams:
+                cam = cams[0]
+                try:
+                    cam._open()
+                except vmbpy.c_binding.VmbError as e:
+                    print(f'Could not open camera: {e}')
+                    return
+                try:
+                    cam.start_streaming(lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
+                    time.sleep(5)
+                    cam.stop_streaming()
+                finally:
+                    cam._close()
+
+    def display_frame(self, cam, stream, frame, title):
+        try:
+            numpy_buffer = frame.as_numpy_ndarray()
+            if len(numpy_buffer.shape) == 2:
+                numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_GRAY2BGR)
+            else:
+                numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_RGB2BGR)
+            cv2.imshow(title, cv2.resize(numpy_buffer,(868, 868)))
+            cv2.waitKey(1)
+        except vmbpy.c_binding.VmbError as e:
+            print(f'Error processing frame: {e}')
 
     def selectCamera(self, key):
         self.camConfig.cam_index = self.indexDict[key]
@@ -596,16 +642,16 @@ class Camera():
         self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
-        detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
+        # detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
         if self.camConfig.detectTags is False:
-            detectAprilTagsCheckbox.deselect()
+            self.detectAprilTagsCheckbox.deselect()
         else:
-            detectAprilTagsCheckbox.select()
+            self.detectAprilTagsCheckbox.select()
             self.createDetector()
-        detectAprilTagsCheckbox.configure(command=self.toggleDetectTags)
-        detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
+        self.detectAprilTagsCheckbox.configure(command=self.toggleDetectTags)
+        self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
 
-        self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
+        # self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         if not self.calibration.validCal:
             self.undistortCheckbox.configure(state='disabled')
 
@@ -624,15 +670,14 @@ class Camera():
         else:
             projectLidarPoints.select()
         projectLidarPoints.configure(command=self.toggleLidarPoints)
-        projectLidarPoints.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+        projectLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        yoloInference = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image')
+        # yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image')
         if self.camConfig.yoloInference is False:
-            yoloInference.deselect()
+            self.yoloInferenceCheckbox.deselect()
         else:
-            yoloInference.select()
-        yoloInference.configure(command=self.toggleYoloInference)
-        yoloInference.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+            self.yoloInferenceCheckbox.select()
+        self.yoloInferenceCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
         detectCornersCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Corners')
@@ -643,30 +688,30 @@ class Camera():
         detectCornersCheckbox.configure(command=self.toggleDetectCorners)
         detectCornersCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
+        # detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
         if self.camConfig.detect_horizon is False:
-            detectHorizonCheckbox.deselect()
+            self.detectHorizonCheckbox.deselect()
         else:
-            detectHorizonCheckbox.select()
-        detectHorizonCheckbox.configure(command=self.toggleDetectHorizon)
-        detectHorizonCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+            self.detectHorizonCheckbox.select()
+        self.detectHorizonCheckbox.configure(command=self.toggleDetectHorizon)
+        self.detectHorizonCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
+        # factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         if self.camConfig.factor_graph is False:
-            factorgraphCheckbox.deselect()
+            self.factorgraphCheckbox.deselect()
         else:
-            factorgraphCheckbox.select()
-        factorgraphCheckbox.configure(command=self.toggleFactorgraph)
-        factorgraphCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+            self.factorgraphCheckbox.select()
+        self.factorgraphCheckbox.configure(command=self.toggleFactorgraph)
+        self.factorgraphCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
+        # hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
         if self.camConfig.hyper_focus is False:
-            hyperfocusCheckbox.deselect()
+            self.hyperfocusCheckbox.deselect()
         else:
-            hyperfocusCheckbox.select()
-        hyperfocusCheckbox.configure(command=self.toggleHyperFocus)
-        hyperfocusCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+            self.hyperfocusCheckbox.select()
+        self.hyperfocusCheckbox.configure(command=self.toggleHyperFocus)
+        self.hyperfocusCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
 
@@ -709,8 +754,7 @@ class Camera():
         self.startStreamOff()
 
     def releaseCamReturnToMain(self):
-        self.startStreamOff()
-        self.vc.release()
+        self.startStreamOffBool()
         self.gui.returnToMain()
 
     def setAprilTagSize(self):
@@ -788,6 +832,10 @@ class Camera():
 
     def toggleYoloInference(self):
         self.camConfig.yoloInference = not self.camConfig.yoloInference
+        if self.camConfig.yoloInference:
+            self.yoloInferenceCheckbox.select()
+        else:
+            self.yoloInferenceCheckbox.deselect()
         self.saveToCache()
 
     def toggleDetectCorners(self):
@@ -796,15 +844,28 @@ class Camera():
 
     def toggleDetectHorizon(self):
         self.camConfig.detect_horizon = not self.camConfig.detect_horizon
+        if self.camConfig.detect_horizon:
+            self.detectHorizonCheckbox.select()
+        else:
+            self.detectHorizonCheckbox.deselect()
         self.saveToCache()
 
     def toggleFactorgraph(self):
         self.camConfig.factor_graph = not self.camConfig.factor_graph
+        if self.camConfig.factor_graph:
+            self.factorgraphCheckbox.select()
+        else:
+            self.factorgraphCheckbox.deselect()
         self.saveToCache()
-        print(self.camConfig.factor_graph)
 
     def toggleHyperFocus(self):
         self.camConfig.hyper_focus = not self.camConfig.hyper_focus
+
+        if self.camConfig.hyper_focus:
+            self.hyperfocusCheckbox.select()
+        else:
+            self.hyperfocusCheckbox.deselect()
+
         self.saveToCache()
 
     def updateImageProcessingKernel(self, newValue):
@@ -829,10 +890,12 @@ class Camera():
             self.camConfig.undistort = False
             return
 
-        if self.undistortCheckbox.get():
-            self.camConfig.undistort = True
+        self.camConfig.undistort = not self.camConfig.undistort
+        if self.camConfig.undistort:
+            self.undistortCheckbox.select()
         else:
-            self.camConfig.undistort = False
+            self.undistortCheckbox.deselect()
+
         self.saveToCache()
 
     def run_detectSingleImage(self):
@@ -869,7 +932,6 @@ class Camera():
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         rval, self.curr_frame = self.vc.read()
         if rval:
-            self.aspectRatio = float(self.curr_frame.shape[1]) / float(self.curr_frame.shape[0])
             cv2.resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
             self.lastHeight = self.curr_frame.shape[0]
             self.lastWidth = self.curr_frame.shape[1]
@@ -887,9 +949,15 @@ class Camera():
     def run_folder_reader(self):
         cv2.destroyAllWindows()
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        imageList = glob.glob(os.path.join(os.path.dirname(self.camConfig.imageFilepath), '*.bmp')) + glob.glob(
-            os.path.join(os.path.dirname(self.camConfig.imageFilepath), '*.png'))
-        imageList = natural_sort(imageList)
+
+        directory = os.path.dirname(self.camConfig.imageFilepath)
+
+        if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
+            self.ImageTimeReader.idsTimes = []
+            imageList = glob.glob(os.path.join(directory,'*.bmp')) + glob.glob(os.path.join(directory,'*.png'))
+            imageList = natural_sort(imageList)
+            for image in imageList:
+                self.ImageTimeReader.idsTimes.append([image, None])
 
         img_id = 0
         play_speed = 1
@@ -900,9 +968,10 @@ class Camera():
 
             if not pause or temp_unpause:
                 temp_unpause = False
-                img_id = (img_id + play_speed) % len(imageList)
-                frame = cv2.imread(imageList[img_id])
-                self.analyze_image(frame)
+                img_id = (img_id + play_speed) % self.ImageTimeReader.numImages
+
+                frame = cv2.imread(os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0]))
+                self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1])
 
             key = cv2.waitKey(1)
 
@@ -930,12 +999,19 @@ class Camera():
                 play_speed -= 1
                 pause = False
 
+            if key == 119:
+                self.toggleUndistort()
+                self.toggleYoloInference()
+                self.toggleDetectHorizon()
+                self.toggleHyperFocus()
+                self.toggleFactorgraph()
+
             if key == 27:
                 break
 
         self.startStreamOff()
 
-    def analyze_image(self, frame):
+    def analyze_image(self, frame, time=None):
 
         self.curr_frame_gray = None
 
@@ -946,21 +1022,9 @@ class Camera():
         self.detectAprilTags()
         self.projectLidarPoints()
         self.detectHorizon()
-
-        if self.camConfig.hyper_focus:
-            if self.last_bounding_box_size is not None:
-                self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
-                    1] + self.radius * 4.0) / 5.0
-            else:
-                self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
-                self.confSlider(self.yoloSession.conf)
-
-            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.10)
-            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
-
-        self.radius = min(800, self.radius + 12)
-
+        self.hyper_focus(time)
         self.run_yolo()
+        self.factor_graph(time)
         self.cleanup()
 
     def undistort(self, frame):
@@ -1120,13 +1184,13 @@ class Camera():
                 if np.abs(x2 - x1) > 0.000001:
                     m = (y2 - y1) / (x2 - x1)
                     y1 = y1 - m * x1
-                    x2 = self.curr_frame.shape[0]
+                    x2 = self.curr_frame.shape[1]
                     self.hor_last_midpoint = ((y1 + m * x2 / 2.0) + self.hor_last_midpoint) / 2.0
                     self.hor_last_slope = (m + self.hor_last_slope) / 2.0
                     color = (20, 150, 20)
 
         x1 = 0
-        x2 = int(self.curr_frame.shape[0])
+        x2 = int(self.curr_frame.shape[1])
         y1 = int(self.hor_last_midpoint - self.hor_last_slope * x2 / 2.0)
         y2 = int(self.hor_last_midpoint + self.hor_last_slope * x2 / 2.0)
 
@@ -1134,7 +1198,50 @@ class Camera():
 
         self.horizon_line = (x1, y1, x2, y2)
 
+    def check_above_horizon(self, pt):
+        if self.horizon_line is None:
+            return True
+
+        x1, y1, x2, y2 = self.horizon_line
+        return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
+
+    def hyper_focus(self, time=None):
+        if not self.camConfig.hyper_focus:
+            return
+
+        if not self.camConfig.factor_graph:
+            if self.last_bounding_box_size is not None:
+                self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
+                    1] + self.radius * 4.0) / 5.0
+            else:
+                self.confSlider(self.yoloSession.conf)
+
+            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
+            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.50)
+
+            self.radius = min(800, self.radius + 12)
+            self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
+            self.confSliderBar.set(self.yoloSession.conf)
+        else:
+            if self.last_bounding_box_size is not None:
+                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.5
+
+            ellipse_width = 5000.0 * self.current_var_y + self.min_radius
+            ellipse_height = 5000.0 * self.current_var_z + self.min_radius
+            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[1] or \
+                    self.curr_FG_pixel[1] > self.curr_frame.shape[0]:
+                return
+            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width,
+                                                  y_axes=ellipse_height)
+            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width*2.0,
+                                                  y_axes=ellipse_height*2.0, dim_factor = 0.00)
+
     def run_yolo(self):
+        '''
+        Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
+        100 meters away, then it updates this class's estimation of the solution.
+        :return: None, but does adjust
+        '''
         if self.camConfig.yoloInference:
             self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame)
             centers, boxes, scores, class_ids, time = output
@@ -1158,11 +1265,10 @@ class Camera():
                 dist_est = 2.0 / (
                             self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
                             self.curr_frame.shape[1])
-                threeD_points = np.linalg.inv(K).dot(twoD_points) * dist_est
-                np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
                 dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
 
                 if dist_est < 100.0 and self.check_above_horizon(self.last_yolo_center):
+                    self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                     cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                                3, (255, 0, 255), 3)
                     self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
@@ -1172,12 +1278,43 @@ class Camera():
         self.last_bounding_box_size = None
         self.last_yolo_center = None
 
-    def check_above_horizon(self, pt):
-        if self.horizon_line is None:
-            return True
+    def factor_graph(self, time):
+        color = (0, 255, 255)
+        if not self.camConfig.factor_graph:
+            self.last_yolo_3d_estimate = None
+            return
+        if self.last_yolo_3d_estimate is not None:
+            self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
+            self.last_time_update = time
+            if self.FG.numMeas > 20:
+                self.FG.popOldestMeas()
+            if self.FG.numMeas > 2:
+                self.FG.opt()
+        else:
+            color = (0, 0, 255)
 
-        x1, y1, x2, y2 = self.horizon_line
-        return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
+        if time is not None and self.FG.numMeas > 2:
+            K = self.calibration.getCameraMatrix()
+            d = self.calibration.getDistortion()
+            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (time-self.last_time_update) * self.FG.r_V_d[-1])
+            self.curr_FG_pixel = (self.curr_FG_pixel/self.curr_FG_pixel[2])[:2]
+
+            size = 15
+            thickness = 1
+            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size,  color, thickness)
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
+
+            self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
+            var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
+
+            self.current_var_x = var_x + var_vx * (time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
+            self.current_var_y = var_y + var_vy * (time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
+            self.current_var_z = var_z + var_vz * (time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
+
+        self.last_yolo_3d_estimate = None
 
     def cleanup(self):
 
@@ -1218,18 +1355,18 @@ class Camera():
 
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
-
+        aspectRatio = self.curr_frame.shape[1]/self.curr_frame.shape[0]
         if not self.lastHeight == height and height != 0:
-            cv2.resizeWindow(self.windowName, int(height * self.aspectRatio), height)
+            cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
             self.lastHeight = height
-            self.lastWidth = int(height * self.aspectRatio)
+            self.lastWidth = int(height * aspectRatio)
         elif not self.lastWidth == width and width != 0:
-            cv2.resizeWindow(self.windowName, width, int(width / self.aspectRatio))
+            cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
             self.lastWidth = width
-            self.lastHeight = int(width / self.aspectRatio)
+            self.lastHeight = int(width / aspectRatio)
 
 
-def dim_except_circle(frame, center, radius, dim_factor=0.5):
+def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     """
     Dims an image everywhere except inside a circle.
 
@@ -1240,9 +1377,19 @@ def dim_except_circle(frame, center, radius, dim_factor=0.5):
         dim_factor (float): Dimming factor (0 to 1, 0 for black, 1 for no dimming).
     """
 
-    # 1. Create a mask
-    mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
-    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+    if y_axes is None:
+        radius = x_axes
+        if dim_factor == 0.0:
+            return dim_entirely(frame, center, radius)
+
+        # 1. Create a mask
+        mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
+        cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+
+    else:
+        mask = np.zeros(frame.shape[:2], dtype='uint8')
+        cv2.ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
+                    angle=0,startAngle=0, endAngle=360, color=255, thickness=-1)
 
     # 2. Dim the entire image
     dimmed_img = (frame * dim_factor).astype("uint8")
@@ -1261,6 +1408,23 @@ def dim_except_circle(frame, center, radius, dim_factor=0.5):
 
     return frame
 
+def dim_entirely(frame, center, radius):
+    """
+    Dims an image everywhere except inside a circle.
+
+    Args:
+        image_path (np.array): the image
+        center (tuple): (x, y) coordinates of the circle's center.
+        radius (int): Radius of the circle.
+        dim_factor (float): Dimming factor (0 to 1, 0 for black, 1 for no dimming).
+    """
+
+    # 1. Create a mask
+    mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
+    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+
+    # 3. Copy the original circle area back to the dimmed image
+    return cv2.bitwise_and(frame, frame, mask=mask)
 
 def natural_sort(l):
     convert = lambda text: int(text) if text.isdigit() else text.lower()

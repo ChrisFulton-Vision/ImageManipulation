@@ -436,6 +436,11 @@ class FrontEndGui(ctk.CTk):
         backToMainButton = ctk.CTkButton(master=self.calFrame, text='Go back', command=self.returnToMain)
         backToMainButton.grid(row=5, column=0, padx=5, pady=5)
 
+    def scaleToSelection(self, x):
+        self.imageConfig.camCal.scaleCalibration(x)
+        self.saveToCache()
+        self.updateCalWindow()
+
     def scaleTo864(self):
         self.imageConfig.camCal.scaleCalibration(864)
         self.saveToCache()
@@ -680,14 +685,13 @@ class FrontEndGui(ctk.CTk):
 
 
     def removeUnused(self):
-        if not os.path.exists(join(self.filepath, '/Removed')):
+        if not os.path.exists(join(self.filepath, 'Removed')):
             os.makedirs(join(self.filepath,'Removed'))
         removeIds = []
         for idx, imgClass in enumerate(self.imageConfig.imgCollection):
 
-            if not imgClass.include and os.path.exists(join(self.filepath,'/Removed/',imgClass.imageName)):
-                os.replace(self.fileName(idx), join(self.filepath, '/Removed/', imgClass.imageName))
-                os.remove(self.fileName(idx))
+            if not imgClass.include and os.path.exists(join(self.filepath,imgClass.imageName)):
+                os.replace(join(self.filepath,imgClass.imageName), join(self.filepath, 'Removed', imgClass.imageName))
 
             if not imgClass.include:
                 removeIds.append(idx)
@@ -704,19 +708,19 @@ class FrontEndGui(ctk.CTk):
             self.openImagesButton.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
 
     def copyToRemovedFolder(self, imgClass):
-        if not os.path.exists(join(self.filepath, '/Removed')):
+        if not os.path.exists(join(self.filepath, 'Removed')):
             os.makedirs(join(self.filepath, 'Removed'))
 
         src_path = join(self.filepath, imgClass.imageName)
-        dst_path = join(self.filepath, '/Removed/', imgClass.imageName)
+        dst_path = join(self.filepath, 'Removed', imgClass.imageName)
 
         if not os.path.exists(dst_path):
             self.writeFile(src_path,dst_path)
 
     def restore(self, imgClass):
-        if os.path.exists(join(self.filepath, '/Removed/', imgClass.imageName)):
+        if os.path.exists(join(self.filepath, 'Removed', imgClass.imageName)):
 
-            src_path = join(self.filepath, '/Removed/', imgClass.imageName)
+            src_path = join(self.filepath, 'Removed', imgClass.imageName)
             dst_path = join(self.filepath, imgClass.imageName)
 
             self.writeFile(src_path, dst_path)
@@ -1204,9 +1208,9 @@ class FrontEndGui(ctk.CTk):
                                             imgClass.imgPts, True)
 
                 min_X = max(int(np.min(imgClass.imgPts[:, 0, 0])-100), 0)
-                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0]+100)), img.shape[0])
+                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0]+100)), img.shape[1])
                 min_Y = max(int(np.min(imgClass.imgPts[:, :, 1]-100)), 0)
-                max_Y = min(int(np.max(imgClass.imgPts[:, :,  1]+100)), img.shape[1])
+                max_Y = min(int(np.max(imgClass.imgPts[:, :,  1]+100)), img.shape[0])
 
                 roi = img[min_Y:max_Y, min_X:max_X, :]
 

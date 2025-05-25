@@ -1,21 +1,29 @@
-import sys
-import os
-
-import cv2, glob, re, time, copy, colorsys
+import sys, os, cv2, glob, time, copy, colorsys, pickle
+from os.path import join
 import numpy as np
 import customtkinter as ctk
 from tkinter import filedialog
-import pickle
 from threading import Thread
+from PIL import Image
+from enum import Enum
+
 from Calibration import Calibration
 import superCalibrateCamera as cam
-from PIL import Image
-from os.path import join
 
 sys.path.append(os.getcwd())
 GREEN = '#2FA572'
 
-class ImageryConfig():
+class CalibrationType(Enum):
+    Chessboard = 'Chessboard'
+    Circles = 'Circles'
+    chArUco = 'chArUco'
+
+class ImageryCalibrationConfig():
+    '''
+    This class stores information cleanly about any calibration that has occurred or is intended to occur. Because
+    it stores all the information and settings for the calibration, this class is neatly packaged in a cache for
+    easy reloading.
+    '''
     def __init__(self):
         self.img_type = 'bmp'
         self.ret = []
@@ -27,7 +35,7 @@ class ImageryConfig():
         self.numInnerCornersH = 11
         self.SUBnumInnerCornersW = 5
         self.SUBnumInnerCornersH = 5
-        self.calMode = 'Chessboard'
+        self.calMode = CalibrationType.Chessboard
         self.spacing = 30.0
         self.maxIter = 100
         self.minStepSize = 0.00001
@@ -38,17 +46,35 @@ class ImageryConfig():
 
     @property
     def num_valid_imgs(self):
+        '''
+        Property method for CalConfig. Call as:
+        calConfig = ImageryCalibrationConfig()
+        num_imgs = calConfig.num_valid_imgs
+        :return: Number of valid images, excluding those specifically not included in submenu or previous cache.
+        Images that aren't included but are in the list are visible in submenus, but not included in calibration.
+        '''
         num_valid = 0
         for img in self.imgCollection:
             if img.include:
                 num_valid += 1
         return num_valid
 
-    def copy(self, guiToCopy):
-        self.__dict__.update(copy.deepcopy(guiToCopy.__dict__))
+    def copy(self, configToCopy):
+        '''
+        Caching helper function. When reading from binary, copy all named dictionary items in the CalibrationConfig.
+        Changes to this class will cause version errors when reading in old configs IFF names are changed or removed.
+        Adding NEW parameters does not create a version error, but the parameter will not change through the load.
+        :param configToCopy: Loaded value, typically from cache.
+        :return:
+        '''
+        self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
 
     @property
     def flags(self):
+        '''
+        Helper function that returns the composite flag value for a calibration based on own settings.
+        :return: cv2-style flags for calibration.
+        '''
         flags = None
         if self.zeroTangentDist:
             flags = cv2.CALIB_ZERO_TANGENT_DIST
@@ -68,6 +94,14 @@ class ImageryConfig():
         return flags
 
 class ImageData():
+    '''
+    This class stores information maintained by a single image. The image MUST have a name which is its filename.
+    Include sets whether the image is part of the calibration.
+    imgPts stores 2d identified features (such as chessboard corners)
+    objPts stores 3d expected features (such as 3d coords for the chessboard)
+    Residual characterizes the performance of the calibration. This is a good estimate for image quality.
+    Sharpness characterizes the blurriness of the image. This is a rough estimate for image quality.
+    '''
     def __init__(self, name=''):
         self.imageName = name
         self.include = True
@@ -77,32 +111,53 @@ class ImageData():
         self.sharpness = None
 
 class FrontEndGui(ctk.CTk):
+    '''
+    This is the main GUI that the user interacts with when running the program. This class manages the main loop,
+    displays the main buttons, creates the submenus (but waits to show them until asked), and generally maintains
+    system state.
+    '''
     def __init__(self, *args, **kwargs):
+
+        # Super class init, necessary for customTkinter
         super().__init__(*args, **kwargs)
+
+        # "Nicely" closes camera, if it is active
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        # Stores calibration times
         self.startTime = time.time()
         self.endTime = time.time()
-        self.imageConfig = ImageryConfig()
+
+        # Stores calibration configuration states
+        self.imageConfig = ImageryCalibrationConfig()
+
+        # Bool for calibration state
         self.calculating = False
-        self.displayImagePointsButton = None
-        self.imageConfigWindowObjects = []
+
+        # Default Geometries for window and subwindows
         self.mainGeometry = '255x500'
         self.imageWinGeometry = '1250x550'
         self.calGeometry = '250x550'
         self.configGeometry = '500x225'
+
+        # Various helper variable NONE-initialization
+        self.displayImagePointsButton = None
         self.currImg = None
         self.firstClick = None
         self.camera = None
         self.initImageFrame = False
+        self.imageConfigWindowObjects = []
         self.scale = 1.0
 
         self.filepath = ''
         self.loadFromCache(True)
 
+        # Empty thread-holding objects
         self.t1 = None
         self.t2 = None
         self.t3 = None
 
+        ##########################################################################
         # Custom TKinter Main Window Configuration
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
@@ -164,7 +219,7 @@ class FrontEndGui(ctk.CTk):
         rowID += 1
 
         # Allow user to select type of calibration
-        modes = ['Chessboard', 'Circles', 'chArUco']
+        modes = [type.value for type in CalibrationType]
         self.selectModeLabel = ctk.CTkLabel(master=self.mainFrame, text='Calibration Type')
         self.selectModeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.selectModeCombo = ctk.CTkComboBox(master=self.mainFrame, values=modes,command=self.updateMode )
@@ -234,35 +289,52 @@ class FrontEndGui(ctk.CTk):
         self.calibrateButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
 
-        self.loadFromCache()
-        self.restoreFromImageConfig()
-
         # Once a calibration is active, allow user to display a window that manages the calibration
-        self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled', command=self.openCalWindow)
-        self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        if self.imageConfig.camCal.calStr is not None:
-            self.displayCal.configure(state='normal')
+        self.displayCal = None
+        self.createCalibrationDisplay(rowID)
         rowID += 1
 
         # Once a calibration is active, allow user to display a window that manages the calibration
-        self.configWindowButton = ctk.CTkButton(self.mainFrame, text='Criteria Configuration',command=self.openConfigWindow)
-        self.configWindowButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        self.configWindowButton = None
+        self.createConfigWindowButton(rowID)
         rowID += 1
 
+        # Create a button that allows a user to clear the cache, but they must select it twice
+        self.clearCacheRow = rowID
         self.protectClearCache()
 
-        # self.setupImageFrame()
+        # Now that necessary starting variables are created, load states from cache
+        self.loadFromCache()
+        self.restoreFromImageConfig()
         self.updateConfigWindow()
         self.updateCalWindow()
 
-    # def __del__(self):
+    def createCalibrationDisplay(self, rowID):
+        self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
+                                        command=self.openCalWindow)
+        self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        if self.imageConfig.camCal.calStr is not None:
+            self.displayCal.configure(state='normal')
+
+    def createCalibrationWindowButton(self, rowID):
+        self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
+                                        command=self.openCalWindow)
+        self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        if self.imageConfig.camCal.calStr is not None:
+            self.displayCal.configure(state='normal')
+
+    def createConfigWindowButton(self, rowID):
+        self.configWindowButton = ctk.CTkButton(self.mainFrame, text='Criteria Configuration',
+                                                command=self.openConfigWindow)
+        self.configWindowButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+
     def on_closing(self):
         '''
         Closes camera streaming down, if it's still active, ensuring all destructors called in sequence
         '''
         if self.camera is not None:
             self.camera.shutdown()
-        self.destroy()
+        self.after(1000, self.destroy())
 
     def openCamera(self):
         '''
@@ -284,7 +356,7 @@ class FrontEndGui(ctk.CTk):
         '''
         Setter from button click
         '''
-        self.imageConfig.calMode = newMode
+        self.imageConfig.calMode = CalibrationType(newMode)
         self.saveToCache()
 
     def updateImgType(self, newImgType):
@@ -854,15 +926,17 @@ class FrontEndGui(ctk.CTk):
         self.saveToCache()
         self.updateIncludeCheckboxes()
 
-    def unprotectClearCache(self):
+    def unprotectClearCache(self, button:ctk.CTkButton):
+        button.grid_forget()
         clearCacheButton = ctk.CTkButton(master=self.mainFrame,text='Really Clear Cache', fg_color='green', command=self.clearCache)
         clearCacheButton.grid(row=13, column=0, columnspan=2, padx=5, pady=5)
         self.after(2000, self.protectClearCache)
         self.after(2000, clearCacheButton.grid_forget)
 
     def protectClearCache(self):
-        clearCacheButton = ctk.CTkButton(master=self.mainFrame,text='Clear Cache', fg_color='blue', hover_color='navy', command=self.unprotectClearCache)
-        clearCacheButton.grid(row=13, column=0, columnspan=2, padx=5, pady=5)
+        clearCacheButton = ctk.CTkButton(master=self.mainFrame,text='Clear Cache', fg_color='blue', hover_color='navy')
+        clearCacheButton.configure(command=lambda button = clearCacheButton: self.unprotectClearCache(button))
+        clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
 
     def clearCache(self):
         if os.path.exists(join(self.filepath, 'imagery_cache.pkl')):
@@ -872,7 +946,7 @@ class FrontEndGui(ctk.CTk):
             clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='Clearing', fg_color='yellow', text_color='black', hover_color='yellow')
             clearCacheButton.grid(row=13, column=0, columnspan=2, padx=5, pady=5)
 
-            self.imageConfig = ImageryConfig()
+            self.imageConfig = ImageryCalibrationConfig()
             self.filepath = filepath
             self.restoreFromWindowState()
             self.loadImages()
@@ -897,7 +971,7 @@ class FrontEndGui(ctk.CTk):
         self.SUBheightComboEntry.set(str(self.imageConfig.SUBnumInnerCornersH))
         self.folderLabel.configure(text="../" + os.path.basename(os.path.normpath(self.filepath)))
         self.selectImgTypeCombo.set(self.imageConfig.img_type)
-        self.selectModeCombo.set(self.imageConfig.calMode)
+        self.selectModeCombo.set(self.imageConfig.calMode.value)
 
     def restoreFromWindowState(self):
         self.imageConfig.invertImage = self.invertImagesCheckbox.get()
@@ -906,7 +980,7 @@ class FrontEndGui(ctk.CTk):
         self.imageConfig.SUBnumInnerCornersW = int(self.SUBwidthComboEntry.get())
         self.imageConfig.SUBnumInnerCornersH = int(self.SUBheightComboEntry.get())
         self.imageConfig.img_type = self.selectImgTypeCombo.get()
-        self.imageConfig.calMode = self.selectModeCombo.get()
+        self.imageConfig.calMode = CalibrationType(self.selectModeCombo.get())
 
     def saveToCache(self):
 
@@ -931,7 +1005,7 @@ class FrontEndGui(ctk.CTk):
             with open(join(self.filepath, 'imagery_cache.pkl'), 'rb') as imageConfigOpen:
                 self.imageConfig.copy(pickle.load(imageConfigOpen))
         else:
-            self.imageConfig = ImageryConfig()
+            self.imageConfig = ImageryCalibrationConfig()
             if not self.imageConfig.camCal.fromFile(self.filepath):
                 self.imageConfig.camCal.fromBinFile(self.filepath)
 
@@ -1059,10 +1133,10 @@ class FrontEndGui(ctk.CTk):
         _resolution = np.mean(_sobel)
 
         # print(f'Laplacian: {_laplacian}')
-        print(f'Sharpness: {_sharpness}')
-        print(f'Contrast: {_contrast}')
-        print(f'Clarity: {_clarity}')
-        print(f'Resolution: {_resolution}')
+        # print(f'Sharpness: {_sharpness}')
+        # print(f'Contrast: {_contrast}')
+        # print(f'Clarity: {_clarity}')
+        # print(f'Resolution: {_resolution}')
 
 
         cv2.imshow(imgClass.imageName, dispImg)
@@ -1163,13 +1237,13 @@ class FrontEndGui(ctk.CTk):
         else:
             gray = cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
 
-        if self.imageConfig.calMode == 'Chessboard':
+        if self.imageConfig.calMode == CalibrationType.Chessboard:
             ret, corners = cv2.findChessboardCorners(gray,
                                                      (self.imageConfig.numInnerCornersW,
                                                       self.imageConfig.numInnerCornersH),
                                                      flags=cv2.ADAPTIVE_THRESH_GAUSSIAN_C)
 
-        elif self.imageConfig.calMode == 'Circles':
+        elif self.imageConfig.calMode == CalibrationType.Circles:
 
             ret, corners = cv2.findCirclesGrid(gray,
                                          (self.imageConfig.numInnerCornersW,

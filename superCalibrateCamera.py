@@ -1,22 +1,19 @@
-import ctypes
-import datetime
+import pickle, copy, os, time, threading, cv2, glob, re, yolo, ctypes, vmbpy.c_binding
 
 import numpy as np
 import customtkinter as ctk
+from vmbpy import *
 from tkinter import filedialog
 from threading import Thread
-
-import vmbpy.c_binding
 from cv2_enumerate_cameras import enumerate_cameras
 from Calibration import Calibration
 from LidarTruth import TruthPoints
-import pickle, copy, os, time, threading, cv2, glob, re, yolo
-from enum import Enum, auto
-from os.path import join
-from PIL import Image, ImageTk
+from enum import Enum
+from PIL import Image
+
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
-from vmbpy import *
+
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
@@ -311,6 +308,7 @@ class Camera():
         self.current_var_x = 10.0
         self.current_var_y = 10.0
         self.current_var_z = 10.0
+        self.shutting_down = False
 
         self.available_sources = [source.value for source in ImageSource]
 
@@ -496,7 +494,6 @@ class Camera():
             self.indexDict[camera_info.name] = camera_info.index
         with VmbSystem.get_instance() as vmb:
             cams = vmb.get_all_cameras()
-            print(cams)
             if cams:
                 cam = cams[0]
                 try:
@@ -750,8 +747,9 @@ class Camera():
         self.cam_frame.pack()
 
     def shutdown(self):
+        self.shutting_down = True
         self.recordOff()
-        self.startStreamOff()
+        self.startStreamOffBool()
 
     def releaseCamReturnToMain(self):
         self.startStreamOffBool()
@@ -796,26 +794,27 @@ class Camera():
         self.showWindow = False
 
     def startStreamOff(self):
-        self.singleImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue',
-                                             text=os.path.basename(self.camConfig.imageFilepath))
-        self.startStreamButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
-        self.multiImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
-
-        self.selectCameraCombo.configure(state='normal')
-        self.startStreamButton.configure(text='Start Stream')
-
-        self.streamOrImgCombo.configure(state='normal')
-
         cv2.destroyAllWindows()
+
+        if self.vc is not None:
+            self.vc.release()
+
+        if not self.shutting_down:
+            self.singleImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue',
+                                                 text=os.path.basename(self.camConfig.imageFilepath))
+            self.startStreamButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
+            self.multiImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
+
+            self.selectCameraCombo.configure(state='normal')
+            self.startStreamButton.configure(text='Start Stream')
+            self.streamOrImgCombo.configure(state='normal')
+
+            self.showWindow = False
 
         if self.t1 is not None:
             self.t1.raise_exception()
             self.t1.join()
 
-        if self.vc is not None:
-            self.vc.release()
-
-        self.showWindow = False
 
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
@@ -936,13 +935,11 @@ class Camera():
             self.lastHeight = self.curr_frame.shape[0]
             self.lastWidth = self.curr_frame.shape[1]
 
-        while rval and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+        while rval and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0 and self.showWindow:
             rval, frame = self.vc.read()
             self.analyze_image(frame)
-
             key = cv2.waitKey(1)
-            if key == 27 or cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) < 1:  # exit on ESC
-                # self.startStreamOff()
+            if key == 27:  # exit on ESC
                 break
         self.startStreamOff()
 

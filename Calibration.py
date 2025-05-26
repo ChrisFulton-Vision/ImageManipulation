@@ -125,13 +125,12 @@ class Calibration:
         self.__dict__.update(copy.deepcopy(calToCopy.__dict__))
 
     def toBinFile(self, fileDirectory):
-        with open(fileDirectory + '\\calibration.bin', 'wb') as file:
+        with open(fileDirectory + '\\calibration.pkl', 'wb') as file:
             pkl.dump(self, file)
 
     def fromBinFile(self, fileDirectory):
-        return False
         if os.path.exists(os.path.join(fileDirectory, 'calibration.pkl')):
-            with open(os.path.join(fileDirectory, 'calibration.bin'), 'rb') as file:
+            with open(os.path.join(fileDirectory, 'calibration.pkl'), 'rb') as file:
                 self.copy(pkl.load(file))
                 return True
         if os.path.basename(fileDirectory) == 'calibration.pkl':

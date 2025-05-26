@@ -345,10 +345,10 @@ class Camera():
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
 
-        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectSingleImage)
+        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectImagesFilepath)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
         self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder',
-                                                    command=self.selectSingleImage)
+                                                    command=self.selectImagesFilepath)
         self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
         self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
         self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider, from_=0.15)
@@ -405,37 +405,44 @@ class Camera():
             pickle.dump(self.calibFile, f)
 
     def selectFolder(self):
-        self.filepath = filedialog.askdirectory(initialdir=self.filepath + "/..", mustexist=True,
-                                                title="Select Imagery Folder")
-        self.saveToCache()
-        self.loadFromCache()
+        fp = self.askFilepath(self.filepath + "/..", "Select Imagery Folder")
+        if fp is not None:
+            self.filepath = fp
+            self.saveToCache()
+            self.loadFromCache()
 
     def loadCalibration(self):
-        self.calibFile = filedialog.askopenfilename(initialdir=self.filepath + '/..',
+        poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
                                                     title='Select Folder of Calibration')
-        self.ingestCalibration()
+        if poss_filepath != '':
+            self.calibFile = poss_filepath
+            self.ingestCalibration()
 
     def selectLidarFile(self):
         if self.camConfig.lidarFilepath is None:
-            self.camConfig.lidarFilepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
+            poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
                                                                       title='Select LIDAR Truth Points')
         else:
-            self.camConfig.lidarFilepath = filedialog.askopenfilename(initialdir=self.camConfig.lidarFilepath + '/..',
-                                                                      title='Select LIDAR Truth Points')
-        self.updateLidarLabel()
-        self.loadTruthPoints()
-        self.saveToCache()
+            poss_filepath = filedialog.askopenfilename(initialdir=self.camConfig.lidarFilepath + '/..',
+                                                                   title='Select LIDAR Truth Points')
+        if poss_filepath != '':
+            self.camConfig.lidarFilepath = poss_filepath
+            self.updateLidarLabel()
+            self.loadTruthPoints()
+            self.saveToCache()
 
     def selectYoloFolder(self):
         if self.camConfig.yoloFilepath is None:
-            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=os.getcwd() + '/..',
+            poss_filepath = filedialog.askdirectory(initialdir=os.getcwd() + '/..',
                                                                   title='Select YOLO Folder')
         else:
-            self.camConfig.yoloFilepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
+            poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
                                                                   title='Select YOLO Folder')
-        self.updateYOLOLabel()
-        self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
-        self.saveToCache()
+        if poss_filepath != '':
+            self.camConfig.yoloFilepath = poss_filepath
+            self.updateYOLOLabel()
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+            self.saveToCache()
 
     def updateLidarLabel(self):
         if self.camConfig.lidarFilepath is not None:
@@ -575,15 +582,17 @@ class Camera():
 
         self.saveToCache()
 
-    def selectSingleImage(self):
+    def selectImagesFilepath(self):
         if self.camConfig.imageFilepath is None:
             initDir = self.filepath + '/..'
         else:
             initDir = os.path.normpath(self.camConfig.imageFilepath)
 
-        self.camConfig.imageFilepath = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
-        self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
-        self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
+        poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
+        if poss_file != '':
+            self.camConfig.imageFilepath = poss_file
+            self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
+            self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
 
     def setupFrame(self):
         rowID = 0
@@ -1362,6 +1371,11 @@ class Camera():
             self.lastWidth = width
             self.lastHeight = int(width / aspectRatio)
 
+    def askFilepath(self, initDir, text):
+        poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True,title=text)
+        if poss_filepath == '':
+            return None
+        return poss_filepath
 
 def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     """

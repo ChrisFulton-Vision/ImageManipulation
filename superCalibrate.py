@@ -169,22 +169,13 @@ class FrontEndGui(ctk.CTk):
         self.mainFrame.grid_columnconfigure([0, 1, 2], weight=1)
         self.mainFrame.pack()
 
+        ##########################################################################
+        # Image Management Frame Setup
         self.imageFrame = ctk.CTkFrame(master=self)
         self.imageFrame.grid_rowconfigure(list(range(10)), weight=1)  # configure grid system
         self.imageFrame.grid_columnconfigure(list(range(11)), weight=1)
         self.subImageFrame = ctk.CTkScrollableFrame(master=self.imageFrame)
         self.subImageFrame.grid(row=2, rowspan=5, column=0, columnspan=12, sticky='NSEW')
-
-        self.calFrame = ctk.CTkFrame(master=self)
-
-        self.calFrame.grid_rowconfigure([0, 1], weight=1)
-        self.calFrame.grid_columnconfigure([0], weight=1)
-
-        self.configFrame = ctk.CTkFrame(master=self)
-        self.stoppingIterationEntry = ctk.CTkEntry(master=self.configFrame)
-        self.stoppingIterationButton = ctk.CTkButton(master=self.configFrame,text='Update', command=self.stoppingCritIterUpdate)
-        self.stoppingMinStepSizeEntry = ctk.CTkEntry(master=self.configFrame)
-        self.stoppingMinStepSizeButton = ctk.CTkButton(master=self.configFrame,text='Update', command=self.stoppingCritMinStepSizeUpdate)
 
         self.leftArrow = ctk.CTkImage( light_image=Image.open('leftArrow.png'), size=(20,20))
         self.rightArrow = ctk.CTkImage( light_image=Image.open('rightArrow.png'), size=(20,20))
@@ -201,8 +192,24 @@ class FrontEndGui(ctk.CTk):
         self.imgGrayProtectedButton = ctk.CTkButton(master=self.imageFrame, text='Grayscale All', hover_color='navy',
                                                fg_color='blue', width=100, command=self.unprotectAllGrayscale)
 
+        ##########################################################################
+        # Calibration Frame Setup
+        self.calFrame = ctk.CTkFrame(master=self)
 
+        self.calFrame.grid_rowconfigure([0, 1], weight=1)
+        self.calFrame.grid_columnconfigure([0], weight=1)
 
+        ##########################################################################
+        # Custom TKinter Configuration Setup
+        self.configFrame = ctk.CTkFrame(master=self)
+        self.stoppingIterationEntry = ctk.CTkEntry(master=self.configFrame)
+        self.stoppingIterationButton = ctk.CTkButton(master=self.configFrame, text='Update',
+                                                     command=self.stoppingCritIterUpdate)
+        self.stoppingMinStepSizeEntry = ctk.CTkEntry(master=self.configFrame)
+        self.stoppingMinStepSizeButton = ctk.CTkButton(master=self.configFrame, text='Update',
+                                                       command=self.stoppingCritMinStepSizeUpdate)
+        ##########################################################################
+        # Now Initialize the buttons on the main frame
         # Use rowID to keep track of which row each object is placed. Allows for easy code integration of new objects
         rowID = 0
 
@@ -213,6 +220,7 @@ class FrontEndGui(ctk.CTk):
         # Add button that allows the user to select the folder of the images
         self.selectFolderButton = ctk.CTkButton(master=self.mainFrame, text='Select Folder',command=self.selectFolder, fg_color="navy")
         self.selectFolderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky="ew")
+
         # On same line, add a button that allows the user to interact with the images in the folder
         self.openImagesButton = ctk.CTkButton(master=self.mainFrame, text='Not Selected', fg_color="black", command=self.openImageWindow)
         self.openImagesButton.grid(row=rowID, column=1, padx=5, pady=5, sticky="ew")
@@ -249,6 +257,7 @@ class FrontEndGui(ctk.CTk):
         self.cornerInputLabel = ctk.CTkLabel(self.mainFrame, text='# of Inner CB Corners')
         self.cornerInputLabel.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
+
         self.widthLabel = ctk.CTkLabel(self.mainFrame, text='Width')
         self.widthLabel.grid(row=rowID, column=0, padx=5, pady=5)
         self.heightLabel = ctk.CTkLabel(self.mainFrame, text='Height')
@@ -1051,17 +1060,15 @@ class FrontEndGui(ctk.CTk):
         self.saveToCache()
 
     def selectFolder(self):
-        self.filepath = os.path.dirname(filedialog.askopenfilename(initialdir=self.filepath + "/..", title="Select Imagery Folder"))
+        poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + "/..", title="Select Imagery Folder")
+        if poss_filepath == '':
+            return
+
+        self.filepath = os.path.dirname(poss_filepath)
         self.folderLabel.configure(text=os.path.basename(self.filepath))
         self.imageConfig.imgCollection = []
         self.loadFromCache(False)
         self.saveToCache()
-
-    # @staticmethod
-    # def natural_sort(l):
-    #     convert = lambda text: int(text) if text.isdigit() else text.lower()
-    #     alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
-    #     return sorted(l, key=alphanum_key)
 
     def sortBySharpness(self):
         self.imageConfig.imgCollection = sorted(self.imageConfig.imgCollection, key=lambda img: self.sharpnessTest(img.sharpness))

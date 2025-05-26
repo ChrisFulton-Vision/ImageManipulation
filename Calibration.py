@@ -129,6 +129,7 @@ class Calibration:
             pkl.dump(self, file)
 
     def fromBinFile(self, fileDirectory):
+        return False
         if os.path.exists(os.path.join(fileDirectory, 'calibration.pkl')):
             with open(os.path.join(fileDirectory, 'calibration.bin'), 'rb') as file:
                 self.copy(pkl.load(file))

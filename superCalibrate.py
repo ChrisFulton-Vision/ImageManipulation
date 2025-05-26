@@ -1123,21 +1123,21 @@ class FrontEndGui(ctk.CTk):
 
         cv2.namedWindow(imgClass.imageName)
 
-        kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
-        sharpened_image = cv2.filter2D(dispImg, -1, kernel)
-
-        gray = cv2.cvtColor(dispImg, cv2.COLOR_BGR2GRAY)
-        _laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        _sharpness = _laplacian.var()
-
-        _contrast = gray.std()
-
-        _clarity = _sharpness * _contrast
-
-        _sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-        _sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-        _sobel = np.sqrt(_sobel_x ** 2 + _sobel_y ** 2)
-        _resolution = np.mean(_sobel)
+        # kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
+        # sharpened_image = cv2.filter2D(dispImg, -1, kernel)
+        #
+        # gray = cv2.cvtColor(dispImg, cv2.COLOR_BGR2GRAY)
+        # _laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        # _sharpness = _laplacian.var()
+        #
+        # _contrast = gray.std()
+        #
+        # _clarity = _sharpness * _contrast
+        #
+        # _sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
+        # _sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
+        # _sobel = np.sqrt(_sobel_x ** 2 + _sobel_y ** 2)
+        # _resolution = np.mean(_sobel)
 
         # print(f'Laplacian: {_laplacian}')
         # print(f'Sharpness: {_sharpness}')
@@ -1147,7 +1147,7 @@ class FrontEndGui(ctk.CTk):
 
 
         cv2.imshow(imgClass.imageName, dispImg)
-        cv2.imshow('Sharper? ', sharpened_image)
+        # cv2.imshow('Sharper? ', sharpened_image)
 
         self.currImgClass = imgClass
         self.currImg = copy.copy(dispImg)
@@ -1191,7 +1191,7 @@ class FrontEndGui(ctk.CTk):
             new_img[:,high_x:] = np.zeros(new_img[:,high_x:].shape)
             new_img[high_y:] = np.zeros(new_img[high_y:].shape)
 
-            cv2.imwrite(join(self.filepath, self.currImgClass.imageName, new_img))
+            cv2.imwrite(join(self.filepath, self.currImgClass.imageName), new_img)
 
             # if h > 1080 or w > 1080:
             #     new_img = cv2.resize(new_img, (int(w / scale), int(h / scale)))

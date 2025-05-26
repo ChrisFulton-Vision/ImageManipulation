@@ -1346,7 +1346,7 @@ class Camera():
         cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
 
         if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
-            cv2.imwrite(self.filepath + '\\' + str(self.img_idx) + '.png', self.markup_frame)
+            cv2.imwrite(os.path.join(self.filepath, str(self.img_idx) + '.png'), self.markup_frame)
             self.img_idx += 1
             self.lastImageTime = time.time()
             self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')

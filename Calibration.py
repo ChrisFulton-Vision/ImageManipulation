@@ -1,4 +1,5 @@
 import os, re, copy
+from os.path import join
 import numpy as np
 import pickle as pkl
 
@@ -92,7 +93,7 @@ class Calibration:
         dist = self.getDistortion()
 
         calStr = ''
-        if mtx is not None and dist is not None and self.calTime is not None and self.numCBUsed is not None:
+        if self.validCal:
             calStr += '#Camera matrix\n'
             calStr += 'fx={:.{}f}'.format(mtx[0, 0], 10) + '\n'
             calStr += 'fy={:.{}f}'.format(mtx[1, 1], 10) + '\n'
@@ -119,18 +120,19 @@ class Calibration:
             calStr += 'hfov=' + str(self.hfov) + "\n"
         else:
             calStr = 'Bad Cal'
+
         return calStr
 
     def copy(self, calToCopy):
         self.__dict__.update(copy.deepcopy(calToCopy.__dict__))
 
     def toBinFile(self, fileDirectory):
-        with open(fileDirectory + '\\calibration.pkl', 'wb') as file:
+        with open(join(fileDirectory,'calibration.pkl'), 'wb') as file:
             pkl.dump(self, file)
 
     def fromBinFile(self, fileDirectory):
-        if os.path.exists(os.path.join(fileDirectory, 'calibration.pkl')):
-            with open(os.path.join(fileDirectory, 'calibration.pkl'), 'rb') as file:
+        if os.path.exists(join(fileDirectory, 'calibration.pkl')):
+            with open(join(fileDirectory, 'calibration.pkl'), 'rb') as file:
                 self.copy(pkl.load(file))
                 return True
         if os.path.basename(fileDirectory) == 'calibration.pkl':
@@ -140,12 +142,12 @@ class Calibration:
         return False
 
     def toFile(self, fileDirectory):
-        with open(fileDirectory + '\\calibration.txt', 'w') as file:
+        with open(join(fileDirectory, 'calibration.txt'), 'w') as file:
             file.write(self.calStr)
 
     def fromFile(self, fileDirectory):
-        if os.path.exists(os.path.join(fileDirectory, 'calibration.txt')):
-            filepath = os.path.join(fileDirectory, 'calibration.txt')
+        if os.path.exists(join(fileDirectory, 'calibration.txt')):
+            filepath = join(fileDirectory, 'calibration.txt')
         elif os.path.exists(fileDirectory) and fileDirectory[-4:] == '.txt':
             filepath = fileDirectory
         else:
@@ -213,16 +215,20 @@ class Calibration:
         else:
             return True
 
-    def scaleCalibration(self, newWidth:int):
+    def scaleCalibration(self, newWidth:int, newHeight:int = None):
         if not self.validCal:
             raise ValueError('Invalid Calibration. Missing necessary parameter.')
 
-        scale = float(newWidth / self.width)
-        self.fx *= scale
-        self.fy *= scale
-        self.cx = scale * (self.cx + 0.5) - 0.5
-        self.cy = scale * (self.cy + 0.5) - 0.5
+        if newHeight is None:
+            newHeight = newWidth
+
+        scale_x = float(newWidth / self.width)
+        scale_y = float(newHeight / self.height)
+        self.fx *= scale_x
+        self.fy *= scale_y
+        self.cx = scale_x * (self.cx + 0.5) - 0.5
+        self.cy = scale_y * (self.cy + 0.5) - 0.5
 
 
-        self.height = int(self.height*scale)
+        self.height = newHeight
         self.width = newWidth

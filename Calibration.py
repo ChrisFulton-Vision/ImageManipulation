@@ -14,12 +14,14 @@ class Calibration:
         self.p1 = None
         self.p2 = None
         self.k3 = None
+        self.k4 = None
         self.calTime = None
         self.numCBUsed = None
         self.rmsError = None
         self.width = None
         self.height = None
         self.hfov = None
+        self.fisheye = None
 
         if filepath is not None:
             self.fromFile(filepath)
@@ -53,7 +55,14 @@ class Calibration:
             return None
 
     def setDistortion(self, dist=None, k1=None, k2=None, p1=None, p2=None, k3=None):
-        if dist is not None:
+        if dist is not None and self.fisheye:
+            self.k1 = dist[0]
+            self.k2 = dist[1]
+            self.k3 = dist[2]
+            self.k4 = dist[3]
+            print('should be good...')
+            print(self.k1, self.k2, self.k3, self.k4)
+        elif dist is not None:
             self.k1 = dist[0]
             self.k2 = dist[1]
             self.p1 = dist[2]
@@ -71,8 +80,15 @@ class Calibration:
             self.p1 = None
             self.p2 = None
             self.k3 = None
+            self.k4 = None
 
     def getDistortion(self):
+        if self.fisheye:
+            if self.k1 is not None and self.k2 is not None and self.k3 is not None and self.k4 is not None:
+                return np.array([self.k1, self.k2, self.k3, self.k4]).flatten()
+            else:
+                return None
+
         if self.k1 is not None and self.k2 is not None and self.p1 is not None and self.p2 is not None and self.k3 is not None:
             return np.array([self.k1, self.k2, self.p1, self.p2, self.k3]).flatten()
         else:
@@ -101,11 +117,17 @@ class Calibration:
             calStr += 'cy={:.{}f}'.format(mtx[1, 2], 10) + '\n\n'
 
             calStr += '#Distortion coefficients\n'
-            calStr += 'k1={:.{}f}'.format(dist[0], 10) + '\n'
-            calStr += 'k2={:.{}f}'.format(dist[1], 10) + '\n'
-            calStr += 'p1={:.{}f}'.format(dist[2], 10) + '\n'
-            calStr += 'p2={:.{}f}'.format(dist[3], 10) + '\n'
-            calStr += 'k3={:.{}f}'.format(dist[4], 10) + '\n\n'
+            if self.fisheye:
+                calStr += 'k1={:.{}f}'.format(dist[0], 10) + '\n'
+                calStr += 'k2={:.{}f}'.format(dist[1], 10) + '\n'
+                calStr += 'k3={:.{}f}'.format(dist[2], 10) + '\n'
+                calStr += 'k4={:.{}f}'.format(dist[3], 10) + '\n\n'
+            else:
+                calStr += 'k1={:.{}f}'.format(dist[0], 10) + '\n'
+                calStr += 'k2={:.{}f}'.format(dist[1], 10) + '\n'
+                calStr += 'p1={:.{}f}'.format(dist[2], 10) + '\n'
+                calStr += 'p2={:.{}f}'.format(dist[3], 10) + '\n'
+                calStr += 'k3={:.{}f}'.format(dist[4], 10) + '\n\n'
 
             calStr += '#Total cal time (sec)\n'
             calStr += 'ct={:.{}f}'.format(self.calTime, 10) + '\n\n'
@@ -196,7 +218,22 @@ class Calibration:
 
     @property
     def validCal(self):
-        if any([self.fx is None,
+        if self.fisheye and any([self.fx is None,
+                self.fy is None,
+                self.cx is None,
+                self.cy is None,
+                self.k1 is None,
+                self.k2 is None,
+                self.k3 is None,
+                self.k4 is None,
+                self.calTime is None,
+                self.numCBUsed is None,
+                self.rmsError is None,
+                self.width is None,
+                self.height is None,
+                self.hfov is None]):
+            return False
+        elif not self.fisheye and any([self.fx is None,
                 self.fy is None,
                 self.cx is None,
                 self.cy is None,
@@ -212,8 +249,7 @@ class Calibration:
                 self.height is None,
                 self.hfov is None]):
             return False
-        else:
-            return True
+        return True
 
     def scaleCalibration(self, newWidth:int, newHeight:int = None):
         if not self.validCal:

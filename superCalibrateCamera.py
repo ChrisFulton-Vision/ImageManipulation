@@ -131,11 +131,37 @@ class thread_with_exception(Thread):
             ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
             print('Exception Raise Failure')
 
+class ImageSliderBar:
+    def __init__(self, num_images):
+        self.pop_up = ctk.CTkToplevel()
+        self.pop_up.focus_force()
+        self.pop_up.geometry('400x200')
+        self.pop_up.grid_columnconfigure(0, weight=1)
+        self.pop_up.grid_rowconfigure([0,1], weight=1)
+        self.num_images = num_images
+        self.play_speed = 1
+        self.curr_img_idx = 0
+
+        self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=num_images, command=self.update_img_id, height=40)
+        self.slider.set(0)
+        self.slider.grid(sticky='ew')
+
+    def update_img_id(self, new_img_idx):
+        self.curr_img_idx = int(new_img_idx)
+
+    def next_id(self):
+        self.curr_img_idx = (self.curr_img_idx + self.play_speed) % self.num_images
+        self.slider.set(self.curr_img_idx)
+        return self.curr_img_idx
+
+    def close(self):
+        self.pop_up.destroy()
+        self.pop_up.update()
 
 class Gabor:
     def __init__(self):
         self.pop_up = ctk.CTkToplevel()
-        self.pop_up.focus_force()
+        self.pop_up.lift()
         self.ksize = (31, 31)
         self.sigma = 3.0
         self.theta = 0.0
@@ -148,7 +174,7 @@ class Gabor:
         self.lambd_label = None
         self.gamma_label = None
 
-        self.pop_up.geometry('200x500')
+        self.pop_up.geometry('200x300')
         self.pop_up.grid_columnconfigure([0, 1], weight=1)
         self.configure_pop_up()
 
@@ -263,11 +289,22 @@ class CameraConfig():
         self.detect_horizon = False
         self.factor_graph = False
         self.hyper_focus = False
+        self.phase_correlation = False
+        self.crosshairs = False
+        self.cubemap = False
+
+        self.yolo_conf = 0.75
+        self.yolo_iou = 1.00
 
         self.processingKernel = ImageKernels.Unchanged
 
     def copy(self, configToCopy):
-        self.__dict__.update(copy.deepcopy(configToCopy.__dict__))
+        for obj in configToCopy.__dict__:
+            try:
+                self.__dict__[obj] = configToCopy.__dict__[obj]
+            except KeyError:
+                # Allows for versioning issues, changed naming conventions.
+                pass
 
 
 class Camera():
@@ -309,6 +346,13 @@ class Camera():
         self.current_var_y = 10.0
         self.current_var_z = 10.0
         self.shutting_down = False
+        self.face_size = None
+        self.faces_dirs = None
+        self.cubemap_faces = None
+        self.map_x = None
+        self.map_y = None
+
+        self.last_image = None
 
         self.available_sources = [source.value for source in ImageSource]
 
@@ -344,6 +388,9 @@ class Camera():
         self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image', command=self.toggleYoloInference)
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
+        self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.cam_frame, text='PhaseCorrelation')
+        self.crosshairsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Crosshairs')
+        self.cubemapCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Cubemap')
 
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectImagesFilepath)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
@@ -359,6 +406,7 @@ class Camera():
 
 
         self.loadFromCache()
+        self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
         self.vc = None
         # self.vc.setExceptionMode(True)
         # self.detector = Detector(refine_edges=1, decode_sharpening=0.0)
@@ -370,7 +418,7 @@ class Camera():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x630'
+        self.camFrameGeometry = '455x720'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -395,7 +443,13 @@ class Camera():
 
         self.updateLidarLabel()
         self.updateYOLOLabel()
+
         self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+        self.yoloSession.conf = self.camConfig.yolo_conf
+        self.confSliderLabel.configure(text='Conf: ' + f'{self.camConfig.yolo_conf:.2f}')
+        self.yoloSession.iou = self.camConfig.yolo_iou
+        self.iouSliderLabel.configure(text='IOU: ' + f'{self.camConfig.yolo_iou:.2f}')
+
         self.loadTruthPoints()
 
     def saveToCache(self):
@@ -459,12 +513,16 @@ class Camera():
                 self.lidarTruthPoints.copy(test)
 
     def confSlider(self, confValue):
+        self.camConfig.yolo_conf = confValue
         self.yoloSession.conf = confValue
         self.confSliderLabel.configure(text='Conf: ' + f'{confValue:.2f}')
+        self.saveToCache()
 
     def iouSlider(self, iouValue):
+        self.camConfig.yolo_iou = iouValue
         self.yoloSession.iou = iouValue
         self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
+        self.saveToCache()
 
     def ingestCalibration(self):
 
@@ -721,6 +779,31 @@ class Camera():
 
         rowID += 1
 
+        if self.camConfig.phase_correlation is False:
+            self.phaseCorrelationCheckbox.deselect()
+        else:
+            self.phaseCorrelationCheckbox.select()
+        self.phaseCorrelationCheckbox.configure(command=self.togglePhaseCorrelation)
+        self.phaseCorrelationCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        if self.camConfig.crosshairs is False:
+            self.crosshairsCheckbox.deselect()
+        else:
+            self.crosshairsCheckbox.select()
+        self.crosshairsCheckbox.configure(command=self.toggleCrosshairs)
+        self.crosshairsCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
+
+        if self.camConfig.cubemap is False:
+            self.cubemapCheckbox.deselect()
+        else:
+            self.cubemapCheckbox.select()
+        self.cubemapCheckbox.configure(command=self.toggleCubemap)
+        self.cubemapCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
+
         imageProcessingKernelLabel = ctk.CTkLabel(self.cam_frame, text='Image Filter: ')
         imageProcessingKernelLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         imageProcessingKernelCombobox = ctk.CTkComboBox(self.cam_frame, values=list(ImageKernels.__members__.keys()))
@@ -876,6 +959,33 @@ class Camera():
 
         self.saveToCache()
 
+    def togglePhaseCorrelation(self):
+        self.camConfig.phase_correlation = not self.camConfig.phase_correlation
+        if self.camConfig.phase_correlation:
+            self.phaseCorrelationCheckbox.select()
+        else:
+            self.phaseCorrelationCheckbox.deselect()
+
+        self.saveToCache()
+
+    def toggleCrosshairs(self):
+        self.camConfig.crosshairs = not self.camConfig.crosshairs
+        if self.camConfig.crosshairs:
+            self.crosshairsCheckbox.select()
+        else:
+            self.crosshairsCheckbox.deselect()
+
+        self.saveToCache()
+
+    def toggleCubemap(self):
+        self.camConfig.cubemap = not self.camConfig.cubemap
+        if self.camConfig.cubemap:
+            self.cubemapCheckbox.select()
+        else:
+            self.cubemapCheckbox.deselect()
+
+        self.saveToCache()
+
     def updateImageProcessingKernel(self, newValue):
         self.camConfig.processingKernel = ImageKernels(newValue)
         self.saveToCache()
@@ -965,8 +1075,9 @@ class Camera():
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
-        img_id = 0
-        play_speed = 1
+        img_slider = ImageSliderBar(self.ImageTimeReader.numImages)
+
+        img_slider.play_speed = 1
         pause = False
         temp_unpause = False
 
@@ -974,7 +1085,7 @@ class Camera():
 
             if not pause or temp_unpause:
                 temp_unpause = False
-                img_id = (img_id + play_speed) % self.ImageTimeReader.numImages
+                img_id = img_slider.next_id()
 
                 frame = cv2.imread(os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0]))
                 self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1])
@@ -982,27 +1093,29 @@ class Camera():
             key = cv2.waitKey(1)
 
             if key == 99:
-                img_id += 1
-                play_speed = 0
+                img_slider.curr_img_idx += 1
+                img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
             if key == 122:
-                img_id -= 1
-                play_speed = 0
+                img_slider.curr_img_idx -= 1
+                img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
             if key == 32:
                 pause = not pause
-                play_speed = 0
+                img_slider.play_speed = 0
                 if not pause:
-                    play_speed = 1
+                    img_slider.play_speed = 1
+
             if key == 100:
-                play_speed += 1
+                img_slider.play_speed += 1
                 pause = False
+                
             if key == 97:
-                play_speed -= 1
+                img_slider.play_speed -= 1
                 pause = False
 
             if key == 119:
@@ -1015,39 +1128,214 @@ class Camera():
             if key == 27:
                 break
 
+        if not self.shutting_down:
+            img_slider.close()
         self.startStreamOff()
 
     def analyze_image(self, frame, time=None):
 
         self.curr_frame_gray = None
 
-        self.undistort(frame)
+        if self.calibration.validCal and self.camConfig.undistort:
+            self.undistort(frame)
+        else:
+            self.curr_frame = frame.copy()
         self.markup_frame = self.curr_frame.copy()
-        self.applyKernel()
-        self.corner_detection()
-        self.detectAprilTags()
-        self.projectLidarPoints()
-        self.detectHorizon()
-        self.hyper_focus(time)
-        self.run_yolo()
-        self.factor_graph(time)
+
+        if self.camConfig.processingKernel != ImageKernels.Unchanged:
+            self.applyKernel()
+
+        if self.camConfig.detect_corners:
+            self.corner_detection()
+
+        if self.detector is not None:
+            self.detectAprilTags()
+
+        if self.camConfig.projectLidarPoints and self.detector is not None:
+            self.projectLidarPoints()
+
+        if self.camConfig.detect_horizon:
+            self.detectHorizon()
+
+        if self.camConfig.hyper_focus:
+            self.hyper_focus(time)
+
+        if self.camConfig.yoloInference:
+            self.run_yolo()
+        else:
+            self.last_bounding_box_size = None
+            self.last_yolo_center = None
+
+        if self.camConfig.factor_graph:
+            self.factor_graph(time)
+        else:
+            self.last_yolo_3d_estimate = None
+
+        if self.camConfig.phase_correlation:
+            self.phase_correlation()
+
         self.cleanup()
 
+    def update_cube_map_vectors(self):
+        """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
+        axes = {
+            'right': ([1, 0, 0], [0, -1, 0]),
+            'left': ([-1, 0, 0], [0, -1, 0]),
+            'top': ([0, -1, 0], [0, 0, -1]),
+            'bottom': ([0, 1, 0], [0, 0, 1]),
+            'front': ([0, 0, 1], [0, -1, 0]),
+            # 'back': ([0, 0, -1], [0, -1, 0]),
+        }
+
+        self.faces_dirs = {}
+        rng = np.linspace(-1, 1, self.face_size)
+        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
+
+        for name, (center, up) in axes.items():
+            center = np.array(center)
+            up = np.array(up)
+            right = np.cross(center, up)
+
+            dirs = (
+                    center[None, None, :]
+                    + xx[..., None] * right[None, None, :]
+                    + yy[..., None] * up[None, None, :]
+            )
+            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
+            self.faces_dirs[name] = dirs.astype(np.float32)
+
+        # return faces
+        self.fisheye_to_cubemap_vectorized()
+
+    def update_frontFace_vector(self):
+        """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
+        axes = {
+            'front': ([0, 0, 1], [0, -1, 0])
+        }
+
+        self.faces_dirs = {}
+        rng = np.linspace(-1, 1, self.face_size)
+        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
+
+        for name, (center, up) in axes.items():
+            center = np.array(center)
+            up = np.array(up)
+            right = np.cross(center, up)
+
+            dirs = (
+                    center[None, None, :]
+                    + xx[..., None] * right[None, None, :]
+                    + yy[..., None] * up[None, None, :]
+            )
+            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
+            self.faces_dirs[name] = dirs.astype(np.float32)
+
+        # return faces
+        self.fisheye_to_cubemap_vectorized()
+
+    def fisheye_to_cubemap_vectorized(self):
+
+        cube_faces = {}
+
+        self.map_x = {}
+        self.map_y = {}
+
+        for face, dirs in self.faces_dirs.items():
+            dirs_reshaped = dirs.reshape(-1, 1, 3)
+
+            # Only keep directions roughly facing the front hemisphere
+            forward_mask = dirs_reshaped[:, 0, 2] > 0  # Z > 0 means forward
+            valid_dirs = dirs_reshaped[forward_mask]
+
+
+            if valid_dirs.size > 0:
+                # Project valid directions
+                img_points, _ = cv2.fisheye.projectPoints(
+                    valid_dirs, np.zeros(3), np.zeros(3),
+                    self.calibration.getCameraMatrix(),
+                    self.calibration.getDistortion()
+                )
+                img_points = img_points.reshape(-1, 2)
+
+                # Prepare remap coordinates
+                full_img_points = np.full((self.face_size * self.face_size, 2), -1, dtype=np.float32)
+                full_img_points[forward_mask] = img_points
+
+                self.map_x[face] = full_img_points[:, 0].reshape(self.face_size, self.face_size)
+                self.map_y[face] = full_img_points[:, 1].reshape(self.face_size, self.face_size)
+
+
+    def apply_fisheye_faces(self, frame):
+        self.cubemap_faces = {}
+
+        for face in self.faces_dirs:
+            self.cubemap_faces[face] = self.remap(face, frame)
+
+    def remap(self, face, frame):
+        return cv2.remap(
+                    frame, self.map_x[face], self.map_y[face],
+                    interpolation=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=(0, 0, 0))
+
+    def stitch_cubemap_faces(self, layout, cells=3):
+        """
+        Arrange the 6 cubemap faces into a 2x3 stitched layout.
+        Layout:
+            +--------+--------+--------+
+            |        |   top  |        |
+            +--------+--------+--------+
+            |  left   | front |  right |
+            +--------+--------+--------+
+            |        | bottom |        |
+            +--------+--------+--------+
+        """
+        stitched = np.zeros((cells * self.face_size, cells * self.face_size, 3), dtype=np.uint8)
+
+        for face, (row, col) in layout.items():
+            if face in self.cubemap_faces:
+                y, x = row * self.face_size, col * self.face_size
+                stitched[y:y + self.face_size, x:x + self.face_size] = self.cubemap_faces[face]
+
+        return stitched
+
     def undistort(self, frame):
-        if self.calibration.validCal and self.camConfig.undistort:
+
+        if self.calibration.fisheye:
+            if self.camConfig.cubemap:
+                if self.face_size is None or self.face_size != 600:
+                    self.face_size = 600
+                    self.update_cube_map_vectors()
+
+                self.apply_fisheye_faces(frame)
+                layout = {
+                    'bottom': (2, 1),
+                    'left': (1, 0),
+                    'front': (1, 1),
+                    'right': (1, 2),
+                    # 'back': (1, 0),
+                    'top': (0, 1)}
+                self.curr_frame = self.stitch_cubemap_faces(layout, cells=3)
+
+            else:
+                if self.face_size is None or self.face_size != min(frame.shape[:2]):
+                    self.face_size = min(frame.shape[:2])
+                    self.update_frontFace_vector()
+
+                self.apply_fisheye_faces(frame)
+
+                layout = {'front': (0, 0)}
+                # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
+                self.curr_frame = self.cubemap_faces['front']
+        else:
             self.curr_frame = cv2.undistort(src=frame,
                                     cameraMatrix=self.calibration.getCameraMatrix(),
                                     distCoeffs=self.calibration.getDistortion())
-        else:
-            self.curr_frame = frame.copy()
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernels.Gabor and self.GaborFilter is not None:
             self.GaborFilter.close()
             self.GaborFilter = None
-
-        if self.camConfig.processingKernel == ImageKernels.Unchanged:
-            return
 
         match self.camConfig.processingKernel:
             case ImageKernels.Sharpen:
@@ -1087,16 +1375,13 @@ class Camera():
         self.markup_frame = cv2.filter2D(self.markup_frame, -1, kernel)
 
     def corner_detection(self):
-        if self.camConfig.detect_corners:
-            if self.curr_frame_gray is None:
-                self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
-            harris_corners = cv2.cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
+        if self.curr_frame_gray is None:
+            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
+        harris_corners = cv2.cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
 
-            self.markup_frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
+        self.markup_frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
 
     def detectAprilTags(self):
-        if self.detector is None:
-            return
 
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
@@ -1125,8 +1410,6 @@ class Camera():
                 self.centers = np.vstack((self.centers, np.array(pixCenter).astype('float32')))
 
     def projectLidarPoints(self):
-        if not self.camConfig.projectLidarPoints or self.detector is None:
-            return
 
         ret = False
         if self.centers is not None and len(self.centers) >= 6:
@@ -1163,8 +1446,6 @@ class Camera():
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
 
     def detectHorizon(self):
-        if not self.camConfig.detect_horizon:
-            return
 
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
@@ -1172,7 +1453,8 @@ class Camera():
         edges = cv2.Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, 50,
-                                minLineLength=100, maxLineGap=20)
+                                minLineLength=np.sum(self.curr_frame.shape)/10.0,
+                                maxLineGap=20)
 
         color = (0, 0, 255)
 
@@ -1212,8 +1494,6 @@ class Camera():
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
     def hyper_focus(self, time=None):
-        if not self.camConfig.hyper_focus:
-            return
 
         if not self.camConfig.factor_graph:
             if self.last_bounding_box_size is not None:
@@ -1230,15 +1510,18 @@ class Camera():
             self.confSliderBar.set(self.yoloSession.conf)
         else:
             if self.last_bounding_box_size is not None:
-                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.5
+                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*9.0
+            # 1.0 for single feature
 
-            ellipse_width = 5000.0 * self.current_var_y + self.min_radius
-            ellipse_height = 5000.0 * self.current_var_z + self.min_radius
+            ellipse_width = 50.0 * self.current_var_y + self.min_radius
+            ellipse_height = 50.0 * self.current_var_z + self.min_radius
+
             if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[1] or \
                     self.curr_FG_pixel[1] > self.curr_frame.shape[0]:
                 return
+
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width,
-                                                  y_axes=ellipse_height)
+                                                  y_axes=ellipse_height, dim_factor=0.10)
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width*2.0,
                                                   y_axes=ellipse_height*2.0, dim_factor = 0.00)
 
@@ -1248,47 +1531,43 @@ class Camera():
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
-        if self.camConfig.yoloInference:
-            self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame)
-            centers, boxes, scores, class_ids, time = output
-            if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
-                best_idx = scores.index(max(scores))
-                img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
-                img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
+        self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame)
+        centers, boxes, scores, class_ids, time = output
+        if len(centers) > 0 :#and self.yoloSession.reader.numClasses == 1:
+            best_idx = scores.index(max(scores))
+            img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
+            img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
 
-                self.last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
-                                               (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
-                self.last_yolo_center = centers[best_idx]
+            self.last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
+                                           (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
+            self.last_yolo_center = centers[best_idx]
 
-                self.last_yolo_center[0] = int(
-                    self.last_yolo_center[0] * img_yolo_x_correction)
-                self.last_yolo_center[1] = int(
-                    self.last_yolo_center[1] * img_yolo_y_correction)
+            self.last_yolo_center[0] = int(
+                self.last_yolo_center[0] * img_yolo_x_correction)
+            self.last_yolo_center[1] = int(
+                self.last_yolo_center[1] * img_yolo_y_correction)
 
-                K = self.calibration.getCameraMatrix()
-                d = self.calibration.getDistortion()
-                twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
-                dist_est = 2.0 / (
-                            self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
-                            self.curr_frame.shape[1])
-                dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
+            K = self.calibration.getCameraMatrix()
+            d = self.calibration.getDistortion()
+            twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
+            dist_est = 2.0 / (
+                        self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
+                        self.curr_frame.shape[1])
+            dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
 
-                if dist_est < 100.0 and self.check_above_horizon(self.last_yolo_center):
-                    self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
-                    cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
-                               3, (255, 0, 255), 3)
-                    self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
-                                               (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
-                    return
+            if dist_est < 100.0 and self.check_above_horizon(self.last_yolo_center):
+                self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
+                cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
+                           3, (255, 0, 255), 3)
+                self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
+                                           (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
+                return
 
         self.last_bounding_box_size = None
         self.last_yolo_center = None
 
     def factor_graph(self, time):
         color = (0, 255, 255)
-        if not self.camConfig.factor_graph:
-            self.last_yolo_3d_estimate = None
-            return
         if self.last_yolo_3d_estimate is not None:
             self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
             self.last_time_update = time
@@ -1322,6 +1601,26 @@ class Camera():
 
         self.last_yolo_3d_estimate = None
 
+    def phase_correlation(self):
+
+        if self.calibration.validCal:
+            cx = int(self.calibration.cx)
+            cy = int(self.calibration.cy)
+        else:
+            cx = int(self.curr_frame.shape[0] / 2)
+            cy = int(self.curr_frame.shape[1] / 2)
+
+        if self.curr_frame_gray is None:
+            self.curr_frame_gray = cv2.cvtColor(self.markup_frame, cv2.COLOR_BGR2GRAY)
+
+        if self.last_image is not None and self.last_image.shape == self.curr_frame_gray.shape:
+            lft_rt, ret = cv2.phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
+                                     self.last_image.astype(np.float64) / 255.0)
+            lft, rt = lft_rt
+            cv2.arrowedLine(self.markup_frame, (cx, cy), (int(cx+10*lft), int(cy+10*rt)), (0, 0, 255), 3)
+
+        self.last_image = copy.deepcopy(self.curr_frame_gray)
+
     def cleanup(self):
 
         if self.calibration.validCal:
@@ -1335,11 +1634,12 @@ class Camera():
         height = self.curr_frame.shape[1]
         thickness = max(int(width / 250), 1)
 
-        crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
-        crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
+        if self.camConfig.crosshairs:
+            crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
+            crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
 
-        cv2.polylines(self.markup_frame, [crosshairsH], True, (0, 255, 0), thickness)
-        cv2.polylines(self.markup_frame, [crosshairsV], True, (0, 255, 0), thickness)
+            cv2.polylines(self.markup_frame, [crosshairsH], True, (0, 255, 0), thickness)
+            cv2.polylines(self.markup_frame, [crosshairsV], True, (0, 255, 0), thickness)
 
         self.potentialResize()
 
@@ -1399,6 +1699,8 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
     else:
         mask = np.zeros(frame.shape[:2], dtype='uint8')
+        # cv2.rectangle(mask, (int(center[0]-x_axes),int(center[1]-y_axes)),(int(center[0]+x_axes),int(center[1]+y_axes)),
+        #               color=255, thickness=-1)
         cv2.ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
                     angle=0,startAngle=0, endAngle=360, color=255, thickness=-1)
 

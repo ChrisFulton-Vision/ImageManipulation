@@ -210,8 +210,8 @@ class YOLO:
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
             cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
-            cv2.putText(image, 'Direct Inference', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75, color, 1)
+        cv2.putText(image, 'Direct Inference', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75, color, 1)
 
         return image
 
@@ -256,6 +256,9 @@ class YOLO:
                                                       distCoeffs=np.zeros((5,)))
         # flags=cv2.SOLVEPNP_ITERATIVE)
 
+        if not ret:
+            return
+
         for y_class_id in y_class_ids:
             if y_class_id <= len(self.reader.idsNamesLocs):
                 # for idNameLoc in reader.idsNamesLocs:
@@ -271,8 +274,9 @@ class YOLO:
                 cv2.putText(image, str(id), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
                             0.75, (50, 255, 255), 1)
 
-                cv2.putText(image, 'SolvePnP Solution', (25, w - 25), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75, (50, 255, 255), 1)
+        cv2.putText(image, 'SolvePnP Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75, (50, 255, 255), 1)
+        cv2.putText(image, f'x:{tvec[2,0]:.3f}, y:{tvec[0,0]:.3f}, z:{tvec[1,0]:.3f}', (25, w-25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
 
                 # image[0:self.pixel_buffer, :] = np.array([0, 0, 0.0])
                 # image[h - self.pixel_buffer:h, :] = np.array([0, 0, 0.0])

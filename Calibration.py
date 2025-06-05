@@ -2,6 +2,7 @@ import os, re, copy
 from os.path import join
 import numpy as np
 import pickle as pkl
+from datetime import datetime
 
 class Calibration:
     def __init__(self, filepath=None):
@@ -22,6 +23,7 @@ class Calibration:
         self.height = None
         self.hfov = None
         self.fisheye = None
+        self.calDatetime = None
 
         if filepath is not None:
             self.fromFile(filepath)
@@ -94,7 +96,7 @@ class Calibration:
         else:
             return None
 
-    def setAccessories(self, calTime, numCBUsed, width, height, hfov, rms):
+    def setAccessories(self, calTime, numCBUsed, width, height, hfov, rms, timeOfCompute=None):
 
         self.calTime = calTime
         self.numCBUsed = numCBUsed
@@ -102,6 +104,7 @@ class Calibration:
         self.height = height
         self.hfov = hfov
         self.rmsError = rms
+        self.calDatetime = timeOfCompute
 
     @property
     def calStr(self):
@@ -110,8 +113,12 @@ class Calibration:
 
         calStr = ''
         if self.validCal:
-            calStr += '#Camera matrix\n'
-            calStr += 'fx={:.{}f}'.format(mtx[0, 0], 10) + '\n'
+            calStr += '# Camera matrix'
+            if self.calDatetime is not None:
+                calStr += ' computed at:\n#{}\n'.format(datetime.date(self.calDatetime))
+            if self.fisheye:
+                calStr += '#Fisheye Cal'
+            calStr += '\nfx={:.{}f}'.format(mtx[0, 0], 10) + '\n'
             calStr += 'fy={:.{}f}'.format(mtx[1, 1], 10) + '\n'
             calStr += 'cx={:.{}f}'.format(mtx[0, 2], 10) + '\n'
             calStr += 'cy={:.{}f}'.format(mtx[1, 2], 10) + '\n\n'
@@ -146,7 +153,14 @@ class Calibration:
         return calStr
 
     def copy(self, calToCopy):
-        self.__dict__.update(copy.deepcopy(calToCopy.__dict__))
+        self.__init__()
+        for obj in calToCopy.__dict__:
+            try:
+                self.__dict__[obj] = calToCopy.__dict__[obj]
+            except KeyError:
+                # Allows for versioning issues, changed naming conventions.
+                print("Older version...")
+                self.calDatetime = None
 
     def toBinFile(self, fileDirectory):
         with open(join(fileDirectory,'calibration.pkl'), 'wb') as file:
@@ -181,6 +195,10 @@ class Calibration:
             with open(filepath, 'r') as file:
                 for line in file:
                     match line[0:2]:
+                        case '#2':
+                            self.calDatetime = datetime.strptime(line[1:-1], '%Y-%m-%d')
+                        case '#F':
+                            self.fisheye = True
                         case 'fx':
                             self.fx = float(line[3:])
                         case 'fy':
@@ -195,6 +213,8 @@ class Calibration:
                             self.k2 = float(line[3:])
                         case 'k3':
                             self.k3 = float(line[3:])
+                        case 'k4':
+                            self.k4 = float(line[3:])
                         case 'p1':
                             self.p1 = float(line[3:])
                         case 'p2':

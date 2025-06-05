@@ -466,8 +466,14 @@ class Camera():
             self.loadFromCache()
 
     def loadCalibration(self):
-        poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
-                                                    title='Select Folder of Calibration')
+        if self.calibFile != '':
+            initial_dir = self.calibFile
+        else:
+            initial_dir = self.filepath
+
+        poss_filepath = filedialog.askopenfilename(initialdir=initial_dir + '/..',
+                                                       title='Select Folder of Calibration')
+
         if poss_filepath != '':
             self.calibFile = poss_filepath
             self.ingestCalibration()
@@ -551,6 +557,11 @@ class Camera():
             self.gui.update()
 
         self.undistortCheckbox.configure(state='normal')
+        if self.calibration.fisheye:
+            cube_state = 'normal'
+        else:
+            cube_state = 'disabled'
+        self.cubemapCheckbox.configure(state=cube_state)
         self.saveToCache()
 
     def scanForCameras(self):
@@ -799,7 +810,7 @@ class Camera():
             self.cubemapCheckbox.deselect()
         else:
             self.cubemapCheckbox.select()
-        self.cubemapCheckbox.configure(command=self.toggleCubemap)
+        self.cubemapCheckbox.configure(command=self.toggleCubemap, state='disabled')
         self.cubemapCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
@@ -1510,7 +1521,7 @@ class Camera():
             self.confSliderBar.set(self.yoloSession.conf)
         else:
             if self.last_bounding_box_size is not None:
-                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*9.0
+                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.5
             # 1.0 for single feature
 
             ellipse_width = 50.0 * self.current_var_y + self.min_radius

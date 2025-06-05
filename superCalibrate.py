@@ -1,3 +1,4 @@
+import datetime
 import sys, os, cv2, glob, time, copy, colorsys, pickle
 from os.path import join
 import numpy as np
@@ -1050,7 +1051,7 @@ class FrontEndGui(ctk.CTk):
         else:
             self.imageConfig = ImageryCalibrationConfig()
             if not self.imageConfig.camCal.fromFile(self.filepath):
-                self.imageConfig.camCal.fromBinFile(self.filepath)
+                success = self.imageConfig.camCal.fromBinFile(self.filepath)
 
         self.restoreFromImageConfig()
         self.loadImages()
@@ -1452,7 +1453,7 @@ class FrontEndGui(ctk.CTk):
         self.imageConfig.camCal.setDistortion(dist=dist.T)
         self.imageConfig.camCal.setAccessories(calTime=self.endTime - self.startTime, numCBUsed=len(images),
                                                width=gray.shape[::-1][0], height=gray.shape[::-1][1], hfov=fovx,
-                                               rms=ret)
+                                               rms=ret, timeOfCompute=datetime.datetime.now())
 
 
         self.updateCalWindow()

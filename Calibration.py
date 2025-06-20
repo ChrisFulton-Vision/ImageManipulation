@@ -25,6 +25,8 @@ class Calibration:
         self.fisheye = None
         self.calDatetime = None
 
+        self.scale = 1.0
+
         if filepath is not None:
             self.fromFile(filepath)
 
@@ -47,11 +49,16 @@ class Calibration:
             self.fy = None
             self.cx = None
             self.cy = None
+        self.scale = 1.0
 
     def getCameraMatrix(self):
         if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None:
-            return np.array([[self.fx, 0.0, self.cx],
-                             [0.0, self.fy, self.cy],
+            fx = self.scale * self.fx
+            fy = self.scale * self.fy
+            cx = self.scale * (self.cx + 0.5) - 0.5
+            cy = self.scale * (self.cy + 0.5) - 0.5
+            return np.array([[fx, 0.0, cx],
+                             [0.0, fy, cy],
                              [0.0, 0.0, 1.0]])
         else:
             return None
@@ -62,8 +69,6 @@ class Calibration:
             self.k2 = dist[1]
             self.k3 = dist[2]
             self.k4 = dist[3]
-            print('should be good...')
-            print(self.k1, self.k2, self.k3, self.k4)
         elif dist is not None:
             self.k1 = dist[0]
             self.k2 = dist[1]
@@ -116,6 +121,7 @@ class Calibration:
             calStr += '# Camera matrix'
             if self.calDatetime is not None:
                 calStr += ' computed at:\n#{}\n'.format(datetime.date(self.calDatetime))
+            calStr += '# Original size: ' + str(int(self.width)) + 'x' + str(int(self.height)) + '\n'
             if self.fisheye:
                 calStr += '#Fisheye Cal'
             calStr += '\nfx={:.{}f}'.format(mtx[0, 0], 10) + '\n'
@@ -145,7 +151,7 @@ class Calibration:
             calStr += 'rmsErr=' + str(self.rmsError) + '\n\n'
 
             calStr += '#Other\n'
-            calStr += 'resolution=' + str(self.width) + 'x' + str(self.height) + '\n'
+            calStr += 'resolution=' + str(int(self.scale * self.width)) + 'x' + str(int(self.scale*self.height)) + '\n'
             calStr += 'hfov=' + str(self.hfov) + "\n"
         else:
             calStr = 'Bad Cal'
@@ -271,20 +277,9 @@ class Calibration:
             return False
         return True
 
-    def scaleCalibration(self, newWidth:int, newHeight:int = None):
+    def scaleCalibration(self, newWidth: int):
+
         if not self.validCal:
             raise ValueError('Invalid Calibration. Missing necessary parameter.')
 
-        if newHeight is None:
-            newHeight = newWidth
-
-        scale_x = float(newWidth / self.width)
-        scale_y = float(newHeight / self.height)
-        self.fx *= scale_x
-        self.fy *= scale_y
-        self.cx = scale_x * (self.cx + 0.5) - 0.5
-        self.cy = scale_y * (self.cy + 0.5) - 0.5
-
-
-        self.height = newHeight
-        self.width = newWidth
+        self.scale = newWidth / self.width

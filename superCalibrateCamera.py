@@ -158,6 +158,39 @@ class ImageSliderBar:
         self.pop_up.destroy()
         self.pop_up.update()
 
+class GifMaker:
+    def __init__(self, gif_name: str = "Output",
+                 width_height: tuple[int, int] = (864, 864),
+                 img_duration: int = 100,
+                 loop: int = 0):
+        self.pop_up = ctk.CTkToplevel()
+        self.pop_up.lift()
+        self.file_path = ''
+        self.width, self.height = width_height
+        self.output_name = gif_name + ".gif"
+        self.img_duration = img_duration
+        self.loop = loop
+        self.thread = thread_with_exception("GifMaker Thread", self.make_gif)
+        self.is_threading = False
+        self.execute_thread()
+
+    def execute_thread(self):
+        if not self.is_threading:
+            self.is_threading = True
+            self.thread.start()
+
+
+    def make_gif(self):
+        time.sleep(1)
+        self.is_threading = False
+        self.thread.raise_exception()
+
+    def numerical_sort(self, file_name):
+        try:
+            return int(file_name.split('.')[0])
+        except (ValueError, IndexError):
+            return float('inf')
+
 class Gabor:
     def __init__(self):
         self.pop_up = ctk.CTkToplevel()
@@ -282,7 +315,7 @@ class CameraConfig():
         self.recording = False
         self.aprilTagSize = 0.168
         self.imageSource = ImageSource.Camera_Stream
-        self.imageFilepath = None
+        self.imageFilepath = ''
         self.lidarFilepath = None
         self.yoloFilepath = ''
         self.detect_corners = False
@@ -307,8 +340,9 @@ class CameraConfig():
                 pass
 
 
-class Camera():
+class CameraGui():
     def __init__(self, gui):
+        # self.GifMaker = GifMaker()
         self.gui = gui
         self.yoloSession = yolo.YOLO()
         self.camConfig = CameraConfig()
@@ -351,6 +385,8 @@ class Camera():
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
+
+        self.bank_indicator_points = None
 
         self.last_image = None
 
@@ -591,7 +627,7 @@ class Camera():
                 numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_GRAY2BGR)
             else:
                 numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_RGB2BGR)
-            cv2.imshow(title, cv2.resize(numpy_buffer,(868, 868)))
+            cv2.imshow(title, cv2.resize(numpy_buffer,(864, 864)))
             cv2.waitKey(1)
         except vmbpy.c_binding.VmbError as e:
             print(f'Error processing frame: {e}')
@@ -655,13 +691,15 @@ class Camera():
         if self.camConfig.imageFilepath is None:
             initDir = self.filepath + '/..'
         else:
-            initDir = os.path.normpath(self.camConfig.imageFilepath)
+            initDir = self.camConfig.imageFilepath #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':
             self.camConfig.imageFilepath = poss_file
             self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
             self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
+
+            self.saveToCache()
 
     def setupFrame(self):
         rowID = 0
@@ -890,7 +928,7 @@ class Camera():
 
         self.streamOrImgCombo.configure(state='disabled')
 
-        self.t1 = thread_with_exception(0, self.run)
+        self.t1 = thread_with_exception("CameraGui Thread", self.run)
         self.t1.start()
 
     def startStreamOffBool(self):
@@ -1099,37 +1137,39 @@ class Camera():
                 img_id = img_slider.next_id()
 
                 frame = cv2.imread(os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0]))
-                self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1])
+                if frame is not None:
+                    self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1],
+                                   self.ImageTimeReader.idsTimes[img_id][0])
 
             key = cv2.waitKey(1)
 
-            if key == 99:
+            if key == 99: # c
                 img_slider.curr_img_idx += 1
                 img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
-            if key == 122:
+            if key == 122: # z
                 img_slider.curr_img_idx -= 1
                 img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
-            if key == 32:
+            if key == 32: # space
                 pause = not pause
                 img_slider.play_speed = 0
                 if not pause:
                     img_slider.play_speed = 1
 
-            if key == 100:
+            if key == 100: # d
                 img_slider.play_speed += 1
                 pause = False
                 
-            if key == 97:
+            if key == 97: # a
                 img_slider.play_speed -= 1
                 pause = False
 
-            if key == 119:
+            if key == 119: # w
                 self.toggleUndistort()
                 self.toggleYoloInference()
                 self.toggleDetectHorizon()
@@ -1143,7 +1183,7 @@ class Camera():
             img_slider.close()
         self.startStreamOff()
 
-    def analyze_image(self, frame, time=None):
+    def analyze_image(self, frame, img_time=None, name = None):
 
         self.curr_frame_gray = None
 
@@ -1169,7 +1209,7 @@ class Camera():
             self.detectHorizon()
 
         if self.camConfig.hyper_focus:
-            self.hyper_focus(time)
+            self.hyper_focus(img_time)
 
         if self.camConfig.yoloInference:
             self.run_yolo()
@@ -1178,12 +1218,72 @@ class Camera():
             self.last_yolo_center = None
 
         if self.camConfig.factor_graph:
-            self.factor_graph(time)
+            self.factor_graph(img_time)
         else:
             self.last_yolo_3d_estimate = None
 
         if self.camConfig.phase_correlation:
             self.phase_correlation()
+
+        if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+            cv2.putText(self.markup_frame, os.path.basename(name), (600, 800 ),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4 )
+
+            if self.bank_indicator_points is None:
+                self.bank_indicator_points = []
+                last_angle = -60
+                for new_angle in np.linspace(-50, 60, 12):
+                    max_rad = 115
+                    if last_angle % 30.0 == 0.0:
+                        max_rad = 125
+                    self.bank_indicator_points.append((432 + int(max_rad * np.sin(np.deg2rad(last_angle))),
+                                                      600 + int(max_rad * np.cos(np.deg2rad(last_angle)))))
+                    self.bank_indicator_points.append((432 + int(100 * np.sin(np.deg2rad(last_angle))),
+                                                      600 + int(100 * np.cos(np.deg2rad(last_angle)))))
+                    self.bank_indicator_points.append((432 + int(100 * np.sin(np.deg2rad(new_angle))),
+                                                      600 + int(100 * np.cos(np.deg2rad(new_angle)))))
+                    last_angle = new_angle
+
+                self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(60))),
+                                                   600 + int(125 * np.cos(np.deg2rad(60)))))
+                # self.bank_indicator_points.append((432 + int(125*np.sin(np.deg2rad(-60))), 600 + int(125*np.cos(np.deg2rad(-60)))))
+                # for theta in np.linspace(-60, -30, 20):
+                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
+                # self.bank_indicator_points.append((432 + int(115 * np.sin(np.deg2rad(-30))), 600 + int(115 * np.cos(np.deg2rad(-30)))))
+                # for theta in np.linspace(-30, 0, 20):
+                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
+                # self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(0))), 600 + int(125 * np.cos(np.deg2rad(0)))))
+                # for theta in np.linspace(0, 30, 20):
+                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
+                # self.bank_indicator_points.append((432 + int(115 * np.sin(np.deg2rad(30))), 600 + int(115 * np.cos(np.deg2rad(30)))))
+                # for theta in np.linspace(30, 60, 20):
+                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
+                # self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(60))), 600 + int(125 * np.cos(np.deg2rad(60)))))
+
+            cv2.polylines(self.markup_frame, [np.array(self.bank_indicator_points)], False, (0, 255, 0))
+
+
+            bank_angle = 20.0 + 10.0 * np.sin(time.time())
+            bank_pts = []
+            bank_pts.append(
+                (432 + int(130 * np.sin(np.deg2rad(bank_angle))),
+                 600 + int(130 * np.cos(np.deg2rad(bank_angle)))))
+            bank_pts.append((432 + int(150 * np.sin(np.deg2rad(bank_angle + 3.0))),
+                             600 + int(150 * np.cos(np.deg2rad(bank_angle + 3.0)))))
+            bank_pts.append((432 + int(150 * np.sin(np.deg2rad(bank_angle - 3.0))),
+                             600 + int(150 * np.cos(np.deg2rad(bank_angle - 3.0)))))
+
+            cmd_bank_angle = 20.0 + 10.0 * np.cos(time.time())
+            cmd_bank_pts = []
+            cmd_bank_pts.append((432 + int(139 * np.sin(np.deg2rad(cmd_bank_angle - 2.0))),
+                             600 + int(139 * np.cos(np.deg2rad(cmd_bank_angle - 2.0)))))
+            cmd_bank_pts.append((432 + int(139 * np.sin(np.deg2rad(cmd_bank_angle + 2.0))),
+                             600 + int(139 * np.cos(np.deg2rad(cmd_bank_angle + 2.0)))))
+            cmd_bank_pts.append((432 + int(130 * np.sin(np.deg2rad(cmd_bank_angle))),
+                             600 + int(130 * np.cos(np.deg2rad(cmd_bank_angle)))))
+
+            cv2.polylines(self.markup_frame, [np.array(bank_pts)], True, (0, 255, 0))
+            cv2.fillPoly(self.markup_frame, [np.array(cmd_bank_pts)], (0, 255, 0))
 
         self.cleanup()
 
@@ -1521,11 +1621,12 @@ class Camera():
             self.confSliderBar.set(self.yoloSession.conf)
         else:
             if self.last_bounding_box_size is not None:
-                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.5
-            # 1.0 for single feature
+                # 1.0 for single feature, 1.5 for drogue
+                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.0
 
-            ellipse_width = 50.0 * self.current_var_y + self.min_radius
-            ellipse_height = 50.0 * self.current_var_z + self.min_radius
+            # 5.0 for single feature, 50.0 for drogue
+            ellipse_width = 5.0 * self.current_var_y + self.min_radius
+            ellipse_height = 5.0 * self.current_var_z + self.min_radius
 
             if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[1] or \
                     self.curr_FG_pixel[1] > self.curr_frame.shape[0]:
@@ -1653,6 +1754,8 @@ class Camera():
             cv2.polylines(self.markup_frame, [crosshairsV], True, (0, 255, 0), thickness)
 
         self.potentialResize()
+
+
 
         cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
 

@@ -148,7 +148,7 @@ class FrontEndGui(ctk.CTk):
         # Default Geometries for window and subwindows
         self.mainGeometry = '255x560'
         self.imageWinGeometry = '1250x550'
-        self.calGeometry = '250x550'
+        self.calGeometry = '250x650'
         self.configGeometry = '500x225'
 
         # Various helper variable NONE-initialization
@@ -326,6 +326,8 @@ class FrontEndGui(ctk.CTk):
         self.calibrateButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
 
+        self.loadFromCache()
+
         # Once a calibration is active, allow user to display a window that manages the calibration
         self.displayCal = None
         self.createCalibrationDisplay(rowID)
@@ -341,7 +343,7 @@ class FrontEndGui(ctk.CTk):
         self.protectClearCache()
 
         # Now that necessary starting variables are created, load states from cache
-        self.loadFromCache()
+
         self.restoreFromImageConfig()
         self.updateConfigWindow()
         self.updateCalWindow()
@@ -350,14 +352,14 @@ class FrontEndGui(ctk.CTk):
         self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
                                         command=self.openCalWindow)
         self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        if self.imageConfig.camCal.calStr is not None:
+        if self.imageConfig.camCal.validCal:
             self.displayCal.configure(state='normal')
 
     def createCalibrationWindowButton(self, rowID):
         self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
                                         command=self.openCalWindow)
         self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        if self.imageConfig.camCal.calStr is not None:
+        if self.imageConfig.camCal.validCal:
             self.displayCal.configure(state='normal')
 
     def createConfigWindowButton(self, rowID):
@@ -379,7 +381,7 @@ class FrontEndGui(ctk.CTk):
         :return:
         '''
         if self.camera is None:
-            self.camera = cam.Camera(self)
+            self.camera = cam.CameraGui(self)
 
         self.camera.showWindow = True
         self.unpackAllFrames()
@@ -530,6 +532,7 @@ class FrontEndGui(ctk.CTk):
     def updateCalWindow(self):
         # If we have a previous calibration
         if self.imageConfig.camCal.validCal:
+
             # Then display the calibration
             saveCalButton = ctk.CTkButton(master=self.calFrame, text='Save Calibration')
             saveCalButton.configure(command=lambda btn=saveCalButton: self.saveCal(btn))
@@ -542,14 +545,11 @@ class FrontEndGui(ctk.CTk):
             scale864Button.grid(row=3, column=0, padx=5, pady=5)
             scale2848Button = ctk.CTkButton(master=self.calFrame, text='Scale to 2848x2848', command=self.scaleTo2848)
             scale2848Button.grid(row=4, column=0, padx=5, pady=5)
+            scaleAnyButton = ctk.CTkButton(master=self.calFrame, text='Scale to Input Size', command=self.scaleToInput)
+            scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
 
         backToMainButton = ctk.CTkButton(master=self.calFrame, text='Go back', command=self.returnToMain)
-        backToMainButton.grid(row=5, column=0, padx=5, pady=5)
-
-    def scaleToSelection(self, x):
-        self.imageConfig.camCal.scaleCalibration(x)
-        self.saveToCache()
-        self.updateCalWindow()
+        backToMainButton.grid(row=6, column=0, padx=5, pady=5)
 
     def scaleTo864(self):
         self.imageConfig.camCal.scaleCalibration(864)
@@ -558,6 +558,14 @@ class FrontEndGui(ctk.CTk):
 
     def scaleTo2848(self):
         self.imageConfig.camCal.scaleCalibration(2848)
+        self.saveToCache()
+        self.updateCalWindow()
+
+    def scaleToInput(self):
+        dialog = ctk.CTkInputDialog(
+            text='Input an integer value. The updated calibration width will be this value.',
+            title='Calibration Scale Selection')
+        self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
         self.saveToCache()
         self.updateCalWindow()
 
@@ -1148,7 +1156,6 @@ class FrontEndGui(ctk.CTk):
 
     def toggleFisheye(self):
         self.imageConfig.fisheye = not self.imageConfig.fisheye
-        print(self.imageConfig.fisheye)
         self.saveToCache()
 
     def showBasicImage(self, imgClass):
@@ -1223,7 +1230,6 @@ class FrontEndGui(ctk.CTk):
             high_x = max(x, first_x)
             high_y = max(y, first_y)
 
-            # print(img.shape)
             new_img = copy.copy(img)
             new_img[:, :low_x] = np.zeros(new_img[:, :low_x].shape)
             new_img[:low_y] = np.zeros(new_img[:low_y].shape)
@@ -1231,9 +1237,6 @@ class FrontEndGui(ctk.CTk):
             new_img[high_y:] = np.zeros(new_img[high_y:].shape)
 
             cv2.imwrite(join(self.filepath, self.currImgClass.imageName), new_img)
-
-            # if h > 1080 or w > 1080:
-            #     new_img = cv2.resize(new_img, (int(w / scale), int(h / scale)))
 
             h, w, toss = new_img.shape
             dispImg = cv2.resize(new_img, (int(w * self.scale), int(h * self.scale)))
@@ -1412,7 +1415,8 @@ class FrontEndGui(ctk.CTk):
                 rvecs=rvecs,
                 tvecs=tvecs,
                 flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC + cv2.fisheye.CALIB_FIX_SKEW,
-                criteria=(cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6))
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, self.imageConfig.maxIter,
+                          self.imageConfig.minStepSize))
             ret = calValues[0]
             mtx = calValues[1]
             dist = np.squeeze(calValues[2])

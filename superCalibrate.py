@@ -565,9 +565,13 @@ class FrontEndGui(ctk.CTk):
         dialog = ctk.CTkInputDialog(
             text='Input an integer value. The updated calibration width will be this value.',
             title='Calibration Scale Selection')
-        self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
-        self.saveToCache()
-        self.updateCalWindow()
+        try:
+            self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
+            self.saveToCache()
+            self.updateCalWindow()
+        except ValueError:
+            print('Invalid input. Please input only an integer.')
+
 
     def updateConfigWindow(self):
         rowID = 0

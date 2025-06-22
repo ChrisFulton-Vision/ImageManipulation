@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import os, glob, re, datetime
+from Calibration import Calibration
 from metaYoloReader import MetaYoloReader
+import copy
 
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
@@ -27,6 +29,7 @@ class YOLO:
         self.output = []
         self.boxes, self.scores, self.class_ids = [], [], []
         self.session = None
+        self.calibration = None
 
         self.class_names = range(numClasses)
         self.yoloSize = yoloSize
@@ -65,7 +68,7 @@ class YOLO:
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
-    def inferOnImage(self, image: np.array, markup_image:np.array) -> (np.array, np.array):
+    def inferOnImage(self, image: np.array, markup_image: np.array) -> (np.array, np.array):
         '''
         Runs the sub-methods necessary to process an image with YOLO
         :param image: np.array from OpenCV
@@ -74,6 +77,9 @@ class YOLO:
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
         return self.markUpImage(markup_image, output), output
+
+    def set_calibration(self, calibration: Calibration) -> None:
+        self.calibration = copy.deepcopy(calibration)
 
     def preprocessImage(self, image: np.array) -> np.array:
         '''
@@ -169,7 +175,7 @@ class YOLO:
             indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
             newCenters, newBoxes, newClass_ids, newScores = [], [], [], []
             for i in indices:
-            # for i in range(len(centers)):
+                # for i in range(len(centers)):
                 newCenters.append(centers[i])
                 newBoxes.append(boxes[i])
                 newClass_ids.append(class_ids[i])
@@ -215,7 +221,7 @@ class YOLO:
 
         return image
 
-    def drawPnP(self, image:np.array, y_class_ids:list, y_centers:list)-> None:
+    def drawPnP(self, image: np.array, y_class_ids: list, y_centers: list) -> None:
         '''
         If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
         onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
@@ -228,10 +234,11 @@ class YOLO:
         h, w, _ = image.shape
         y_h, y_w = self.yoloSize
 
-        scale = 864.0 / 1424.0
-        calibration = np.array(
-            [[scale * 1548.72, 0, scale * (911.2923 + 0.5) - 0.5], [0.0, scale * 1550.61, scale * (828.34 + 0.5) - 0.5],
-             [0.0, 0.0, 1.0]])
+        if self.calibration is None:
+            return
+
+        self.calibration.scaleCalibration(y_w)
+
         np.set_printoptions(suppress=True, precision=4)
         object_points = []
         image_points = []
@@ -252,9 +259,9 @@ class YOLO:
 
         ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
                                                       imagePoints=image_points,
-                                                      cameraMatrix=calibration,
-                                                      distCoeffs=np.zeros((5,)))
-        # flags=cv2.SOLVEPNP_ITERATIVE)
+                                                      cameraMatrix=self.calibration.getCameraMatrix(),
+                                                      distCoeffs=np.zeros((5,)),
+                                                      flags=cv2.SOLVEPNP_ITERATIVE)
 
         if not ret:
             return
@@ -265,7 +272,8 @@ class YOLO:
                 id = self.reader.idsNamesLocs[y_class_id][0]
                 xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
                 projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
-                                                      cameraMatrix=calibration, distCoeffs=np.zeros((5,)))
+                                                      cameraMatrix=self.calibration.getCameraMatrix(),
+                                                      distCoeffs=np.zeros((5,)))
                 x, y = np.squeeze(projectedPixel)
                 if np.isnan(x) or np.isnan(y):
                     return
@@ -276,12 +284,13 @@ class YOLO:
 
         cv2.putText(image, 'SolvePnP Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
                     0.75, (50, 255, 255), 1)
-        cv2.putText(image, f'x:{tvec[2,0]:.3f}, y:{tvec[0,0]:.3f}, z:{tvec[1,0]:.3f}', (25, w-25), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
+        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{tvec[0, 0]:.3f}, z:{tvec[1, 0]:.3f}', (25, w - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
 
-                # image[0:self.pixel_buffer, :] = np.array([0, 0, 0.0])
-                # image[h - self.pixel_buffer:h, :] = np.array([0, 0, 0.0])
-                # image[:, 0:self.pixel_buffer] = np.array([0, 0, 0.0])
-                # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
+        # image[0:self.pixel_buffer, :] = np.array([0, 0, 0.0])
+        # image[h - self.pixel_buffer:h, :] = np.array([0, 0, 0.0])
+        # image[:, 0:self.pixel_buffer] = np.array([0, 0, 0.0])
+        # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
 
 
 def natural_sort(l):
@@ -289,17 +298,19 @@ def natural_sort(l):
     alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
     return sorted(l, key=alphanum_key)
 
+
 if __name__ == '__main__':
-    yolo = YOLO(conf = 0.75, iou = 0.99, yoloSize=(864, 864),
-                 model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
-                 numClasses = 1)
+    yolo = YOLO(conf=0.75, iou=0.99, yoloSize=(864, 864),
+                model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
+                numClasses=1)
 
     np.set_printoptions(suppress=True)
 
     # testImage = cv2.imread('BoundingBoxCandidates/13608.bmp')
     # testImage, sol = yolo.inferOnImage(testImage)
 
-    allImages = glob.glob(os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
+    allImages = glob.glob(
+        os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
 
     allImages = natural_sort(allImages)
 

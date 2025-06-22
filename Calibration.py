@@ -1,8 +1,11 @@
-import os, re, copy
-from os.path import join
-import numpy as np
+import os
 import pickle as pkl
+import re
 from datetime import datetime
+from os.path import join
+
+import numpy as np
+
 
 class Calibration:
     def __init__(self, filepath=None):

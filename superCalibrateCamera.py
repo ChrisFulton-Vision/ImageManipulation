@@ -10,10 +10,11 @@ from Calibration import Calibration
 from LidarTruth import TruthPoints
 from enum import Enum
 from PIL import Image
+from RollInterpreter import RollReader as RollRdr
+from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
 
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
-
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
@@ -131,13 +132,14 @@ class thread_with_exception(Thread):
             ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
             print('Exception Raise Failure')
 
+
 class ImageSliderBar:
     def __init__(self, num_images):
         self.pop_up = ctk.CTkToplevel()
         self.pop_up.focus_force()
         self.pop_up.geometry('400x200')
         self.pop_up.grid_columnconfigure(0, weight=1)
-        self.pop_up.grid_rowconfigure([0,1], weight=1)
+        self.pop_up.grid_rowconfigure([0, 1], weight=1)
         self.num_images = num_images
         self.play_speed = 1
         self.curr_img_idx = 0
@@ -157,6 +159,7 @@ class ImageSliderBar:
     def close(self):
         self.pop_up.destroy()
         self.pop_up.update()
+
 
 class GifMaker:
     def __init__(self, gif_name: str = "Output",
@@ -179,7 +182,6 @@ class GifMaker:
             self.is_threading = True
             self.thread.start()
 
-
     def make_gif(self):
         time.sleep(1)
         self.is_threading = False
@@ -190,6 +192,7 @@ class GifMaker:
             return int(file_name.split('.')[0])
         except (ValueError, IndexError):
             return float('inf')
+
 
 class Gabor:
     def __init__(self):
@@ -221,10 +224,10 @@ class Gabor:
         sigma_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
 
-        self.theta_label = ctk.CTkLabel(self.pop_up, text=f'Theta: {np.rad2deg(self.theta):.2f}')
+        self.theta_label = ctk.CTkLabel(self.pop_up, text=f'Theta: {rad2deg(self.theta):.2f}')
         self.theta_label.grid(row=rowID, column=0, padx=5, pady=5)
         rowID += 1
-        theta_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=np.pi * 2.0, command=self.update_theta)
+        theta_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=PI * 2.0, command=self.update_theta)
         theta_slider.set(self.theta)
         theta_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
@@ -251,7 +254,7 @@ class Gabor:
 
     def update_theta(self, slider_value):
         self.theta = slider_value
-        self.theta_label.configure(text=f'Theta: {np.rad2deg(self.theta):.2f}')
+        self.theta_label.configure(text=f'Theta: {rad2deg(self.theta):.2f}')
 
     def update_lambd(self, slider_value):
         self.lambd = slider_value
@@ -325,6 +328,8 @@ class CameraConfig():
         self.phase_correlation = False
         self.crosshairs = False
         self.cubemap = False
+        self.hud = False
+        self.hud_data_filepath = ''
 
         self.yolo_conf = 0.75
         self.yolo_iou = 1.00
@@ -385,6 +390,7 @@ class CameraGui():
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
+        self.rollReader = RollRdr()
 
         self.bank_indicator_points = None
 
@@ -404,10 +410,18 @@ class CameraGui():
                                               text="../" + os.path.basename(os.path.normpath(self.filepath)))
         self.selectTruthPointsButton = ctk.CTkButton(master=self.cam_frame, text='Select LIDAR Points',
                                                      hover_color='blue', command=self.selectLidarFile)
+        self.selectFlightLogButton = ctk.CTkButton(master=self.cam_frame, text='Select Flight Log File',
+                                                     hover_color='blue', command=self.selectLogFile)
 
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(
                 os.path.normpath(self.camConfig.lidarFilepath)))
+        else:
+            self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
+
+        if self.camConfig.hud_data_filepath is not None:
+            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(
+                os.path.normpath(self.camConfig.hud_data_filepath)))
         else:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
 
@@ -421,27 +435,30 @@ class CameraGui():
         self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
         self.detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
-        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image', command=self.toggleYoloInference)
+        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image',
+                                                     command=self.toggleYoloInference)
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
         self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.cam_frame, text='PhaseCorrelation')
         self.crosshairsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Crosshairs')
         self.cubemapCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Cubemap')
+        self.hudCheckbox = ctk.CTkCheckBox(self.cam_frame, text='HUD')
 
-        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img', command=self.selectImagesFilepath)
+        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img',
+                                                     command=self.selectImagesFilepath)
         self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
         self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder',
                                                     command=self.selectImagesFilepath)
         self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
         self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
         self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider, from_=0.15)
-        self.confSliderBar.set(0.75)
         self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
         self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
-        self.iouSliderBar.set(1.00)
-
 
         self.loadFromCache()
+        self.confSliderBar.set(self.camConfig.yolo_conf)
+        self.iouSliderBar.set(self.camConfig.yolo_iou)
+
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
         self.vc = None
         # self.vc.setExceptionMode(True)
@@ -454,7 +471,7 @@ class CameraGui():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x720'
+        self.camFrameGeometry = '455x770'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -477,8 +494,11 @@ class CameraGui():
 
         self.ingestCalibration()
 
+        if not self.camConfig.hud_data_filepath == '':
+            self.rollReader.read_files(self.camConfig.hud_data_filepath)
         self.updateLidarLabel()
         self.updateYOLOLabel()
+        self.updateFlightLogLabel()
 
         self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
         self.yoloSession.conf = self.camConfig.yolo_conf
@@ -508,7 +528,7 @@ class CameraGui():
             initial_dir = self.filepath
 
         poss_filepath = filedialog.askopenfilename(initialdir=initial_dir + '/..',
-                                                       title='Select Folder of Calibration')
+                                                   title='Select Folder of Calibration')
 
         if poss_filepath != '':
             self.calibFile = poss_filepath
@@ -517,23 +537,37 @@ class CameraGui():
     def selectLidarFile(self):
         if self.camConfig.lidarFilepath is None:
             poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
-                                                                      title='Select LIDAR Truth Points')
+                                                       title='Select LIDAR Truth Points')
         else:
             poss_filepath = filedialog.askopenfilename(initialdir=self.camConfig.lidarFilepath + '/..',
-                                                                   title='Select LIDAR Truth Points')
+                                                       title='Select LIDAR Truth Points')
         if poss_filepath != '':
             self.camConfig.lidarFilepath = poss_filepath
             self.updateLidarLabel()
             self.loadTruthPoints()
             self.saveToCache()
 
+    def selectLogFile(self):
+        if self.camConfig.hud_data_filepath == '':
+            poss_filepath = filedialog.askdirectory(initialdir=self.filepath + '/..',
+                                                       title='Select Flight Log Data')
+        else:
+            poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.hud_data_filepath + '/..',
+                                                       title='Select Flight Log Data')
+        if poss_filepath != '':
+            self.camConfig.hud_data_filepath = poss_filepath
+            self.rollReader.read_files(poss_filepath)
+            self.updateFlightLogLabel()
+            self.saveToCache()
+
+
     def selectYoloFolder(self):
         if self.camConfig.yoloFilepath is None:
             poss_filepath = filedialog.askdirectory(initialdir=os.getcwd() + '/..',
-                                                                  title='Select YOLO Folder')
+                                                    title='Select YOLO Folder')
         else:
             poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
-                                                                  title='Select YOLO Folder')
+                                                    title='Select YOLO Folder')
         if poss_filepath != '':
             self.camConfig.yoloFilepath = poss_filepath
             self.updateYOLOLabel()
@@ -543,6 +577,10 @@ class CameraGui():
     def updateLidarLabel(self):
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel.configure(text=os.path.basename(self.camConfig.lidarFilepath))
+
+    def updateFlightLogLabel(self):
+        if self.camConfig.hud_data_filepath is not None:
+            self.selectFlightLogLabel.configure(text=os.path.basename(self.camConfig.hud_data_filepath))
 
     def updateYOLOLabel(self):
         if self.camConfig.yoloFilepath is not None:
@@ -598,6 +636,8 @@ class CameraGui():
         else:
             cube_state = 'disabled'
         self.cubemapCheckbox.configure(state=cube_state)
+
+        self.yoloSession.set_calibration(self.calibration)
         self.saveToCache()
 
     def scanForCameras(self):
@@ -614,7 +654,8 @@ class CameraGui():
                     print(f'Could not open camera: {e}')
                     return
                 try:
-                    cam.start_streaming(lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
+                    cam.start_streaming(
+                        lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
                     time.sleep(5)
                     cam.stop_streaming()
                 finally:
@@ -627,7 +668,7 @@ class CameraGui():
                 numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_GRAY2BGR)
             else:
                 numpy_buffer = cv2.cvtColor(numpy_buffer, cv2.COLOR_RGB2BGR)
-            cv2.imshow(title, cv2.resize(numpy_buffer,(864, 864)))
+            cv2.imshow(title, cv2.resize(numpy_buffer, (864, 864)))
             cv2.waitKey(1)
         except vmbpy.c_binding.VmbError as e:
             print(f'Error processing frame: {e}')
@@ -691,7 +732,7 @@ class CameraGui():
         if self.camConfig.imageFilepath is None:
             initDir = self.filepath + '/..'
         else:
-            initDir = self.camConfig.imageFilepath #os.path.normpath(self.camConfig.imageFilepath)
+            initDir = self.camConfig.imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':
@@ -745,6 +786,10 @@ class CameraGui():
 
         self.selectYOLO_folderButton.grid(row=rowID, column=0, padx=5, pady=5)
         self.selectYOLO_folderLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        rowID += 1
+
+        self.selectFlightLogButton.grid(row=rowID, column=0, padx=5, pady=5)
+        self.selectFlightLogLabel.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
         self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
@@ -844,12 +889,19 @@ class CameraGui():
 
         rowID += 1
 
-        if self.camConfig.cubemap is False:
+        if not self.camConfig.cubemap:
             self.cubemapCheckbox.deselect()
         else:
             self.cubemapCheckbox.select()
         self.cubemapCheckbox.configure(command=self.toggleCubemap, state='disabled')
         self.cubemapCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        if not self.camConfig.hud:
+            self.hudCheckbox.deselect()
+        else:
+            self.hudCheckbox.select()
+        self.hudCheckbox.configure(command=self.toggleHud)
+        self.hudCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
 
@@ -956,7 +1008,6 @@ class CameraGui():
             self.t1.raise_exception()
             self.t1.join()
 
-
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
         self.recording = True
@@ -1032,6 +1083,15 @@ class CameraGui():
             self.cubemapCheckbox.select()
         else:
             self.cubemapCheckbox.deselect()
+
+        self.saveToCache()
+
+    def toggleHud(self):
+        self.camConfig.hud = not self.camConfig.hud
+        if self.camConfig.hud:
+            self.hudCheckbox.select()
+        else:
+            self.hudCheckbox.deselect()
 
         self.saveToCache()
 
@@ -1119,7 +1179,7 @@ class CameraGui():
 
         if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
             self.ImageTimeReader.idsTimes = []
-            imageList = glob.glob(os.path.join(directory,'*.bmp')) + glob.glob(os.path.join(directory,'*.png'))
+            imageList = glob.glob(os.path.join(directory, '*.bmp')) + glob.glob(os.path.join(directory, '*.png'))
             imageList = natural_sort(imageList)
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
@@ -1139,37 +1199,37 @@ class CameraGui():
                 frame = cv2.imread(os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0]))
                 if frame is not None:
                     self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1],
-                                   self.ImageTimeReader.idsTimes[img_id][0])
+                                       self.ImageTimeReader.idsTimes[img_id][0])
 
             key = cv2.waitKey(1)
 
-            if key == 99: # c
+            if key == 99:  # c
                 img_slider.curr_img_idx += 1
                 img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
-            if key == 122: # z
+            if key == 122:  # z
                 img_slider.curr_img_idx -= 1
                 img_slider.play_speed = 0
                 temp_unpause = True
                 pause = True
 
-            if key == 32: # space
+            if key == 32:  # space
                 pause = not pause
                 img_slider.play_speed = 0
                 if not pause:
                     img_slider.play_speed = 1
 
-            if key == 100: # d
+            if key == 100:  # d
                 img_slider.play_speed += 1
                 pause = False
-                
-            if key == 97: # a
+
+            if key == 97:  # a
                 img_slider.play_speed -= 1
                 pause = False
 
-            if key == 119: # w
+            if key == 119:  # w
                 self.toggleUndistort()
                 self.toggleYoloInference()
                 self.toggleDetectHorizon()
@@ -1183,7 +1243,7 @@ class CameraGui():
             img_slider.close()
         self.startStreamOff()
 
-    def analyze_image(self, frame, img_time=None, name = None):
+    def analyze_image(self, frame, img_time=None, name=None):
 
         self.curr_frame_gray = None
 
@@ -1225,67 +1285,69 @@ class CameraGui():
         if self.camConfig.phase_correlation:
             self.phase_correlation()
 
+        if self.camConfig.hud and img_time is not None:
+            self.draw_hud(img_time)
+
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            cv2.putText(self.markup_frame, os.path.basename(name), (600, 800 ),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4 )
-
-            if self.bank_indicator_points is None:
-                self.bank_indicator_points = []
-                last_angle = -60
-                for new_angle in np.linspace(-50, 60, 12):
-                    max_rad = 115
-                    if last_angle % 30.0 == 0.0:
-                        max_rad = 125
-                    self.bank_indicator_points.append((432 + int(max_rad * np.sin(np.deg2rad(last_angle))),
-                                                      600 + int(max_rad * np.cos(np.deg2rad(last_angle)))))
-                    self.bank_indicator_points.append((432 + int(100 * np.sin(np.deg2rad(last_angle))),
-                                                      600 + int(100 * np.cos(np.deg2rad(last_angle)))))
-                    self.bank_indicator_points.append((432 + int(100 * np.sin(np.deg2rad(new_angle))),
-                                                      600 + int(100 * np.cos(np.deg2rad(new_angle)))))
-                    last_angle = new_angle
-
-                self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(60))),
-                                                   600 + int(125 * np.cos(np.deg2rad(60)))))
-                # self.bank_indicator_points.append((432 + int(125*np.sin(np.deg2rad(-60))), 600 + int(125*np.cos(np.deg2rad(-60)))))
-                # for theta in np.linspace(-60, -30, 20):
-                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
-                # self.bank_indicator_points.append((432 + int(115 * np.sin(np.deg2rad(-30))), 600 + int(115 * np.cos(np.deg2rad(-30)))))
-                # for theta in np.linspace(-30, 0, 20):
-                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
-                # self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(0))), 600 + int(125 * np.cos(np.deg2rad(0)))))
-                # for theta in np.linspace(0, 30, 20):
-                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
-                # self.bank_indicator_points.append((432 + int(115 * np.sin(np.deg2rad(30))), 600 + int(115 * np.cos(np.deg2rad(30)))))
-                # for theta in np.linspace(30, 60, 20):
-                #     self.bank_indicator_points.append((432 + int(100*np.sin(np.deg2rad(theta))), 600 + int(100*np.cos(np.deg2rad(theta)))))
-                # self.bank_indicator_points.append((432 + int(125 * np.sin(np.deg2rad(60))), 600 + int(125 * np.cos(np.deg2rad(60)))))
-
-            cv2.polylines(self.markup_frame, [np.array(self.bank_indicator_points)], False, (0, 255, 0))
-
-
-            bank_angle = 20.0 + 10.0 * np.sin(time.time())
-            bank_pts = []
-            bank_pts.append(
-                (432 + int(130 * np.sin(np.deg2rad(bank_angle))),
-                 600 + int(130 * np.cos(np.deg2rad(bank_angle)))))
-            bank_pts.append((432 + int(150 * np.sin(np.deg2rad(bank_angle + 3.0))),
-                             600 + int(150 * np.cos(np.deg2rad(bank_angle + 3.0)))))
-            bank_pts.append((432 + int(150 * np.sin(np.deg2rad(bank_angle - 3.0))),
-                             600 + int(150 * np.cos(np.deg2rad(bank_angle - 3.0)))))
-
-            cmd_bank_angle = 20.0 + 10.0 * np.cos(time.time())
-            cmd_bank_pts = []
-            cmd_bank_pts.append((432 + int(139 * np.sin(np.deg2rad(cmd_bank_angle - 2.0))),
-                             600 + int(139 * np.cos(np.deg2rad(cmd_bank_angle - 2.0)))))
-            cmd_bank_pts.append((432 + int(139 * np.sin(np.deg2rad(cmd_bank_angle + 2.0))),
-                             600 + int(139 * np.cos(np.deg2rad(cmd_bank_angle + 2.0)))))
-            cmd_bank_pts.append((432 + int(130 * np.sin(np.deg2rad(cmd_bank_angle))),
-                             600 + int(130 * np.cos(np.deg2rad(cmd_bank_angle)))))
-
-            cv2.polylines(self.markup_frame, [np.array(bank_pts)], True, (0, 255, 0))
-            cv2.fillPoly(self.markup_frame, [np.array(cmd_bank_pts)], (0, 255, 0))
+            cv2.putText(self.markup_frame, os.path.basename(name), (600, 800),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
 
         self.cleanup()
+
+    def draw_hud(self, img_time):
+        if self.bank_indicator_points is None:
+            self.bank_indicator_points = []
+            last_angle = -60
+            for new_angle in np.linspace(-50, 60, 12):
+                max_rad = 0.10
+                if last_angle % 30.0 == 0.0:
+                    max_rad = 0.11
+                normal_ang = 0.08
+                self.bank_indicator_points.append((0.5 + max_rad * sin(deg2rad(last_angle)),
+                                                   0.8 + max_rad * cos(deg2rad(last_angle))))
+                self.bank_indicator_points.append((0.5 + normal_ang * sin(deg2rad(last_angle)),
+                                                   0.8 + normal_ang * cos(deg2rad(last_angle))))
+                self.bank_indicator_points.append((0.5 + normal_ang * sin(deg2rad(new_angle)),
+                                                   0.8 + normal_ang * cos(deg2rad(new_angle))))
+                last_angle = new_angle
+
+            self.bank_indicator_points.append((0.5 + 0.11 * sin(deg2rad(60)),
+                                               0.8 + 0.11 * cos(deg2rad(60))))
+
+        x, y, _ = self.markup_frame.shape
+        lines = (np.array([x, y]) * np.array(self.bank_indicator_points)).astype(int)
+        cv2.polylines(self.markup_frame, [lines],
+                      False, (0, 255, 0), 2)
+
+        bank_angle, cmd_bank_angle, mode = self.rollReader.get_roll_at(img_time)
+
+        # bank_angle = 0.0 + 60.0 * sin(img_time)
+        bank_pts = []
+        bank_pts.append((0.5 + 0.079 * sin(deg2rad(cmd_bank_angle)),
+                             0.8 + 0.079 * cos(deg2rad(cmd_bank_angle))))
+        bank_pts.append((0.5 + 0.050 * sin(deg2rad(cmd_bank_angle + 15.0)),
+                             0.8 + 0.050 * cos(deg2rad(cmd_bank_angle + 15.0))))
+        bank_pts.append((0.5 + 0.050 * sin(deg2rad(cmd_bank_angle - 15.0)),
+                             0.8 + 0.050 * cos(deg2rad(cmd_bank_angle - 15.0))))
+
+        # cmd_bank_angle = 0.0 + 60.0 * cos(img_time)
+        cmd_bank_pts = []
+        cmd_bank_pts.append(
+            (0.5 + 0.079 * sin(deg2rad(bank_angle)),
+             0.8 + 0.079 * cos(deg2rad(bank_angle))))
+        cmd_bank_pts.append((0.5 + 0.065 * sin(deg2rad(bank_angle + 10.0)),
+                         0.8 + 0.065 * cos(deg2rad(bank_angle + 10.0))))
+        cmd_bank_pts.append((0.5 + 0.065 * sin(deg2rad(bank_angle - 10.0)),
+                         0.8 + 0.065 * cos(deg2rad(bank_angle - 10.0))))
+
+        lines = (np.array([x, y]) * np.array(bank_pts)).astype(int)
+        cmd_lines = (np.array([x, y]) * np.array(cmd_bank_pts)).astype(int)
+        cv2.polylines(self.markup_frame, [lines], True, (0, 255, 0))
+        cv2.fillPoly(self.markup_frame, [cmd_lines], (0, 255, 0))
+        if mode:
+            tl = np.array([.40 * x, .80 * y]).astype(int)
+            br = np.array([.60 * x, .95 * y]).astype(int)
+            cv2.rectangle(self.markup_frame, tl, br, (0, 255, 0))
 
     def update_cube_map_vectors(self):
         """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -1358,7 +1420,6 @@ class CameraGui():
             forward_mask = dirs_reshaped[:, 0, 2] > 0  # Z > 0 means forward
             valid_dirs = dirs_reshaped[forward_mask]
 
-
             if valid_dirs.size > 0:
                 # Project valid directions
                 img_points, _ = cv2.fisheye.projectPoints(
@@ -1375,7 +1436,6 @@ class CameraGui():
                 self.map_x[face] = full_img_points[:, 0].reshape(self.face_size, self.face_size)
                 self.map_y[face] = full_img_points[:, 1].reshape(self.face_size, self.face_size)
 
-
     def apply_fisheye_faces(self, frame):
         self.cubemap_faces = {}
 
@@ -1384,10 +1444,10 @@ class CameraGui():
 
     def remap(self, face, frame):
         return cv2.remap(
-                    frame, self.map_x[face], self.map_y[face],
-                    interpolation=cv2.INTER_LINEAR,
-                    borderMode=cv2.BORDER_CONSTANT,
-                    borderValue=(0, 0, 0))
+            frame, self.map_x[face], self.map_y[face],
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0))
 
     def stitch_cubemap_faces(self, layout, cells=3):
         """
@@ -1440,8 +1500,8 @@ class CameraGui():
                 self.curr_frame = self.cubemap_faces['front']
         else:
             self.curr_frame = cv2.undistort(src=frame,
-                                    cameraMatrix=self.calibration.getCameraMatrix(),
-                                    distCoeffs=self.calibration.getDistortion())
+                                            cameraMatrix=self.calibration.getCameraMatrix(),
+                                            distCoeffs=self.calibration.getDistortion())
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernels.Gabor and self.GaborFilter is not None:
@@ -1564,7 +1624,7 @@ class CameraGui():
         edges = cv2.Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, 50,
-                                minLineLength=np.sum(self.curr_frame.shape)/10.0,
+                                minLineLength=np.sum(self.curr_frame.shape) / 10.0,
                                 maxLineGap=20)
 
         color = (0, 0, 255)
@@ -1622,20 +1682,21 @@ class CameraGui():
         else:
             if self.last_bounding_box_size is not None:
                 # 1.0 for single feature, 1.5 for drogue
-                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])*1.0
+                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1]) * 1.0
 
             # 5.0 for single feature, 50.0 for drogue
             ellipse_width = 5.0 * self.current_var_y + self.min_radius
             ellipse_height = 5.0 * self.current_var_z + self.min_radius
 
-            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[1] or \
+            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[
+                1] or \
                     self.curr_FG_pixel[1] > self.curr_frame.shape[0]:
                 return
 
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width,
                                                   y_axes=ellipse_height, dim_factor=0.10)
-            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width*2.0,
-                                                  y_axes=ellipse_height*2.0, dim_factor = 0.00)
+            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
+                                                  y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
     def run_yolo(self):
         '''
@@ -1645,7 +1706,7 @@ class CameraGui():
         '''
         self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame)
         centers, boxes, scores, class_ids, time = output
-        if len(centers) > 0 :#and self.yoloSession.reader.numClasses == 1:
+        if len(centers) > 0:  #and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
             img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
@@ -1663,11 +1724,11 @@ class CameraGui():
             d = self.calibration.getDistortion()
             twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
             dist_est = 2.0 / (
-                        self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
-                        self.curr_frame.shape[1])
+                    self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
+                    self.curr_frame.shape[1])
             dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
 
-            if dist_est < 100.0 and self.check_above_horizon(self.last_yolo_center):
+            if self.check_above_horizon(self.last_yolo_center):
                 self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                 cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                            3, (255, 0, 255), 3)
@@ -1693,12 +1754,13 @@ class CameraGui():
         if time is not None and self.FG.numMeas > 2:
             K = self.calibration.getCameraMatrix()
             d = self.calibration.getDistortion()
-            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (time-self.last_time_update) * self.FG.r_V_d[-1])
-            self.curr_FG_pixel = (self.curr_FG_pixel/self.curr_FG_pixel[2])[:2]
+            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (time - self.last_time_update) * self.FG.r_V_d[-1])
+            self.curr_FG_pixel = (self.curr_FG_pixel / self.curr_FG_pixel[2])[:2]
 
             size = 15
             thickness = 1
-            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size,  color, thickness)
+            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
+                       thickness)
             cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
                      [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
             cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
@@ -1727,9 +1789,9 @@ class CameraGui():
 
         if self.last_image is not None and self.last_image.shape == self.curr_frame_gray.shape:
             lft_rt, ret = cv2.phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
-                                     self.last_image.astype(np.float64) / 255.0)
+                                             self.last_image.astype(np.float64) / 255.0)
             lft, rt = lft_rt
-            cv2.arrowedLine(self.markup_frame, (cx, cy), (int(cx+10*lft), int(cy+10*rt)), (0, 0, 255), 3)
+            cv2.arrowedLine(self.markup_frame, (cx, cy), (int(cx + 10 * lft), int(cy + 10 * rt)), (0, 0, 255), 3)
 
         self.last_image = copy.deepcopy(self.curr_frame_gray)
 
@@ -1755,8 +1817,6 @@ class CameraGui():
 
         self.potentialResize()
 
-
-
         cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
 
         if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
@@ -1775,7 +1835,7 @@ class CameraGui():
 
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
-        aspectRatio = self.curr_frame.shape[1]/self.curr_frame.shape[0]
+        aspectRatio = self.curr_frame.shape[1] / self.curr_frame.shape[0]
         if not self.lastHeight == height and height != 0:
             cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
             self.lastHeight = height
@@ -1785,11 +1845,13 @@ class CameraGui():
             self.lastWidth = width
             self.lastHeight = int(width / aspectRatio)
 
-    def askFilepath(self, initDir, text):
-        poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True,title=text)
+    @staticmethod
+    def askFilepath(initDir, text):
+        poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True, title=text)
         if poss_filepath == '':
             return None
         return poss_filepath
+
 
 def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     """
@@ -1816,7 +1878,7 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
         # cv2.rectangle(mask, (int(center[0]-x_axes),int(center[1]-y_axes)),(int(center[0]+x_axes),int(center[1]+y_axes)),
         #               color=255, thickness=-1)
         cv2.ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
-                    angle=0,startAngle=0, endAngle=360, color=255, thickness=-1)
+                    angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
 
     # 2. Dim the entire image
     dimmed_img = (frame * dim_factor).astype("uint8")
@@ -1835,6 +1897,7 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
     return frame
 
+
 def dim_entirely(frame, center, radius):
     """
     Dims an image everywhere except inside a circle.
@@ -1852,6 +1915,7 @@ def dim_entirely(frame, center, radius):
 
     # 3. Copy the original circle area back to the dimmed image
     return cv2.bitwise_and(frame, frame, mask=mask)
+
 
 def natural_sort(l):
     convert = lambda text: int(text) if text.isdigit() else text.lower()

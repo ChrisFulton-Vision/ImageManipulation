@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from os.path import join
 
-class RollReader:
+class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
         self.roll_dict = None
         self.cmd_dict = None
@@ -22,7 +22,7 @@ class RollReader:
             return False
 
         # Check if required columns are present
-        if not {'timestamp', 'Roll', 'DesRoll'}.issubset(self.roll_dict.columns):
+        if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns):
             return False
 
         if not {'timestamp', 'C1', 'C8'}.issubset(self.cmd_dict.columns):
@@ -40,11 +40,21 @@ class RollReader:
         if not self.ready:
             return 0.0, 0.0, False
 
+        # print(f"Img Time: {query_time}")
         query_time += self.offset
+        # print(f"GPS Time: {query_time}\n")
 
         # Handle out-of-bounds
-        if query_time < self.roll_dict['timestamp'].iloc[0] or query_time > self.roll_dict['timestamp'].iloc[-1]:
-            raise ValueError("query_time is outside the range of available times")
+        if query_time < self.roll_dict['timestamp'].iloc[0]:
+            # print('Beginning of file...\n')
+            return self.roll_dict['Roll'][0], self.roll_dict['DesRoll'][0], self.roll_dict['Pitch'][0], \
+            self.roll_dict['DesPitch'][0], self.cmd_dict['C8'][0]
+
+        if query_time > self.roll_dict['timestamp'].iloc[-1]:
+            # print('End of file...\n')
+            return self.roll_dict['Roll'].iloc[-1], self.roll_dict['DesRoll'].iloc[-1], self.roll_dict['Pitch'].iloc[-1], \
+            self.roll_dict['DesPitch'].iloc[-1], self.cmd_dict['C8'].iloc[-1]
+
 
 
         # Use numpy to interpolate
@@ -59,6 +69,17 @@ class RollReader:
             self.roll_dict['timestamp'],
             self.roll_dict['DesRoll']
         )
+        interpolated_pitch = np.interp(
+            query_time,
+            self.roll_dict['timestamp'],
+            self.roll_dict['Pitch']
+        )
+        # Use numpy to interpolate
+        interpolated_cmd_pitch = np.interp(
+            query_time,
+            self.roll_dict['timestamp'],
+            self.roll_dict['DesPitch']
+        )
 
         interpolated_mode = np.interp(
             query_time,
@@ -67,11 +88,11 @@ class RollReader:
         )
         mode = 950 < interpolated_mode < 1400
 
-        return interpolated_roll, interpolated_cmd_roll, mode
+        return interpolated_roll, interpolated_cmd_roll, interpolated_pitch, interpolated_cmd_pitch, mode
 
 # file = filedialog.askopenfilename(initialdir='./')
 # print(file)
 # file = 'C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/LOGS/00000064/XKF1.csv'
-# RR = RollReader(file)
+# RR = AttitudeReader(file)
 # for i in range(1000):
 #     print(RR.get_roll_at(1748534621.7987978 + i))

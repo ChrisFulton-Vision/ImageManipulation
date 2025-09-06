@@ -13,6 +13,8 @@ import superCalibrateCamera as cam
 
 sys.path.append(os.getcwd())
 GREEN = '#2FA572'
+FILEPATH_CACHE = 'Caches/filepath_cache.pkl'
+IMAGE_CACHE = 'imagery_cache.pkl'  # Local to each folder structure, stored with imagery
 
 
 class CalibrationType(Enum):
@@ -21,7 +23,7 @@ class CalibrationType(Enum):
     chArUco = 'chArUco'
 
 
-class ImageryCalibrationConfig():
+class ImageryCalibrationConfig:
     '''
     This class stores information cleanly about any calibration that has occurred or is intended to occur. Because
     it stores all the information and settings for the calibration, this class is neatly packaged in a cache for
@@ -101,7 +103,7 @@ class ImageryCalibrationConfig():
         return flags
 
 
-class ImageData():
+class ImageData:
     '''
     This class stores information maintained by a single image. The image MUST have a name which is its filename.
     Include sets whether the image is part of the calibration.
@@ -990,9 +992,9 @@ class FrontEndGui(ctk.CTk):
         clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
 
     def clearCache(self):
-        if os.path.exists(join(self.filepath, 'imagery_cache.pkl')):
+        if os.path.exists(join(self.filepath, IMAGE_CACHE)):
             filepath = copy.copy(self.filepath)
-            os.remove(join(self.filepath, 'imagery_cache.pkl'))
+            os.remove(join(self.filepath, IMAGE_CACHE))
 
             clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='Clearing', fg_color='yellow',
                                              text_color='black', hover_color='yellow')
@@ -1041,24 +1043,24 @@ class FrontEndGui(ctk.CTk):
     def saveToCache(self):
 
         if len(self.imageConfig.img_collection) > 0:
-            with open(join(self.filepath, 'imagery_cache.pkl'), 'wb') as f:
+            with open(join(self.filepath, IMAGE_CACHE), 'wb') as f:
                 pickle.dump(self.imageConfig, f)
 
-        with open('filepath_cache.pkl', 'wb') as f:
+        with open(FILEPATH_CACHE, 'wb') as f:
             pickle.dump(self.filepath, f)
 
     def loadFromCache(self, init=False):
-        if init and not os.path.exists('filepath_cache.pkl'):
+        if init and not os.path.exists(FILEPATH_CACHE):
             self.filepath = os.getcwd()
             return
 
         if init:
-            with open('filepath_cache.pkl', 'rb') as filepathOpen:
+            with open(FILEPATH_CACHE, 'rb') as filepathOpen:
                 self.filepath = pickle.load(filepathOpen)
                 return
 
-        if os.path.exists(join(self.filepath, 'imagery_cache.pkl')):
-            with open(join(self.filepath, 'imagery_cache.pkl'), 'rb') as imageConfigOpen:
+        if os.path.exists(join(self.filepath, IMAGE_CACHE)):
+            with open(join(self.filepath, IMAGE_CACHE), 'rb') as imageConfigOpen:
                 self.imageConfig.copy(pickle.load(imageConfigOpen))
         else:
             self.imageConfig = ImageryCalibrationConfig()

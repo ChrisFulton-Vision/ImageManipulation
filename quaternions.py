@@ -24,6 +24,7 @@ import numpy as np
 from numpy import cos, arccos, sin, arcsin, tan, arctan, arctan2, rad2deg, deg2rad, sqrt, abs
 from typing_extensions import Self, Union
 import copy
+from copy import deepcopy
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 class Quaternion:
@@ -35,15 +36,15 @@ class Quaternion:
 
         # Included for redundancy, if a quaternion is passed in, make a copy of its values
         if isinstance(quat, Quaternion):
-            self.s = copy.deepcopy(quat.s)
-            self.vec = copy.deepcopy(quat.vec)
+            self.s = deepcopy(quat.s)
+            self.vec = deepcopy(quat.vec)
             # raise ValueError(f'Gave me a quaternion already, with {s = } and {vec = }')
             return
 
         #
         if s is None and vec is None and quat is not None:
-            self.s = quat[0]
-            self.vec = quat[1:4].flatten()
+            self.s = deepcopy(quat[0])
+            self.vec = deepcopy(quat[1:4]).flatten()
             self.checkUnit(makeUnitVec)
             return
 
@@ -55,7 +56,7 @@ class Quaternion:
 
         if s is None:
             if np.shape(vec) == (3,):
-                self.vec = vec
+                self.vec = deepcopy(vec)
             elif np.shape(vec) == (3, 1) or np.shape(vec) == (1, 3):
                 self.vec = vec.flatten()
             else:
@@ -67,14 +68,14 @@ class Quaternion:
         if vec is None:
             if len(s) > 1:
                 raise ValueError('s should be a single float')
-            self.s = s
+            self.s = deepcopy(s)
             self.vec = np.zeros((3,))
         else:
             self.s = s
             if np.shape(vec) == (3,):
-                self.vec = vec
+                self.vec = deepcopy(vec)
             elif np.shape(vec) == (3, 1) or np.shape(vec) == (1, 3):
-                self.vec = vec.flatten()
+                self.vec = deepcopy(vec).flatten()
             else:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
         self.checkUnit(makeUnitVec)
@@ -220,21 +221,37 @@ class Quaternion:
         '''
         >>> for _ in range(100):
         ...     q = randomQuat()
-        ...     delt = 0.0001
+        ...     delt = 0.0000001
         ...     qs = Quaternion(s=q.s+delt, vec=q.vec)
         ...     qx = Quaternion(s=q.s, vec=q.vec + np.array([delt, 0.0, 0.0]))
-        ...     qz = Quaternion(s=q.s, vec=q.vec + np.array([0.0, delt, 0.0]))
-        ...     qy = Quaternion(s=q.s, vec=q.vec + np.array([0.0, 0.0, delt]))
-        ...     vecs = np.random.random((100,3))
+        ...     qy = Quaternion(s=q.s, vec=q.vec + np.array([0.0, delt, 0.0]))
+        ...     qz = Quaternion(s=q.s, vec=q.vec + np.array([0.0, 0.0, delt]))
+        ...     vecs = np.random.random((50,3))
         ...     for vec in vecs:
-        ...         print(vec)
+        ...         analy_deriv = q.T.vect_deriv(vec, True)
+        ...         h0 = q.T * vec
+        ...         hs = qs.T * vec
+        ...         hx = qx.T * vec
+        ...         hy = qy.T * vec
+        ...         hz = qz.T * vec
+        ...         np.testing.assert_allclose(analy_deriv, np.column_stack([(hs-h0)/delt, (hx-h0)/delt, (hy-h0)/delt, (hz-h0)/delt]),
+        ...                                    atol=0.0001, rtol=0.0001)
+        ...     q = randomQuat()
+        ...     delt = 0.0000001
+        ...     qs = Quaternion(s=q.s+delt, vec=q.vec)
+        ...     qx = Quaternion(s=q.s, vec=q.vec + np.array([delt, 0.0, 0.0]))
+        ...     qy = Quaternion(s=q.s, vec=q.vec + np.array([0.0, delt, 0.0]))
+        ...     qz = Quaternion(s=q.s, vec=q.vec + np.array([0.0, 0.0, delt]))
+        ...     vecs = np.random.random((50,3))
+        ...     for vec in vecs:
         ...         analy_deriv = q.vect_deriv(vec, False)
         ...         h0 = q * vec
         ...         hs = qs * vec
         ...         hx = qx * vec
         ...         hy = qy * vec
         ...         hz = qz * vec
-        ...         np.testing.assert_allclose(analy_deriv, np.array([(hs-h0)/delt, (hx-h0)/delt, (hy-h0)/delt, (hz-h0)/delt]))
+        ...         np.testing.assert_allclose(analy_deriv, np.column_stack([(hs-h0)/delt, (hx-h0)/delt, (hy-h0)/delt, (hz-h0)/delt]),
+        ...                                    atol=0.0001, rtol=0.0001)
         '''
         # This one can be a little tricky. These produce four different answers:
         # q.vectDeriv(vec, False)
@@ -252,27 +269,27 @@ class Quaternion:
         deriv = np.zeros((3, 4))
 
         # d_q0
-        deriv[:, 0] = 2 * self.s * vect + 2 * np.cross(self.vec, vect)
+        deriv[:, 0] = 2.0 * (self.s * vect + np.cross(self.vec, vect))
 
         # d_qx
-        deriv[:, 1] = np.array([2 * (self.vec[0] * vect[0] + np.dot(self.vec, vect)),
-                                2 * self.vec[1] * vect[0],
-                                2 * self.vec[2] * vect[0]]) + \
-                      -2 * self.vec[0] * vect + \
-                      2 * self.s * np.array([0.0, -vect[2], vect[1]])
+        deriv[:, 1] = 2.0 * (np.array([self.vec[0] * vect[0] + np.dot(self.vec, vect),
+                                self.vec[1] * vect[0],
+                                self.vec[2] * vect[0]]) + \
+                      -self.vec[0] * vect + \
+                      self.s * np.array([0.0, -vect[2], vect[1]]))
 
         # d_qy
-        deriv[:, 2] = np.array([2 * self.vec[0] * vect[1],
-                                2 * (self.vec[1] * vect[1] + np.dot(self.vec, vect)),
-                                2 * self.vec[2] * vect[1]]) + \
-                      -2 * self.vec[1] * vect + \
-                      2 * self.s * np.array([vect[2], 0.0, -vect[0]])
+        deriv[:, 2] = 2.0 * (np.array([self.vec[0] * vect[1],
+                                (self.vec[1] * vect[1] + np.dot(self.vec, vect)),
+                                self.vec[2] * vect[1]]) + \
+                      -self.vec[1] * vect + \
+                      self.s * np.array([vect[2], 0.0, -vect[0]]))
         # d_qz
-        deriv[:, 3] = np.array([2 * self.vec[0] * vect[2],
-                                2 * self.vec[1] * vect[2],
-                                2 * (self.vec[2] * vect[2] + np.dot(self.vec, vect))]) + \
-                      -2 * self.vec[2] * vect + \
-                      2 * self.s * np.array([-vect[1], vect[0], 0.0])
+        deriv[:, 3] = 2.0 * (np.array([self.vec[0] * vect[2],
+                                self.vec[1] * vect[2],
+                                (self.vec[2] * vect[2] + np.dot(self.vec, vect))]) + \
+                      -self.vec[2] * vect + \
+                      self.s * np.array([-vect[1], vect[0], 0.0]))
 
         if isQuatConjugated:
             deriv[:, 1] *= -1.0
@@ -280,10 +297,12 @@ class Quaternion:
             deriv[:, 3] *= -1.0
             if projectPerpendicular:
                 P = np.eye(4) - np.outer(self.T.ndarray, self.T.ndarray)
+                return deriv @ P
         elif projectPerpendicular:
             P = np.eye(4) - np.outer(self.ndarray, self.ndarray)
+            return deriv @ P
 
-        return deriv @ P
+        return deriv
 
     def to_dcm(self):
         return quat2mat(self.ndarray)
@@ -309,6 +328,9 @@ class Quaternion:
     def qv_mult_alt(self, multVec):
         t = 2.0 * np.cross(self.vec, multVec)
         return multVec + self.s * t + np.cross(self.vec, t)
+
+    def copy(self):
+        return deepcopy(self)
 
     @property
     def T(self):

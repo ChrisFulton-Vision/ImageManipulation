@@ -304,6 +304,16 @@ class Quaternion:
 
         return deriv
 
+    def transpose_vec_deriv(self, vect: np.array, projectPerpendicular: bool = True):
+        '''
+        Tiny helper, that helps perform the transpose derivative without mistakes.
+        partial ( q.T * vec) / partial (q) may now be written:
+                q.transpose_vec_deriv(vec)
+        instead of
+                q.T.vect_deriv(vec, True)
+        '''
+        return self.T.vect_deriv(vect, True, projectPerpendicular)
+
     def to_dcm(self):
         return quat2mat(self.ndarray)
 

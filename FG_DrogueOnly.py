@@ -103,7 +103,6 @@ class FactorGraph:
 
     def newRecvMeas(self, drgVec, t=None):
         self.optComplete = False
-
         # Realign measurements to:
         # 0: Drogue from (recv or tanker) Camera
 
@@ -136,10 +135,14 @@ class FactorGraph:
             
             delT = self.time_log[-1] - self.time_log[-2]
 
-            self.meas.append(self.curr_meas)
-            self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis,:], axis=0)  # Drg from Recv
-            self.r_V_d = np.append(self.r_V_d, ((self.r_T_d[-1] - self.r_T_d[-2])/delT)[np.newaxis,:], axis=0)
+            if self.time_log[-1] <= self.time_log[-2]:
+                self.reset()
+                self.newRecvMeas(drgVec, t)
+                return
 
+            self.meas.append(self.curr_meas)
+            self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis, :], axis=0)  # Drg from Recv
+            self.r_V_d = np.append(self.r_V_d, ((self.r_T_d[-1] - self.r_T_d[-2]) / delT)[np.newaxis, :], axis=0)
 
         self.numMeas += 1
 
@@ -212,10 +215,17 @@ class FactorGraph:
 
         return y
 
+    def reset(self):
+        self.r_T_d = np.zeros((1, 3))
+        self.r_V_d = np.zeros((1, 3))
+        self.time_log = np.zeros((1,))
+        self.meas = np.zeros((1,))
+        self.numMeas = 0
+
     def popOldestMeas(self):
         self.optComplete = False
 
-        if self.numMeas > 0:
+        if self.numMeas > 1:
             self.numMeas -= 1
 
             self.time_log = self.time_log[1:]
@@ -223,11 +233,8 @@ class FactorGraph:
 
             self.r_T_d = self.r_T_d[1:]
             self.r_V_d = self.r_V_d[1:]
-
-        if self.numMeas == 0:
-            self.r_T_d = np.zeros((1,3))
-            self.r_V_d = np.zeros((1,3))
-            self.time_log = np.zeros((1,))
+        elif self.numMeas <= 1:
+            self.reset()
 
     def stateFromTimestep(self, meas_idx):
         # s: r_T_d, r_V_d
@@ -305,11 +312,11 @@ class FactorGraph:
         # [r_T_d, r_V_d]
         return [r_T_d, r_V_d]
 
-    def reset(self):
-        while self.numMeas > 0:
-            self.popOldestMeas()
 
     def opt(self, func=None):
+        if self.time_log[-1] <= self.time_log[-2]:
+            self.reset()
+            return
 
         self.num_iters = 0
         prev_ratio = np.inf
@@ -326,6 +333,7 @@ class FactorGraph:
             y = self.create_y()
             is_scale_good = False
             Qy = Q.dot(self.create_y())
+            Qy_mag = Qy.T.dot(Qy)
             QL = Q.dot(self.create_L())
             # Qy = self.create_y()
             # QL = self.create_L()
@@ -355,7 +363,6 @@ class FactorGraph:
                 # print('Updated Estimate')
                 new_Qy = Q.dot(self.create_y(next_states))
 
-                Qy_mag = Qy.T.dot(Qy)
                 pred_Qy = Qy - QL.dot(delta_x * scale)
 
                 if np.abs(Qy_mag - pred_Qy.dot(pred_Qy)) > 0.00001:

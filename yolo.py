@@ -5,11 +5,17 @@ import os, glob, re, datetime
 from Calibration import Calibration
 from metaYoloReader import MetaYoloReader
 import copy
+import matplotlib.pyplot as plt
+from quaternions import Quaternion as q
+from quaternions import *
 
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
 ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
 
+LIGHTBLUE = (255, 255, 0)
+YELLOW = (50, 255, 255)
+RED = (120, 120, 255)
 
 class YOLO:
     '''
@@ -33,6 +39,12 @@ class YOLO:
 
         self.class_names = range(numClasses)
         self.yoloSize = yoloSize
+
+        self.orig_tvec = []
+        self.bias_tvec = []
+        self.plotCount = 0
+
+        self.biasTracker = {}
 
         self.setNewFolder(model_path)
 
@@ -125,33 +137,61 @@ class YOLO:
     def interpretOutput(self, output: np.array) -> (list, list, list, list):
         '''
         Takes outputs from onnxruntime and processes them
+        Filters to retain only the highest-confidence detection for each class
         :param output:  onnxruntime session outputs
         :return: cleaner outputs for interpretation
         '''
 
-        centers, boxes, scores, class_ids = [], [], [], []
+        best_detections = {}  # class_id: (confidence, center, box)
+
         if output is not None:
             predictions = np.squeeze(output[0])
         else:
             predictions = []
 
-        for idx, detection in enumerate(predictions):
+        for detection in predictions:
             x, y, w_box, h_box, confidence = detection[:5]
             class_probs = detection[5:]
 
             if confidence > self.conf:
+                class_id = int(np.argmax(class_probs))
+                max_class_conf = class_probs[class_id]
+
+                # You can choose to factor in class confidence or use the object confidence
+                combined_conf = confidence * max_class_conf
+
                 x1 = (x - w_box / 2)
                 y1 = (y - h_box / 2)
                 x2 = (x + w_box / 2)
                 y2 = (y + h_box / 2)
 
-                # if (x1 > self.pixel_buffer and x2 < self.yoloSize[0] - self.pixel_buffer
-                #         and y1 > self.pixel_buffer and y2 < self.yoloSize[1] - self.pixel_buffer):
+                buffer = 10
+                width, height = self.yoloSize
 
-                centers.append([x, y])
-                boxes.append([x1, y1, x2, y2])
-                scores.append(float(confidence))
-                class_ids.append(np.argmax(class_probs))
+                # Assume that the bounding box continues outside the image, and do not use since the bounding
+                # box may be cut off!
+                if x1 - buffer < 0 or y1 - buffer < 0 or x2 + buffer > width or y2 + buffer > height:
+                    continue
+
+                if (class_id not in best_detections) or (combined_conf > best_detections[class_id][0]):
+                    best_detections[class_id] = (
+                        combined_conf,
+                        [x, y],
+                        [x1, y1, x2, y2],
+                        float(confidence)
+                    )
+
+        # Decompose detections into return format
+        centers = []
+        boxes = []
+        scores = []
+        class_ids = []
+
+        for class_id, (_, center, box, score) in best_detections.items():
+            centers.append(center)
+            boxes.append(box)
+            scores.append(score)
+            class_ids.append(class_id)
 
         return centers, boxes, scores, class_ids
 
@@ -166,10 +206,9 @@ class YOLO:
         h, w, _ = image.shape
 
         centers, boxes, scores, class_ids, time = output
-        color = (255, 255, 0)
 
         text = f'Inference time: {time:.3f}s'
-        cv2.putText(image, text, (10, 50), cv2.FONT_HERSHEY_PLAIN, 2, (255, 255, 0), 3)
+        cv2.putText(image, text, (10, 50), cv2.FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 3)
 
         if len(class_ids) > 0:
             indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
@@ -181,14 +220,14 @@ class YOLO:
                 newClass_ids.append(class_ids[i])
                 newScores.append(scores[i])
 
-            image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores, color)
+            image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores)
             if len(set(indices)) > 5:
                 self.drawPnP(image, newClass_ids, newCenters)
 
         return image
 
     def drawBoxes(self, image: np.array, newCenters: list, newBoxes: list,
-                  newClass_ids: list, newScores: list, color: (int, int, int)) -> np.array:
+                  newClass_ids: list, newScores: list) -> np.array:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -213,11 +252,12 @@ class YOLO:
             y2 = int(h / y_h * y2)
 
             label = f"{class_id}: {score:.2f}"
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 1)
+            cv2.rectangle(image, (x1, y1), (x2, y2), LIGHTBLUE, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
-        cv2.putText(image, 'Direct Inference', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75, color, 1)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0,0,0), 6)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, LIGHTBLUE, 3)
+        cv2.putText(image, 'Direct Inference', (25, w - 100), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75, LIGHTBLUE, 1)
 
         return image
 
@@ -239,7 +279,7 @@ class YOLO:
 
         self.calibration.scaleCalibration(y_w)
 
-        np.set_printoptions(suppress=True, precision=4)
+
         object_points = []
         image_points = []
         badList = []
@@ -261,36 +301,135 @@ class YOLO:
                                                       imagePoints=image_points,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)),
+                                                      confidence=0.99,
                                                       flags=cv2.SOLVEPNP_ITERATIVE)
-
+        # print(f'Rvec: {np.squeeze(rvec)}')
+        # print(f'Tvec: {np.squeeze(tvec)}')
+        dcm, jacob = cv2.Rodrigues(rvec)
+        np.set_printoptions(suppress=True, precision=10)
+        print(mat2quat(dcm), np.squeeze(tvec))
         if not ret:
             return
 
-        for y_class_id in y_class_ids:
+        # output = {}
+        # output['Rvec'] = np.squeeze(rvec)
+        # output['Tvec'] = np.squeeze(tvec)
+
+        # print(inliers)
+
+        # for id in range(len(self.reader.idsNamesLocs)):
+        #     xyz = np.array(self.reader.idsNamesLocs[id][2:])
+        #     projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
+        #                                           cameraMatrix=self.calibration.getCameraMatrix(),
+        #                                           distCoeffs=np.zeros((5,)))
+            # print( f'Original feature: {y_class_id}\nOriginal Yolo Detect: {y_center}\nReprojection: {projectedPixel}\n\n')
+
+            # output[id] = projectedPixel
+
+        # input = {}
+
+        for y_class_id, y_center in zip(y_class_ids, y_centers):
             if y_class_id <= len(self.reader.idsNamesLocs):
+
                 # for idNameLoc in reader.idsNamesLocs:
                 id = self.reader.idsNamesLocs[y_class_id][0]
                 xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
                 projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)))
+                # print( f'Original feature: {y_class_id}\nOriginal Yolo Detect: {y_center}\nReprojection: {projectedPixel}\n\n')
+                # input[y_class_id] = y_center
+
                 x, y = np.squeeze(projectedPixel)
                 if np.isnan(x) or np.isnan(y):
                     return
-                x = int(w / y_w * x)
-                y = int(h / y_h * y)
-                cv2.putText(image, str(id), (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75, (50, 255, 255), 1)
+                x = w / y_w * x
+                y = h / y_h * y
 
-        cv2.putText(image, 'SolvePnP Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75, (50, 255, 255), 1)
-        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{tvec[0, 0]:.3f}, z:{tvec[1, 0]:.3f}', (25, w - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
+                x_yolo, y_yolo = y_center
 
-        # image[0:self.pixel_buffer, :] = np.array([0, 0, 0.0])
-        # image[h - self.pixel_buffer:h, :] = np.array([0, 0, 0.0])
-        # image[:, 0:self.pixel_buffer] = np.array([0, 0, 0.0])
-        # image[:, w - self.pixel_buffer:w] = np.array([0, 0, 0.0])
+                # This section establishes a threshold for error estimates that are not outlier rejected
+                # print((x-x_yolo) ** 2.0 + (y - y_yolo) ** 2.0, 30.0 ** 2)
+                if (x-x_yolo) ** 2.0 + (y - y_yolo) ** 2.0 < 40.0 ** 2:
+                # print(y_class_id, y_class_id in inliers)
+                # if y_class_id in inliers:
+                    if y_class_id in self.biasTracker:
+                        num, x_bias, y_bias = self.biasTracker[y_class_id]
+                        if num > 9:
+                            num = 9
+                        self.biasTracker[y_class_id] = [num + 1, (x_bias * num + x - x_yolo) / (num + 1),
+                                                        (y_bias * num + y - y_yolo) / (num + 1)]
+                    else:
+                        self.biasTracker[y_class_id] = [1, x-x_yolo, y-y_yolo]
+
+                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, YELLOW, 3)
+
+                # print(f'Class: {y_class_id}\nOrig: {x_yolo}, {y_yolo}. Proj: {x}, {y}')
+                # print(f'Diff- x: {x - x_yolo}, {y - y_yolo}, norm: {np.sqrt((x - x_yolo) ** 2 + (y - y_yolo) ** 2)}')
+                if y_class_id in self.biasTracker:
+                    num, x_corr, y_corr = self.biasTracker[y_class_id]
+                    # print(f'Bias- {x_corr}, y: {y_corr}, Num: {num}')
+                    # print(f'Corrected- x: {x - x_yolo - x_corr}, y: {y - y_yolo - y_corr}, norm: {np.sqrt((x-x_yolo-x_corr)**2+(y-y_yolo-y_corr)**2)}')
+                    cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.75, RED, 2)
+                # print()
+
+        # # print(f'Rvec: {output['Rvec']}')
+        # print(f'Tvec: {output['Tvec']}')
+        # print('Feature, [YOLO x, YOLO y], [Proj x, Proj y]')
+        # for id in range(len(self.reader.idsNamesLocs)):
+        #     try:
+        #         print(id, ",", np.array(input[id]), ',', np.squeeze(np.array(output[id])))
+        #     except KeyError:
+        #         print(id, ", Not found,", np.squeeze(np.array(output[id])))
+        # print('\n\n')
+
+        bias_image_points = []
+        for idx, y_class_id in enumerate(y_class_ids):
+            if y_class_id not in badList and y_class_id < len(self.reader.idsNamesLocs):
+                if y_class_id in self.biasTracker:
+                    num, x_corr, y_corr = self.biasTracker[y_class_id]
+                    x_yolo, y_yolo = y_centers[idx]
+                    bias_image_points.append((x_yolo+x_corr, y_yolo+y_corr))
+                else:
+                    bias_image_points.append(y_centers[idx])
+        bias_image_points = np.array(bias_image_points)
+
+        ret, bias_rvec, bias_tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
+                                                      imagePoints=bias_image_points,
+                                                      cameraMatrix=self.calibration.getCameraMatrix(),
+                                                      distCoeffs=np.zeros((5,)),
+                                                      flags=cv2.SOLVEPNP_ITERATIVE)
+        self.orig_tvec.append(tvec)
+        self.bias_tvec.append(bias_tvec)
+        self.plotCount += 1
+        # print(np.squeeze(np.array(self.orig_tvec)))
+        tvecs = np.squeeze(np.array(self.orig_tvec))
+        # print()
+        # print(np.squeeze(np.array(self.bias_tvec)))
+        bias_tvecs = np.squeeze(np.array(self.bias_tvec))
+        # print('\n\n')
+
+        # print(self.plotCount)
+        # if len(tvecs.shape) > 1 and self.plotCount > 200:
+        #     plt.title("Rigid vs. Semi-Rigid 3D Model Solve-PnP Solution")
+        #     plt.xlabel("Frame Number")
+        #     plt.ylabel("")
+        #     plt.plot(tvecs[:, 2], label='Rigid Model', linewidth=2.0)
+        #     plt.plot(bias_tvecs[:, 2], label='Semi-Rigid Model', linewidth=2.0)
+        #     plt.legend()
+        #     plt.tight_layout()
+        #     plt.show()
+        #     self.plotCount = 0
+
+
+        cv2.putText(image, 'SolvePnP Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75, YELLOW, 1)
+        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{tvec[0, 0]:.3f}, z:{tvec[1, 0]:.3f}', (25, w - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
+        cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{bias_tvec[0, 0]:.3f}, z:{bias_tvec[1, 0]:.3f}', (25, w - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
 
 
 def natural_sort(l):

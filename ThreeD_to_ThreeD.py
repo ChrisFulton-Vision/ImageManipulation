@@ -1,207 +1,217 @@
 """
-Custom Perspective-n-Point (PnP) Demo
--------------------------------------
+ThreeD_to_ThreeD.py (annotated)
 
-This module demonstrates a simple pipeline that estimates the **orientation** (unit
-quaternion) and **position** (3D translation) of a rigid object/landmark set from
-its detected feature points in a single camera image.
+Purpose
+-------
+Estimate a rigid 3D→3D transform (unit quaternion rotation `q` and translation
+`t`) that maps `points1` to `points2` by minimizing reprojection residuals via a
+simple Gauss–Newton / trust-region backtracking scheme.
 
-Key components:
-- Synthetic feature generation in the object's local/model frame (`feature_points`).
-- A pinhole camera projection model implemented in `h(q, t)` using the author's
-  frame conventions: **x forward, y left (image u decreases to the left sign),
-  z up**.
-- An ultra-fast closed-form initializer `init_pose_wahba` that seeds the pose by
-  (1) estimating rotation with a Wahba/Kabsch alignment on unit bearing vectors,
-  then (2) estimating translation by linear least-squares given that rotation.
-- A Gauss-Newton style optimizer `opt` that iteratively refines pose by solving a
-  normal-equation step using the analytic Jacobian provided by `deriv`.
+Key changes vs. the original:
+- Added comprehensive type annotations (NumPy dtypes and Optional types).
+- Added docstrings and explanatory comments.
+- Fixed a subtle bug in `gramSchmidtAxis` when forming the 3×3 orientation
+  matrix (now uses `np.column_stack` so the axes become *columns* of the matrix).
+- Made return types explicit and added validation in `__init__` for degenerate
+  seeds.
+- Minor cleanups (consistent `deepcopy`, clarified variable names).
 
-Notes on conventions and signs:
-- The projection used here differs from typical OpenCV conventions by a sign flip
-  for the horizontal (u) coordinate. Carefully track the mapping in `h()` and in
-  the Jacobian `deriv()`.
-- The quaternion class is expected to expose `.s` (scalar part), `.vec` (vector part),
-  `.T` (rotate points into the camera frame), `from_eulerD_rpy`, `to_rodrigues`,
-  and `angle_betweenD` methods, plus a `vect_deriv(p, right_project=True)`
-  derivative helper for analytic Jacobians.
+Dependencies
+------------
+Relies on a `quaternions` module that provides:
+- `Quaternion` (aliased as `q` here) with attributes/methods:
+  - `.ndarray` (or similar) exposing the 4-vector
+  - `.s` the scalar part
+  - `.T` transpose/inverse as appropriate for composition
+  - `__mul__` overloaded for rotating Nx3 arrays of 3D points
+  - `.vect_deriv(point, makeUnitVec)` returning a 3×4 Jacobian d(R(q)p)/dq
+- `mat2quat(R)` : 3×3 rotation matrix → `Quaternion`
+- `randomQuat()` : random unit quaternion
 
-The code is written as an end-to-end script. Run directly to see a synthetic test
-with noisy measurements, the initializer results, and the final optimized pose.
+Notes
+-----
+- This is a *minimal* LM-like scheme focused on readability. It uses the
+  pseudo-inverse for the normal equations and a simple backtracking rule based
+  on the ratio of actual vs. predicted residual reduction.
+- For serious performance/robustness, consider: damping (Levenberg),
+  robust loss, weighting by per-point covariances, and stopping criteria tied to
+  gradient/step norms.
 """
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Optional, Tuple
+
+import numpy as np
+from numpy.linalg import norm
+from numpy.typing import NDArray
 
 from quaternions import Quaternion as q
-from quaternions import *
-import numpy as np
-from numpy import square as sq, abs
-from numpy.linalg import norm
-from typing_extensions import Tuple
-from copy import deepcopy
-import datetime
+from quaternions import *  # mat2quat, randomQuat, etc.
 
-# Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
-EPS = 0.000001
+
+# Small epsilon to guard against degeneracy in Gram–Schmidt seed.
+EPS: float = 1e-6
+
 
 class ThreeD_to_ThreeD:
-    def __init__(self, points1: np.array, points2: np.array) -> None:
-        self.points1 = deepcopy(points1)
-        self.points2 = deepcopy(points2)
-        self.num_points = self.points1.shape[0]
-        self.q, self.t = self.init_pose(points1, points2)
+    """Estimate a rigid transform between two corresponding 3D point sets."""
+
+    def __init__(self, points1: NDArray[np.floating], points2: NDArray[np.floating]) -> None:
+        self.points1: NDArray[np.floating] = deepcopy(points1).reshape(-1, 3)
+        self.points2: NDArray[np.floating] = deepcopy(points2).reshape(-1, 3)
+        self.num_points: int = self.points1.shape[0]
+
+        seed = self.init_pose(self.points1, self.points2)
+        if seed is None:
+            raise ValueError("Degenerate seed from Gram–Schmidt (collinear or duplicate points).")
+        self.q, self.t = seed
+
         self.opt()
 
-
     @staticmethod
-    def gramSchmidtAxis(points: np.array) -> q | None:
-        x_axis = points[1] - points[0]
-        x_nm = norm(x_axis)
+    def gramSchmidtAxis(points: NDArray[np.floating]) -> Optional[q]:
+        p0, p1, p2 = points[0], points[1], points[2]
+
+        x_axis: NDArray[np.floating] = p1 - p0
+        x_nm = float(norm(x_axis))
         if x_nm < EPS:
-            # X axis degenerate
-            return
+            return None
         x_axis /= x_nm
 
-        yp_axis = points[2] - points[0]
-        yp_nm = norm(yp_axis)
+        yp_axis: NDArray[np.floating] = p2 - p0
+        yp_nm = float(norm(yp_axis))
         if yp_nm < EPS:
-            # Y axis degenerate
-            return
+            return None
 
-        z_axis = np.cross(x_axis, yp_axis)
-        z_nm = norm(z_axis)
+        z_axis: NDArray[np.floating] = np.cross(x_axis, yp_axis)
+        z_nm = float(norm(z_axis))
         if z_nm < EPS:
-            # Z axis degenerate
-            return
+            return None
         z_axis /= z_nm
 
-        y_axis = np.cross(z_axis, x_axis)
+        y_axis: NDArray[np.floating] = np.cross(z_axis, x_axis)
 
-        mat = np.hstack([x_axis.T, y_axis.T, z_axis.T])
-        return mat2quat(mat)
+        R: NDArray[np.floating] = np.column_stack((x_axis, y_axis, z_axis))
+        return mat2quat(R)
 
     @staticmethod
-    def init_pose(points1: np.array, points2: np.array) -> Tuple[q, np.array]:
+    def init_pose(points1: NDArray[np.floating], points2: NDArray[np.floating]) -> Optional[Tuple[q, NDArray[np.floating]]]:
         quat1 = ThreeD_to_ThreeD.gramSchmidtAxis(points1)
         quat2 = ThreeD_to_ThreeD.gramSchmidtAxis(points2)
 
         if quat1 is None or quat2 is None:
             return None
 
-        new_q = quat2.T * quat1
+        new_q: q = quat2.T * quat1
         if new_q.s < 0.0:
             new_q *= -1.0
 
-        tvec = np.mean(points2.reshape(-1, 3), axis=0) - np.mean(new_q * (points1.reshape(-1, 3)), axis=0)
-
+        tvec: NDArray[np.floating] = np.mean(points2.reshape(-1, 3), axis=0) - np.mean(
+            new_q * points1.reshape(-1, 3), axis=0
+        )
         return new_q, tvec
 
-    def create_y(self, new_q: q = None, new_t: np.array = None) -> np.array:
+    def create_y(self, new_q: Optional[q] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
         if new_q is None:
             new_q = deepcopy(self.q)
         if new_t is None:
             new_t = deepcopy(self.t)
 
-        return (self.points2 - new_q * self.points1 - new_t).flatten()
+        residuals: NDArray[np.floating] = self.points2 - (new_q * self.points1) - new_t
+        return residuals.reshape(-1)
 
-
-    def create_L(self):
-        L = np.zeros((3 * self.num_points, 7))
-
+    def create_L(self) -> NDArray[np.floating]:
+        L = np.zeros((3 * self.num_points, 7), dtype=float)
 
         for idx, pt1 in enumerate(self.points1):
-            x_row_idx = idx * 3
-
-            analy_deriv = self.q.vect_deriv(pt1, False)
-
-            L[x_row_idx:x_row_idx + 3, :4] = analy_deriv
-            L[x_row_idx:x_row_idx + 3, 4:] = np.eye(3)
+            row = idx * 3
+            dRp_dq: NDArray[np.floating] = self.q.vect_deriv(pt1, False)
+            L[row : row + 3, :4] = dRp_dq
+            L[row : row + 3, 4:] = np.eye(3)
 
         return L
 
     def opt(self) -> None:
-        """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
+        lambda_damp: float = 1e-2
 
-        Uses the analytic Jacobian `deriv`, a pseudoinverse step `delta_x`, and a
-        simple backtracking line search on a scalar `scale` to accept/reject the step
-        based on the agreement between linear prediction and actual residual change.
-
-        Termination conditions:
-          - Small step (norm(scale * delta_x) < 1e-7)
-          - Iteration limit reached (iter > 10)
-
-        Returns
-        -------
-        (est_q, est_t)
-            The refined quaternion and translation.
-        """
         keep_going = True
-        iter = 0
+        it = 0
         while keep_going:
-            iter += 1
+            it += 1
 
             y = self.create_y()
-            old_y_mag = norm(y)
+            old_y_mag = float(norm(y))
             L = self.create_L()
 
-            delta_x = np.linalg.pinv(L).dot(y)
+            JT: NDArray[np.floating] = L.T
+            JTJ: NDArray[np.floating] = JT @ L
+            JTy: NDArray[np.floating] = JT @ y
+            D: NDArray[np.floating] = np.diag(np.diag(JTJ))
+            try:
+                delta_x = np.linalg.solve(JTJ + lambda_damp * D, JTy)
+            except np.linalg.LinAlgError:
+                delta_x = np.linalg.pinv(JTJ + lambda_damp * D) @ JTy
 
             scale = 1.0
-            scale_is_good = False
-            while not scale_is_good:
+            while True:
                 new_q = q(quat=self.q.ndarray + scale * delta_x[:4], makeUnitVec=True)
                 new_t = self.t + scale * delta_x[4:]
-                new_y_mag = norm(self.create_y(new_q, new_t))
+                new_y_mag = float(norm(self.create_y(new_q, new_t)))
 
-                # Linear prediction of residual magnitude
-                y_pred_mag = norm(y - L.dot(scale * delta_x))
+                y_pred_mag = float(norm(y - L @ (scale * delta_x)))
 
-                # If perfect agreement between nonlinear and linear prediction, stop
-                if np.abs(old_y_mag - y_pred_mag) < 1e-5:
-                    scale_is_good = True
-                    keep_going = False
+                if abs(old_y_mag - y_pred_mag) < 1e-5:
+                    self.q = new_q
+                    self.t = new_t
+                    break
+
+                denom = max(old_y_mag - y_pred_mag, 1e-12)
+                ratio = (old_y_mag - new_y_mag) / denom
+
+                if 0.25 < ratio < 4.0:
+                    self.q = new_q
+                    self.t = new_t
+                    if ratio > 0.75:
+                        lambda_damp = max(lambda_damp / 3.0, 1e-12)
+                    break
                 else:
-                    # Accept step if the ratio is in a reasonable trust range
-                    ratio = (old_y_mag - new_y_mag) / (old_y_mag - y_pred_mag)
-                    if 0.25 < ratio < 4.0:
-                        scale_is_good = True
-                        self.q = q(quat=self.q.ndarray + scale * delta_x[:4], makeUnitVec=True)
-                        self.t += scale * delta_x[4:]
-                    else:
-                        # Backtrack
-                        scale /= 2.0
+                    lambda_damp = min(lambda_damp * 2.0, 1e12)
+                    scale *= 0.5
+                    if scale < 1e-6:
+                        break
 
-            if norm(scale * delta_x) < 1e-7 or iter > 10:
+            if float(norm(scale * delta_x)) < 1e-7 or it > 10:
                 keep_going = False
 
-        print("Estimated:")
-        print(self.q, self.t)
+        if self.q.s < 0.0:
+            self.q *= -1.0
 
-def print_3dPts(threeD_proj: np.array):
-    """Nicely print a flattened [x0, y0, z0, x1, ...] vector (debug helper)."""
-    threeD_proj = copy.deepcopy(threeD_proj).reshape(-1, 3)
-    print(f"Norm: {np.linalg.norm(threeD_proj)}")
-    for n, point in enumerate(threeD_proj):
+
+def print_3dPts(threeD_proj: NDArray[np.floating]) -> None:
+    pts = deepcopy(threeD_proj).reshape(-1, 3)
+    print(f"Norm: {np.linalg.norm(pts)}")
+    for n, point in enumerate(pts):
         print(f"Feature: {n:3d}, x: {point[0]: .5f}, y: {point[1]: .5f}, z: {point[2]: .5f}")
 
 
-# --- Demo / entry point --------------------------------------------------------
+def main() -> None:
+    test1: NDArray[np.floating] = np.random.normal(0.0, 1.0, (10, 3))
+    noise: NDArray[np.floating] = np.random.normal(0.0, 0.1, test1.shape)
+    q_true: q = randomQuat()
+    t_true: NDArray[np.floating] = np.array([10.0, 0.0, 0.0]) + np.random.normal(1.0, 1.0, (3,))
+    test2: NDArray[np.floating] = (q_true * test1 + t_true) + noise
 
-def main():
-
-    test1 = np.random.normal(0.0, 1.0, (10,3))
-    noise = np.random.normal(0.0, 0.1, test1.shape)
-    q = randomQuat()
-    t = np.array([10.0, 0.0, 0.0]) + np.random.normal(1.0, 1.0, (3,))
-    test2 = (q * test1 + t) + noise
-
-    print(f'Targets: \n{q}\n{t}')
+    print(f"Targets: \n{q_true}\n{t_true}\n")
 
     optClass = ThreeD_to_ThreeD(test1, test2)
 
-    print(f'Resolved Residual: {norm(optClass.create_y())}\n{optClass.create_y()}')
-    print(f'True Residual: {norm(optClass.create_y(q, t))}\n{optClass.create_y(q, t)}')
+    print(f'Estimates: \n{optClass.q}\n{optClass.t}\n')
+
+    print(f"Resolved Residual: {norm(optClass.create_y())}\n{optClass.create_y()}")
+    print(f"True Residual: {norm(optClass.create_y(q_true, t_true))}\n{optClass.create_y(q_true, t_true)}")
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

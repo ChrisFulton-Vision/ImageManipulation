@@ -28,9 +28,6 @@ Notes on conventions and signs:
 
 The code is written as an end-to-end script. Run directly to see a synthetic test
 with noisy measurements, the initializer results, and the final optimized pose.
-
-This file intentionally **does not change program behavior**; only documentation
-and comments were added for clarity.
 """
 
 from quaternions import Quaternion as q
@@ -405,7 +402,7 @@ def deriv(est_q: q, est_t: np.array):
     State ordering: x = [qs, qx, qy, qz, tx, ty, tz]^T  (7 parameters)
     Output ordering matches `h()`: [u0, v0, u1, v1, ...] (2N measurements).
 
-    This leverages the quaternion helper `est_q.T.vect_deriv(p, True)` which is
+    This leverages the quaternion helper `est_q.transpose_vec_deriv(p)` which is
     expected to produce d(X_cam)/dq for a model point `p`, already projected to
     the tangent space of unit quaternions (right-projected onto the constraint).
 
@@ -435,7 +432,7 @@ def deriv(est_q: q, est_t: np.array):
     # Loop over features to accumulate per-point analytic derivatives
     for idx, feature in enumerate(FEATURE_OFFSETS):
         # new_deriv is the 3x4 Jacobian d(X_cam)/d[q s qx qy qz] for this point
-        new_deriv = est_q.T.vect_deriv(feature, True)
+        new_deriv = est_q.transpose_vec_deriv(feature)
 
         dx_dqs, dx_dqx, dx_dqy, dx_dqz = new_deriv[0, :]
         dy_dqs, dy_dqx, dy_dqy, dy_dqz = new_deriv[1, :]
@@ -632,9 +629,9 @@ def main():
 
     # Diagnostics: compare residuals
     print("Final Residual: ")
-    print(print_rayPts(h(est_q, est_t) - meas_pix))
+    print_rayPts(h(est_q, est_t) - meas_pix)
     print("Optimal Residual: ")
-    print(print_rayPts(h(true_q, true_t) - meas_pix))
+    print_rayPts(h(true_q, true_t) - meas_pix)
 
     # Summary
     print("\n\nTrue:")

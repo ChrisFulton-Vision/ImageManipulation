@@ -257,7 +257,8 @@ class Quaternion:
         # q.vectDeriv(vec, False)
         # q.T.vectDeriv(vec, False) <= Invalid!
         # q.vectDeriv(vec, True) <= Invalid!
-        # q.T.vectDeriv(vec, True)
+        # q.T.vectDeriv(vec, True) ... Valid, but better is:
+        # q.transpose_vec_deriv(vec)
 
         '''
         This function returns the Jacobian in 3x4, presuming you are taking the partial derivative

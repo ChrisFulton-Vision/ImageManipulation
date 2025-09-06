@@ -902,7 +902,7 @@ class CameraGui():
         self.showWindow = True
         self.singleImageTextButton.configure(command=self.startStreamOff, text='Stop Displaying', fg_color=GREEN,
                                              hover_color='navy')
-        self.startStreamButton.configure(command=self.startStreamOff, text='Stop Streaming', fg_color=GREEN,
+        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=GREEN,
                                          hover_color='navy')
         self.multiImageTextButton.configure(command=self.startStreamOff, fg_color=GREEN, hover_color='navy')
 
@@ -917,8 +917,9 @@ class CameraGui():
         self.showWindow = False
 
     def startStreamOff(self):
+        cv2.waitKey(1)
 
-        if self.vc is not None:
+        if self.vc is not None and self.vc.isOpened():
             self.vc.release()
             self.vc = None
 
@@ -935,9 +936,9 @@ class CameraGui():
             self.showWindow = False
 
 
-        if self.t1 is not None:
-            self.t1.raise_exception()
-            self.t1.join()
+        # if self.t1 is not None:
+        #     self.t1.raise_exception()
+        #     self.t1.join()
 
         cv2.destroyAllWindows()
 
@@ -1089,12 +1090,15 @@ class CameraGui():
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
+        self.t1.raise_exception()
+        self.t1.join()
+
     def run_video_stream(self):
 
         self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
         self.vc.set(cv2.CAP_PROP_FPS, 60)
 
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         rval, self.curr_frame = self.vc.read()
         if rval:
@@ -1192,11 +1196,13 @@ class CameraGui():
         self.startStreamOff()
 
     def analyze_image(self, frame, img_time=None, name=None):
+        if frame is None:
+            return
 
         self.curr_frame_gray = None
 
         if self.calibration.validCal and self.camConfig.undistort:
-            self.undistort(frame)
+            self.undistort(frame.copy())
         else:
             self.curr_frame = frame.copy()
         self.markup_frame = self.curr_frame.copy()

@@ -31,14 +31,14 @@ class TruthPoints:
         # MOCAP 2025 Sept AprilTags
         self.truthPoints['3'] = np.array([-0.12710, -1.21415, -1.23755])
         self.truthPoints['5'] = np.array([0.70693, -1.90905, -0.70546])
-        self.truthPoints['8'] = np.array([1.38529, 2.16612, -1.24269])
+        self.truthPoints['8'] = np.array([1.38641, 2.16063, -1.22338])
         self.truthPoints['9'] = np.array([5.35155, -1.39477, 0.29776])
         self.truthPoints['13'] = np.array([1.98385, -0.65895, -1.24558])
-        self.truthPoints['15'] = np.array([3.14300, 1.31598, -0.78247])
+        self.truthPoints['15'] = np.array([3.14318, 1.31491, -0.78264])
         self.truthPoints['16'] = np.array([3.12187, 0.52254, -0.65637])
         self.truthPoints['18'] = np.array([3.49844, 0.51306, -0.23403])
         self.truthPoints['19'] = np.array([2.07009, -1.72274, -0.69668])
-        self.truthPoints['20'] = np.array([3.92250, -3.10489, 0.24589])
+        self.truthPoints['20'] = np.array([3.92248, -3.10489, 0.24576])
         self.truthPoints['21'] = np.array([3.12467, -0.07760, -1.24881])
         self.truthPoints['22'] = np.array([1.67668, -0.00762, -1.70942])
         self.truthPoints['23'] = np.array([2.16908, -1.33895, -0.46741])
@@ -60,6 +60,10 @@ class TruthPoints:
     def saveToCache(self):
         with open('LIDAR_Truth_Points.pkl', 'wb') as f:
             pickle.dump(self, f)
+            print(f'Saved as LIDAR_Truth_Points.pkl')
 
     def copy(self, classToCopy):
         self.__dict__.update(copy.deepcopy(classToCopy.__dict__))
+
+if __name__ == '__main__':
+    TruthPoints()

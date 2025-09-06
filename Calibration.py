@@ -55,7 +55,11 @@ class Calibration:
         self.scale = 1.0
 
     def getCameraMatrix(self):
-        if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None:
+        # Included for backwards compatibility
+        if not hasattr(self, "scale"):
+            self.scale = 1.0
+
+        if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None and self.scale is not None:
             fx = self.scale * self.fx
             fy = self.scale * self.fy
             cx = self.scale * (self.cx + 0.5) - 0.5

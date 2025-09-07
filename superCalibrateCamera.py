@@ -240,7 +240,8 @@ class CameraConfig():
         self.cam_index = 0
         self.detectTags = False
         self.undistort = False
-        self.projectLidarPoints = False
+        self.pnpLidarPoints = False
+        self.qnpLidarPoints = False
         self.yoloInference = False
         self.secondsBetweenImages = 1.0
         self.recording = False
@@ -752,13 +753,23 @@ class CameraGui():
         self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        projectLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='Project Lidar Points into Image')
-        if self.camConfig.projectLidarPoints is False:
-            projectLidarPoints.deselect()
+        pnpLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='SolvePnP LiDAR Into Image')
+        if self.camConfig.pnpLidarPoints is False:
+            pnpLidarPoints.deselect()
         else:
-            projectLidarPoints.select()
-        projectLidarPoints.configure(command=self.toggleLidarPoints)
-        projectLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+            pnpLidarPoints.select()
+        pnpLidarPoints.configure(command=self.togglePnpLidarPoints)
+        pnpLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        qnpLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='SolveQnP LiDAR Into Image')
+        if self.camConfig.qnpLidarPoints is False:
+            qnpLidarPoints.deselect()
+        else:
+            qnpLidarPoints.select()
+        qnpLidarPoints.configure(command=self.toggleQnpLidarPoints)
+        qnpLidarPoints.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
 
         # yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image')
         if self.camConfig.yoloInference is False:
@@ -957,8 +968,12 @@ class CameraGui():
                                     command=self.recordOn)
         self.recording = False
 
-    def toggleLidarPoints(self):
-        self.camConfig.projectLidarPoints = not self.camConfig.projectLidarPoints
+    def togglePnpLidarPoints(self):
+        self.camConfig.pnpLidarPoints = not self.camConfig.pnpLidarPoints
+        self.saveToCache()
+
+    def toggleQnpLidarPoints(self):
+        self.camConfig.qnpLidarPoints = not self.camConfig.qnpLidarPoints
         self.saveToCache()
 
     def toggleYoloInference(self):
@@ -1222,8 +1237,11 @@ class CameraGui():
         if self.detector is not None:
             self.detectAprilTags()
 
-        if self.camConfig.projectLidarPoints and self.detector is not None:
-            self.projectLidarPoints()
+        if self.camConfig.pnpLidarPoints and self.detector is not None:
+            self.pnpLidarPoints()
+
+        if self.camConfig.qnpLidarPoints and self.detector is not None:
+            self.qnpLidarPoints()
 
         if self.camConfig.detect_horizon:
             self.detectHorizon()
@@ -1577,7 +1595,7 @@ class CameraGui():
             else:
                 self.centers = np.vstack((self.centers, np.array(pixCenter).astype('float32')))
 
-    def projectLidarPoints(self):
+    def pnpLidarPoints(self):
 
         ret = False
         if self.centers is not None and len(self.centers) >= 6:
@@ -1592,15 +1610,16 @@ class CameraGui():
                 except KeyError as e:
                     removeIDs.append(idx)
 
+            centers = self.centers.copy()
             for id in reversed(removeIDs):
-                self.centers = np.delete(self.centers, id, axis=0)
+                centers = np.delete(centers, id, axis=0)
             points = np.array(points)
 
             if len(points) < 6:
                 return
 
             ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
-                                           imagePoints=self.centers,
+                                           imagePoints=centers,
                                            cameraMatrix=self.calibration.getCameraMatrix(),
                                            distCoeffs=distParams,
                                            flags=cv2.SOLVEPNP_ITERATIVE)
@@ -1624,8 +1643,7 @@ class CameraGui():
                                                     [1., 0., 0.],
                                                     [0., 1., 0.]], float))
 
-                quat, vect = solveQnP(points, self.centers, self.calibration.fx, self.calibration.fy,
-                                      self.calibration.cx, self.calibration.cy, None, q_aftr_from_cv * quatPnP, (q_aftr_from_cv * quatPnP) * -vectPnP)
+                quat, vect = solveQnP(points, centers, self.calibration, None) #, q_aftr_from_cv * quatPnP, (q_aftr_from_cv * quatPnP) * -vectPnP)
 
 
                 xyz_proj = quat * points + vect
@@ -1633,33 +1651,75 @@ class CameraGui():
                 us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
                 us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
                 us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
-                self.plotOnImg(us_vs_s_proj.astype(int),
-                               list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
 
-                print(f'QuatPnP:           {quatPnP}')
-                print(f'MySol in cv frame: {(q_aftr_from_cv.T * quat).force_s_pos}')
-                print(f'AngleBetween(deg): {(q_aftr_from_cv.T * quat).angle_betweenD(quatPnP)}')
-                print(f'PnP in my frame: {q_aftr_from_cv * quatPnP}')
-                print(f'MySol:           {quat}')
-                print(f'AngleBetween(deg): {(q_aftr_from_cv * quatPnP).angle_betweenD(quat)}')
+                # print(f'QuatPnP:           {quatPnP}')
+                # print(f'MySol in cv frame: {(q_aftr_from_cv.T * quat).force_s_pos}')
+                # print(f'AngleBetween(deg): {(q_aftr_from_cv.T * quat).angle_betweenD(quatPnP)}')
+                # print(f'PnP in my frame: {q_aftr_from_cv * quatPnP}')
+                # print(f'MySol:           {quat}')
+                # print(f'AngleBetween(deg): {(q_aftr_from_cv * quatPnP).angle_betweenD(quat)}')
+                #
+                # print(vectPnP)
+                # print(quat * -vect)
+                # print()
 
-                print(vectPnP)
-                print(quat * -vect)
-                print()
-                c_R, _ = cv2.Rodrigues(rvec)
-
-
-                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format( quat, 'ijk.6f'), (50, 75), cv2.FONT_HERSHEY_DUPLEX, 2,
+                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(q_aftr_from_cv * quatPnP, 'ijk.6f'), (50, 75),
+                            cv2.FONT_HERSHEY_DUPLEX, 2,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 150), cv2.FONT_HERSHEY_DUPLEX, 2,
+                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((vectPnP))),
+                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, 2,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
 
-        if self.projectProbe is not None and self.camConfig.projectLidarPoints:
-            cv2.circle(self.markup_frame, self.projectProbe[0, 0, :].astype(int), 6, (255, 0, 0), 6)
-            cv2.putText(self.markup_frame, "Probe Tip", self.projectProbe[0, 0, :].astype(int) - [50, 50],
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
+
+        # if self.projectProbe is not None and self.camConfig.projectLidarPoints:
+        #     cv2.circle(self.markup_frame, self.projectProbe[0, 0, :].astype(int), 6, (255, 0, 0), 6)
+        #     cv2.putText(self.markup_frame, "Probe Tip", self.projectProbe[0, 0, :].astype(int) - [50, 50],
+        #                 cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
+    def qnpLidarPoints(self):
+
+        ret = False
+        if self.centers is not None and len(self.centers) >= 6:
+            truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
+
+            points = []
+            distParams = np.zeros((5,))  # use image undistort instead
+
+            removeIDs = []
+            for idx, detectID in enumerate(self.detectIDS):
+                try:
+                    points.append(truthPoints[str(detectID[0])])
+                except KeyError as e:
+                    removeIDs.append(idx)
+
+            centers = self.centers.copy()
+            for id in reversed(removeIDs):
+                centers = np.delete(centers, id, axis=0)
+            points = np.array(points)
+
+            if len(points) < 6:
+                return
+
+            quat, vect = solveQnP(points, centers, self.calibration, None)
+
+            xyz_proj = quat * self.lidarTruthPoints.getTruthPointsNumpy() + vect
+
+            us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
+            us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
+            us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
+
+            self.plotOnImg(us_vs_s_proj.astype(int),
+                           list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
+
+
+
+            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format( quat, 'ijk.6f'), (50, 225), cv2.FONT_HERSHEY_DUPLEX, 2,
+                        (255, 255, 0), 3,
+                        cv2.LINE_AA)
+            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 300), cv2.FONT_HERSHEY_DUPLEX, 2,
+                        (255, 255, 0), 3,
+                        cv2.LINE_AA)
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):

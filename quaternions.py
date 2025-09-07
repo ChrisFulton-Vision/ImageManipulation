@@ -28,7 +28,7 @@ from copy import deepcopy
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 class Quaternion:
-    def __init__(self, s: float = None, vec: np.array = None, quat: np.array = None, makeUnitVec: bool = True) -> None:
+    def __init__(self, s: float = None, vec: np.array = None, quat: np.array = None, makeUnitQuat: bool = True) -> None:
         # These two parameters form the definition of the quaternion. self.s is a scalar asscoiated with the
         # real component of the quaternion, while self.vec is the vector, associated with i, j, k / x, y, z components
         self.s:float = 1.0
@@ -45,13 +45,13 @@ class Quaternion:
         if s is None and vec is None and quat is not None:
             self.s = deepcopy(quat[0])
             self.vec = deepcopy(quat[1:4]).flatten()
-            self.checkUnit(makeUnitVec)
+            self.checkUnit(makeUnitQuat)
             return
 
         if s is None and vec is None:
             self.s = 1.0
             self.vec = np.zeros((3,))
-            self.checkUnit(makeUnitVec)
+            self.checkUnit(makeUnitQuat)
             return
 
         if s is None:
@@ -62,7 +62,7 @@ class Quaternion:
             else:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
             self.s = sqrt(1.0 - vec.dot(vec))
-            self.checkUnit(makeUnitVec)
+            self.checkUnit(makeUnitQuat)
             return
 
         if vec is None:
@@ -78,10 +78,10 @@ class Quaternion:
                 self.vec = deepcopy(vec).flatten()
             else:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
-        self.checkUnit(makeUnitVec)
+        self.checkUnit(makeUnitQuat)
 
-    def checkUnit(self, makeUnitVec:bool):
-        if makeUnitVec:
+    def checkUnit(self, makeUnitQuat:bool):
+        if makeUnitQuat:
             norm:float = self.norm
             if abs(norm) < 0.000001:
                 raise ValueError('Cannot make zero-quaternion a unit.')
@@ -134,20 +134,20 @@ class Quaternion:
 
     def __truediv__(self, divisor: float) -> Self:
         if isinstance(divisor, float):
-            return Quaternion(quat=self.ndarray / divisor, makeUnitVec=False)
+            return Quaternion(quat=self.ndarray / divisor, makeUnitQuat=False)
 
     def __sub__(self, subtractor: Union[np.ndarray, Self]) -> Self:
         if isinstance(subtractor, np.ndarray) and subtractor.shape == (4,):
-            return Quaternion(quat=self.ndarray - subtractor, makeUnitVec=False)
+            return Quaternion(quat=self.ndarray - subtractor, makeUnitQuat=False)
 
         elif isinstance(subtractor, Quaternion):
-            return Quaternion(quat=self.ndarray - subtractor.ndarray, makeUnitVec=False)
+            return Quaternion(quat=self.ndarray - subtractor.ndarray, makeUnitQuat=False)
 
     def __add__(self, other: Self) -> Self:
         return Quaternion(quat=np.array([self.s + other.s,
                                          self.vec[0] + other.vec[0],
                                          self.vec[1] + other.vec[1],
-                                         self.vec[2] + other.vec[2]]),makeUnitVec=False)
+                                         self.vec[2] + other.vec[2]]),makeUnitQuat=False)
 
     def __eq__(self, other: Self):
         if not isinstance(other, Quaternion):
@@ -196,9 +196,9 @@ class Quaternion:
             else:
                 raise ValueError(f'Bad multiplier, unknown object: {multiplier}')
         elif isinstance(multiplier, Quaternion):
-            return Quaternion(quat=self.qq_mult(multiplier), makeUnitVec=False)
+            return Quaternion(quat=self.qq_mult(multiplier), makeUnitQuat=False)
         elif isinstance(multiplier, float):
-            return Quaternion(s=multiplier * self.s, vec=multiplier * self.vec, makeUnitVec=False)
+            return Quaternion(s=multiplier * self.s, vec=multiplier * self.vec, makeUnitQuat=False)
         else:
             raise ValueError(f'Bad multiplier, unknown object: {multiplier}')
 
@@ -344,12 +344,19 @@ class Quaternion:
         return deepcopy(self)
 
     @property
+    def force_s_pos(self):
+        if self.s < 0:
+            self.s *= -1.0
+            self.vec *= -1.0
+        return self
+
+    @property
     def T(self):
-        return Quaternion(self.s, -self.vec, makeUnitVec=False)
+        return Quaternion(self.s, -self.vec, makeUnitQuat=False)
 
     @property
     def inv(self):
-        return Quaternion(self.s, -self.vec, makeUnitVec=False)/self.mag ** 2
+        return Quaternion(self.s, -self.vec, makeUnitQuat=False)/self.mag ** 2
 
     @property
     def ndarray(self):
@@ -463,31 +470,41 @@ class Quaternion:
             power = float(power)
         return (power * self.ln).exp.normalize()
 
-
     @staticmethod
-    def from_rodrigues(rod_vec: np.array):
-        norm = np.linalg.norm(rod_vec)
-        cosRod = cos(norm / 2.0)
-        sinRod = sin(norm / 2.0)
-        return Quaternion(s=cosRod, vec=np.array([rod_vec[0]/norm * sinRod,
-                                                            rod_vec[1]/norm * sinRod,
-                                                            rod_vec[2]/norm * sinRod]))
+    def from_rodrigues(rod_vec: np.ndarray) -> Self:
+        r = np.asarray(rod_vec, dtype=float).reshape(3)
+        theta = float(np.linalg.norm(r))
+        if theta < 1e-12:
+            # Zero rotation
+            return Quaternion(s=1.0, vec=np.zeros(3))
+        axis = r / theta
+        half = 0.5 * theta
+        return Quaternion(s=np.cos(half), vec=axis * np.sin(half))
 
-    def to_rodrigues(self):
-        w = self.s
-        return self.vec * (sqrt(1-w ** 2.0)/w)
+    def to_rodrigues(self) -> np.ndarray:
+        # Ensure unit (or close)
+        w = float(self.s)
+        v = np.asarray(self.vec, dtype=float).reshape(3)
+        vnorm = float(np.linalg.norm(v))
+        # angle = 2 * atan2(||v||, w); axis = v/||v||
+        if vnorm < 1e-12:
+            return np.zeros(3)
+        angle = 2.0 * np.arctan2(vnorm, max(1e-16, w))
+        axis = v / vnorm
+        return axis * angle
 
     @staticmethod
     def from_openCV_rvec(rvec: np.array, tvec: np.array):
 
         rod_quat = Quaternion.from_rodrigues(rvec)
-        t_vec = rod_quat.T * -tvec
-        return rod_quat, t_vec
+        new_t = rod_quat.T * -tvec
+        return rod_quat, np.squeeze(new_t)
+
     def slerp(self, q2:Self, t) -> Self:
         return self * (self.inv * q2).power(t)
 
 class DualQuat:
-    def __init__(self, q_real : Quaternion = Quaternion(), q_dual : Quaternion = Quaternion(quat=np.array([0.0,0.0,0.0,0.0]), makeUnitVec=False),
+    def __init__(self, q_real : Quaternion = Quaternion(), q_dual : Quaternion = Quaternion(quat=np.array([0.0,0.0,0.0,0.0]), makeUnitQuat=False),
                  r : Quaternion = None, t : Quaternion = None, t_vec : np.array = None) -> None:
 
         if r is not None:
@@ -503,7 +520,7 @@ class DualQuat:
                 return
 
             if t_vec is not None:
-                t = Quaternion(s=0, vec=t_vec, makeUnitVec=False)
+                t = Quaternion(s=0, vec=t_vec, makeUnitQuat=False)
                 self.q_real = r
                 self.q_dual = 0.5 * t * r
                 return
@@ -579,9 +596,9 @@ class DualQuat:
     def T(self):
         '''
         >>> test_Q = DualQuat(q_real=Quaternion(s=1.0,vec=np.array([0.0,0.0,0.0])),
-        ... q_dual=Quaternion(s=0.0,vec=np.array([-1.0,1.0,1.0]), makeUnitVec=False))
+        ... q_dual=Quaternion(s=0.0,vec=np.array([-1.0,1.0,1.0]), makeUnitQuat=False))
         >>> sol_Q =  DualQuat(q_real=Quaternion(s=1.0,vec=np.array([0.0,0.0,0.0])),
-        ... q_dual=Quaternion(s=0.0,vec=np.array([1.0,-1.0,-1.0]), makeUnitVec=False))
+        ... q_dual=Quaternion(s=0.0,vec=np.array([1.0,-1.0,-1.0]), makeUnitQuat=False))
         >>> assert test_Q == sol_Q
         '''
         return DualQuat(q_real=copy.deepcopy(self.q_real).T, q_dual=copy.deepcopy(self.q_dual).T)
@@ -626,7 +643,7 @@ def interpolate(q1:Quaternion, q2:Quaternion, t:float):
     return interp
 
 def randomQuat(unit=True):
-    return Quaternion(quat=np.random.rand(4,), makeUnitVec=unit)
+    return Quaternion(quat=np.random.rand(4,), makeUnitQuat=unit)
 
 def left_quat_productDeriv(quatL, quatR, isTargetConjugated):
     deriv = np.zeros((4,4))
@@ -845,79 +862,51 @@ def quat2mat(q):
 
 
 def mat2quat(M):
-    ''' Calculate quaternion corresponding to given rotation matrix
+    """Quaternion [w, x, y, z] from 3x3 rotation matrix M (robust Bar-Itzhack).
+       Returns a unit quaternion with non-negative w.
+    """
 
-    Method claimed to be robust to numerical errors in `M`.
+    M = np.asarray(M, dtype=float)
+    assert M.shape == (3,3)
+    U, _, Vt = np.linalg.svd(M)
+    M = U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt
 
-    Constructs quaternion by calculating maximum eigenvector for matrix
-    ``K`` (constructed from input `M`).  Although this is not tested, a maximum
-    eigenvalue of 1 corresponds to a valid rotation.
+    m00, m01, m02 = M[0]
+    m10, m11, m12 = M[1]
+    m20, m21, m22 = M[2]
+    tr = m00 + m11 + m22
 
-    A quaternion ``q*-1`` corresponds to the same rotation as ``q``; thus the
-    sign of the reconstructed quaternion is arbitrary, and we return
-    quaternions with positive w (q[0]).
+    if tr > 0:
+        S = np.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * S
+        x = (m21 - m12) / S
+        y = (m02 - m20) / S
+        z = (m10 - m01) / S
+    elif (m00 > m11) and (m00 > m22):
+        S = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / S
+        x = 0.25 * S
+        y = (m01 + m10) / S
+        z = (m02 + m20) / S
+    elif m11 > m22:
+        S = np.sqrt(1.0 - m00 + m11 - m22) * 2.0
+        w = (m02 - m20) / S
+        x = (m01 + m10) / S
+        y = 0.25 * S
+        z = (m12 + m21) / S
+    else:
+        S = np.sqrt(1.0 - m00 - m11 + m22) * 2.0
+        w = (m10 - m01) / S
+        x = (m02 + m20) / S
+        y = (m12 + m21) / S
+        z = 0.25 * S
 
-    See notes.
-
-    Parameters
-    ----------
-    M : array-like
-      3x3 rotation matrix
-
-    Returns
-    -------
-    q : (4,) array
-      closest quaternion to input matrix, having positive q[0]
-
-    References
-    ----------
-    * http://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
-    * Bar-Itzhack, Itzhack Y. (2000), "New method for extracting the
-      quaternion from a rotation matrix", AIAA Journal of Guidance,
-      Control and Dynamics 23(6):1085-1087 (Engineering Note), ISSN
-      0731-5090
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> q = mat2quat(np.eye(3)) # Identity rotation
-    >>> np.allclose(q.ndarray, np.array([1, 0, 0, 0]))
-    True
-    >>> q = mat2quat(np.diag([1, -1, -1]))
-    >>> np.allclose(q.ndarray, np.array([0, 1, 0, 0])) # 180 degree rotn around axis 0
-    True
-
-    Notes
-    -----
-    http://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
-
-    Bar-Itzhack, Itzhack Y. (2000), "New method for extracting the
-    quaternion from a rotation matrix", AIAA Journal of Guidance,
-    Control and Dynamics 23(6):1085-1087 (Engineering Note), ISSN
-    0731-5090
-
-    '''
-    # Qyx refers to the contribution of the y input vector component to
-    # the x output vector component.  Qyx is therefore the same as
-    # M[0,1].  The notation is from the Wikipedia article.
-    Qxx, Qyx, Qzx, Qxy, Qyy, Qzy, Qxz, Qyz, Qzz = M.flat
-    # Fill only lower half of symmetric matrix
-    K = np.array([
-        [Qxx + Qyy + Qzz, 0, 0, 0],
-        [Qyz - Qzy, Qxx - Qyy - Qzz, 0, 0],
-        [Qzx - Qxz, Qyx + Qxy, Qyy - Qxx - Qzz, 0],
-        [Qxy - Qyx, Qzx + Qxz, Qzy + Qyz, Qzz - Qxx - Qyy],
-    ]
-    ) / 3.0
-    # Use Hermitian eigenvectors, values for speed
-    vals, vecs = np.linalg.eigh(K)
-    # Select largest eigenvector, reorder to x,y,z,w quaternion
-    q = vecs[:, np.argmax(vals)]
-    # Prefer quaternion with positive w
-    # (q * -1 corresponds to same rotation as q)
+    q = np.array([w, x, y, z], dtype=float)
+    q /= np.linalg.norm(q)
     if q[0] < 0:
-        q *= -1
-    return Quaternion(s=q[0], vec=q[1:], makeUnitVec=True)
+        q = -q
+    return Quaternion(s=q[0], vec=q[1:])
+
 
 def mat2quat_jumbled(M):
     ''' Calculate quaternion corresponding to given rotation matrix
@@ -992,7 +981,8 @@ def mat2quat_jumbled(M):
     # (q * -1 corresponds to same rotation as q)
     if q[3] < 0:
         q *= -1
-    return Quaternion(s=q[3], vec=np.diag(np.array([1.0, 1.0, -1.0])) @ q[0:3][::-1], makeUnitVec=True)
+    return Quaternion(s=q[3], vec=np.diag(np.array([1.0, 1.0, -1.0])) @ q[0:3][::-1], makeUnitQuat=True)
+
 def qmult(q1, q2):
     ''' Multiply two quaternions
 

@@ -1620,33 +1620,39 @@ class CameraGui():
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
                 quatPnP, vectPnP = q.from_openCV_rvec(rvec, tvec)
-                vectPnP = np.squeeze(vectPnP)
-                S_MODEL = np.eye(3)
-                S_MODEL[1,1] = -1.0
-                quat, vect = solveQnP((S_MODEL @ points.T ).T, self.centers, self.calibration.fx, self.calibration.fy,
-                                      self.calibration.cx, self.calibration.cy, None, quatPnP, vectPnP)
+                q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
+                                                    [1., 0., 0.],
+                                                    [0., 1., 0.]], float))
 
-                xyz_proj = quat.T * (S_MODEL @ points.T).T + vect
+                quat, vect = solveQnP(points, self.centers, self.calibration.fx, self.calibration.fy,
+                                      self.calibration.cx, self.calibration.cy, None, q_aftr_from_cv * quatPnP, (q_aftr_from_cv * quatPnP) * -vectPnP)
+
+
+                xyz_proj = quat * points + vect
 
                 us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-                us_vs_s_proj[:, 0] = self.calibration.fx * -xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
+                us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
                 us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
                 self.plotOnImg(us_vs_s_proj.astype(int),
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
 
-                test = np.array([[1.0, 0.0, 0.0],[0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
-                quatCV = test @ cv2.Rodrigues(rvec)[0]
-                print(mat2quat(quatCV))
-                print(quatPnP, '\n', vectPnP)
-                print(S_MODEL @ (quat * -vect))
+                print(f'QuatPnP:           {quatPnP}')
+                print(f'MySol in cv frame: {(q_aftr_from_cv.T * quat).force_s_pos}')
+                print(f'AngleBetween(deg): {(q_aftr_from_cv.T * quat).angle_betweenD(quatPnP)}')
+                print(f'PnP in my frame: {q_aftr_from_cv * quatPnP}')
+                print(f'MySol:           {quat}')
+                print(f'AngleBetween(deg): {(q_aftr_from_cv * quatPnP).angle_betweenD(quat)}')
+
+                print(vectPnP)
+                print(quat * -vect)
                 print()
                 c_R, _ = cv2.Rodrigues(rvec)
 
 
-                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 75), cv2.FONT_HERSHEY_DUPLEX, 2,
+                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format( quat, 'ijk.6f'), (50, 75), cv2.FONT_HERSHEY_DUPLEX, 2,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze(vect)), (50, 150), cv2.FONT_HERSHEY_DUPLEX, 2,
+                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 150), cv2.FONT_HERSHEY_DUPLEX, 2,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
 

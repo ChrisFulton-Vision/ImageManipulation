@@ -89,14 +89,11 @@ INTRINSIC = np.array([[0.0, 0.0, 1.0], [FX, 0.0, CX], [0.0, FY, CY]])
 # OpenCV:      u = FX*(Xc/Zc)+CX, v = FY*(Yc/Zc)+CY
 # The axis map that matches the pixel equations is:
 #   [Xc, Yc, Zc]^T = C * [x, y, z]^T with C below (det = -1).
-C_OURS_TO_CV = np.array([[0., -1., 0.],
+C_OURS_TO_CV = np.array([[0., 1., 0.],
                          [0., 0., 1.],
                          [1., 0., 0.]], dtype=float)
 C_CV_TO_OURS = C_OURS_TO_CV.T
 
-# To keep rotations proper (det=+1) through the bridge, reflect the model once
-# on the OpenCV side. This is NOT seeding; it's a static coordinate conversion.
-S_MODEL = np.diag([1., -1., 1.])  # det = -1
 
 K_CV = np.array([[FX, 0., CX],
                  [0., FY, CY],
@@ -106,7 +103,7 @@ DIST_COEFFS = np.zeros(5, dtype=float)
 
 def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
     """Convert OpenCV camera pose to your convention (proper rotation)."""
-    R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
+    R_ours = C_CV_TO_OURS @ R_cv
     t_ours = C_CV_TO_OURS @ t_cv
     return mat2quat(R_ours.T), t_ours
 
@@ -130,7 +127,7 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
     """
     # Prep data in OpenCV's model/camera convention (handedness-safe bridge)
     img = image_points_flat.reshape(-1, 2).astype(np.float64)
-    obj_cv = (S_MODEL @ object_points.T).T.astype(np.float64)
+    obj_cv = object_points
 
     def pos_depth_frac(R_cv: np.ndarray, t_cv: np.ndarray) -> float:
         # Z in OpenCV camera frame
@@ -213,7 +210,7 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
     No seeding from your pipeline.
     """
     img = image_points_flat.reshape(-1, 2).astype(np.float64)
-    obj_cv = (S_MODEL @ object_points.T).T.astype(np.float64)
+    obj_cv = object_points
 
     ok, rvec, tvec, inliers = cv2.solvePnPRansac(
         objectPoints=obj_cv,
@@ -396,7 +393,7 @@ def h(est_q: q, est_t: np.array, feature_points, fx, fy, cx, cy):
     """
     xyz_proj = est_q.T * feature_points + est_t
     us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-    us_vs_s_proj[:, 0] = fx * -xyz_proj[:, 1] / xyz_proj[:, 0] + cx
+    us_vs_s_proj[:, 0] = fx * xyz_proj[:, 1] / xyz_proj[:, 0] + cx
     us_vs_s_proj[:, 1] = fy * xyz_proj[:, 2] / xyz_proj[:, 0] + cy
 
     return us_vs_s_proj.flatten()
@@ -454,8 +451,8 @@ def deriv(est_q: q, est_t: np.array, feature_points=FEATURE_OFFSETS,
         # Projection partials for u, v with respect to x, y, z at this point
         #   u = FX * ( -y / x ) + CX =>  du/dy = -FX / x, du/dx = FX * y / x^2
         #   v = FY * (  z / x ) + CY =>  dv/dz =  FY / x, dv/dx = -FY * z / x^2
-        du_dy = -fx / x_hat[idx]
-        du_dx = fx * y_hat[idx] / sq(x_hat[idx])
+        du_dy = fx / x_hat[idx]
+        du_dx = -fx * y_hat[idx] / sq(x_hat[idx])
         dv_dz = fy / x_hat[idx]
         dv_dx = -fy * z_hat[idx] / sq(x_hat[idx])
 
@@ -589,15 +586,13 @@ def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array =
 def solveQnP(object_pts, img_pts, fx, fy, cx, cy, sigma_squared=None, test_q=None, test_t=None):
     img_pts = deepcopy(img_pts).flatten()
     init_q, init_t = init_pose_wahba(object_pts, img_pts, fx, fy, cx, cy)
-    print(f'Init: {init_q}, {init_t}')
     est_q, est_t = opt(init_q, init_t, img_pts, sigma_squared, object_pts, fx, fy, cx, cy)
     print(f'Init Val: {norm(img_pts - h(init_q, init_t, object_pts, fx, fy, cx, cy))}')
-    print(f'Est: {est_q}, {est_t}')
     print(f'Est Val: {norm(img_pts - h(est_q, est_t, object_pts, fx, fy, cx, cy))}')
-    print(f'Mod Val: {norm(img_pts - h(est_q, est_t * 0.5, object_pts, fx, fy, cx, cy))}')
     if test_q is not None and test_t is not None:
         print(f'Test Val: {norm(img_pts - h(test_q, test_t, object_pts, fx, fy, cx, cy))}')
         print()
+    est_q.force_s_pos
     return est_q, est_t
 
 
@@ -616,7 +611,7 @@ def main():
     true_t = np.array([20.0, 0.0, 0.0])
 
     # Ideal projections of model features
-    orig_meas_pix = h(true_q, true_t)
+    orig_meas_pix = h(true_q, true_t, FEATURE_OFFSETS, FX, FY, CX, CY)
 
     print("True Location in pixel space")
     print_rayPts(orig_meas_pix)
@@ -654,9 +649,9 @@ def main():
 
     # Diagnostics: compare residuals
     print("Final Residual: ")
-    print_rayPts(h(est_q, est_t) - meas_pix)
+    print_rayPts(h(est_q, est_t, FEATURE_OFFSETS, FX, FY, CX, CY) - meas_pix)
     print("Optimal Residual: ")
-    print_rayPts(h(true_q, true_t) - meas_pix)
+    print_rayPts(h(true_q, true_t, FEATURE_OFFSETS, FX, FY, CX, CY) - meas_pix)
 
     # Summary
     print("\n\nTrue:")

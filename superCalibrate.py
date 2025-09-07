@@ -1253,8 +1253,8 @@ class FrontEndGui(ctk.CTk):
 
     def findChessboardCorners(self, imgClass, showImage=True, updateImageFrame=False):
 
-        # if imgClass.imgPts is not None:
-        #     return  # Already have points for this image
+        if imgClass.imgPts is not None and not showImage:
+            return  # Already have points for this image
 
         img = cv2.imread(join(self.filepath, imgClass.imageName))
 
@@ -1289,6 +1289,9 @@ class FrontEndGui(ctk.CTk):
             gray = inv_img
         else:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        if imgClass.imgPts is not None and showImage:
+            self.drawImagePoints(imgClass, img, gray)
 
         if self.imageConfig.calMode == CalibrationType.Chessboard:
             ret, corners = cv2.findChessboardCorners(gray,
@@ -1329,35 +1332,39 @@ class FrontEndGui(ctk.CTk):
         self.saveToCache()
 
         if showImage:
-            if imgClass.imgPts is not None:
-                # Draw and display the corners
-                img = cv2.drawChessboardCorners(img,
-                                                (self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H),
-                                                imgClass.imgPts, True)
+            self.drawImagePoints(imgClass, img, gray)
 
-                min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
-                max_X = min(int(np.max(imgClass.imgPts[:, 0, 0] + 100)), img.shape[1])
-                min_Y = max(int(np.min(imgClass.imgPts[:, :, 1] - 100)), 0)
-                max_Y = min(int(np.max(imgClass.imgPts[:, :, 1] + 100)), img.shape[0])
 
-                roi = img[min_Y:max_Y, min_X:max_X, :]
+    def drawImagePoints(self, imgClass, img, gray):
+        if imgClass.imgPts is not None:
+            # Draw and display the corners
+            img = cv2.drawChessboardCorners(img,
+                                            (
+                                            self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H),
+                                            imgClass.imgPts, True)
 
-                cv2.imshow('Chessboard Corners Detected', roi)
-                cv2.waitKey(0)
-            else:
-                imgClass.imgPts = None
-                imgClass.objPts = None
-                imgClass.include = False
+            min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
+            max_X = min(int(np.max(imgClass.imgPts[:, 0, 0] + 100)), img.shape[1])
+            min_Y = max(int(np.min(imgClass.imgPts[:, :, 1] - 100)), 0)
+            max_Y = min(int(np.max(imgClass.imgPts[:, :, 1] + 100)), img.shape[0])
 
-                if showImage:
-                    h, w = gray.shape
-                    # if h > 1080 or w > 1080:
-                    #     scale = max(h / 1080, w / 1080) * 1.1
-                    #     gray = cv2.resize(gray, (int(w / scale), int(h / scale)))
-                    dispImg = cv2.resize(gray, (int(w * self.scale), int(h * self.scale)))
-                    cv2.imshow('NO CHESSBOARD CORNERS FOUND', dispImg)
-                    cv2.waitKey(0)
-                    cv2.destroyAllWindows()
+            roi = img[min_Y:max_Y, min_X:max_X, :]
+
+            cv2.imshow('Chessboard Corners Detected', roi)
+            cv2.waitKey(0)
+        else:
+            imgClass.imgPts = None
+            imgClass.objPts = None
+            imgClass.include = False
+
+            h, w = gray.shape
+            # if h > 1080 or w > 1080:
+            #     scale = max(h / 1080, w / 1080) * 1.1
+            #     gray = cv2.resize(gray, (int(w / scale), int(h / scale)))
+            dispImg = cv2.resize(gray, (int(w * self.scale), int(h * self.scale)))
+            cv2.imshow('NO CHESSBOARD CORNERS FOUND', dispImg)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
     def findIndexGivenImageName(self, name):
         sol_idx = None

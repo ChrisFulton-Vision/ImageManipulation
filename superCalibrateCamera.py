@@ -15,6 +15,7 @@ from AttitudeInterpreter import AttitudeReader as AttRdr
 from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
 from quaternions import Quaternion as q
 from quaternions import *
+from TwoD_to_ThreeD import solveQnP
 
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
@@ -872,7 +873,12 @@ class CameraGui():
     def shutdown(self):
         self.shutting_down = True
         self.recordOff()
-        self.startStreamOff()
+        self.startStreamOffBool()
+
+        # check to make sure window is closed
+        # trying to shut down while window is open causes crash
+        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
+            time.sleep(1)
 
     def releaseCamReturnToMain(self):
         self.startStreamOffBool()
@@ -900,11 +906,11 @@ class CameraGui():
 
     def startStreamOn(self):
         self.showWindow = True
-        self.singleImageTextButton.configure(command=self.startStreamOff, text='Stop Displaying', fg_color=GREEN,
+        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying', fg_color=GREEN,
                                              hover_color='navy')
         self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=GREEN,
                                          hover_color='navy')
-        self.multiImageTextButton.configure(command=self.startStreamOff, fg_color=GREEN, hover_color='navy')
+        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=GREEN, hover_color='navy')
 
         self.selectCameraCombo.configure(state='disabled')
 
@@ -1613,7 +1619,30 @@ class CameraGui():
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
-                quat, vect = q.from_openCV_rvec(rvec, tvec)
+                quatPnP, vectPnP = q.from_openCV_rvec(rvec, tvec)
+                vectPnP = np.squeeze(vectPnP)
+                S_MODEL = np.eye(3)
+                S_MODEL[1,1] = -1.0
+                quat, vect = solveQnP((S_MODEL @ points.T ).T, self.centers, self.calibration.fx, self.calibration.fy,
+                                      self.calibration.cx, self.calibration.cy, None, quatPnP, vectPnP)
+
+                xyz_proj = quat.T * (S_MODEL @ points.T).T + vect
+
+                us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
+                us_vs_s_proj[:, 0] = self.calibration.fx * -xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
+                us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
+                self.plotOnImg(us_vs_s_proj.astype(int),
+                               list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
+
+                test = np.array([[1.0, 0.0, 0.0],[0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+                quatCV = test @ cv2.Rodrigues(rvec)[0]
+                print(mat2quat(quatCV))
+                print(quatPnP, '\n', vectPnP)
+                print(S_MODEL @ (quat * -vect))
+                print()
+                c_R, _ = cv2.Rodrigues(rvec)
+
+
                 cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 75), cv2.FONT_HERSHEY_DUPLEX, 2,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
@@ -1625,6 +1654,18 @@ class CameraGui():
             cv2.circle(self.markup_frame, self.projectProbe[0, 0, :].astype(int), 6, (255, 0, 0), 6)
             cv2.putText(self.markup_frame, "Probe Tip", self.projectProbe[0, 0, :].astype(int) - [50, 50],
                         cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
+
+    @staticmethod
+    def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
+        """Convert OpenCV camera pose to your convention (proper rotation)."""
+        S_MODEL = np.diag([1., -1., 1.])  # det = -1
+        C_OURS_TO_CV = np.array([[0., -1., 0.],
+                                 [0., 0., 1.],
+                                 [1., 0., 0.]], dtype=float)
+        C_CV_TO_OURS = C_OURS_TO_CV.T
+        R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
+        t_ours = C_CV_TO_OURS @ t_cv
+        return mat2quat(R_ours.T), t_ours
 
     def detectHorizon(self):
 

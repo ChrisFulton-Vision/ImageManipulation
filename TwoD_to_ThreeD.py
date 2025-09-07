@@ -36,6 +36,7 @@ import numpy as np
 from numpy import square as sq
 from numpy.linalg import norm
 import copy
+from copy import deepcopy
 import cv2
 import datetime
 
@@ -43,6 +44,7 @@ import datetime
 np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
 
 NUM_OF_POINTS = 20
+
 
 def feature_points():
     """Return model-frame feature points as a (N, 3) ndarray.
@@ -68,9 +70,11 @@ def feature_points():
     going_out = np.random.normal(0.0, 3.0, (NUM_OF_POINTS, 3))
     return going_out
 
+
 def pixel_point_covariances():
     sigma_squared = sq(np.random.normal(3.0, 2.0, (2 * NUM_OF_POINTS)))
     return sigma_squared
+
 
 # --- Global synthetic scene & camera intrinsics --------------------------------
 FEATURE_OFFSETS = feature_points()
@@ -85,18 +89,18 @@ INTRINSIC = np.array([[0.0, 0.0, 1.0], [FX, 0.0, CX], [0.0, FY, CY]])
 # OpenCV:      u = FX*(Xc/Zc)+CX, v = FY*(Yc/Zc)+CY
 # The axis map that matches the pixel equations is:
 #   [Xc, Yc, Zc]^T = C * [x, y, z]^T with C below (det = -1).
-C_OURS_TO_CV = np.array([[ 0., -1.,  0.],
-                         [ 0.,  0.,  1.],
-                         [ 1.,  0.,  0.]], dtype=float)
+C_OURS_TO_CV = np.array([[0., -1., 0.],
+                         [0., 0., 1.],
+                         [1., 0., 0.]], dtype=float)
 C_CV_TO_OURS = C_OURS_TO_CV.T
 
 # To keep rotations proper (det=+1) through the bridge, reflect the model once
 # on the OpenCV side. This is NOT seeding; it's a static coordinate conversion.
 S_MODEL = np.diag([1., -1., 1.])  # det = -1
 
-K_CV = np.array([[FX,  0., CX],
-                 [ 0., FY, CY],
-                 [ 0.,  0.,  1.]], dtype=float)
+K_CV = np.array([[FX, 0., CX],
+                 [0., FY, CY],
+                 [0., 0., 1.]], dtype=float)
 DIST_COEFFS = np.zeros(5, dtype=float)
 
 
@@ -106,9 +110,11 @@ def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
     t_ours = C_CV_TO_OURS @ t_cv
     return mat2quat(R_ours.T), t_ours
 
+
 def _rms_h(q_, t_, meas_flat):
     r = (h(q_, t_) - meas_flat).reshape(-1, 2)
-    return float(np.sqrt(np.mean(r[:,0]**2 + r[:,1]**2)))
+    return float(np.sqrt(np.mean(r[:, 0] ** 2 + r[:, 1] ** 2)))
+
 
 def opencv_pnp_iterative_baseline(object_points: np.ndarray,
                                   image_points_flat: np.ndarray,
@@ -142,7 +148,8 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
     if not ok:
         raise RuntimeError("OpenCV SOLVEPNP_ITERATIVE failed (no seed).")
 
-    R_cv, _ = cv2.Rodrigues(rvec); t_cv = tvec.reshape(3)
+    R_cv, _ = cv2.Rodrigues(rvec);
+    t_cv = tvec.reshape(3)
     pf = pos_depth_frac(R_cv, t_cv)
 
     # --- 2) If cheirality is good, convert & return ---
@@ -166,7 +173,8 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
     best = None
     best_key = None
     for i in range(len(rvecs)):
-        R_i, _ = cv2.Rodrigues(rvecs[i]); t_i = tvecs[i].reshape(3)
+        R_i, _ = cv2.Rodrigues(rvecs[i]);
+        t_i = tvecs[i].reshape(3)
         pf_i = pos_depth_frac(R_i, t_i)
         err_i = float(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else np.inf
         key = (-pf_i, err_i)  # maximize pf_i, then minimize error
@@ -183,12 +191,13 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
         cameraMatrix=K_CV,
         distCoeffs=DIST_COEFFS,
         rvec=cv2.Rodrigues(R_seed)[0],
-        tvec=t_seed.reshape(3,1),
+        tvec=t_seed.reshape(3, 1),
         useExtrinsicGuess=True,
         flags=cv2.SOLVEPNP_ITERATIVE,
     )
     if ok_polish:
-        R_cv, _ = cv2.Rodrigues(rvec_pol); t_cv = tvec_pol.reshape(3)
+        R_cv, _ = cv2.Rodrigues(rvec_pol);
+        t_cv = tvec_pol.reshape(3)
     else:
         R_cv, t_cv = R_seed, t_seed  # use the AP3P candidate directly
 
@@ -211,7 +220,7 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
         imagePoints=img,
         cameraMatrix=K_CV,
         distCoeffs=DIST_COEFFS,
-        reprojectionError=ransac_thresh_px,    # try 8–12 px for ~5 px per-axis noise
+        reprojectionError=ransac_thresh_px,  # try 8–12 px for ~5 px per-axis noise
         confidence=0.999,
         iterationsCount=3000,
         flags=cv2.SOLVEPNP_AP3P,
@@ -375,7 +384,7 @@ def init_pose_wahba(Xw, meas_pix, fx, fy, cx, cy):
 
 # --- Camera projection ----------------------------------------------------------
 
-def h(est_q: q, est_t: np.array):
+def h(est_q: q, est_t: np.array, feature_points, fx, fy, cx, cy):
     """Project all `FEATURE_OFFSETS` into pixel coordinates given pose (q, t).
 
     The pose maps model points into the camera frame as:  X_cam = q.T * X + t
@@ -385,18 +394,18 @@ def h(est_q: q, est_t: np.array):
 
     Returns a flattened length-2N vector [u0, v0, u1, v1, ...].
     """
-    xyz_proj = est_q.T * FEATURE_OFFSETS + est_t
-
+    xyz_proj = est_q.T * feature_points + est_t
     us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-    us_vs_s_proj[:, 0] = FX * -xyz_proj[:, 1] / xyz_proj[:, 0] + CX
-    us_vs_s_proj[:, 1] = FY * xyz_proj[:, 2] / xyz_proj[:, 0] + CY
+    us_vs_s_proj[:, 0] = fx * -xyz_proj[:, 1] / xyz_proj[:, 0] + cx
+    us_vs_s_proj[:, 1] = fy * xyz_proj[:, 2] / xyz_proj[:, 0] + cy
 
     return us_vs_s_proj.flatten()
 
 
 # --- Analytic Jacobian of h w.r.t. (q, t) -------------------------------------
 
-def deriv(est_q: q, est_t: np.array):
+def deriv(est_q: q, est_t: np.array, feature_points=FEATURE_OFFSETS,
+          fx=FX, fy=FY, cx=CX, cy=CY):
     """Return analytic Jacobian L = dh/dx evaluated at (est_q, est_t).
 
     State ordering: x = [qs, qx, qy, qz, tx, ty, tz]^T  (7 parameters)
@@ -411,26 +420,27 @@ def deriv(est_q: q, est_t: np.array):
     np.ndarray, shape (2N, 7)
         Jacobian matrix.
     """
-    L = np.zeros((2 * len(FEATURE_OFFSETS), 7))
+    num_points = len(feature_points)
+    L = np.zeros((2 * num_points, 7))
 
     # Current camera-frame coordinates of each feature
-    xyz_proj = est_q.T * FEATURE_OFFSETS + est_t
+    xyz_proj = est_q.T * feature_points + est_t
 
     # Unpack for compact per-point derivatives of the projection
     x_hat, y_hat, z_hat = xyz_proj[:, 0], xyz_proj[:, 1], xyz_proj[:, 2]
 
     # Placeholders for partials of each (u,v) w.r.t. state components
-    dfeature_dqs = np.zeros((len(FEATURE_OFFSETS), 2))
-    dfeature_dqx = np.zeros((len(FEATURE_OFFSETS), 2))
-    dfeature_dqy = np.zeros((len(FEATURE_OFFSETS), 2))
-    dfeature_dqz = np.zeros((len(FEATURE_OFFSETS), 2))
+    dfeature_dqs = np.zeros((num_points, 2))
+    dfeature_dqy = np.zeros((num_points, 2))
+    dfeature_dqz = np.zeros((num_points, 2))
+    dfeature_dqx = np.zeros((num_points, 2))
 
-    dfeature_dvx = np.zeros((len(FEATURE_OFFSETS), 2))  # w.r.t. tx
-    dfeature_dvy = np.zeros((len(FEATURE_OFFSETS), 2))  # w.r.t. ty
-    dfeature_dvz = np.zeros((len(FEATURE_OFFSETS), 2))  # w.r.t. tz
+    dfeature_dvx = np.zeros((num_points, 2))  # w.r.t. tx
+    dfeature_dvy = np.zeros((num_points, 2))  # w.r.t. ty
+    dfeature_dvz = np.zeros((num_points, 2))  # w.r.t. tz
 
     # Loop over features to accumulate per-point analytic derivatives
-    for idx, feature in enumerate(FEATURE_OFFSETS):
+    for idx, feature in enumerate(feature_points):
         # new_deriv is the 3x4 Jacobian d(X_cam)/d[q s qx qy qz] for this point
         new_deriv = est_q.transpose_vec_deriv(feature)
 
@@ -444,10 +454,10 @@ def deriv(est_q: q, est_t: np.array):
         # Projection partials for u, v with respect to x, y, z at this point
         #   u = FX * ( -y / x ) + CX =>  du/dy = -FX / x, du/dx = FX * y / x^2
         #   v = FY * (  z / x ) + CY =>  dv/dz =  FY / x, dv/dx = -FY * z / x^2
-        du_dy = -FX / x_hat[idx]
-        du_dx = FX * y_hat[idx] / sq(x_hat[idx])
-        dv_dz = FY / x_hat[idx]
-        dv_dx = -FY * z_hat[idx] / sq(x_hat[idx])
+        du_dy = -fx / x_hat[idx]
+        du_dx = fx * y_hat[idx] / sq(x_hat[idx])
+        dv_dz = fy / x_hat[idx]
+        dv_dx = -fy * z_hat[idx] / sq(x_hat[idx])
 
         # Chain rule: d(u,v)/dq = d(u,v)/d(x,y,z) * d(x,y,z)/dq
         dfeature_dqs[idx, 0] = du_dy * dy_dqs + du_dx * dx_dqs
@@ -499,7 +509,8 @@ def print_rayPts(ray_proj: np.array):
         print(f"Feature: {n:3d}, px: {ray[0]: .5f}, py: {ray[1]: .5f}")
 
 
-def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array = None):
+def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array = None, feature_points=FEATURE_OFFSETS,
+        fx=FX, fy=FY, cx=CX, cy=CY):
     """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
 
     Uses the analytic Jacobian `deriv`, a pseudoinverse step `delta_x`, and a
@@ -520,9 +531,9 @@ def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array =
     while keep_going:
         iter += 1
 
-        y = meas_pix - h(est_q, est_t)
+        y = meas_pix - h(est_q, est_t, feature_points, fx, fy, cx, cy)
         old_y_mag = norm(y)
-        L = deriv(est_q, est_t)
+        L = deriv(est_q, est_t, feature_points, fx, fy, cx, cy)
 
         if sigma_squared is not None:
             Q = np.diag(1.0 / sigma_squared)
@@ -537,13 +548,16 @@ def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array =
             # Trial step
             if sigma_squared is not None:
                 new_y_mag = norm(Q.dot(
-                # new_y_mag=norm(
-                    meas_pix- h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                        est_t + scale * delta_x[4:],)))
-            else:
-                new_y_mag=norm(
+                    # new_y_mag=norm(
                     meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:], ))
+                                 est_t + scale * delta_x[4:],
+                                 feature_points,
+                                 fx, fy, cx, cy)))
+            else:
+                new_y_mag = norm(
+                    meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
+                                 est_t + scale * delta_x[4:],
+                                 feature_points, fx, fy, cx, cy))
 
             # Linear prediction of residual magnitude
             y_pred_mag = norm(y - L.dot(scale * delta_x))
@@ -569,15 +583,27 @@ def opt(est_q: q, est_t: np.array, meas_pix: np.array, sigma_squared: np.array =
         if norm(scale * delta_x) < 1e-7 or iter > 10:
             keep_going = False
 
-    print("Estimated:")
-    print(est_q, est_t)
+    return est_q, est_t
+
+
+def solveQnP(object_pts, img_pts, fx, fy, cx, cy, sigma_squared=None, test_q=None, test_t=None):
+    img_pts = deepcopy(img_pts).flatten()
+    init_q, init_t = init_pose_wahba(object_pts, img_pts, fx, fy, cx, cy)
+    print(f'Init: {init_q}, {init_t}')
+    est_q, est_t = opt(init_q, init_t, img_pts, sigma_squared, object_pts, fx, fy, cx, cy)
+    print(f'Init Val: {norm(img_pts - h(init_q, init_t, object_pts, fx, fy, cx, cy))}')
+    print(f'Est: {est_q}, {est_t}')
+    print(f'Est Val: {norm(img_pts - h(est_q, est_t, object_pts, fx, fy, cx, cy))}')
+    print(f'Mod Val: {norm(img_pts - h(est_q, est_t * 0.5, object_pts, fx, fy, cx, cy))}')
+    if test_q is not None and test_t is not None:
+        print(f'Test Val: {norm(img_pts - h(test_q, test_t, object_pts, fx, fy, cx, cy))}')
+        print()
     return est_q, est_t
 
 
 # --- Demo / entry point --------------------------------------------------------
 
 def main():
-
     """Run a synthetic pose-estimation demo using the functions above."""
     # Convention: x forward, y left, z up
 
@@ -606,7 +632,6 @@ def main():
     else:
         # Add i.i.d. Gaussian pixel noise (sigma=5 px) to simulate detections
         meas_pix = orig_meas_pix + np.random.normal(0.0, 2.0, orig_meas_pix.shape)
-
 
     print("\nNoisy \"Measured\" Location in pixel space")
     print_rayPts(meas_pix)

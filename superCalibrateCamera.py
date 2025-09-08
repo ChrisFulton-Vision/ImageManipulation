@@ -247,7 +247,6 @@ class CameraConfig():
         self.recording = False
         self.aprilTagSize = 0.168
         self.imageSource = ImageSource.Camera_Stream
-        self.imageFilepath = ''
         self.lidarFilepath = None
         self.yoloFilepath = ''
         self.detect_corners = False
@@ -1166,13 +1165,20 @@ class CameraGui():
                 temp_unpause = False
                 img_id = img_slider.next_id()
 
-                frame = cv2.imread(os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0]))
-                if frame is not None:
-                    if self.ImageTimeReader.idsTimes[img_id][1] is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[img_id][0])
-                    else:
-                        self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1] + special_img_time_offset,
-                                       self.ImageTimeReader.idsTimes[img_id][0])
+            curr_filepath = os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0])
+            frame = None
+
+            if os.path.exists(curr_filepath):
+                frame = cv2.imread(curr_filepath)
+
+            if frame is not None:
+                if self.ImageTimeReader.idsTimes[img_id][1] is None:
+                    self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[img_id][0])
+                else:
+                    self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1] + special_img_time_offset,
+                                   self.ImageTimeReader.idsTimes[img_id][0])
+            else:
+                print(f"Log File Error: {self.ImageTimeReader.idsTimes[img_id][0]} doesn't exist.")
 
             key = cv2.waitKey(1)
 
@@ -1267,8 +1273,10 @@ class CameraGui():
             self.draw_hud(img_time)
 
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            cv2.putText(self.markup_frame, os.path.basename(name), (600, 800),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, 4)
+            img_w, img_h, *_ = self.curr_frame.shape
+            cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
+                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 0), 4)
 
         self.cleanup()
 
@@ -1349,7 +1357,7 @@ class CameraGui():
                      (int(x * 0.60), int(y * 0.7 + y * (pitch_angle - i) / 200.0)), (0, 255, 0), 2)
                 cv2.putText(self.markup_frame, f'{i:.0f}',
                             (int(x * 0.62), int(y * 0.7 + y * (pitch_angle - i) / 200.0)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
         cv2.circle(self.markup_frame, (int(x*0.5), int(y*0.7)), 5, (0,255,0), 2)
 
 
@@ -1584,9 +1592,9 @@ class CameraGui():
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
             cv2.polylines(self.markup_frame, polyline, True, (0, 255, 0), 4, lineType=cv2.FILLED)
             cv2.putText(self.markup_frame, str(id[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 4)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 0), 4)
             cv2.putText(self.markup_frame, str(id[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 0, 0), 1)
 
             self.detectIDS.append(id)
 
@@ -1640,38 +1648,18 @@ class CameraGui():
 
                 quatPnP, vectPnP = q.from_openCV_rvec(rvec, tvec)
                 q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
-                                                    [1., 0., 0.],
-                                                    [0., 1., 0.]], float))
+                                                            [1., 0., 0.],
+                                                            [0., 1., 0.]], float))
 
-                quat, vect = solveQnP(points, centers, self.calibration, None) #, q_aftr_from_cv * quatPnP, (q_aftr_from_cv * quatPnP) * -vectPnP)
-
-
-                xyz_proj = quat * points + vect
-
-                us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-                us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
-                us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
-
-                # print(f'QuatPnP:           {quatPnP}')
-                # print(f'MySol in cv frame: {(q_aftr_from_cv.T * quat).force_s_pos}')
-                # print(f'AngleBetween(deg): {(q_aftr_from_cv.T * quat).angle_betweenD(quatPnP)}')
-                # print(f'PnP in my frame: {q_aftr_from_cv * quatPnP}')
-                # print(f'MySol:           {quat}')
-                # print(f'AngleBetween(deg): {(q_aftr_from_cv * quatPnP).angle_betweenD(quat)}')
-                #
-                # print(vectPnP)
-                # print(quat * -vect)
-                # print()
 
                 cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(q_aftr_from_cv * quatPnP, 'ijk.6f'), (50, 75),
-                            cv2.FONT_HERSHEY_DUPLEX, 2,
+                            cv2.FONT_HERSHEY_DUPLEX, self.small_text,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
                 cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((vectPnP))),
-                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, 2,
+                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, self.small_text,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-
 
         # if self.projectProbe is not None and self.camConfig.projectLidarPoints:
         #     cv2.circle(self.markup_frame, self.projectProbe[0, 0, :].astype(int), 6, (255, 0, 0), 6)
@@ -1712,12 +1700,12 @@ class CameraGui():
             self.plotOnImg(us_vs_s_proj.astype(int),
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
 
-
-
-            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format( quat, 'ijk.6f'), (50, 225), cv2.FONT_HERSHEY_DUPLEX, 2,
+            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225), cv2.FONT_HERSHEY_DUPLEX,
+                        self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 300), cv2.FONT_HERSHEY_DUPLEX, 2,
+            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 300), cv2.FONT_HERSHEY_DUPLEX,
+                        self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
 
@@ -1884,7 +1872,7 @@ class CameraGui():
             cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                      [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
             cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75, color, 1)
+                        0.75 * font_scale(self.markup_frame.shape[1]), color, 1)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
@@ -1949,9 +1937,9 @@ class CameraGui():
         for idx, pxPt in enumerate(points):
             cv2.circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 12,
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 0), 12,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2, color, 3, cv2.LINE_AA)
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, color, 3, cv2.LINE_AA)
 
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
@@ -1971,6 +1959,18 @@ class CameraGui():
         if poss_filepath == '':
             return None
         return poss_filepath
+
+    @property
+    def small_text(self) -> float:
+        return 0.25 * font_scale(self.curr_frame.shape[1])
+
+    @property
+    def med_text(self) -> float:
+        return .5 * font_scale(self.curr_frame.shape[1])
+
+    @property
+    def lrg_text(self) -> float:
+        return .75 * font_scale(self.curr_frame.shape[1])
 
 
 def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
@@ -2017,6 +2017,8 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
     return frame
 
+def font_scale(dim: float|int) -> float:
+    return float(dim/640)
 
 def dim_entirely(frame, center, radius):
     """

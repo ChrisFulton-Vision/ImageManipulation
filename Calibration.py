@@ -54,6 +54,15 @@ class Calibration:
             self.cy = None
         self.scale = 1.0
 
+    @property
+    def K(self):
+        return self.getCameraMatrix()
+    @property
+    def inv(self):
+        return np.array([[1.0/self.fx, 0.0, -self.cx / self.fx],
+                         [0.0, 1.0/self.fy, -self.cy / self.fy],
+                         [0.0, 0.0, 1.0]])
+
     def getCameraMatrix(self):
         # Included for backwards compatibility
         if not hasattr(self, "scale"):

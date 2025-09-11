@@ -243,6 +243,7 @@ class CameraConfig():
         self.pnpLidarPoints = False
         self.qnpLidarPoints = False
         self.yoloInference = False
+        self.yoloBiasTracking = False
         self.secondsBetweenImages = 1.0
         self.recording = False
         self.aprilTagSize = 0.168
@@ -367,6 +368,8 @@ class CameraGui():
         self.detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
         self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image',
                                                      command=self.toggleYoloInference)
+        self.yoloBiasCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO Bias Tracking',
+                                                    command=self.toggleYoloBiasTracking)
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
         self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.cam_frame, text='PhaseCorrelation')
@@ -775,7 +778,13 @@ class CameraGui():
             self.yoloInferenceCheckbox.deselect()
         else:
             self.yoloInferenceCheckbox.select()
-        self.yoloInferenceCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+        self.yoloInferenceCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        if self.camConfig.yoloBiasTracking is False:
+            self.yoloBiasCheckbox.deselect()
+        else:
+            self.yoloBiasCheckbox.select()
+        self.yoloBiasCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
         detectCornersCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Corners')
@@ -981,6 +990,14 @@ class CameraGui():
             self.yoloInferenceCheckbox.select()
         else:
             self.yoloInferenceCheckbox.deselect()
+        self.saveToCache()
+
+    def toggleYoloBiasTracking(self):
+        self.camConfig.yoloBiasTracking = not self.camConfig.yoloBiasTracking
+        if self.camConfig.yoloBiasTracking:
+            self.yoloBiasCheckbox.select()
+        else:
+            self.yoloBiasCheckbox.deselect()
         self.saveToCache()
 
     def toggleDetectCorners(self):
@@ -1273,10 +1290,10 @@ class CameraGui():
             self.draw_hud(img_time)
 
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, 4)
+            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 0), 4)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 4)
 
         self.cleanup()
 
@@ -1809,7 +1826,7 @@ class CameraGui():
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
-        self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame)
+        self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame, self.camConfig.yoloBiasTracking)
         centers, boxes, scores, class_ids, time = output
         if len(centers) > 0:  #and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))

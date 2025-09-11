@@ -67,7 +67,7 @@ def robust_init_pose(Xw, uv, cal):
                   [0, cal.fy, cal.cy],
                   [0, 0, 1]], dtype=np.float32)
 
-    ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, flags=cv2.SOLVEPNP_EPNP)
+    ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
     if not ok:
         # Fallback (very rare): Wahba seed
         q0, t0 = init_pose_wahba(Xw, uv, cal)
@@ -75,34 +75,23 @@ def robust_init_pose(Xw, uv, cal):
 
     Rcv, _ = cv2.Rodrigues(rvec)
 
-    # If you truly want to accept EPnP "as-is", set PICK_PERM=False
-    PICK_PERM = True
-
-    if not PICK_PERM:
-        q_seed = mat2quat(Rcv.T)
-        ytil = (uv[:, 0] - cal.cx) / cal.fx
-        ztil = (uv[:, 1] - cal.cy) / cal.fy
-        t_seed = _solve_t_given_R(Xw, ytil, ztil, Rcv)
-        return q_seed, t_seed
-
     # Minimal, robust pick between Rcv and your display-permuted P @ Rcv
     P = np.array([[0., 0., 1.],
                   [1., 0., 0.],
                   [0., 1., 0.]], dtype=float)
 
-    def _scoreR(Rcand):
-        ytil = (uv[:, 0] - cal.cx) / cal.fx
-        ztil = (uv[:, 1] - cal.cy) / cal.fy
-        t = _solve_t_given_R(Xw, ytil, ztil, Rcand)
-        qk = mat2quat(Rcand.T)
-        res = np.linalg.norm(h(qk, t, Xw, cal) - uv.flatten())
-        return res, qk, t
-
-    candA = _scoreR(Rcv)
-    candB = _scoreR(P @ Rcv)
-    best = candA if candA[0] <= candB[0] else candB
-    _, q_best, t_best = best
-    return q_best, t_best
+    q_seed = mat2quat( (P @ Rcv).T)
+    ytil = (uv[:, 0] - cal.cx) / cal.fx
+    ztil = (uv[:, 1] - cal.cy) / cal.fy
+    t_seed = _solve_t_given_R(Xw, ytil, ztil, P @ Rcv)
+    # print("GOOD:")
+    # print(Xw)
+    # print(ytil)
+    # print(ztil)
+    # print(P @ Rcv)
+    # print(t_seed)
+    # print()
+    return q_seed, t_seed
 
 
 # --- Small helpers --------------------------------------------------------------
@@ -526,12 +515,58 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
 
     return est_q, est_t
 
+def DLT(object_pts, img_pts, cal: Calibration):
+    image_points_norm = img_pts.squeeze()
+    num_points = len(img_pts)
+
+    A = np.zeros((2 * num_points, 12))
+
+    for i in range(num_points):
+        X, Y, Z = object_pts[i]
+        x, y = image_points_norm[i]
+
+        A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
+        A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
+
+    # 2. Solve the linear system Ap = 0 using SVD
+    _, _, Vt = np.linalg.svd(A)
+    # The solution is the last column of V (or last row of Vt)
+    p = Vt[-1, :]
+    P = p.reshape((3, 4))
+
+    # 3. Extract K, R, and t from the projection matrix P
+    # P = K[R|t] => M = inv(K) * P
+    M = cal.inv @ P
+    R_init, t_init = M[:, :3], M[:, 3]
+
+    # 4. Enforce orthogonality on R
+    U, _, Vt_r = np.linalg.svd(R_init)
+    R = U @ Vt_r
+    if np.linalg.det(R) < 0:
+        R *= -1.0
+
+    P = np.array([[0, 0, 1],
+                  [1, 0, 0],
+                  [0, 1, 0]])
+    R = P @ R
+    ytil = (img_pts[:, 0] - cal.cx) / cal.fx
+    ztil = (img_pts[:, 1] - cal.cy) / cal.fy
+    t = _solve_t_given_R(object_pts, ytil, ztil, R)
+
+    # 5. Get the final rvec
+    # rvec, _ = cv2.Rodrigues(R)
+    q_init = mat2quat(R.T)
+
+    return q_init, t
+
 
 def solveQnP(object_pts, img_pts, cal: Calibration, sigma_squared=None):
+    q_init, t_init = DLT(object_pts, img_pts, cal)
     img_pts = deepcopy(img_pts).flatten()
 
-    init_q, init_t = robust_init_pose(object_pts, img_pts, cal)
-    est_q, est_t = opt(init_q, init_t, img_pts, object_pts, cal, sigma_squared)
+    est_q, est_t = opt(q_init, t_init, img_pts, object_pts, cal, sigma_squared)
+    # est_q, est_t = init_q, init_t
+
     est_q.force_s_pos
 
     est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal,

@@ -478,16 +478,12 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
             # Trial step
             if sigma_squared is not None:
                 new_y_mag = norm(Q.dot(
-                    # new_y_mag=norm(
                     meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:],
-                                 feature_points,
-                                 cal)))
+                                 est_t + scale * delta_x[4:], feature_points, cal)))
             else:
                 new_y_mag = norm(
                     meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:],
-                                 feature_points, cal))
+                                 est_t + scale * delta_x[4:], feature_points, cal))
 
             # Linear prediction of residual magnitude
             y_pred_mag = norm(y - L.dot(scale * delta_x))
@@ -515,7 +511,7 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
 
     return est_q, est_t
 
-def DLT(object_pts, img_pts, cal: Calibration):
+def DLT(object_pts, img_pts, cal: Calibration, sigma_squared: np.array = None):
     image_points_norm = img_pts.squeeze()
     num_points = len(img_pts)
 
@@ -527,6 +523,10 @@ def DLT(object_pts, img_pts, cal: Calibration):
 
         A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
         A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
+
+    if sigma_squared is not None:
+        Q = np.diag(1.0 / sigma_squared)
+        A = Q @ A
 
     # 2. Solve the linear system Ap = 0 using SVD
     _, _, Vt = np.linalg.svd(A)
@@ -561,7 +561,12 @@ def DLT(object_pts, img_pts, cal: Calibration):
 
 
 def solveQnP(object_pts, img_pts, cal: Calibration, sigma_squared=None):
-    q_init, t_init = DLT(object_pts, img_pts, cal)
+
+    # sigma_squared = np.ones_like(img_pts.flatten())
+    # sigma_squared[0] = 100.0
+    # sigma_squared[1] = 100.0
+
+    q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
     img_pts = deepcopy(img_pts).flatten()
 
     est_q, est_t = opt(q_init, t_init, img_pts, object_pts, cal, sigma_squared)
@@ -569,8 +574,8 @@ def solveQnP(object_pts, img_pts, cal: Calibration, sigma_squared=None):
 
     est_q.force_s_pos
 
-    est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal,
-                                            min_ch=0.90, margin_px=100.0)
+    # est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal,
+                                            # min_ch=0.90, margin_px=100.0)
 
     # print(f'Residual: {norm(img_pts - h(est_q, est_t, object_pts, cal))}')
     # print(f'Init: {init_q}, {init_t}')

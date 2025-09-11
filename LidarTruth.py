@@ -29,7 +29,8 @@ class TruthPoints:
         # self.truthPoints['23'] = np.array([2.15135, 3.04855, -0.73227])
 
         # MOCAP 2025 Sept AprilTags
-        self.truthPoints['3'] = np.array([-0.12710, -1.21415, -1.23755])
+        self.truthPoints['3'] = np.array([-0.12710, -1.21415, -1.23755])  # True location
+        # self.truthPoints['3'] = np.array([-0.12710, -1.21415, 10.0 - 1.23755])  # Modified location to test system
         self.truthPoints['5'] = np.array([0.70693, -1.90905, -0.70546])
         self.truthPoints['8'] = np.array([1.38641, 2.16063, -1.22338])
         self.truthPoints['9'] = np.array([5.35155, -1.39477, 0.29776])

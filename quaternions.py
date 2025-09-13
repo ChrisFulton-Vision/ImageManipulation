@@ -66,7 +66,7 @@ class Quaternion:
             return
 
         if vec is None:
-            if len(s) > 1:
+            if not type(s, float):
                 raise ValueError('s should be a single float')
             self.s = deepcopy(s)
             self.vec = np.zeros((3,))
@@ -343,7 +343,6 @@ class Quaternion:
     def copy(self):
         return deepcopy(self)
 
-    @property
     def force_s_pos(self):
         if self.s < 0:
             self.s *= -1.0

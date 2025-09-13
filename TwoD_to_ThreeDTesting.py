@@ -640,6 +640,7 @@ def main():
     # Nonlinear refinement
     opt_start_time = datetime.datetime.now()
     est_q, est_t = opt(est_q, est_t, meas_pix, sigma_squared)
+    est_q.force_s_pos()
     opt_end_time = datetime.datetime.now()
 
     # Diagnostics: compare residuals

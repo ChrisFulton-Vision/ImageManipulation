@@ -39,17 +39,16 @@ Notes
 """
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Optional, Tuple
 
-import numpy as np
+from sys import maxsize
 from numpy.linalg import norm
 from numpy.typing import NDArray
 
-from quaternions import Quaternion as q
+from quaternions import Quaternion as Quat
 from quaternions import *  # mat2quat, randomQuat, etc.
 
-np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
+np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 
 # Small epsilon to guard against degeneracy in Gram–Schmidt seed.
 EPS: float = 1e-6
@@ -71,7 +70,7 @@ class ThreeD_to_ThreeD:
         self.opt()
 
     @staticmethod
-    def gramSchmidtAxis(points: NDArray[np.floating]) -> Optional[q]:
+    def gramSchmidtAxis(points: NDArray[np.floating]) -> Optional[Quat]:
         p0, p1, p2 = points[0], points[1], points[2]
 
         x_axis: NDArray[np.floating] = p1 - p0
@@ -97,14 +96,15 @@ class ThreeD_to_ThreeD:
         return mat2quat(R)
 
     @staticmethod
-    def init_pose(points1: NDArray[np.floating], points2: NDArray[np.floating]) -> Optional[Tuple[q, NDArray[np.floating]]]:
+    def init_pose(points1: NDArray[np.floating], points2: NDArray[np.floating]) -> (
+            Optional)[Tuple[Quat, NDArray[np.floating]]]:
         quat1 = ThreeD_to_ThreeD.gramSchmidtAxis(points1)
         quat2 = ThreeD_to_ThreeD.gramSchmidtAxis(points2)
 
         if quat1 is None or quat2 is None:
             return None
 
-        new_q: q = quat2.T * quat1
+        new_q: Quat = quat2.T * quat1
         if new_q.s < 0.0:
             new_q *= -1.0
 
@@ -113,7 +113,7 @@ class ThreeD_to_ThreeD:
         )
         return new_q, tvec
 
-    def create_y(self, new_q: Optional[q] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
+    def create_y(self, new_q: Optional[Quat] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
         if new_q is None:
             new_q = deepcopy(self.q)
         if new_t is None:
@@ -128,8 +128,8 @@ class ThreeD_to_ThreeD:
         for idx, pt1 in enumerate(self.points1):
             row = idx * 3
             dRp_dq: NDArray[np.floating] = self.q.vect_deriv(pt1, False)
-            L[row : row + 3, :4] = dRp_dq
-            L[row : row + 3, 4:] = np.eye(3)
+            L[row: row + 3, :4] = dRp_dq
+            L[row: row + 3, 4:] = np.eye(3)
 
         return L
 
@@ -156,7 +156,7 @@ class ThreeD_to_ThreeD:
 
             scale = 1.0
             while True:
-                new_q = q(quat=self.q.ndarray + scale * delta_x[:4], makeUnitVec=True)
+                new_q = Quat(quat=self.q.ndarray + scale * delta_x[:4], makeUnitQuat=True)
                 new_t = self.t + scale * delta_x[4:]
                 new_y_mag = float(norm(self.create_y(new_q, new_t)))
 
@@ -199,7 +199,7 @@ def print_3dPts(threeD_proj: NDArray[np.floating]) -> None:
 def main() -> None:
     test1: NDArray[np.floating] = np.random.normal(0.0, 1.0, (10, 3))
     noise: NDArray[np.floating] = np.random.normal(0.0, 0.1, test1.shape)
-    q_true: q = randomQuat()
+    q_true: Quat = randomQuat()
     t_true: NDArray[np.floating] = np.array([10.0, 0.0, 0.0]) + np.random.normal(1.0, 1.0, (3,))
     test2: NDArray[np.floating] = (q_true * test1 + t_true) + noise
 

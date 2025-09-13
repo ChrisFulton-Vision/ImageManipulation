@@ -30,68 +30,71 @@ The code is written as an end-to-end script. Run directly to see a synthetic tes
 with noisy measurements, the initializer results, and the final optimized pose.
 """
 
+from sys import maxsize
 from quaternions import Quaternion as q
 from quaternions import *
 from Calibration import Calibration
 import numpy as np
-import cv2
 from numpy import square as sq
 from numpy.linalg import norm
+from numpy.typing import NDArray
 from copy import deepcopy
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
-np.set_printoptions(suppress=True, precision=4, threshold=np.inf)
+np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 
 
 def _ensure_shapes(Xw, uv):
     Xw = np.asarray(Xw, float)
     uv = np.asarray(uv, float)
-    if Xw.ndim == 1: Xw = Xw.reshape(-1, 3)
-    if uv.ndim == 1: uv = uv.reshape(-1, 2)
+    if Xw.ndim == 1:
+        Xw = Xw.reshape(-1, 3)
+    if uv.ndim == 1:
+        uv = uv.reshape(-1, 2)
     return Xw, uv
 
 
-def robust_init_pose(Xw, uv, cal):
-    """
-    EPnP-only seeding.
-    - Uses cv2.SOLVEPNP_EPNP to get an initial rotation.
-    - Converts to your quaternion convention (R = q.T).
-    - Computes t with your closed-form _solve_t_given_R so it's consistent with h().
-    - Optional tiny axis-permutation pick (P @ R) for your display convention.
-    """
-    Xw, uv = _ensure_shapes(Xw, uv)
-
-    obj = Xw.astype(np.float32)
-    img = uv.astype(np.float32)
-    K = np.array([[cal.fx, 0, cal.cx],
-                  [0, cal.fy, cal.cy],
-                  [0, 0, 1]], dtype=np.float32)
-
-    ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
-    if not ok:
-        # Fallback (very rare): Wahba seed
-        q0, t0 = init_pose_wahba(Xw, uv, cal)
-        return q0, t0
-
-    Rcv, _ = cv2.Rodrigues(rvec)
-
-    # Minimal, robust pick between Rcv and your display-permuted P @ Rcv
-    P = np.array([[0., 0., 1.],
-                  [1., 0., 0.],
-                  [0., 1., 0.]], dtype=float)
-
-    q_seed = mat2quat( (P @ Rcv).T)
-    ytil = (uv[:, 0] - cal.cx) / cal.fx
-    ztil = (uv[:, 1] - cal.cy) / cal.fy
-    t_seed = _solve_t_given_R(Xw, ytil, ztil, P @ Rcv)
-    # print("GOOD:")
-    # print(Xw)
-    # print(ytil)
-    # print(ztil)
-    # print(P @ Rcv)
-    # print(t_seed)
-    # print()
-    return q_seed, t_seed
+# def robust_init_pose(Xw, uv, cal):
+#     """
+#     EPnP-only seeding.
+#     - Uses cv2.SOLVEPNP_EPNP to get an initial rotation.
+#     - Converts to your quaternion convention (R = q.T).
+#     - Computes t with your closed-form _solve_t_given_R, so it's consistent with h().
+#     - Optional tiny axis-permutation pick (P @ R) for your display convention.
+#     """
+#     Xw, uv = _ensure_shapes(Xw, uv)
+#
+#     obj = Xw.astype(np.float32)
+#     img = uv.astype(np.float32)
+#     K = np.array([[cal.fx, 0, cal.cx],
+#                   [0, cal.fy, cal.cy],
+#                   [0, 0, 1]], dtype=np.float32)
+#
+#     ok, rvec, tvec = cv2.solvePnP(obj, img, K, None, flags=cv2.SOLVEPNP_SQPNP)
+#     if not ok:
+#         # Fallback (very rare): Wahba seed
+#         q0, t0 = init_pose_wahba(Xw, uv, cal)
+#         return q0, t0
+#
+#     Rcv, _ = cv2.Rodrigues(rvec)
+#
+#     # Minimal, robust pick between Rcv and your display-permuted P @ Rcv
+#     P = np.array([[0., 0., 1.],
+#                   [1., 0., 0.],
+#                   [0., 1., 0.]], dtype=float)
+#
+#     q_seed = mat2quat( (P @ Rcv).T)
+#     ytil = (uv[:, 0] - cal.cx) / cal.fx
+#     ztil = (uv[:, 1] - cal.cy) / cal.fy
+#     t_seed = _solve_t_given_R(Xw, ytil, ztil, P @ Rcv)
+#     # print("GOOD:")
+#     # print(Xw)
+#     # print(ytil)
+#     # print(ztil)
+#     # print(P @ Rcv)
+#     # print(t_seed)
+#     # print()
+#     return q_seed, t_seed
 
 
 # --- Small helpers --------------------------------------------------------------
@@ -150,162 +153,162 @@ def _solve_t_given_R(Xw, y_tilde, z_tilde, R, w=None):
     return t
 
 
-# --- Fast initializer: Wahba/Kabsch rotation + linear t ------------------------
-
-def init_pose_wahba(Xw, meas_pix, cal: Calibration):
-    """
-    Robust seed that matches your projection:
-        u = FX * ( +y / x ) + CX
-        v = FY * (  z / x ) + CY
-
-    Strategy:
-      1) Build unit bearing rays B from pixels (two variants: nominal y/x and flipped).
-      2) Object-centered Wahba/Kabsch using weighted directions of centered 3D points.
-      3) Solve t linearly given R to match y/x, z/x (your algebra).
-      4) Enforce cheirality by majority (x_cam > 0).
-      5) Evaluate BOTH branches against actual pixel residual via h(), pick lower.
-
-    Returns:
-      (q_init, t_init) where q_init.T == R used by h().
-    """
-    # --- inputs to numpy arrays / shapes ---------------------------------------
-    Xw = np.asarray(Xw, float).reshape(-1, 3)
-    uv = np.asarray(meas_pix, float).reshape(-1, 2)
-    N = Xw.shape[0]
-
-    # Pixel -> slopes consistent with h(): +y/x and +z/x
-    ytil_nom = (uv[:, 0] - cal.cx) / cal.fx
-    ztil = (uv[:, 1] - cal.cy) / cal.fy
-
-    # Center and build weighted directions of object points
-    Xc = Xw - Xw.mean(axis=0, keepdims=True)
-    Xdir = _row_normed(Xc)
-
-    # Gentle weight clamp to avoid hinging on a single far tag
-    w0 = np.linalg.norm(Xc, axis=1)
-    if np.all(np.isfinite(w0)) and np.any(w0 > 0):
-        p20, p80 = np.percentile(w0, [20.0, 80.0])
-        w0 = np.clip(w0, p20, p80)
-        w0 /= (w0.mean() + 1e-12)
-    else:
-        w0 = np.ones(N, dtype=float)
-
-    def solve_branch(ytil_current):
-        """Compute (R, t, q, residual) for one y/x sign branch."""
-        # Bearings B = unit([1, y/x, z/x]) to align with camera-frame axes used by h()
-        B = _row_normed(np.column_stack([np.ones(N), ytil_current, ztil]))
-
-        # Wahba/Kabsch on weighted directions: H = (B * w)^T @ Xdir
-        H = (B * w0[:, None]).T @ Xdir
-        U, S, Vt = np.linalg.svd(H, full_matrices=False)
-        R = U @ Vt
-        if np.linalg.det(R) < 0:  # enforce det +1 with minimal change
-            U[:, -1] *= -1
-            R = U @ Vt
-
-        # Linear t that matches the y/x and z/x equations (your helper)
-        t = _solve_t_given_R(Xw, ytil_current, ztil, R, w=w0)
-
-        # Majority cheirality: x_cam must be positive for most points
-        X_cam = Xw @ R.T + t
-        if np.count_nonzero(X_cam[:, 0] > 0.0) < 0.8 * N:
-            # Minimal reflection that flips x while preserving right-handedness
-            R = R @ np.diag([-1.0, -1.0, 1.0])
-            t[:2] *= -1.0
-
-        # Map to your quaternion convention (q.T == R used by h())
-        q_corr = q(quat=np.array([0.0259804137, -0.3295700285, 0.3014442269, 0.8943377396]))
-        qk = q_corr * mat2quat(R.T)
-
-        # Pixel residual under the actual projection model
-        pred = h(qk, t, Xw, cal)
-        res = float(np.linalg.norm(uv.flatten() - pred))
-        return res, qk, t
-
-    # Evaluate both branches: nominal y/x and flipped y/x
-    candidates = [
-        solve_branch(ytil_nom),
-        solve_branch(-ytil_nom),
-    ]
-
-    # Choose the candidate with the lower pixel-space residual
-    candidates.sort(key=lambda c: c[0])
-    _, q_best, t_best = candidates[0]
-    return q_best, t_best
-
-
-def _cheirality_frac_Rt(R, t, Xw, eps=1e-9):
-    Xc = (R @ Xw.T).T + t
-    return float(np.count_nonzero(Xc[:, 0] > eps)) / Xw.shape[0]
-
-
-def _post_refine_flip_biside(est_q, est_t, meas_pix, object_pts, cal,
-                             min_ch=0.90, margin_px=100.0):
-    """
-    Final sanity check that tries 180° flips on BOTH sides of R:
-      candidates:  R,
-                   F @ R, R @ F for F in {Rx, Ry, Rz(=xy)}
-    For each candidate:
-      - re-solve t with _solve_t_given_R
-      - compute residual under h
-      - require cheirality >= min_ch
-    Switching rule:
-      • If current pose is cheirality-INVALID and some candidate is VALID,
-        take the VALID one with lowest residual (no margin).
-      • Else (current VALID), only switch if residual improves by >= margin_px.
-    """
-    import numpy as np
-
-    uv = np.asarray(meas_pix, float).reshape(-1, 2)
-    Xw = np.asarray(object_pts, float).reshape(-1, 3)
-
-    # Current state
-    R0 = quat2mat(est_q.ndarray).T
-    res0 = float(np.linalg.norm(uv.flatten() - h(est_q, est_t, Xw, cal)))
-    ch0 = _cheirality_frac_Rt(R0, est_t, Xw)
-
-    # 180° proper rotations about camera axes
-    Fx = np.diag([1.0, -1.0, -1.0])  # about cam-x
-    Fy = np.diag([-1.0, 1.0, -1.0])  # about cam-y
-    Fz = np.diag([-1.0, -1.0, 1.0])  # about cam-z
-
-    ytil = (uv[:, 0] - cal.cx) / cal.fx
-    ztil = (uv[:, 1] - cal.cy) / cal.fy
-
-    def score_R(Rcand):
-        t = _solve_t_given_R(Xw, ytil, ztil, Rcand)
-        q_new = mat2quat(Rcand.T)  # returns your Quaternion
-        res = float(np.linalg.norm(uv.flatten() - h(q_new, t, Xw, cal)))
-        ch = _cheirality_frac_Rt(Rcand, t, Xw)
-        return res, ch, q_new, t
-
-    cands = []
-    # identity first (so cands[0] is "current")
-    cands.append(score_R(R0))
-
-    # LEFT (camera-frame) flips
-    for F in (Fx, Fy, Fz):
-        cands.append(score_R(F @ R0))
-    # RIGHT (world-frame) flips
-    for F in (Fx, Fy, Fz):
-        cands.append(score_R(R0 @ F))
-
-    # Partition by cheirality validity
-    valid = [(r, c, qn, tn) for (r, c, qn, tn) in cands if c >= min_ch]
-    resI, chI, _, _ = cands[0]
-
-    # If current is invalid but some candidate is valid → take best valid
-    if chI < min_ch and valid:
-        best_r, _, best_q, best_t = min(valid, key=lambda x: x[0])
-        return best_q, best_t
-
-    # If current is valid → only switch on a big residual gain
-    if valid:
-        best_r, _, best_q, best_t = min(valid, key=lambda x: x[0])
-        if (resI - best_r) >= margin_px:
-            return best_q, best_t
-
-    return est_q, est_t
+# # --- Fast initializer: Wahba/Kabsch rotation + linear t ------------------------
+#
+# def init_pose_wahba(Xw, meas_pix, cal: Calibration):
+#     """
+#     Robust seed that matches your projection:
+#         u = FX * ( +y / x ) + CX
+#         v = FY * (  z / x ) + CY
+#
+#     Strategy:
+#       1) Build unit bearing rays B from pixels (two variants: nominal y/x and flipped).
+#       2) Object-centered Wahba/Kabsch using weighted directions of centered 3D points.
+#       3) Solve t linearly given R to match y/x, z/x (your algebra).
+#       4) Enforce cheirality by majority (x_cam > 0).
+#       5) Evaluate BOTH branches against actual pixel residual via h(), pick lower.
+#
+#     Returns:
+#       (q_init, t_init) where q_init.T == R used by h().
+#     """
+#     # --- inputs to numpy arrays / shapes ---------------------------------------
+#     Xw = np.asarray(Xw, float).reshape(-1, 3)
+#     uv = np.asarray(meas_pix, float).reshape(-1, 2)
+#     N = Xw.shape[0]
+#
+#     # Pixel -> slopes consistent with h(): +y/x and +z/x
+#     ytil_nom = (uv[:, 0] - cal.cx) / cal.fx
+#     ztil = (uv[:, 1] - cal.cy) / cal.fy
+#
+#     # Center and build weighted directions of object points
+#     Xc = Xw - Xw.mean(axis=0, keepdims=True)
+#     Xdir = _row_normed(Xc)
+#
+#     # Gentle weight clamp to avoid hinging on a single far tag
+#     w0 = np.linalg.norm(Xc, axis=1)
+#     if np.all(np.isfinite(w0)) and np.any(w0 > 0):
+#         p20, p80 = np.percentile(w0, [20.0, 80.0])
+#         w0 = np.clip(w0, p20, p80)
+#         w0 /= (w0.mean() + 1e-12)
+#     else:
+#         w0 = np.ones(N, dtype=float)
+#
+#     def solve_branch(ytil_current):
+#         """Compute (R, t, q, residual) for one y/x sign branch."""
+#         # Bearings B = unit([1, y/x, z/x]) to align with camera-frame axes used by h()
+#         B = _row_normed(np.column_stack([np.ones(N), ytil_current, ztil]))
+#
+#         # Wahba/Kabsch on weighted directions: H = (B * w)^T @ Xdir
+#         H = (B * w0[:, None]).T @ Xdir
+#         U, S, Vt = np.linalg.svd(H, full_matrices=False)
+#         R = U @ Vt
+#         if np.linalg.det(R) < 0:  # enforce det +1 with minimal change
+#             U[:, -1] *= -1
+#             R = U @ Vt
+#
+#         # Linear t that matches the y/x and z/x equations (your helper)
+#         t = _solve_t_given_R(Xw, ytil_current, ztil, R, w=w0)
+#
+#         # Majority cheirality: x_cam must be positive for most points
+#         X_cam = Xw @ R.T + t
+#         if np.count_nonzero(X_cam[:, 0] > 0.0) < 0.8 * N:
+#             # Minimal reflection that flips x while preserving right-handedness
+#             R = R @ np.diag([-1.0, -1.0, 1.0])
+#             t[:2] *= -1.0
+#
+#         # Map to your quaternion convention (q.T == R used by h())
+#         q_corr = q(quat=np.array([0.0259804137, -0.3295700285, 0.3014442269, 0.8943377396]))
+#         qk = q_corr * mat2quat(R.T)
+#
+#         # Pixel residual under the actual projection model
+#         pred = h(qk, t, Xw, cal)
+#         res = float(np.linalg.norm(uv.flatten() - pred))
+#         return res, qk, t
+#
+#     # Evaluate both branches: nominal y/x and flipped y/x
+#     candidates = [
+#         solve_branch(ytil_nom),
+#         solve_branch(-ytil_nom),
+#     ]
+#
+#     # Choose the candidate with the lower pixel-space residual
+#     candidates.sort(key=lambda c: c[0])
+#     _, q_best, t_best = candidates[0]
+#     return q_best, t_best
+#
+#
+# def _cheirality_frac_Rt(R, t, Xw, eps=1e-9):
+#     Xc = (R @ Xw.T).T + t
+#     return float(np.count_nonzero(Xc[:, 0] > eps)) / Xw.shape[0]
+#
+#
+# def _post_refine_flip_biside(est_q, est_t, meas_pix, object_pts, cal,
+#                              min_ch=0.90, margin_px=100.0):
+#     """
+#     Final sanity check that tries 180° flips on BOTH sides of R:
+#       candidates:  R,
+#                    F @ R, R @ F for F in {Rx, Ry, Rz(=xy)}
+#     For each candidate:
+#       - re-solve t with _solve_t_given_R
+#       - compute residual under h
+#       - require cheirality >= min_ch
+#     Switching rule:
+#       • If current pose is cheirality-INVALID and some candidate is VALID,
+#         take the VALID one with lowest residual (no margin).
+#       • Else (current VALID), only switch if residual improves by >= margin_px.
+#     """
+#     import numpy as np
+#
+#     uv = np.asarray(meas_pix, float).reshape(-1, 2)
+#     Xw = np.asarray(object_pts, float).reshape(-1, 3)
+#
+#     # Current state
+#     R0 = quat2mat(est_q.ndarray).T
+#     res0 = float(np.linalg.norm(uv.flatten() - h(est_q, est_t, Xw, cal)))
+#     ch0 = _cheirality_frac_Rt(R0, est_t, Xw)
+#
+#     # 180° proper rotations about camera axes
+#     Fx = np.diag([1.0, -1.0, -1.0])  # about cam-x
+#     Fy = np.diag([-1.0, 1.0, -1.0])  # about cam-y
+#     Fz = np.diag([-1.0, -1.0, 1.0])  # about cam-z
+#
+#     ytil = (uv[:, 0] - cal.cx) / cal.fx
+#     ztil = (uv[:, 1] - cal.cy) / cal.fy
+#
+#     def score_R(Rcand):
+#         t = _solve_t_given_R(Xw, ytil, ztil, Rcand)
+#         q_new = mat2quat(Rcand.T)  # returns your Quaternion
+#         res = float(np.linalg.norm(uv.flatten() - h(q_new, t, Xw, cal)))
+#         ch = _cheirality_frac_Rt(Rcand, t, Xw)
+#         return res, ch, q_new, t
+#
+#     cands = []
+#     # identity first (so cands[0] is "current")
+#     cands.append(score_R(R0))
+#
+#     # LEFT (camera-frame) flips
+#     for F in (Fx, Fy, Fz):
+#         cands.append(score_R(F @ R0))
+#     # RIGHT (world-frame) flips
+#     for F in (Fx, Fy, Fz):
+#         cands.append(score_R(R0 @ F))
+#
+#     # Partition by cheirality validity
+#     valid = [(r, c, qn, tn) for (r, c, qn, tn) in cands if c >= min_ch]
+#     resI, chI, _, _ = cands[0]
+#
+#     # If current is invalid but some candidate is valid → take best valid
+#     if chI < min_ch and valid:
+#         best_r, _, best_q, best_t = min(valid, key=lambda x: x[0])
+#         return best_q, best_t
+#
+#     # If current is valid → only switch on a big residual gain
+#     if valid:
+#         best_r, _, best_q, best_t = min(valid, key=lambda x: x[0])
+#         if (resI - best_r) >= margin_px:
+#             return best_q, best_t
+#
+#     return est_q, est_t
 
 
 # --- Camera projection ----------------------------------------------------------
@@ -436,8 +439,8 @@ def print_rayPts(ray_proj: np.array):
         print(f"Feature: {n:3d}, px: {ray[0]: .5f}, py: {ray[1]: .5f}")
 
 
-def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
-        cal: Calibration, sigma_squared: np.array = None):
+def opt(img_pts: NDArray, object_pts: NDArray,
+        cal: Calibration, seed_q: q = None, seed_t: NDArray = None, sigma_squared: NDArray = None):
     """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
 
     Uses the analytic Jacobian `deriv`, a pseudoinverse step `delta_x`, and a
@@ -453,22 +456,30 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
     (est_q, est_t)
         The refined quaternion and translation.
     """
-    est_q = deepcopy(seed_q)
-    est_t = deepcopy(seed_t)
+
+    if seed_q is None or seed_t is None:
+        est_q, est_t = DLT(object_pts, img_pts, cal, sigma_squared)
+    else:
+        est_q = deepcopy(seed_q)
+        est_t = deepcopy(seed_t)
+
+    meas_pix = img_pts.flatten()
 
     keep_going = True
-    iter = 0
+    iter_num = 0
     while keep_going:
-        iter += 1
+        iter_num += 1
 
-        y = meas_pix - h(est_q, est_t, feature_points, cal)
+        y = meas_pix - h(est_q, est_t, object_pts, cal)
         old_y_mag = norm(y)
-        L = deriv(est_q, est_t, feature_points, cal)
+        L = deriv(est_q, est_t, object_pts, cal)
 
         if sigma_squared is not None:
             Q = np.diag(1.0 / sigma_squared)
             y = Q.dot(y)
             L = Q.dot(L)
+        else:
+            Q = None
 
         delta_x = np.linalg.pinv(L).dot(y)
 
@@ -476,14 +487,14 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
         scale_is_good = False
         while not scale_is_good:
             # Trial step
-            if sigma_squared is not None:
+            if Q is not None:
                 new_y_mag = norm(Q.dot(
-                    meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:], feature_points, cal)))
+                    meas_pix - h(q(s=float(est_q.s + scale * delta_x[0]), vec=est_q.vec + scale * delta_x[1:4]),
+                                 est_t + scale * delta_x[4:], object_pts, cal)))
             else:
                 new_y_mag = norm(
-                    meas_pix - h(q(s=est_q.s + scale * delta_x[0], vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:], feature_points, cal))
+                    meas_pix - h(q(s=float(est_q.s + scale * delta_x[0]), vec=est_q.vec + scale * delta_x[1:4]),
+                                 est_t + scale * delta_x[4:], object_pts, cal))
 
             # Linear prediction of residual magnitude
             y_pred_mag = norm(y - L.dot(scale * delta_x))
@@ -498,7 +509,7 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
                 if 0.25 < ratio < 4.0:
                     scale_is_good = True
                     est_q = q(
-                        s=est_q.s + scale * delta_x[0],
+                        s=float(est_q.s + scale * delta_x[0]),
                         vec=est_q.vec + scale * delta_x[1:4],
                     )
                     est_t += scale * delta_x[4:]
@@ -506,20 +517,21 @@ def opt(seed_q: q, seed_t: np.array, meas_pix: np.array, feature_points,
                     # Backtrack
                     scale /= 2.0
 
-        if norm(scale * delta_x) < 1e-7 or iter > 10:
+        if norm(scale * delta_x) < 1e-7 or iter_num > 10:
             keep_going = False
 
     return est_q, est_t
 
-def DLT(object_pts, img_pts, cal: Calibration, sigma_squared: np.array = None):
-    image_points_norm = img_pts.squeeze()
+
+def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, sigma_squared: np.array = None):
+
     num_points = len(img_pts)
 
     A = np.zeros((2 * num_points, 12))
 
     for i in range(num_points):
         X, Y, Z = object_pts[i]
-        x, y = image_points_norm[i]
+        x, y = img_pts[i]
 
         A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
         A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
@@ -530,6 +542,7 @@ def DLT(object_pts, img_pts, cal: Calibration, sigma_squared: np.array = None):
 
     # 2. Solve the linear system Ap = 0 using SVD
     _, _, Vt = np.linalg.svd(A)
+
     # The solution is the last column of V (or last row of Vt)
     p = Vt[-1, :]
     P = p.reshape((3, 4))
@@ -560,22 +573,26 @@ def DLT(object_pts, img_pts, cal: Calibration, sigma_squared: np.array = None):
     return q_init, t
 
 
-def solveQnP(object_pts, img_pts, cal: Calibration, sigma_squared=None):
+def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_squared=None):
+    """
+    :param object_pts: Truth Object Points
+    :param img_pts: Detected Feature points in image
+    :param cal: Camera calibration from Calibration.py
+    :param sigma_squared:
+    :return:
+    """
 
-    # sigma_squared = np.ones_like(img_pts.flatten())
-    # sigma_squared[0] = 100.0
-    # sigma_squared[1] = 100.0
+    sigma_squared = np.ones(2 * len(object_pts))
+    sigma_squared[0] = 100.0
+    sigma_squared[1] = 100.0
 
-    q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
-    img_pts = deepcopy(img_pts).flatten()
+    # q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
+    est_q, est_t = opt(img_pts, object_pts, cal, sigma_squared=sigma_squared)
+    # est_q, est_t = q_init, t_init
 
-    est_q, est_t = opt(q_init, t_init, img_pts, object_pts, cal, sigma_squared)
-    # est_q, est_t = init_q, init_t
+    est_q.force_s_pos()
 
-    est_q.force_s_pos
-
-    # est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal,
-                                            # min_ch=0.90, margin_px=100.0)
+    # est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal, min_ch=0.90, margin_px=100.0)
 
     # print(f'Residual: {norm(img_pts - h(est_q, est_t, object_pts, cal))}')
     # print(f'Init: {init_q}, {init_t}')

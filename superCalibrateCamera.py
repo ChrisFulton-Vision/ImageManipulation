@@ -237,6 +237,7 @@ class ImageKernels(Enum):
 
 class CameraConfig():
     def __init__(self):
+        self.imageFilepath = None
         self.cam_index = 0
         self.detectTags = False
         self.undistort = False
@@ -269,8 +270,9 @@ class CameraConfig():
         for obj in configToCopy.__dict__:
             try:
                 self.__dict__[obj] = configToCopy.__dict__[obj]
-            except KeyError:
+            except KeyError as e:
                 # Allows for versioning issues, changed naming conventions.
+                print(f"Old cache loaded. Observe: {e}")
                 pass
 
 
@@ -319,7 +321,7 @@ class CameraGui():
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
-        self.rollReader = AttRdr()
+        self.attReader = AttRdr()
 
         self.imageProcessingKernelCombobox = None
 
@@ -428,7 +430,7 @@ class CameraGui():
         self.ingestCalibration()
 
         if not self.camConfig.hud_data_filepath == '':
-            self.rollReader.read_files(self.camConfig.hud_data_filepath)
+            self.attReader.read_files(self.camConfig.hud_data_filepath)
         self.updateLidarLabel()
         self.updateYOLOLabel()
         self.updateFlightLogLabel()
@@ -489,7 +491,7 @@ class CameraGui():
                                                        title='Select Flight Log Data')
         if poss_filepath != '':
             self.camConfig.hud_data_filepath = poss_filepath
-            self.rollReader.read_files(poss_filepath)
+            self.attReader.read_files(poss_filepath)
             self.updateFlightLogLabel()
             self.saveToCache()
 
@@ -1245,6 +1247,7 @@ class CameraGui():
 
         self.curr_frame_gray = None
 
+        # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
         if self.calibration.validCal and self.camConfig.undistort:
             self.undistort(frame.copy())
         else:
@@ -1324,7 +1327,7 @@ class CameraGui():
         cv2.polylines(self.markup_frame, [lines],
                       False, (0, 255, 0), 2)
 
-        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, mode = self.rollReader.get_roll_at(img_time)
+        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, mode = self.attReader.get_roll_at(img_time)
 
         # bank_angle = 0.0 + 60.0 * sin(img_time)
         bank_pts = []

@@ -1,4 +1,4 @@
-'''Functions to operate on, or return, quaternions.
+"""Functions to operate on, or return, quaternions.
 
 Quaternions here consist of 4 values ``w, x, y, z``, where ``w`` is the
 real (scalar) part, and ``x, y, z`` are the complex (vector) part.
@@ -18,21 +18,24 @@ Terms used in function names:
 * *aff* : affine array shape (4, 4) (3D homogenous coordinates)
 * *quat* : quaternion shape (4,)
 * *axangle* : rotations encoded by axis vector and angle scalar
-'''
+"""
 
 import numpy as np
-from numpy import cos, arccos, sin, arcsin, tan, arctan, arctan2, rad2deg, deg2rad, sqrt, abs
+from numpy import cos, arccos, sin, arcsin, arctan2, rad2deg, deg2rad, sqrt, abs
 from typing_extensions import Self, Union
-import copy
 from copy import deepcopy
+
 _FLOAT_EPS = np.finfo(np.float64).eps
 
+
 class Quaternion:
+    __array_priority__ = 10_000  # overrides numpy priority for right mult
+
     def __init__(self, s: float = None, vec: np.array = None, quat: np.array = None, makeUnitQuat: bool = True) -> None:
         # These two parameters form the definition of the quaternion. self.s is a scalar asscoiated with the
         # real component of the quaternion, while self.vec is the vector, associated with i, j, k / x, y, z components
-        self.s:float = 1.0
-        self.vec:np.array = np.zeros((3,))
+        self.s: float = 1.0
+        self.vec: np.array = np.zeros((3,))
 
         # Included for redundancy, if a quaternion is passed in, make a copy of its values
         if isinstance(quat, Quaternion):
@@ -80,16 +83,16 @@ class Quaternion:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
         self.checkUnit(makeUnitQuat)
 
-    def checkUnit(self, makeUnitQuat:bool):
+    def checkUnit(self, makeUnitQuat: bool):
         if makeUnitQuat:
-            norm:float = self.norm
+            norm: float = self.norm
             if abs(norm) < 0.000001:
                 raise ValueError('Cannot make zero-quaternion a unit.')
             self.s /= norm
             self.vec /= norm
 
     def __str__(self) -> str:
-        strg:str = ''
+        strg: str = ''
         if self.s < 0:
             strg += f'[{self.s:.10f}, <'
         else:
@@ -109,7 +112,7 @@ class Quaternion:
         return strg
 
     def __format__(self, format_spec: str) -> str:
-        def plus_or_minus(val:float, ijk_spec:str = '.3f')->str:
+        def plus_or_minus(val: float, ijk_spec: str = '.3f') -> str:
             return f' - {-val:{ijk_spec}}' if val < 0.0 else f' + {val:{ijk_spec}}'
 
         if format_spec[:3] == 'ijk':
@@ -147,7 +150,7 @@ class Quaternion:
         return Quaternion(quat=np.array([self.s + other.s,
                                          self.vec[0] + other.vec[0],
                                          self.vec[1] + other.vec[1],
-                                         self.vec[2] + other.vec[2]]),makeUnitQuat=False)
+                                         self.vec[2] + other.vec[2]]), makeUnitQuat=False)
 
     def __eq__(self, other: Self):
         if not isinstance(other, Quaternion):
@@ -162,12 +165,37 @@ class Quaternion:
 
         return False
 
+    # NEP-18 hook: intercept np.matmul(A, q) when q is a Quaternion
+    def __array_function__(self, func, types, args, kwargs):
+        if func is np.matmul:
+            A, B = args
+            # cases: A @ q   or   q @ B (you can support both if you like)
+            if isinstance(B, Quaternion):
+                return B.__rmatmul__(A)  # defer to our rmatmul
+            # (Optional) support q @ A if you want:
+            if isinstance(A, Quaternion):
+                # define your left-matmul here if desired
+                return A @ B
+        return NotImplemented
 
     def __rmul__(self, other):
         if isinstance(other, float):
             return self * other
+
+    def __rmatmul__(self, other):
+        if isinstance(other, np.ndarray):
+            if other.shape[0] == 4:
+                going_out = np.zeros((other.T.shape))
+                for idx, quat in enumerate(other):
+                    going_out[idx] = (Quaternion(quat=quat,makeUnitQuat=False).__mul__(self)).ndarray
+                return going_out
+
+
+    def __matmul__(self, multiplier):
+        return self * multiplier
+
     def __mul__(self, multiplier):
-        '''
+        """
         "*" Operator override:
         If multiplier is a 3x1 np.array, treat it like a quat-vect multiplication
             return 3x1 np.array vector
@@ -181,12 +209,14 @@ class Quaternion:
         rotated by the quaternion and then returned as a Nx3 np.array
         If multiplier is another Quaternion object, treat it like quat-quat,
             return 4x1 np.array
-        '''
+        """
         if isinstance(multiplier, np.ndarray):
             if multiplier.shape == (3,):
                 return self.qv_mult(multiplier)
             if multiplier.shape == (4,):
                 return self.qn_mult(multiplier)
+            if multiplier.shape[1] == 4:
+                return self.qQs_mult(multiplier)
             if multiplier.shape == (3, 3):
                 return self.qM_mult(multiplier)
             if multiplier.shape[1] == 3:
@@ -212,13 +242,23 @@ class Quaternion:
         return self
 
     def qVECS_mult(self, vecs: np.array):
-        sol:np.array = np.zeros(vecs.shape)
+        sol: np.array = np.zeros(vecs.shape)
         for idx, vec in enumerate(vecs):
             sol[idx] = self.qv_mult(vec)
         return sol
 
-    def vect_deriv(self, vect: np.array, isQuatConjugated: bool, projectPerpendicular: bool = True):
+    def vect_deriv(self, vect: np.array, isQuatConjugated: bool):
         '''
+        Important note! Finding the quaternion partial derivatives with respect to a quaternion that is transposed is
+        an entirely different operation!! Be careful when using this function.
+        The derivative quaternion MUST be transposed, and must be ALSO be handled with the boolean entry.
+        Example: partial of q1.T * v1 with respect to q1 should be input as:
+        q1.T.vect_deriv(v1, True)
+
+        A BETTER implementation would be to use this pure method exclusively for non-transposed quaternions
+        For transposed quaternions, use:
+        q1.transpose_vect_deriv(v1)
+
         >>> for _ in range(100):
         ...     q = randomQuat()
         ...     delt = 0.0000001
@@ -258,7 +298,7 @@ class Quaternion:
         # q.T.vectDeriv(vec, False) <= Invalid!
         # q.vectDeriv(vec, True) <= Invalid!
         # q.T.vectDeriv(vec, True) ... Valid, but better is:
-        # q.transpose_vec_deriv(vec)
+        # q.transpose_vect_deriv(vec)
 
         '''
         This function returns the Jacobian in 3x4, presuming you are taking the partial derivative
@@ -274,46 +314,40 @@ class Quaternion:
 
         # d_qx
         deriv[:, 1] = 2.0 * (np.array([self.vec[0] * vect[0] + np.dot(self.vec, vect),
-                                self.vec[1] * vect[0],
-                                self.vec[2] * vect[0]]) + \
-                      -self.vec[0] * vect + \
-                      self.s * np.array([0.0, -vect[2], vect[1]]))
+                                       self.vec[1] * vect[0],
+                                       self.vec[2] * vect[0]]) +
+                             -self.vec[0] * vect +
+                             self.s * np.array([0.0, -vect[2], vect[1]]))
 
         # d_qy
         deriv[:, 2] = 2.0 * (np.array([self.vec[0] * vect[1],
-                                (self.vec[1] * vect[1] + np.dot(self.vec, vect)),
-                                self.vec[2] * vect[1]]) + \
-                      -self.vec[1] * vect + \
-                      self.s * np.array([vect[2], 0.0, -vect[0]]))
+                                       (self.vec[1] * vect[1] + np.dot(self.vec, vect)),
+                                       self.vec[2] * vect[1]]) +
+                             -self.vec[1] * vect +
+                             self.s * np.array([vect[2], 0.0, -vect[0]]))
         # d_qz
         deriv[:, 3] = 2.0 * (np.array([self.vec[0] * vect[2],
-                                self.vec[1] * vect[2],
-                                (self.vec[2] * vect[2] + np.dot(self.vec, vect))]) + \
-                      -self.vec[2] * vect + \
-                      self.s * np.array([-vect[1], vect[0], 0.0]))
+                                       self.vec[1] * vect[2],
+                                       (self.vec[2] * vect[2] + np.dot(self.vec, vect))]) +
+                             -self.vec[2] * vect +
+                             self.s * np.array([-vect[1], vect[0], 0.0]))
 
         if isQuatConjugated:
-            deriv[:, 1] *= -1.0
-            deriv[:, 2] *= -1.0
-            deriv[:, 3] *= -1.0
-            if projectPerpendicular:
-                P = np.eye(4) - np.outer(self.T.ndarray, self.T.ndarray)
-                return deriv @ P
-        elif projectPerpendicular:
-            P = np.eye(4) - np.outer(self.ndarray, self.ndarray)
-            return deriv @ P
+            deriv[:, 1:] = -deriv[:, 1:]
+            P = self.T.normal_plane_projection
+        else:
+            P = self.normal_plane_projection
+        return deriv @ P
 
-        return deriv
-
-    def transpose_vec_deriv(self, vect: np.array, projectPerpendicular: bool = True):
+    def transpose_vect_deriv(self, vect: np.array):
         '''
         Tiny helper, that helps perform the transpose derivative without mistakes.
         partial ( q.T * vec) / partial (q) may now be written:
-                q.transpose_vec_deriv(vec)
+                q.transpose_vect_deriv(vec)
         instead of
                 q.T.vect_deriv(vec, True)
         '''
-        return self.T.vect_deriv(vect, True, projectPerpendicular)
+        return self.T.vect_deriv(vect, True)
 
     def to_dcm(self):
         return quat2mat(self.ndarray)
@@ -323,6 +357,12 @@ class Quaternion:
 
     def qn_mult(self, multNdarray):
         return qmult(self.ndarray, multNdarray)
+
+    def qQs_mult(self, QsNdarray):
+        going_out = np.zeros((QsNdarray.shape))
+        for idx, quat_as_ndarray in enumerate(QsNdarray):
+            going_out[idx] = qmult(self.ndarray, quat_as_ndarray)
+        return going_out
 
     def qv_mult(self, multVec):
         return (2 * np.dot(self.vec, multVec) * self.vec +
@@ -355,7 +395,7 @@ class Quaternion:
 
     @property
     def inv(self):
-        return Quaternion(self.s, -self.vec, makeUnitQuat=False)/self.mag ** 2
+        return Quaternion(self.s, -self.vec, makeUnitQuat=False) / self.mag ** 2
 
     @property
     def ndarray(self):
@@ -455,16 +495,17 @@ class Quaternion:
     @property
     def exp(self):
         if np.linalg.norm(self.vec) > 0.00000001:
-            return np.exp(self.s) * Quaternion(s=cos(np.linalg.norm(self.vec)), vec=self.vec/np.linalg.norm(self.vec)*sin(np.linalg.norm(self.vec)))
+            return np.exp(self.s) * Quaternion(s=cos(np.linalg.norm(self.vec)),
+                                               vec=self.vec / np.linalg.norm(self.vec) * sin(np.linalg.norm(self.vec)))
         return Quaternion(s=1.0, vec=np.zeros((3,)))
 
     @property
     def ln(self):
         if np.linalg.norm(self.vec) < 0.000001:
-            return Quaternion(s=0.0, vec= np.zeros((3,)))
-        return Quaternion(s=np.log(self.norm), vec=self.vec/np.linalg.norm(self.vec)*np.acos(self.s/self.norm))
+            return Quaternion(s=0.0, vec=np.zeros((3,)))
+        return Quaternion(s=np.log(self.norm), vec=self.vec / np.linalg.norm(self.vec) * np.acos(self.s / self.norm))
 
-    def power(self, power:float):
+    def power(self, power: float):
         if not isinstance(power, float):
             power = float(power)
         return (power * self.ln).exp.normalize()
@@ -499,236 +540,250 @@ class Quaternion:
         new_t = rod_quat.T * -tvec
         return rod_quat, np.squeeze(new_t)
 
-    def slerp(self, q2:Self, t) -> Self:
+    def slerp(self, q2: Self, t) -> Self:
         return self * (self.inv * q2).power(t)
 
-class DualQuat:
-    def __init__(self, q_real : Quaternion = Quaternion(), q_dual : Quaternion = Quaternion(quat=np.array([0.0,0.0,0.0,0.0]), makeUnitQuat=False),
-                 r : Quaternion = None, t : Quaternion = None, t_vec : np.array = None) -> None:
-
-        if r is not None:
-            if not 1-10*_FLOAT_EPS < r.mag < 1+10*_FLOAT_EPS:
-                raise TypeError(f'Input r should be a unit quaternion (r.mag == 1.0):  r.mag={r.mag}')
-
-            if t is not None:
-                if t.s < -_FLOAT_EPS or t.s > _FLOAT_EPS:
-                    raise TypeError(f'Input t should be a pure quaternion (t.s == 0):  t.s={t.s}')
-
-                self.q_real = r
-                self.q_dual = 0.5 * t * r
-                return
-
-            if t_vec is not None:
-                t = Quaternion(s=0, vec=t_vec, makeUnitQuat=False)
-                self.q_real = r
-                self.q_dual = 0.5 * t * r
-                return
-
-            raise TypeError(f'Rotation Quaterion input, {r}, but neither t nor t_vec were supplied.')
-
-        if not isinstance(q_real,Quaternion) or not isinstance(q_dual, Quaternion):
-            raise TypeError(f'Bad input types. Required Quaternions: q_real: {type(q_real)}, q_dual: {type(q_dual)}')
-
-        self.q_real = q_real
-        self.q_dual = q_dual
-
-    def __str__(self) -> str:
-        return f'{self.q_real.__str__()} + {self.q_dual.__str__()}\u03B5'
-
-    def __mul__(self, other) -> Self:
-        going_out = copy.deepcopy(self)
-        otherCopy = copy.deepcopy(other)
-
-        if isinstance(otherCopy, float) or isinstance(otherCopy, int):
-            going_out.q_real *= otherCopy
-            going_out.q_dual *= otherCopy
-            return going_out
-
-        if isinstance(otherCopy, DualQuat):
-            going_out.q_dual = going_out.q_real * otherCopy.q_dual + going_out.q_dual * otherCopy.q_real
-            going_out.q_real *= otherCopy.q_real
-            return going_out
-
-        if isinstance(otherCopy, np.ndarray) and otherCopy.shape == (3,):
-            multiplier = Quaternion(s=0.0, vec=otherCopy)
-            going_out.q_dual = going_out.q_real * multiplier + going_out.q_dual * Quaternion()
-            return going_out
-
-        raise ValueError('Object Type Unknown: {type(other)} is not a valid object.')
-
-    def __rmul__(self, other) -> Self:
-        if isinstance(other, DualQuat):
-            raise TypeError("It shouldn't be able to get here, but it would multiple wrong now.")
-        return copy.deepcopy(self) * other
-
-    def __sub__(self, other : Self) -> Self:
-        going_out = copy.deepcopy(self)
-        if isinstance(other, DualQuat):
-            # going_out.q_real += other.q_real
-            going_out.q_dual -= other.q_dual
-        return going_out
-
-    def __add__(self, other : Self) -> Self:
-        going_out = copy.deepcopy(self)
-        if isinstance(other, DualQuat):
-            # going_out.q_real += other.q_real
-            going_out.q_dual += other.q_dual
-        return going_out
-
-    def __neg__(self):
-        return self * -1.0
-
-    def __eq__(self, other):
-        if not isinstance(other, DualQuat):
-            raise TypeError(f'Comparing two unlike objects. Self (DualQuat) and {type(other)}')
-
-        if self.q_real == other.q_real and self.q_dual == other.q_dual:
-            return True
-
-        return False
-
-    def translateInFrame(self, vec):
-        new_t_vec = self.t_vec + vec
-        return DualQuat(r=self.r, t_vec=new_t_vec)
+    @property
+    def normal_plane_projection(self):
+        return np.eye(4) - np.outer(self.ndarray, self.ndarray)
 
     @property
-    def T(self):
-        '''
-        >>> test_Q = DualQuat(q_real=Quaternion(s=1.0,vec=np.array([0.0,0.0,0.0])),
-        ... q_dual=Quaternion(s=0.0,vec=np.array([-1.0,1.0,1.0]), makeUnitQuat=False))
-        >>> sol_Q =  DualQuat(q_real=Quaternion(s=1.0,vec=np.array([0.0,0.0,0.0])),
-        ... q_dual=Quaternion(s=0.0,vec=np.array([1.0,-1.0,-1.0]), makeUnitQuat=False))
-        >>> assert test_Q == sol_Q
-        '''
-        return DualQuat(q_real=copy.deepcopy(self.q_real).T, q_dual=copy.deepcopy(self.q_dual).T)
+    def inplace_deriv(self):
+        return self.normal_plane_projection
 
     @property
-    def mag(self) -> float:
-        return self.T * self
+    def T_inplace_deriv(self):
+        P = self.T.normal_plane_projection
+        P[1:] = -P[1:]
+        return P
 
-    @property
-    def norm(self) -> float:
-        return self.T * self
-    @property
-    def inv(self):
-        if self.q_real.norm > _FLOAT_EPS:
-            return DualQuat(q_real = copy.deepcopy(self.q_real).inv, q_dual= copy.deepcopy(self.q_real).inv * -0.5 * copy.deepcopy(self.q_dual) * copy.deepcopy(self.q_real).inv)
-        raise ValueError('No Inverse, Magnitude too close to 0')
-
-    @property
-    def r(self):
-        return self.q_real
-
-    @property
-    def t(self):
-        return 2.0 * self.q_dual * self.q_real.T
-
-    @property
-    def t_vec(self):
-        return (2.0 * self.q_dual * self.q_real.T).ndarray[1:4]
-
-    @property
-    def isUnit(self):
-        return (1.0 - 10.0*_FLOAT_EPS < self.q_real.mag < 1.0 + 10.0*_FLOAT_EPS and
-                -_FLOAT_EPS < self.q_real.ndarray.dot(self.q_dual.ndarray) < _FLOAT_EPS)
 
 pure_qs = Quaternion(s=1.0, vec=np.zeros((3,)))
-pure_qx = Quaternion(s=0.0, vec=np.array([1.0,0.0,0.0]))
-pure_qy = Quaternion(s=0.0, vec=np.array([0.0,1.0,0.0]))
-pure_qz = Quaternion(s=0.0, vec=np.array([0.0,0.0,1.0]))
+pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
+pure_qy = Quaternion(s=0.0, vec=np.array([0.0, 1.0, 0.0]))
+pure_qz = Quaternion(s=0.0, vec=np.array([0.0, 0.0, 1.0]))
 
-def interpolate(q1:Quaternion, q2:Quaternion, t:float):
-    interp : Quaternion = q1 * (q1.inv * q2).power(t)
+
+def interpolate(q1: Quaternion, q2: Quaternion, t: float):
+    interp: Quaternion = q1 * (q1.inv * q2).power(t)
     return interp
 
+
 def randomQuat(unit=True):
-    return Quaternion(quat=np.random.rand(4,), makeUnitQuat=unit)
+    return Quaternion(quat=np.random.rand(4, ), makeUnitQuat=unit)
+
 
 def left_quat_productDeriv(quatL, quatR, isTargetConjugated):
-    deriv = np.zeros((4,4))
-    deriv[:, 0] = (pure_qs * quatR).ndarray
-    deriv[:, 1] = (pure_qx * quatR).ndarray
-    deriv[:, 2] = (pure_qy * quatR).ndarray
-    deriv[:, 3] = (pure_qz * quatR).ndarray
+    """
+    Important note! Finding the quaternion partial derivatives with respect to a quaternion that is transposed is
+    an entirely different operation!! Be careful when using this function.
+    The derivative quaternion should NOT be transposed, and instead must be handled with the boolean entry.
+    Other quaternions MUST be input as their transpose, if they are transposed in the original equation.
+    Example: partial of q1.T * q2.T with respect to q1 should be input as:
+    left_quat_productDeriv(q1, q2.T, True)
+    >>> for i in range(100):
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     q0 = q1 * q2
+    ...     delt = 0.00000001
+    ...     qs = Quaternion(s=q1.s + delt, vec=q1.vec) * q2
+    ...     qx = Quaternion(s=q1.s, vec=q1.vec + np.array([delt, 0, 0])) * q2
+    ...     qy = Quaternion(s=q1.s, vec=q1.vec + np.array([0, delt, 0])) * q2
+    ...     qz = Quaternion(s=q1.s, vec=q1.vec + np.array([0, 0, delt])) * q2
+    ...     analy_deriv = left_quat_productDeriv(q1, q2, False)
+    ...     np.testing.assert_allclose(analy_deriv, np.array([(qs-q0).ndarray/delt,(qx-q0).ndarray/delt,(qy-q0).ndarray/delt,(qz-q0).ndarray/delt]).T, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     q0 = q1.T * q2
+    ...     delt = 0.00000001
+    ...     qs = Quaternion(s=q1.s + delt, vec=q1.vec).T * q2
+    ...     qx = Quaternion(s=q1.s, vec=q1.vec + np.array([delt, 0, 0])).T * q2
+    ...     qy = Quaternion(s=q1.s, vec=q1.vec + np.array([0, delt, 0])).T * q2
+    ...     qz = Quaternion(s=q1.s, vec=q1.vec + np.array([0, 0, delt])).T * q2
+    ...     analy_deriv = left_quat_productDeriv(q1, q2, True)
+    ...     np.testing.assert_allclose(analy_deriv, np.array([(qs-q0).ndarray/delt,(qx-q0).ndarray/delt,(qy-q0).ndarray/delt,(qz-q0).ndarray/delt]).T, rtol=1e-05, atol=1e-05)
+
+    :param quatL:
+    :param quatR:
+    :param isTargetConjugated:
+    :return:
+    """
     if isTargetConjugated:
-        deriv[:, 1:] = -deriv[:,1:]
-    return deriv
+        return (quatL.T_inplace_deriv @ quatR).T
+    else:
+        return (quatL.inplace_deriv @ quatR).T
+
 
 def right_quat_productDeriv(quatL, quatR, isTargetConjugated):
-    deriv = np.zeros((4,4))
-    deriv[:, 0] = (quatL * pure_qs).ndarray
-    deriv[:, 1] = (quatL * pure_qx).ndarray
-    deriv[:, 2] = (quatL * pure_qy).ndarray
-    deriv[:, 3] = (quatL * pure_qz).ndarray
+    """
+    Important note! Finding the quaternion partial derivatives with respect to a quaternion that is transposed is
+    an entirely different operation!! Be careful when using this function.
+    The derivative quaternion should NOT be transposed, and instead must be handled with the boolean entry.
+    Other quaternions MUST be input as their transpose, if they are transposed in the original equation.
+    Example: partial of q1.T * q2.T with respect to q2 should be input as:
+    right_quat_productDeriv(q1.T, q2, True)
+
+    >>> for i in range(100):
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     q0 = q1 * q2
+    ...     delt = 0.00000001
+    ...     qs = q1 * Quaternion(s=q2.s + delt, vec=q2.vec)
+    ...     qx = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([delt, 0, 0]))
+    ...     qy = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, delt, 0]))
+    ...     qz = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, 0, delt]))
+    ...     analy_deriv = right_quat_productDeriv(q1, q2, False)
+    ...     np.testing.assert_allclose(analy_deriv, np.array([(qs-q0).ndarray/delt,(qx-q0).ndarray/delt,(qy-q0).ndarray/delt,(qz-q0).ndarray/delt]).T, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     q0 = q1 * q2.T
+    ...     delt = 0.00000001
+    ...     qs = q1 * Quaternion(s=q2.s + delt, vec=q2.vec).T
+    ...     qx = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([delt, 0, 0])).T
+    ...     qy = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, delt, 0])).T
+    ...     qz = q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, 0, delt])).T
+    ...     analy_deriv = right_quat_productDeriv(q1, q2, True)
+    ...     np.testing.assert_allclose(analy_deriv, np.array([(qs-q0).ndarray/delt,(qx-q0).ndarray/delt,(qy-q0).ndarray/delt,(qz-q0).ndarray/delt]).T, rtol=1e-05, atol=1e-05)
+
+    :param quatL:
+    :param quatR:
+    :param isTargetConjugated:
+    :return:
+    """
     if isTargetConjugated:
-        deriv[:, 1:] = -deriv[:,1:]
-    return deriv
+        return (quatL @ quatR.T_inplace_deriv).T
+    else:
+        return (quatL @ quatR.inplace_deriv).T
 
 def tri_quat_productDeriv(quat1, quat2, quat3, idx, isTargetConjugated):
-    '''
-    >>> for i in range(1000):
+    """
+    Important note! Finding the quaternion partial derivatives with respect to a quaternion that is transposed is
+    an entirely different operation!! Be careful when using this function.
+    The derivative quaternion should NOT be transposed, and instead must be handled with the boolean entry.
+    Other quaternions MUST be input as their transpose, if they are transposed in the original equation.
+    Example: partial of q1 * q2.T * q3.T with respect to q2 should be input as:
+    tri_quat_productDeriv(q1, q2, q3.T, 'm', True)
+
+    >>> for i in range(100):
     ...     q0 = randomQuat()
     ...     q1 = randomQuat()
     ...     q2 = randomQuat()
-    ...     delt = 0.00000001
-    ...     mult = q0 * q1 * q2
-    ...     q1.s += delt
-    ...     sMult = q0 * q1 * q2
-    ...     q1.s -= delt
-    ...
-    ...     q1.vec[0] += delt
-    ...     xMult = q0 * q1 * q2
-    ...     q1.vec[0] -= delt
-    ...
-    ...     q1.vec[1] += delt
-    ...     yMult = q0 * q1 * q2
-    ...     q1.vec[1] -= delt
-    ...
-    ...     q1.vec[2] += delt
-    ...     zMult = q0 * q1 * q2
-    ...     q1.vec[2] -= delt
+    ...     delt = 0.0000001
+    ...     mult0 = q0 * q1 * q2.T
+    ...     mults = q0 * Quaternion(s=q1.s + delt, vec=q1.vec) * q2.T
+    ...     multx = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([delt, 0, 0])) * q2.T
+    ...     multy = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([0, delt, 0])) * q2.T
+    ...     multz = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([0, 0, delt])) * q2.T
     ...
     ...     numDeriv = np.zeros((4,4))
     ...
-    ...     numDeriv[:,0] = ((sMult - mult)/delt).ndarray
-    ...     numDeriv[:,1] = ((xMult - mult)/delt).ndarray
-    ...     numDeriv[:,2] = ((yMult - mult)/delt).ndarray
-    ...     numDeriv[:,3] = ((zMult - mult)/delt).ndarray
+    ...     numDeriv[:,0] = ((mults - mult0)/delt).ndarray
+    ...     numDeriv[:,1] = ((multx - mult0)/delt).ndarray
+    ...     numDeriv[:,2] = ((multy - mult0)/delt).ndarray
+    ...     numDeriv[:,3] = ((multz - mult0)/delt).ndarray
     ...
-    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2, 'm', False), numDeriv, rtol=1e-05, atol=1e-05)
+    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2.T, 'm', False), numDeriv, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q0 = randomQuat()
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     delt = 0.0000001
+    ...     mult0 = q0 * q1.T * q2
+    ...     mults = q0 * Quaternion(s=q1.s + delt, vec=q1.vec).T * q2
+    ...     multx = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([delt, 0, 0])).T * q2
+    ...     multy = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([0, delt, 0])).T * q2
+    ...     multz = q0 * Quaternion(s=q1.s, vec=q1.vec + np.array([0, 0, delt])).T * q2
+    ...
+    ...     numDeriv = np.zeros((4,4))
+    ...
+    ...     numDeriv[:,0] = ((mults - mult0)/delt).ndarray
+    ...     numDeriv[:,1] = ((multx - mult0)/delt).ndarray
+    ...     numDeriv[:,2] = ((multy - mult0)/delt).ndarray
+    ...     numDeriv[:,3] = ((multz - mult0)/delt).ndarray
+    ...
+    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2, 'm', True), numDeriv, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q0 = randomQuat()
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     delt = 0.0000001
+    ...     mult0 = q0 * q1 * q2
+    ...     mults = Quaternion(s=q0.s + delt, vec=q0.vec) * q1 * q2
+    ...     multx = Quaternion(s=q0.s, vec=q0.vec + np.array([delt, 0, 0])) * q1 * q2
+    ...     multy = Quaternion(s=q0.s, vec=q0.vec + np.array([0, delt, 0])) * q1 * q2
+    ...     multz = Quaternion(s=q0.s, vec=q0.vec + np.array([0, 0, delt])) * q1 * q2
+    ...
+    ...     numDeriv = np.zeros((4,4))
+    ...
+    ...     numDeriv[:,0] = ((mults - mult0)/delt).ndarray
+    ...     numDeriv[:,1] = ((multx - mult0)/delt).ndarray
+    ...     numDeriv[:,2] = ((multy - mult0)/delt).ndarray
+    ...     numDeriv[:,3] = ((multz - mult0)/delt).ndarray
+    ...
+    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2, 'l', False), numDeriv, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q0 = randomQuat()
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     delt = 0.0000001
+    ...     mult0 = q0.T * q1 * q2
+    ...     mults = Quaternion(s=q0.s + delt, vec=q0.vec).T * q1 * q2
+    ...     multx = Quaternion(s=q0.s, vec=q0.vec + np.array([delt, 0, 0])).T * q1 * q2
+    ...     multy = Quaternion(s=q0.s, vec=q0.vec + np.array([0, delt, 0])).T * q1 * q2
+    ...     multz = Quaternion(s=q0.s, vec=q0.vec + np.array([0, 0, delt])).T * q1 * q2
+    ...
+    ...     numDeriv = np.zeros((4,4))
+    ...
+    ...     numDeriv[:,0] = ((mults - mult0)/delt).ndarray
+    ...     numDeriv[:,1] = ((multx - mult0)/delt).ndarray
+    ...     numDeriv[:,2] = ((multy - mult0)/delt).ndarray
+    ...     numDeriv[:,3] = ((multz - mult0)/delt).ndarray
+    ...
+    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2, 'l', True), numDeriv, rtol=1e-05, atol=1e-05)
+    >>> for i in range(100):
+    ...     q0 = randomQuat()
+    ...     q1 = randomQuat()
+    ...     q2 = randomQuat()
+    ...     delt = 0.0000001
+    ...     mult0 = q0 * q1 * q2
+    ...     mults = q0 * q1 * Quaternion(s=q2.s + delt, vec=q2.vec)
+    ...     multx = q0 * q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([delt, 0, 0]))
+    ...     multy = q0 * q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, delt, 0]))
+    ...     multz = q0 * q1 * Quaternion(s=q2.s, vec=q2.vec + np.array([0, 0, delt]))
+    ...
+    ...     numDeriv = np.zeros((4,4))
+    ...
+    ...     numDeriv[:,0] = ((mults - mult0)/delt).ndarray
+    ...     numDeriv[:,1] = ((multx - mult0)/delt).ndarray
+    ...     numDeriv[:,2] = ((multy - mult0)/delt).ndarray
+    ...     numDeriv[:,3] = ((multz - mult0)/delt).ndarray
+    ...
+    ...     np.testing.assert_allclose(tri_quat_productDeriv(q0, q1, q2, 'r', False), numDeriv, rtol=1e-05, atol=1e-05)
 
     :param quat1: q0 in quaternion multiplication q0 * q1 * q2
     :param quat2: q1 in quaternion multiplication q0 * q1 * q2
     :param quat3: q2 in quaternion multiplication q0 * q1 * q2
     :return: Partial derivative of multiplication with respect to idx, 'l' for left, 'm' for middle', 'r' for right
-    '''
-    deriv = np.zeros((4,4))
+    """
+    deriv = np.zeros((4, 4))
     if idx == 'l':
-        deriv[:, 0] = (pure_qs * quat2 * quat3).ndarray
-        deriv[:, 1] = (pure_qx * quat2 * quat3).ndarray
-        deriv[:, 2] = (pure_qy * quat2 * quat3).ndarray
-        deriv[:, 3] = (pure_qz * quat2 * quat3).ndarray
-        if isTargetConjugated:
-            deriv[:, 1:] = -deriv[:,1:]
-        return deriv
+        return left_quat_productDeriv(quat1, quat2 * quat3, isTargetConjugated)
 
     if idx == 'm':
-        deriv[:, 0] = (quat1 * pure_qs * quat3).ndarray
-        deriv[:, 1] = (quat1 * pure_qx * quat3).ndarray
-        deriv[:, 2] = (quat1 * pure_qy * quat3).ndarray
-        deriv[:, 3] = (quat1 * pure_qz * quat3).ndarray
         if isTargetConjugated:
-            deriv[:, 1:] = -deriv[:,1:]
+            P = quat2.T.normal_plane_projection
+        else:
+            P = quat2.normal_plane_projection
+
+        deriv = (quat1 @ P @ quat3).T
+        if isTargetConjugated:
+            deriv[:, 1:] = -deriv[:, 1:]
         return deriv
 
     if idx == 'r':
-        deriv[:, 0] = (quat1 * quat2 * pure_qs).ndarray
-        deriv[:, 1] = (quat1 * quat2 * pure_qx).ndarray
-        deriv[:, 2] = (quat1 * quat2 * pure_qy).ndarray
-        deriv[:, 3] = (quat1 * quat2 * pure_qz).ndarray
-        if isTargetConjugated:
-            deriv[:, 1:] = -deriv[:,1:]
-        return deriv
+        return right_quat_productDeriv(quat1 * quat2, quat3, isTargetConjugated)
 
     raise ValueError('tri_quat_productDeriv idx should be \'l\', \'m\', or \'r\'')
 
@@ -835,7 +890,7 @@ def quat2mat(q):
     '''
     if isinstance(q, Quaternion):
         w = q.s
-        x,y,z = q.vec
+        x, y, z = q.vec
     else:
         w, x, y, z = q
     Nq = w * w + x * x + y * y + z * z
@@ -866,7 +921,7 @@ def mat2quat(M):
     """
 
     M = np.asarray(M, dtype=float)
-    assert M.shape == (3,3)
+    assert M.shape == (3, 3)
     U, _, Vt = np.linalg.svd(M)
     M = U @ np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))]) @ Vt
 
@@ -904,7 +959,7 @@ def mat2quat(M):
     q /= np.linalg.norm(q)
     if q[0] < 0:
         q = -q
-    return Quaternion(s=q[0], vec=q[1:])
+    return Quaternion(s=float(q[0]), vec=q[1:])
 
 
 def mat2quat_jumbled(M):
@@ -981,6 +1036,7 @@ def mat2quat_jumbled(M):
     if q[3] < 0:
         q *= -1
     return Quaternion(s=q[3], vec=np.diag(np.array([1.0, 1.0, -1.0])) @ q[0:3][::-1], makeUnitQuat=True)
+
 
 def qmult(q1, q2):
     ''' Multiply two quaternions
@@ -1075,4 +1131,3 @@ def qinverse(q):
 def qeye(dtype=np.float64):
     ''' Return identity quaternion '''
     return np.array([1.0, 0, 0, 0], dtype=dtype)
-

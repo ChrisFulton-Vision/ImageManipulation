@@ -1667,6 +1667,7 @@ class CameraGui():
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
                 quatPnP, vectPnP = q.from_openCV_rvec(rvec, tvec)
+
                 q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
                                                             [1., 0., 0.],
                                                             [0., 1., 0.]], float))
@@ -1710,12 +1711,19 @@ class CameraGui():
                 return
 
             quat, vect = solveQnP(points, centers, self.calibration, None)
-
             xyz_proj = quat * self.lidarTruthPoints.getTruthPointsNumpy() + vect
 
+            vect = quat.T * -vect
+            q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
+                                                [1., 0., 0.],
+                                                [0., 1., 0.]], float))
+
+            quat = q_aftr_from_cv * quat
+
+
             us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-            us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 1] / xyz_proj[:, 0] + self.calibration.cx
-            us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 2] / xyz_proj[:, 0] + self.calibration.cy
+            us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 0] / xyz_proj[:, 2] + self.calibration.cx
+            us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 1] / xyz_proj[:, 2] + self.calibration.cy
 
             self.plotOnImg(us_vs_s_proj.astype(int),
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
@@ -1724,7 +1732,7 @@ class CameraGui():
                         self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((quat * -vect))), (50, 300), cv2.FONT_HERSHEY_DUPLEX,
+            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300), cv2.FONT_HERSHEY_DUPLEX,
                         self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)

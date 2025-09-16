@@ -36,7 +36,7 @@ from Calibration import Calibration
 import numpy as np
 from numpy import square as sq
 from numpy.linalg import norm
-from copy import deepcopy
+from copy import deepcopy, copy
 import cv2
 import datetime
 
@@ -408,7 +408,7 @@ def deriv(est_q: q, est_t: np.array, feature_points=FEATURE_OFFSETS,
     State ordering: x = [qs, qx, qy, qz, tx, ty, tz]^T  (7 parameters)
     Output ordering matches `h()`: [u0, v0, u1, v1, ...] (2N measurements).
 
-    This leverages the quaternion helper `est_q.transpose_vec_deriv(p)` which is
+    This leverages the quaternion helper `est_q.transpose_vect_deriv(p)` which is
     expected to produce d(X_cam)/dq for a model point `p`, already projected to
     the tangent space of unit quaternions (right-projected onto the constraint).
 
@@ -439,7 +439,7 @@ def deriv(est_q: q, est_t: np.array, feature_points=FEATURE_OFFSETS,
     # Loop over features to accumulate per-point analytic derivatives
     for idx, feature in enumerate(feature_points):
         # new_deriv is the 3x4 Jacobian d(X_cam)/d[q s qx qy qz] for this point
-        new_deriv = est_q.transpose_vec_deriv(feature)
+        new_deriv = est_q.transpose_vect_deriv(feature)
 
         dx_dqs, dx_dqx, dx_dqy, dx_dqz = new_deriv[0, :]
         dy_dqs, dy_dqx, dy_dqy, dy_dqz = new_deriv[1, :]
@@ -632,8 +632,8 @@ def main():
     seed_start_time = datetime.datetime.now()
     init_q, init_t = init_pose_wahba(FEATURE_OFFSETS, meas_pix, FX, FY, CX, CY)
     seed_end_time = datetime.datetime.now()
-    est_q = copy.copy(init_q)
-    est_t = copy.copy(init_t)
+    est_q = copy(init_q)
+    est_t = copy(init_t)
     print(f"Init:")
     print(est_q, est_t)
 

@@ -16,6 +16,7 @@ ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
 LIGHTBLUE = (255, 255, 0)
 YELLOW = (50, 255, 255)
 RED = (120, 120, 255)
+BLACK = (0, 0, 0)
 
 
 class YOLO:
@@ -213,7 +214,7 @@ class YOLO:
         centers, boxes, scores, class_ids, time = output
 
         text = f'Inference time: {time:.3f}s'
-        cv2.putText(image, text, (10, 50), cv2.FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 3)
+        cv2.putText(image, text, (10, 50), cv2.FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 4)
 
         if len(class_ids) > 0:
             indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
@@ -311,7 +312,8 @@ class YOLO:
 
         dcm, jacob = cv2.Rodrigues(rvec)
         np.set_printoptions(suppress=True, precision=10)
-        # print(mat2quat(dcm), np.squeeze(tvec))
+
+
         if not ret:
             return
 
@@ -319,13 +321,12 @@ class YOLO:
 
         cv2.putText(image, 'SolvePnP Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                     0.75, YELLOW, 1)
-        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{tvec[0, 0]:.3f}, z:{tvec[1, 0]:.3f}', (25, w - 50),
+        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{-tvec[0, 0]:.3f}, z:{-tvec[1, 0]:.3f}', (25, w - 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
 
-        if self.bias_tracking_active:
-            self.draw_BiasPnP(image, y_class_ids, y_centers, object_points, badList, rvec, tvec)
+        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec)
 
-    def draw_BiasPnP(self, image: np.array, y_class_ids: list, y_centers: list, object_points: np.array, badList: list,
+    def draw_PnP_proj(self, image: np.array, y_class_ids: list, y_centers: list, object_points: np.array, badList: list,
                      rvec: np.array, tvec: np.array):
 
         h, w, _ = image.shape
@@ -337,6 +338,7 @@ class YOLO:
                 # for idNameLoc in reader.idsNamesLocs:
                 id = self.reader.idsNamesLocs[y_class_id][0]
                 xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
+
                 projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)))
@@ -361,9 +363,11 @@ class YOLO:
                         self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
 
                 cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, BLACK, 4)
+                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
                             0.75, YELLOW, 3)
 
-                if y_class_id in self.biasTracker:
+                if self.bias_tracking_active and y_class_id in self.biasTracker:
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
                     cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.75, RED, 2)
@@ -404,7 +408,7 @@ class YOLO:
         #     plt.tight_layout()
         #     plt.show()
         #     self.plotCount = 0
-        cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{bias_tvec[0, 0]:.3f}, z:{bias_tvec[1, 0]:.3f}', (25, w - 25),
+        cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
 
 

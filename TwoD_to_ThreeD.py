@@ -57,48 +57,7 @@ def _row_normed(A, eps=1e-12):
     return A / np.clip(n, eps, None)
 
 
-def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
-    """Solve translation t linearly given rotation R and image ratios (y/x, z/x).
 
-    Projection used by h():
-        u = fx * (  x / z ) + cx  ->  x/z = (u - cx)/fx = x_tilde
-        v = fy * (  y / z ) + cy  ->  y/z = (v - cy)/fy = y_tilde
-
-    For X_cam = R Xw + t with x = a1 + tx, y = a2 + ty, z = a3 + tz:
-        x_tilde * (a3 + tz) = a1 + tx  ->  -tx     + (x_tilde)*tz =  a1 - x_tilde*a3
-        y_tilde * (a3 + tz) = a2 + ty  ->      -ty + (y_tilde)*tz =  a2 - y_tilde*a3
-    """
-    R = np.asarray(R, float)
-    Xw = np.asarray(Xw, float)
-    x_tilde = np.asarray(x_tilde, float).reshape(-1)
-    y_tilde = np.asarray(y_tilde, float).reshape(-1)
-
-    r1, r2, r3 = R
-    a1 = Xw @ r1
-    a2 = Xw @ r2
-    a3 = Xw @ r3
-    N = Xw.shape[0]
-
-    A = np.zeros((2 * N, 3), dtype=float)
-    b = np.zeros(2 * N, dtype=float)
-
-    # x/z equation rows
-    A[0::2, 0] = -1.0
-    A[0::2, 2] = x_tilde
-    b[0::2] = a1 - x_tilde * a3
-
-    # y/z equation rows
-    A[1::2, 1] = -1.0
-    A[1::2, 2] = y_tilde
-    b[1::2] = a2 - y_tilde * a3
-
-    if w is not None:
-        ww = np.repeat(np.asarray(w, float).reshape(-1), 2)
-        A = ww[:, None] * A
-        b = ww * b
-
-    t, *_ = np.linalg.lstsq(A, b, rcond=None)
-    return t
 
 # --- Camera projection ----------------------------------------------------------
 
@@ -150,29 +109,13 @@ def deriv(est_q: q, est_t: np.array, feature_points, cal: Calibration):
     # Unpack for compact per-point derivatives of the projection
     X_hat, Y_hat, Z_hat = xyz_proj[:, 0], xyz_proj[:, 1], xyz_proj[:, 2]
 
-    # Placeholders for partials of each (u,v) w.r.t. state components
-    dfeature_dqs = np.zeros((num_points, 2))
-    dfeature_dqy = np.zeros((num_points, 2))
-    dfeature_dqz = np.zeros((num_points, 2))
-    dfeature_dqx = np.zeros((num_points, 2))
-
-    dfeature_dvx = np.zeros((num_points, 2))  # w.r.t. tx
-    dfeature_dvy = np.zeros((num_points, 2))  # w.r.t. ty
-    dfeature_dvz = np.zeros((num_points, 2))  # w.r.t. tz
-
     # Loop over features to accumulate per-point analytic derivatives
     for idx, feature in enumerate(feature_points):
         # new_deriv is the 3x4 Jacobian d(X_cam)/d[q s qx qy qz] for this point
         new_deriv = est_q.vect_deriv(feature, False)
 
-        # Chain rule using d(X,Y,Z)/dq from transpose_vect_deriv(...)
-        # (rename locals to DX_dqs, DY_dqs, DZ_dqs to make it clear)
-        DX_dqs, DX_dqx, DX_dqy, DX_dqz = new_deriv[0, :]
-        DY_dqs, DY_dqx, DY_dqy, DY_dqz = new_deriv[1, :]
-        DZ_dqs, DZ_dqx, DZ_dqy, DZ_dqz = new_deriv[2, :]
-
         # Translation effect on camera-frame coords is identity
-        dx_dtx, dy_dty, dz_dtz = 1.0, 1.0, 1.0
+        # dx_dtx, dy_dty, dz_dtz = 1.0, 1.0, 1.0
 
         # Projection partials for u, v with respect to x, y, z at this point
         #   u = FX * (  x / z ) + CX =>  du/dx =  FX / z, du/dz = -FX * x / z^2
@@ -183,44 +126,13 @@ def deriv(est_q: q, est_t: np.array, feature_points, cal: Calibration):
         dv_dY = cal.fy / Z_hat[idx]
         dv_dZ = -cal.fy * Y_hat[idx] / sq(Z_hat[idx])
 
-        # Quaternion columns
-        dfeature_dqs[idx, 0] = du_dX * DX_dqs + du_dZ * DZ_dqs
-        dfeature_dqs[idx, 1] = dv_dY * DY_dqs + dv_dZ * DZ_dqs
+        dUV_dXYZ = np.array([[du_dX, 0.0, du_dZ],
+                           [0.0, dv_dY, dv_dZ]])
 
-        dfeature_dqx[idx, 0] = du_dX * DX_dqx + du_dZ * DZ_dqx
-        dfeature_dqx[idx, 1] = dv_dY * DY_dqx + dv_dZ * DZ_dqx
-
-        dfeature_dqy[idx, 0] = du_dX * DX_dqy + du_dZ * DZ_dqy
-        dfeature_dqy[idx, 1] = dv_dY * DY_dqy + dv_dZ * DZ_dqy
-
-        dfeature_dqz[idx, 0] = du_dX * DX_dqz + du_dZ * DZ_dqz
-        dfeature_dqz[idx, 1] = dv_dY * DY_dqz + dv_dZ * DZ_dqz
+        L[2*idx:2*idx+2, 0:4] = dUV_dXYZ @ new_deriv
 
         # Translation columns (∂(X,Y,Z)/∂t = I)
-        dfeature_dvx[idx, 0] = du_dX  # w.r.t tx
-        dfeature_dvx[idx, 1] = 0.0
-
-        dfeature_dvy[idx, 0] = 0.0
-        dfeature_dvy[idx, 1] = dv_dY  # w.r.t ty
-
-        dfeature_dvz[idx, 0] = du_dZ  # w.r.t tz
-        dfeature_dvz[idx, 1] = dv_dZ
-
-    # Stack columns in state order: [qs, qx, qy, qz, tx, ty, tz]
-    L[:, 0] = dfeature_dqs.flatten()
-    L[:, 1] = dfeature_dqx.flatten()
-    L[:, 2] = dfeature_dqy.flatten()
-    L[:, 3] = dfeature_dqz.flatten()
-
-    L[:, 4] = dfeature_dvx.flatten()
-    L[:, 5] = dfeature_dvy.flatten()
-    L[:, 6] = dfeature_dvz.flatten()
-
-    # Finite-difference debug code retained (commented) for validation
-    # delt = 1e-5
-    # h_1 = h(est_q, est_t)
-    # h_2 = h(q(s=est_q.s + delt, vec=est_q.vec + np.array([0.0, 0.0, 0.0])), est_t)
-    # print_rayPts((h_2 - h_1) / delt)
+        L[2*idx:2*idx+2, 4:7] = dUV_dXYZ
 
     return L
 
@@ -363,6 +275,45 @@ def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, sigma_squared: 
 
     return q_init, t
 
+def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
+    """Solve translation t linearly given rotation R and image ratios (y/x, z/x).
+
+    Projection used by h():
+        u = fx * (  x / z ) + cx  ->  x/z = (u - cx)/fx = x_tilde
+        v = fy * (  y / z ) + cy  ->  y/z = (v - cy)/fy = y_tilde
+
+    For X_cam = R Xw + t with x = a1 + tx, y = a2 + ty, z = a3 + tz:
+        x_tilde * (a3 + tz) = a1 + tx  ->  -tx     + (x_tilde)*tz =  a1 - x_tilde*a3
+        y_tilde * (a3 + tz) = a2 + ty  ->      -ty + (y_tilde)*tz =  a2 - y_tilde*a3
+    """
+    R = np.asarray(R, float)
+    Xw = np.asarray(Xw, float)
+    x_tilde = np.asarray(x_tilde, float).reshape(-1)
+    y_tilde = np.asarray(y_tilde, float).reshape(-1)
+
+    N = Xw.shape[0]
+    a1, a2, a3 = (R @ Xw.T)
+
+    A = np.zeros((2 * N, 3), dtype=float)
+    b = np.zeros(2 * N, dtype=float)
+
+    # x/z equation rows
+    A[0::2, 0] = -1.0
+    A[0::2, 2] = x_tilde
+    b[0::2] = a1 - x_tilde * a3
+
+    # y/z equation rows
+    A[1::2, 1] = -1.0
+    A[1::2, 2] = y_tilde
+    b[1::2] = a2 - y_tilde * a3
+
+    if w is not None:
+        ww = np.repeat(np.asarray(w, float).reshape(-1), 2)
+        A = ww[:, None] * A
+        b = ww * b
+
+    t, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return t
 
 def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_squared=None):
     """
@@ -373,9 +324,13 @@ def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_sq
     :return:
     """
 
-    # sigma_squared = np.ones(2 * len(object_pts))
-    # sigma_squared[0] = 100.0
-    # sigma_squared[1] = 100.0
+    sigma_squared = np.ones(2 * len(object_pts))
+    sigma_squared[0] = 100.0
+    sigma_squared[1] = 100.0
+
+    print(f'ImgPts: \n{img_pts}')
+    print(f'ObjPts: \n{object_pts}')
+    print(f'Cal: \n{cal.getCameraMatrix()}')
 
     # q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
     est_q, est_t = opt(img_pts, object_pts, cal, sigma_squared=sigma_squared)
@@ -390,6 +345,7 @@ def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_sq
     # print(f'InitM: \n{quat2mat(init_q)}')
     # print(f'Est: {est_q}, {est_t}')
     # print(f'EstM: \n{quat2mat(est_q)}')
+    # print(f'EstT: \n{est_t}')
     # print(f'Trans: \n{quat2mat(init_q) @ quat2mat(est_q.T)}')
     # print(f'Ang Between (deg): {est_q.angle_betweenD(init_q)}\n\n')
     return est_q, est_t

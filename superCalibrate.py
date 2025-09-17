@@ -850,24 +850,22 @@ class FrontEndGui(ctk.CTk):
             self.writeFile(src_path, dst_path)
 
     def writeFile(self, src_path, dst_path):
-        try:
-            # Open the source file in binary read mode
-            with open(src_path, 'rb') as src:
-                # Open the destination file in binary write mode
-                with open(dst_path, 'wb') as dest:
-                    # Read and write the file in chunks
-                    while True:
-                        chunk = src.read(4096)  # Read in chunks of 4 KB
-                        if not chunk:
-                            break
-                        dest.write(chunk)
-
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-        except PermissionError as e:
-            print(f"Permission error: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
+        if os.path.exists(src_path):
+            try:
+                # Open the source file in binary read mode
+                with open(src_path, 'rb') as src:
+                    # Open the destination file in binary write mode
+                    with open(dst_path, 'wb') as dest:
+                        # Read and write the file in chunks
+                        while True:
+                            chunk = src.read(4096)  # Read in chunks of 4 KB
+                            if not chunk:
+                                break
+                            dest.write(chunk)
+            except PermissionError as e:
+                print(f"Permission error: {e}")
+            except Exception as e:
+                print(f"An unexpected error occurred: {e}")
 
     def updateIncludeCheckboxes(self):
         for idx, allGuiItems in enumerate(self.imageConfigWindowObjects):
@@ -1050,11 +1048,11 @@ class FrontEndGui(ctk.CTk):
             pickle.dump(self.filepath, f)
 
     def loadFromCache(self, init=False):
-        if init and not os.path.exists(FILEPATH_CACHE):
-            self.filepath = os.getcwd()
-            return
-
         if init:
+            if not os.path.exists(FILEPATH_CACHE):
+                self.filepath = os.getcwd()
+                return
+
             with open(FILEPATH_CACHE, 'rb') as filepathOpen:
                 self.filepath = pickle.load(filepathOpen)
                 return

@@ -523,9 +523,13 @@ class CameraGui():
 
     def loadTruthPoints(self):
         if self.camConfig.lidarFilepath is not None:
-            with open(self.camConfig.lidarFilepath, 'rb') as f:
-                test = pickle.load(f)
-                self.lidarTruthPoints.copy(test)
+            if os.path.exists(self.camConfig.lidarFilepath):
+                with open(self.camConfig.lidarFilepath, 'rb') as f:
+                    test = pickle.load(f)
+                    self.lidarTruthPoints.copy(test)
+            else:
+                print(f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
+
 
     def confSlider(self, confValue):
         self.camConfig.yolo_conf = confValue

@@ -37,23 +37,30 @@ class AttitudeReader:
         return True
 
     def get_roll_at(self, query_time):
-        if not self.ready:
-            return 0.0, 0.0, False
+
+        query_time += self.offset
+
+        if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0] or query_time > \
+                self.roll_dict['timestamp'].iloc[-1]:
+            return 180.0, 0.0, 180.0, 0.0, False
+
+        # if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0]:
+        #     return 180.0, 0.0, 180.0, 0.0, False
 
         # print(f"Img Time: {query_time}")
-        query_time += self.offset
+
         # print(f"GPS Time: {query_time}\n")
 
         # Handle out-of-bounds
-        if query_time < self.roll_dict['timestamp'].iloc[0]:
-            # print('Beginning of file...\n')
-            return self.roll_dict['Roll'][0], self.roll_dict['DesRoll'][0], self.roll_dict['Pitch'][0], \
-            self.roll_dict['DesPitch'][0], self.cmd_dict['C8'][0]
+        # if query_time < self.roll_dict['timestamp'].iloc[0]:
+        #     print('Beginning of file...\n')
+        #     return self.roll_dict['Roll'][0], self.roll_dict['DesRoll'][0], self.roll_dict['Pitch'][0], \
+        #     self.roll_dict['DesPitch'][0], self.cmd_dict['C8'][0]
 
-        if query_time > self.roll_dict['timestamp'].iloc[-1]:
-            # print('End of file...\n')
-            return self.roll_dict['Roll'].iloc[-1], self.roll_dict['DesRoll'].iloc[-1], self.roll_dict['Pitch'].iloc[-1], \
-            self.roll_dict['DesPitch'].iloc[-1], self.cmd_dict['C8'].iloc[-1]
+        # if query_time > self.roll_dict['timestamp'].iloc[-1]:
+        #     print('End of file...\n')
+        #     return self.roll_dict['Roll'].iloc[-1], self.roll_dict['DesRoll'].iloc[-1], self.roll_dict['Pitch'].iloc[-1], \
+        #     self.roll_dict['DesPitch'].iloc[-1], self.cmd_dict['C8'].iloc[-1]
 
 
 

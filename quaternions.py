@@ -125,6 +125,9 @@ class Quaternion:
         else:
             return self.__str__()
 
+    def __repr__(self):
+        return '\n' + self.__str__()
+
     def __xor__(self, scalar: float):
         print(scalar, self)
         return self.power(scalar)
@@ -268,7 +271,7 @@ class Quaternion:
         ...     qz = Quaternion(s=q.s, vec=q.vec + np.array([0.0, 0.0, delt]))
         ...     vecs = np.random.random((50,3))
         ...     for vec in vecs:
-        ...         analy_deriv = q.T.vect_deriv(vec, True)
+        ...         analy_deriv = q.vect_deriv(vec, True)
         ...         h0 = q.T * vec
         ...         hs = qs.T * vec
         ...         hx = qx.T * vec
@@ -296,8 +299,8 @@ class Quaternion:
         # This one can be a little tricky. These produce four different answers:
         # q.vectDeriv(vec, False)
         # q.T.vectDeriv(vec, False) <= Invalid!
-        # q.vectDeriv(vec, True) <= Invalid!
-        # q.T.vectDeriv(vec, True) ... Valid, but better is:
+        # q.T.vectDeriv(vec, True) <= Invalid!
+        # q.vectDeriv(vec, True)  ... Valid, but better is:
         # q.transpose_vect_deriv(vec)
 
         '''
@@ -309,34 +312,39 @@ class Quaternion:
 
         deriv = np.zeros((3, 4))
 
+        if not isQuatConjugated:
+            quat = self.copy()
+        else:
+            quat = self.T.copy()
+
         # d_q0
-        deriv[:, 0] = 2.0 * (self.s * vect + np.cross(self.vec, vect))
+        deriv[:, 0] = 2.0 * (quat.s * vect + np.cross(quat.vec, vect))
 
         # d_qx
-        deriv[:, 1] = 2.0 * (np.array([self.vec[0] * vect[0] + np.dot(self.vec, vect),
-                                       self.vec[1] * vect[0],
-                                       self.vec[2] * vect[0]]) +
-                             -self.vec[0] * vect +
-                             self.s * np.array([0.0, -vect[2], vect[1]]))
+        deriv[:, 1] = 2.0 * (np.array([quat.vec[0] * vect[0] + np.dot(quat.vec, vect),
+                                       quat.vec[1] * vect[0],
+                                       quat.vec[2] * vect[0]]) +
+                             -quat.vec[0] * vect +
+                             quat.s * np.array([0.0, -vect[2], vect[1]]))
 
         # d_qy
-        deriv[:, 2] = 2.0 * (np.array([self.vec[0] * vect[1],
-                                       (self.vec[1] * vect[1] + np.dot(self.vec, vect)),
-                                       self.vec[2] * vect[1]]) +
-                             -self.vec[1] * vect +
-                             self.s * np.array([vect[2], 0.0, -vect[0]]))
+        deriv[:, 2] = 2.0 * (np.array([quat.vec[0] * vect[1],
+                                       (quat.vec[1] * vect[1] + np.dot(quat.vec, vect)),
+                                       quat.vec[2] * vect[1]]) +
+                             -quat.vec[1] * vect +
+                             quat.s * np.array([vect[2], 0.0, -vect[0]]))
         # d_qz
-        deriv[:, 3] = 2.0 * (np.array([self.vec[0] * vect[2],
-                                       self.vec[1] * vect[2],
-                                       (self.vec[2] * vect[2] + np.dot(self.vec, vect))]) +
-                             -self.vec[2] * vect +
-                             self.s * np.array([-vect[1], vect[0], 0.0]))
+        deriv[:, 3] = 2.0 * (np.array([quat.vec[0] * vect[2],
+                                       quat.vec[1] * vect[2],
+                                       (quat.vec[2] * vect[2] + np.dot(quat.vec, vect))]) +
+                             -quat.vec[2] * vect +
+                             quat.s * np.array([-vect[1], vect[0], 0.0]))
 
         if isQuatConjugated:
             deriv[:, 1:] = -deriv[:, 1:]
-            P = self.T.normal_plane_projection
+            P = quat.T.normal_plane_projection
         else:
-            P = self.normal_plane_projection
+            P = quat.normal_plane_projection
         return deriv @ P
 
     def transpose_vect_deriv(self, vect: np.array):
@@ -347,7 +355,7 @@ class Quaternion:
         instead of
                 q.T.vect_deriv(vec, True)
         '''
-        return self.T.vect_deriv(vect, True)
+        return self.vect_deriv(vect, True)
 
     def to_dcm(self):
         return quat2mat(self.ndarray)
@@ -403,7 +411,7 @@ class Quaternion:
 
     @property
     def conj(self):
-        return Quaternion(np.append(self.s, -self.vec))
+        return self.T
 
     @property
     def norm(self):
@@ -495,15 +503,15 @@ class Quaternion:
     @property
     def exp(self):
         if np.linalg.norm(self.vec) > 0.00000001:
-            return np.exp(self.s) * Quaternion(s=cos(np.linalg.norm(self.vec)),
-                                               vec=self.vec / np.linalg.norm(self.vec) * sin(np.linalg.norm(self.vec)))
-        return Quaternion(s=1.0, vec=np.zeros((3,)))
+            vec_norm = np.linalg.norm(self.vec)
+            return np.exp(self.s) * Quaternion(s=cos(vec_norm), vec=self.vec / vec_norm * sin(vec_norm), makeUnitQuat=False)
+        return Quaternion(s=1.0, vec=np.zeros((3,)), makeUnitQuat=False)
 
     @property
     def ln(self):
         if np.linalg.norm(self.vec) < 0.000001:
-            return Quaternion(s=0.0, vec=np.zeros((3,)))
-        return Quaternion(s=np.log(self.norm), vec=self.vec / np.linalg.norm(self.vec) * np.acos(self.s / self.norm))
+            return Quaternion(s=0.0, vec=np.zeros((3,)), makeUnitQuat=False)
+        return Quaternion(s=np.log(self.norm), vec=self.vec / np.linalg.norm(self.vec) * np.acos(self.s / self.norm), makeUnitQuat=False)
 
     def power(self, power: float):
         if not isinstance(power, float):
@@ -534,10 +542,14 @@ class Quaternion:
         return axis * angle
 
     @staticmethod
-    def from_openCV_rvec(rvec: np.array, tvec: np.array):
+    def fromOpenCV_toAftr_rvec(rvec: np.array, tvec: np.array):
 
-        rod_quat = Quaternion.from_rodrigues(rvec)
-        new_t = rod_quat.T * -tvec
+        q_CV_TO_AFTR = mat2quat(np.array([[0., 0., 1.],
+                                            [-1., 0., 0.],
+                                            [0., -1., 0.]], float))
+
+        rod_quat = q_CV_TO_AFTR * Quaternion.from_rodrigues(rvec)
+        new_t = q_CV_TO_AFTR * tvec
         return rod_quat, np.squeeze(new_t)
 
     def slerp(self, q2: Self, t) -> Self:

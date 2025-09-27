@@ -57,34 +57,94 @@ class thread_with_exception(Thread):
 
 
 class ImageSliderBar:
-    def __init__(self, num_images):
-        self.pop_up = ctk.CTkToplevel()
-        self.pop_up.title('Playback control')
-        self.pop_up.focus_force()
-        self.pop_up.geometry('400x200')
-        self.pop_up.grid_columnconfigure(0, weight=1)
-        self.pop_up.grid_rowconfigure([0, 1], weight=1)
-        self.num_images = num_images
+    def __init__(self, num_images: int, refresh_hz: float = 20.0):
+        self.alive = True
+        self.num_images = int(num_images)
         self.play_speed = 1
         self.curr_img_idx = 0
 
-        self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=num_images, command=self.update_img_id, height=40)
-        self.slider.set(0)
+        # --- UI ---
+        self.pop_up = ctk.CTkToplevel()
+        self.pop_up.title('Playback control')
+        self.pop_up.geometry('400x200')
+        self.pop_up.grid_columnconfigure(0, weight=1)
+        self.pop_up.grid_rowconfigure([0, 1], weight=1)
+        self.pop_up.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=self.num_images,
+                                    command=self.update_img_id, height=40)
         self.slider.grid(sticky='ew')
+        self.slider.set(0)
+
+        # --- Throttle config/state ---
+        self.refresh_interval = 1.0 / max(1.0, float(refresh_hz))  # seconds
+        self._last_ui_ts = 0.0
+        self._ui_pending = False
+        self._after_id = None
 
     def update_img_id(self, new_img_idx):
         self.curr_img_idx = int(new_img_idx)
 
     def next_id(self):
+        """Called from worker thread: advances index AND schedules a throttled UI update."""
+        if not self.alive or self.num_images <= 0:
+            return self.curr_img_idx
+
         self.curr_img_idx = (self.curr_img_idx + self.play_speed) % self.num_images
-        self.slider.set(self.curr_img_idx)
-        if self.curr_img_idx >= self.num_images:
-            self.curr_img_idx = 0
+        self._schedule_throttled_set()
         return self.curr_img_idx
 
+    # ---------------- internal helpers ----------------
+
+    def _schedule_throttled_set(self):
+        """Coalesce slider.set() calls to ~refresh_hz on the Tk thread."""
+        if not self.alive:
+            return
+
+        now = time.monotonic()
+        elapsed = now - self._last_ui_ts
+        due_in = max(0.0, self.refresh_interval - elapsed)
+
+        # If an update is already scheduled, don't enqueue another
+        if self._ui_pending:
+            return
+
+        def _do_set():
+            # Runs on Tk thread
+            self._after_id = None
+            self._ui_pending = False
+            if self.alive and self.slider.winfo_exists():
+                # Note: this set() won't recurse into next_id() because it's bound to UI drag only
+                self.slider.set(self.curr_img_idx)
+                self._last_ui_ts = time.monotonic()
+
+        try:
+            self._ui_pending = True
+            if due_in <= 0.0:
+                self._after_id = self.slider.after(0, _do_set)
+            else:
+                # One trailing update scheduled; any intervening next_id() calls are coalesced
+                self._after_id = self.slider.after(int(due_in * 1000), _do_set)
+        except Exception:
+            # Tk is probably tearing down; ignore
+            self._ui_pending = False
+            self._after_id = None
+
     def close(self):
-        self.pop_up.destroy()
-        self.pop_up.update()
+        """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
+        self.alive = False
+        try:
+            if self._after_id is not None:
+                try:
+                    self.slider.after_cancel(self._after_id)
+                except Exception:
+                    pass
+                self._after_id = None
+                self._ui_pending = False
+            if self.pop_up and self.pop_up.winfo_exists():
+                self.pop_up.destroy()
+        except Exception:
+            pass
 
 
 class GifMaker:
@@ -316,12 +376,15 @@ class CameraGui():
         self.current_var_y = 10.0
         self.current_var_z = 10.0
         self.shutting_down = False
+        self.printLidar = False
         self.face_size = None
         self.faces_dirs = None
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
         self.attReader = AttRdr()
+        self.pnpResult = None
+        self.qnpResult = None
 
         self.imageProcessingKernelCombobox = None
 
@@ -337,6 +400,8 @@ class CameraGui():
                                                hover_color='blue')
         self.recordButton = ctk.CTkButton(master=self.cam_frame, text='Saving Imagery', fg_color='green',
                                           hover_color='navy', command=self.recordOff)
+        self.printButton = ctk.CTkButton(master=self.cam_frame, text='Print LiDAR', fg_color='green',
+                                          hover_color='navy', command=self.printLidarOnce)
         self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                                  command=self.selectCamera)
         self.selectFolderLabel = ctk.CTkLabel(self.cam_frame,
@@ -491,6 +556,7 @@ class CameraGui():
                                                        title='Select Flight Log Data')
         if poss_filepath != '':
             self.camConfig.hud_data_filepath = poss_filepath
+            self.attReader = AttRdr()
             self.attReader.read_files(poss_filepath)
             self.updateFlightLogLabel()
             self.saveToCache()
@@ -878,10 +944,11 @@ class CameraGui():
         rowID += 1
 
         self.recordOff()
-        self.recordButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+        self.recordButton.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+        self.printButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        activeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Time Between Saved Frames",
+        activeEntryButton = ctk.CTkButton(self.cam_frame, text="Time Between Saved Frames",
                                           command=self.getEntryValue)
         activeEntryButton.grid(row=rowID, column=0, padx=5, pady=5)
 
@@ -955,7 +1022,8 @@ class CameraGui():
             self.vc = None
 
         if not self.shutting_down:
-            self.singleImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue',
+            if self.camConfig.imageFilepath is not None:
+                self.singleImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue',
                                                  text=os.path.basename(self.camConfig.imageFilepath))
             self.startStreamButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
             self.multiImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
@@ -981,6 +1049,9 @@ class CameraGui():
         self.recordButton.configure(fg_color='red', text=f'Saved Imagery: #{self.img_idx}', hover_color='blue',
                                     command=self.recordOn)
         self.recording = False
+
+    def printLidarOnce(self):
+        self.printLidar = True
 
     def togglePnpLidarPoints(self):
         self.camConfig.pnpLidarPoints = not self.camConfig.pnpLidarPoints
@@ -1170,7 +1241,7 @@ class CameraGui():
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
-        img_slider = ImageSliderBar(self.ImageTimeReader.numImages)
+        img_slider = ImageSliderBar(self.ImageTimeReader.numImages, refresh_hz=1000.0)
 
         img_slider.play_speed = 1
         pause = False
@@ -1245,7 +1316,7 @@ class CameraGui():
             img_slider.close()
         self.startStreamOff()
 
-    def analyze_image(self, frame, img_time=None, name=None):
+    def analyze_image(self, frame, img_time=None, name=None, print_params=False):
         if frame is None:
             return
 
@@ -1269,9 +1340,13 @@ class CameraGui():
 
         if self.camConfig.pnpLidarPoints and self.detector is not None:
             self.pnpLidarPoints()
+        else:
+            self.pnpResult = None
 
         if self.camConfig.qnpLidarPoints and self.detector is not None:
             self.qnpLidarPoints()
+        else:
+            self.qnpResult = None
 
         if self.camConfig.detect_horizon:
             self.detectHorizon()
@@ -1300,9 +1375,45 @@ class CameraGui():
             (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 4)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         self.cleanup()
+
+        if self.printLidar:
+            self.print_pnp_results()
+
+    def print_pnp_results(self):
+        np.set_printoptions(precision=5, threshold=np.inf, suppress=True)
+
+        points = None
+        if self.centers is not None and len(self.centers) >= 6:
+            truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
+            points = []
+            distParams = np.zeros((5,))  # use image undistort instead
+
+            removeIDs = []
+            for idx, detectID in enumerate(self.detectIDS):
+                try:
+                    points.append(truthPoints[str(detectID[0])])
+                except KeyError as e:
+                    removeIDs.append(idx)
+
+            centers = self.centers.copy()
+            for id in reversed(removeIDs):
+                centers = np.delete(centers, id, axis=0)
+            points = np.array(points)
+
+        if points is not None and self.detector is not None:
+            print(f'Obj Points: \n{points}')
+        if self.centers is not None:
+            print(f'Img Points: \n{self.centers}')
+        print(f'Cam Matrix: \n{self.calibration.getCameraMatrix()}')
+        if self.pnpResult is not None:
+            print(f'PnP Result: \ncam_R_tgt:\n{self.pnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.pnpResult[1]}')
+        if self.qnpResult is not None:
+            print(f'QnP Result: \ncam_R_tgt:\n{self.qnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.qnpResult[1]}')
+        print()
+        self.printLidar = False
 
     def draw_hud(self, img_time):
         if self.bank_indicator_points is None:
@@ -1669,19 +1780,16 @@ class CameraGui():
 
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
+                
+                quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
-                quatPnP, vectPnP = q.from_openCV_rvec(rvec, tvec)
+                self.pnpResult = (quatPnP, vectPnP)
 
-                q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
-                                                            [1., 0., 0.],
-                                                            [0., 1., 0.]], float))
-
-
-                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(q_aftr_from_cv * quatPnP, 'ijk.6f'), (50, 75),
+                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
                             cv2.FONT_HERSHEY_DUPLEX, self.small_text,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(np.squeeze((vectPnP))),
+                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
                             (50, 150), cv2.FONT_HERSHEY_DUPLEX, self.small_text,
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
@@ -1717,10 +1825,12 @@ class CameraGui():
             quat, vect = solveQnP(points, centers, self.calibration, None)
             xyz_proj = quat * self.lidarTruthPoints.getTruthPointsNumpy() + vect
 
-            vect = quat.T * -vect
             q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
-                                                [1., 0., 0.],
-                                                [0., 1., 0.]], float))
+                                                [-1., 0., 0.],
+                                                [0., -1., 0.]], float))
+
+            vect = q_aftr_from_cv * vect
+
 
             quat = q_aftr_from_cv * quat
 
@@ -1731,7 +1841,7 @@ class CameraGui():
 
             self.plotOnImg(us_vs_s_proj.astype(int),
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
-
+            self.qnpResult = (quat, vect)
             cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225), cv2.FONT_HERSHEY_DUPLEX,
                         self.small_text,
                         (255, 255, 0), 3,
@@ -1843,7 +1953,7 @@ class CameraGui():
         '''
         self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame, self.camConfig.yoloBiasTracking)
         centers, boxes, scores, class_ids, time = output
-        if len(centers) > 0:  #and self.yoloSession.reader.numClasses == 1:
+        if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
             img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
@@ -1858,7 +1968,7 @@ class CameraGui():
                 self.last_yolo_center[1] * img_yolo_y_correction)
 
             K = self.calibration.getCameraMatrix()
-            d = self.calibration.getDistortion()
+            # d = self.calibration.getDistortion()  # Presume undistorted image
             twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
             dist_est = 2.0 / (
                     self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
@@ -1904,7 +2014,7 @@ class CameraGui():
             cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                      [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
             cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75 * font_scale(self.markup_frame.shape[1]), color, 1)
+                        0.75, color, 1)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()

@@ -328,10 +328,6 @@ def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_sq
     sigma_squared[0] = 100.0
     sigma_squared[1] = 100.0
 
-    print(f'ImgPts: \n{img_pts}')
-    print(f'ObjPts: \n{object_pts}')
-    print(f'Cal: \n{cal.getCameraMatrix()}')
-
     # q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
     est_q, est_t = opt(img_pts, object_pts, cal, sigma_squared=sigma_squared)
     # est_q, est_t = q_init, t_init

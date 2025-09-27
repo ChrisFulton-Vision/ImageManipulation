@@ -260,8 +260,8 @@ class YOLO:
             label = f"{class_id}: {score:.2f}"
             cv2.rectangle(image, (x1, y1), (x2, y2), LIGHTBLUE, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 6)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, LIGHTBLUE, 3)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHTBLUE, 1)
 
         cv2.putText(image, 'Direct Inference', (25, w - 100), cv2.FONT_HERSHEY_SIMPLEX,
                     0.75, LIGHTBLUE, 1)
@@ -363,9 +363,9 @@ class YOLO:
                         self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
 
                 cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75, BLACK, 4)
+                            0.5, BLACK, 3)
                 cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75, YELLOW, 3)
+                            0.5, YELLOW, 2)
 
                 if self.bias_tracking_active and y_class_id in self.biasTracker:
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
@@ -408,7 +408,8 @@ class YOLO:
         #     plt.tight_layout()
         #     plt.show()
         #     self.plotCount = 0
-        cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
+        if self.bias_tracking_active:
+            cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
 
 

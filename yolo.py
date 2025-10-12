@@ -201,7 +201,7 @@ class YOLO:
 
         return centers, boxes, scores, class_ids
 
-    def markUpImage(self, image: np.array, output: (list, list, list, list)) -> np.array:
+    def markUpImage(self, image: np.array, output: (list, list, list, list)) -> tuple[np.array, tuple[np.array, np.array]]:
         '''
         Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
         up the image with a PnP solution as well.
@@ -228,9 +228,10 @@ class YOLO:
 
             image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores)
             if len(set(indices)) > 5:
-                self.drawPnP(image, newClass_ids, newCenters)
+                rvec_tvec = self.drawPnP(image, newClass_ids, newCenters)
+                return image, rvec_tvec
 
-        return image
+        return image, None
 
     def drawBoxes(self, image: np.array, newCenters: list, newBoxes: list,
                   newClass_ids: list, newScores: list) -> np.array:
@@ -263,12 +264,12 @@ class YOLO:
             cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
             cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHTBLUE, 1)
 
-        cv2.putText(image, 'Direct Inference', (25, w - 100), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(image, 'Direct Inference', (25, h - 100), cv2.FONT_HERSHEY_SIMPLEX,
                     0.75, LIGHTBLUE, 1)
 
         return image
 
-    def drawPnP(self, image: np.array, y_class_ids: list, y_centers: list) -> None:
+    def drawPnP(self, image: np.array, y_class_ids: list, y_centers: list) -> tuple[np.array, np.array]:
         '''
         If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
         onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
@@ -321,10 +322,12 @@ class YOLO:
 
         cv2.putText(image, 'SolvePnP Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                     0.75, YELLOW, 1)
-        cv2.putText(image, f'x:{tvec[2, 0]:.3f}, y:{-tvec[0, 0]:.3f}, z:{-tvec[1, 0]:.3f}', (25, w - 50),
+        cv2.putText(image, f'x:{tvec[0, 0]:.3f}, y:{tvec[1, 0]:.3f}, z:{tvec[2, 0]:.3f}', (25, w - 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
 
         self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec)
+
+        return (rvec, tvec)
 
     def draw_PnP_proj(self, image: np.array, y_class_ids: list, y_centers: list, object_points: np.array, badList: list,
                      rvec: np.array, tvec: np.array):
@@ -435,7 +438,7 @@ if __name__ == '__main__':
     allImages = natural_sort(allImages)
 
     for imgFP in allImages:
-        newImg, sol = yolo.inferOnImage(cv2.imread(imgFP))
+        (newImg, rvec_tvec), sol = yolo.inferOnImage(cv2.imread(imgFP))
         cv2.imshow('YOLO', newImg)
         # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
         key = cv2.waitKey(0)

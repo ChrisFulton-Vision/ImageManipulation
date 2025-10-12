@@ -25,7 +25,7 @@ class AttitudeReader:
         if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns):
             return False
 
-        if not {'timestamp', 'C1', 'C8'}.issubset(self.cmd_dict.columns):
+        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns):
             return False
 
         self.offset = offset_dict['offset'][0]
@@ -42,7 +42,7 @@ class AttitudeReader:
 
         if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0] or query_time > \
                 self.roll_dict['timestamp'].iloc[-1]:
-            return 180.0, 0.0, 180.0, 0.0, False
+            return 180.0, 0.0, 180.0, 0.0, 0.0, False
 
         # if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0]:
         #     return 180.0, 0.0, 180.0, 0.0, False
@@ -70,23 +70,31 @@ class AttitudeReader:
             self.roll_dict['timestamp'],
             self.roll_dict['Roll']
         )
-        # Use numpy to interpolate
+
         interpolated_cmd_roll = np.interp(
             query_time,
             self.roll_dict['timestamp'],
             self.roll_dict['DesRoll']
         )
+
         interpolated_pitch = np.interp(
             query_time,
             self.roll_dict['timestamp'],
             self.roll_dict['Pitch']
         )
-        # Use numpy to interpolate
+
         interpolated_cmd_pitch = np.interp(
             query_time,
             self.roll_dict['timestamp'],
             self.roll_dict['DesPitch']
         )
+
+        interpolated_cmd_throttle = self.throttle_pwm_to_perc(
+            np.interp(
+            query_time,
+            self.cmd_dict['timestamp'],
+            self.cmd_dict['C3']
+        ))
 
         interpolated_mode = np.interp(
             query_time,
@@ -95,8 +103,10 @@ class AttitudeReader:
         )
         mode = 950 < interpolated_mode < 1400
 
-        return interpolated_roll, interpolated_cmd_roll, interpolated_pitch, interpolated_cmd_pitch, mode
+        return interpolated_roll, interpolated_cmd_roll, interpolated_pitch, interpolated_cmd_pitch, interpolated_cmd_throttle, mode
 
+    def throttle_pwm_to_perc(self, throttle_pwm: np.array) -> np.array:
+        return (throttle_pwm - 1300.0) / (1880.0 - 1330.0) * 100.0
 # file = filedialog.askopenfilename(initialdir='./')
 # print(file)
 # file = 'C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/LOGS/00000064/XKF1.csv'

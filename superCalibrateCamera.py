@@ -1355,7 +1355,7 @@ class CameraGui():
             self.hyper_focus(img_time)
 
         if self.camConfig.yoloInference:
-            self.run_yolo()
+            self.run_yolo(img_time)
         else:
             self.last_bounding_box_size = None
             self.last_yolo_center = None
@@ -1371,10 +1371,17 @@ class CameraGui():
         if self.camConfig.hud and img_time is not None:
             self.draw_hud(img_time)
 
+        height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
+        if img_time is not None:
+            time_str = f"Flight Time: {img_time + 173.11338 - 11.658461:.2f}"
+            (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
+            img_w, img_h, *_ = self.curr_frame.shape
+            cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         self.cleanup()
@@ -1442,7 +1449,7 @@ class CameraGui():
         cv2.polylines(self.markup_frame, [lines],
                       False, (0, 255, 0), 2)
 
-        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, mode = self.attReader.get_roll_at(img_time)
+        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_roll_at(img_time + 173.11338 - 11.658461)
 
         # bank_angle = 0.0 + 60.0 * sin(img_time)
         bank_pts = []
@@ -1467,21 +1474,21 @@ class CameraGui():
         cmd_lines = (np.array([x, y]) * np.array(cmd_bank_pts)).astype(int)
 
         # Bank Cmd
-        cv2.polylines(self.markup_frame, [lines], True, (0, 255, 0))
+        cv2.polylines(self.markup_frame, [lines], True, (0, 255, 0), 2)
         # Bank Response
         cv2.fillPoly(self.markup_frame, [cmd_lines], (0, 255, 0))
 
         # Pitch Cmd
         left_tri = np.array([[x * 0.49, y * 0.70 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
                              [x * 0.47, y * 0.69 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                             [x * 0.47, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]])
+                             [x * 0.47, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]]).astype(int)
 
-        cv2.polylines(self.markup_frame, [left_tri.astype(int)], True, (0, 255, 0), 2)
+        cv2.polylines(self.markup_frame, [left_tri],True, (0, 255, 0), 2)
         right_tri = np.array([[x * 0.51, y * 0.70 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                             [x * 0.53, y * 0.69 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                             [x * 0.53, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]])
+                              [x * 0.53, y * 0.69 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
+                              [x * 0.53, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]]).astype(int)
 
-        cv2.polylines(self.markup_frame, [right_tri.astype(int)], True, (0, 255, 0), 2)
+        cv2.polylines(self.markup_frame, [right_tri], True, (0, 255, 0), 2)
 
         # Pitch Response
         for i in [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0]:
@@ -1500,6 +1507,27 @@ class CameraGui():
         # cv2.putText(self.markup_frame, f'{pitch_angle:.2f}', (int(x * 0.51), int(y * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 1,
         #             (0, 255, 0))
 
+
+        # Throttle response
+        num = 20
+        center = (int(x * 0.75), int(y * 0.75))
+        thetas = np.linspace(0.0, 245.0, num)
+        theta = cmd_throttle * 2.450
+        points = np.zeros((num,2), int)
+        r = 0.06
+        points[:, 0] = center[0] + (np.sin(np.deg2rad(thetas)) * x * r).astype(int)
+        points[:, 1] = center[1] - (np.cos(np.deg2rad(thetas)) * x * r).astype(int)
+
+        tri = np.array([[center[0] + (np.sin(np.deg2rad(theta)) * x * (r*0.95)), center[1] - (np.cos(np.deg2rad(theta)) * x * (r*0.95))],
+                        [center[0] + (np.sin(np.deg2rad(theta + 5.0)) * x * (r*0.8)), center[1] - (np.cos(np.deg2rad(theta + 5.0)) * x * (r*0.6))],
+                        [center[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r*0.8)), center[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r*0.6))]], np.int32)
+
+        cv2.polylines(self.markup_frame, [points], False, (0, 255, 0), 2)  # Arc
+        cv2.fillPoly(self.markup_frame, [tri], (0, 255, 0))  # Triangle Pointer
+        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), 2)
+        cv2.putText(self.markup_frame, f'{cmd_throttle:.1f}%',
+                    (int(center[0] - width/2), int(center[1] - height/2)),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
 
         # vision system on
         if mode:
@@ -1945,15 +1973,20 @@ class CameraGui():
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
                                                   y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
-    def run_yolo(self):
+    def run_yolo(self, img_time):
         '''
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
-        self.markup_frame, output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame, self.camConfig.yoloBiasTracking)
+        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame, self.camConfig.yoloBiasTracking)
+
         centers, boxes, scores, class_ids, time = output
-        if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
+        
+        if rvec_tvec is not None:
+            self.last_yolo_3d_estimate = np.squeeze(rvec_tvec[1])
+        
+        elif len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
             img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
@@ -1970,13 +2003,19 @@ class CameraGui():
             K = self.calibration.getCameraMatrix()
             # d = self.calibration.getDistortion()  # Presume undistorted image
             twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
-            dist_est = 2.0 / (
-                    self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
-                    self.curr_frame.shape[1])
-            dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
+            # dist_est = 2.0 / (
+            #         self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
+            #         self.curr_frame.shape[1])
+            # dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
+            dist_est = self.calibration.fx * 4.07 / (self.last_bounding_box_size[0])
 
             if self.check_above_horizon(self.last_yolo_center):
                 self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
+                w, h, _ = self.curr_frame.shape
+                cv2.putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75, (50, 255, 255), 1)
+                cv2.putText(self.markup_frame, f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}', (25, w - 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
                 # cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                 #            3, (255, 0, 255), 3)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
@@ -1987,7 +2026,8 @@ class CameraGui():
         self.last_yolo_center = None
 
     def factor_graph(self, time):
-        color = (0, 255, 255)
+        color = (120, 255, 120)
+
         if self.last_yolo_3d_estimate is not None:
             self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
             self.last_time_update = time
@@ -2006,6 +2046,16 @@ class CameraGui():
 
             h, w, _ = self.markup_frame.shape
             size = 15
+            thickness = 2
+            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
+                       thickness)
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
+            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75, (0, 0, 0), thickness)
+
             thickness = 1
             cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
                        thickness)
@@ -2013,10 +2063,11 @@ class CameraGui():
                      [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
             cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                      [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
-            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, w - 50), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75, color, 1)
+            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.75, color, thickness)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
+
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
 
             self.current_var_x = var_x + var_vx * (time - self.last_time_update) * np.abs(self.curr_r_V_d[0])

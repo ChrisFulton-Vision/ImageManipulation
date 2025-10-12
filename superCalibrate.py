@@ -1290,6 +1290,7 @@ class FrontEndGui(ctk.CTk):
 
         if imgClass.imgPts is not None and showImage:
             self.drawImagePoints(imgClass, img, gray)
+            return
 
         if self.imageConfig.calMode == CalibrationType.Chessboard:
             ret, corners = cv2.findChessboardCorners(gray,

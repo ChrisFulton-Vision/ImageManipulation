@@ -9,6 +9,17 @@ import matplotlib.pyplot as plt
 from quaternions import Quaternion as q
 from quaternions import *
 
+for key in ("CUDA_PATH", "CUDNN_PATH"):
+    p = os.environ.get(key)
+    if p and os.path.isdir(p):
+        os.add_dll_directory(p)
+
+# Ensure CUDA_PATH is in environment: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin
+# Ensure CUDNN_PATH is in environment: C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6
+import onnxruntime as ort
+print(f'OnnxVersion: {ort.__version__}')
+print(f'Onnx Providers: {ort.get_available_providers()}')
+
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
 ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)

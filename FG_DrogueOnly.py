@@ -73,9 +73,9 @@ class FactorGraph:
         # self.cam_cov = np.array([0.6, 5.0, 5.0]) * 4.0 ** 2
         # self.V_cov = np.array([1.0, 1.0, 1.0]) * 2.0 ** 2
         # self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * 1.0 ** 2
-        self.cam_cov = np.array([0.6, 5.0, 5.0]) * (4.0 ** 2) / 20.0
-        self.V_cov = np.array([1.0, 1.0, 1.0]) * (2.0 ** 2) / 20.0
-        self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * (2.0 ** 2) / 20.0
+        self.cam_cov = np.array([5.0, 5.0, 1.0]) * (5.0 ** 2)
+        self.V_cov = np.array([0.1, 0.1, 0.1]) * (1.00 ** 2)
+        self.Vdot_cov = np.array([0.1, 0.1, 0.1]) * (1.00 ** 2)
 
         self.numMeas = 0
 
@@ -108,6 +108,9 @@ class FactorGraph:
 
         if self.numMeas == 0:
 
+            if drgVec[2] > 200.0:
+                return
+
             self.curr_meas = [drgVec]
 
             self.meas = self.curr_meas
@@ -122,23 +125,35 @@ class FactorGraph:
                 self.time_log[0] = t - self.startTime
 
         else:
-            self.curr_meas = drgVec
+
+            if drgVec[2] > 200.0:
+                drgVec *= self.meas[-1][2] / drgVec[2]
 
             if t is None:
                 epoch = datetime.datetime(1970, 1, 1)
                 t = (datetime.datetime.now() - epoch).total_seconds() - self.startTime
-                self.time_log = np.append(self.time_log, t)
             else:
                 t = t - self.startTime
-                self.time_log = np.append(self.time_log, t)
 
-            
-            delT = self.time_log[-1] - self.time_log[-2]
+            delT = t - self.time_log[-1]
 
-            if self.time_log[-1] <= self.time_log[-2]:
+            # If we've gone back in time, assume
+            # 1. we're in playback mode
+            # 2. the user is rewinding. So reset.
+            if t <= self.time_log[-1]:
                 self.reset()
                 self.newRecvMeas(drgVec, t)
                 return
+
+            # Threshold extreme velocity jumps. But, delete old measurement, so
+            # we don't get stuck hold old, bad measurement.
+            if np.linalg.norm((drgVec - self.r_T_d[-1]) / delT) > 100.0:
+                self.popOldestMeas()
+                return
+
+            self.time_log = np.append(self.time_log, t)
+
+            self.curr_meas = drgVec
 
             self.meas.append(self.curr_meas)
             self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis, :], axis=0)  # Drg from Recv
@@ -153,6 +168,7 @@ class FactorGraph:
         for idx in range(self.numMeas):
             iter = idx * 9
             cam_T_d = self.meas[idx]
+
             Q[iter + 0: iter + 3, iter + 0: iter + 3] = 1.0 / la.norm(cam_T_d) * np.diag(self.cam_cov)
 
             if idx < self.numMeas - 1:

@@ -16,6 +16,7 @@ from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
 from quaternions import Quaternion as q
 from quaternions import *
 from TwoD_to_ThreeD import solveQnP
+from bufferImageLoader import BufferedImageLoader as imgBuf
 
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
@@ -1229,11 +1230,14 @@ class CameraGui():
         self.startStreamOff()
 
     def run_folder_reader(self):
+        import os, glob, cv2, pandas as pd
+
         cv2.destroyAllWindows()
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
 
         directory = os.path.dirname(self.camConfig.imageFilepath)
 
+        # --- build ImageTimeReader exactly like before ---
         if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
             self.ImageTimeReader.idsTimes = []
             imageList = glob.glob(os.path.join(directory, '*.bmp')) + glob.glob(os.path.join(directory, '*.png'))
@@ -1241,80 +1245,139 @@ class CameraGui():
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
-        img_slider = ImageSliderBar(self.ImageTimeReader.numImages, refresh_hz=1000.0)
+        # Absolute paths list for the buffered loader (same order as idsTimes)
+        paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+        num_images = len(paths)
 
+        img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
         img_slider.play_speed = 1
         pause = False
         temp_unpause = False
 
+        # time offset, exactly as before
         try:
             offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
             special_img_time_offset = offset_dict['offset'][0]
         except FileNotFoundError:
             special_img_time_offset = 0
 
-        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+        # --- NEW: start the background buffered loader ---
+        loader = imgBuf(
+            filepaths=paths,
+            max_buffer=32,
+            preprocess=None,  # e.g., pass a resize/undistort(img) if you want it off-UI thread
+            start_index=0,
+            loop=True,
+            read_flags=cv2.IMREAD_COLOR,
+        ).start()
 
-            if not pause or temp_unpause:
-                temp_unpause = False
-                img_id = img_slider.next_id()
+        prev_idx = 0
+        try:
+            while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
 
-            curr_filepath = os.path.join(directory, self.ImageTimeReader.idsTimes[img_id][0])
-            frame = None
-
-            if os.path.exists(curr_filepath):
-                frame = cv2.imread(curr_filepath)
-
-            if frame is not None:
-                if self.ImageTimeReader.idsTimes[img_id][1] is None:
-                    self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[img_id][0])
+                # Decide next image index (unchanged logic)
+                if not pause or temp_unpause:
+                    temp_unpause = False
+                    img_id = img_slider.next_id()
                 else:
-                    self.analyze_image(frame, self.ImageTimeReader.idsTimes[img_id][1] + special_img_time_offset,
-                                   self.ImageTimeReader.idsTimes[img_id][0])
-            else:
-                print(f"Log File Error: {self.ImageTimeReader.idsTimes[img_id][0]} doesn't exist.")
+                    # When paused, keep current index
+                    img_id = img_slider.curr_img_idx
 
-            key = cv2.waitKey(1)
+                # Keep slider and our local cursor consistent
+                img_slider.curr_img_idx = max(0, min(img_id, num_images - 1))
 
-            if key == 99:  # c
-                img_slider.curr_img_idx += 1
-                img_slider.play_speed = 0
-                temp_unpause = True
-                pause = True
+                # --- buffered fetch logic ---
+                # If we’re playing linearly (+1), let the loader stream naturally.
+                # On a jump/step, seek & clear buffer so we land exactly on img_id.
+                is_sequential = (not pause) and (img_id == (prev_idx + 1) % max(1, num_images))
+                if not is_sequential:
+                    loader.seek(img_id, clear_buffer=True)
+                    # give the worker a moment on big jumps
+                    got = loader.get_next(timeout=0.25)
+                else:
+                    got = loader.get_next(timeout=0.02)
 
-            if key == 122:  # z
-                img_slider.curr_img_idx -= 1
-                img_slider.play_speed = 0
-                temp_unpause = True
-                pause = True
+                frame = None
+                got_idx = None
+                if got is not None:
+                    got_idx, frame = got
 
-            if key == 32:  # space
-                pause = not pause
-                img_slider.play_speed = 0
-                if not pause:
-                    img_slider.play_speed = 1
+                    # If we didn’t seek (sequential play), got_idx should match the stream’s next index.
+                    # If we did seek, we already cleared the buffer; first frame should be our target.
+                    # As a safety, if indices mismatched due to a race, try once more with a short wait.
+                    if got_idx != img_id:
+                        # Try to catch up quickly
+                        got2 = loader.get_next(timeout=0.05)
+                        if got2 is not None:
+                            got_idx, frame = got2
 
-            if key == 100:  # d
-                img_slider.play_speed += 1
-                pause = False
+                curr_filepath = paths[img_id]
 
-            if key == 97:  # a
-                img_slider.play_speed -= 1
-                pause = False
+                if frame is not None and os.path.exists(curr_filepath):
+                    # Preserve your timestamp/offset logic exactly
+                    ts = self.ImageTimeReader.idsTimes[img_id][1]
+                    if ts is None:
+                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[img_id][0])
+                    else:
+                        self.analyze_image(frame, ts + special_img_time_offset,
+                                           self.ImageTimeReader.idsTimes[img_id][0])
+                else:
+                    print(
+                        f"Log File Error: {self.ImageTimeReader.idsTimes[img_id][0]} doesn't exist or failed to load.")
 
-            if key == 119:  # w
-                self.toggleUndistort()
-                self.toggleYoloInference()
-                self.toggleDetectHorizon()
-                self.toggleHyperFocus()
-                self.toggleFactorgraph()
+                prev_idx = img_id  # track for next loop
 
-            if key == 27:
-                break
+                key = cv2.waitKey(1)
 
-        if not self.shutting_down:
-            img_slider.close()
-        self.startStreamOff()
+                if key == 99:  # c
+                    img_slider.curr_img_idx += 1
+                    img_slider.play_speed = 0
+                    temp_unpause = True
+                    pause = True
+                    # ensure buffer jumps exactly to requested frame
+                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                if key == 122:  # z
+                    img_slider.curr_img_idx -= 1
+                    img_slider.play_speed = 0
+                    temp_unpause = True
+                    pause = True
+                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                if key == 32:  # space
+                    pause = not pause
+                    img_slider.play_speed = 0
+                    if not pause:
+                        img_slider.play_speed = 1
+                        # nudge loader to where slider is resuming from
+                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                if key == 100:  # d
+                    img_slider.play_speed += 1
+                    pause = False
+                    # no seek needed; let stream run
+
+                if key == 97:  # a
+                    img_slider.play_speed -= 1
+                    pause = False
+                    # no seek needed; let stream run
+
+                if key == 119:  # w
+                    self.toggleUndistort()
+                    self.toggleYoloInference()
+                    self.toggleDetectHorizon()
+                    self.toggleHyperFocus()
+                    self.toggleFactorgraph()
+
+                if key == 27:
+                    break
+
+        finally:
+            # close UI and background thread exactly like before
+            if not self.shutting_down:
+                img_slider.close()
+            loader.stop()
+            self.startStreamOff()
 
     def analyze_image(self, frame, img_time=None, name=None, print_params=False):
         if frame is None:

@@ -1,115 +1,97 @@
+# AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
 import pandas as pd
 import numpy as np
 from os.path import join
 
 class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
+        # raw dfs (only used during load)
+        self.spd_dict = None
         self.roll_dict = None
         self.cmd_dict = None
+
+        # numpy caches
+        self.spd_t = self.spd_v = None                  # ARSP.csv
+        self.att_t = self.roll = self.desroll = None    # ATT.csv
+        self.pitch = self.despitch = None
+        self.cmd_t = self.c1 = self.c3 = self.c8 = None # RCOU.csv
+        self.cmd_throttle_perc = None                   # pre-mapped throttle %
+
         self.offset = 0.0
         self.ready = False
-
         if csv_folder_path is not None:
             self.read_files(csv_folder_path)
 
     def read_files(self, csv_folder_path: str):
-        # Load CSV and extract Time and Roll columns
         try:
+            self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
-            self.cmd_dict = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
-            offset_dict = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
+            self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
+            offset_dict    = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
         except FileNotFoundError:
             return False
 
-        # Check if required columns are present
-        if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns):
-            return False
+        # validate columns (same checks you had)
+        if not {'timestamp', 'Airspeed'}.issubset(self.spd_dict.columns): return False
+        if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns): return False
+        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns): return False
 
-        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns):
-            return False
+        self.offset = float(offset_dict['offset'][0])
 
-        self.offset = offset_dict['offset'][0]
-
-        # Sort by Time for proper interpolation
+        # stable ascending time -> better for np.interp
+        self.spd_dict  = self.spd_dict.sort_values('timestamp').reset_index(drop=True)
         self.roll_dict = self.roll_dict.sort_values('timestamp').reset_index(drop=True)
-        self.cmd_dict = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
+        self.cmd_dict  = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
+
+        # ---- one-time conversion to NumPy (choose dtypes deliberately) ----
+        # timestamps as float64 (interp domain), signals as float32 (fast + compact)
+        self.spd_t = self.spd_dict['timestamp'].to_numpy(np.float64)
+        self.spd_v = self.spd_dict['Airspeed' ].to_numpy(np.float32)
+
+        self.att_t    = self.roll_dict['timestamp'].to_numpy(np.float64)
+        self.roll     = self.roll_dict['Roll'    ].to_numpy(np.float32)
+        self.desroll  = self.roll_dict['DesRoll' ].to_numpy(np.float32)
+        self.pitch    = self.roll_dict['Pitch'   ].to_numpy(np.float32)
+        self.despitch = self.roll_dict['DesPitch'].to_numpy(np.float32)
+
+        self.cmd_t = self.cmd_dict['timestamp'].to_numpy(np.float64)
+        self.c1    = self.cmd_dict['C1'].to_numpy(np.float32)
+        self.c3    = self.cmd_dict['C3'].to_numpy(np.float32)  # throttle pwm
+        self.c8    = self.cmd_dict['C8'].to_numpy(np.float32)  # mode pwm
+
+        # pre-map throttle → percent now so per-frame work is only one interp
+        self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c3).astype(np.float32)
+
+        # free dataframes to reduce memory/GC churn
+        self.spd_dict = self.roll_dict = self.cmd_dict = None
+
         self.ready = True
         return True
 
     def get_roll_at(self, query_time):
-
-        query_time += self.offset
-
-        if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0] or query_time > \
-                self.roll_dict['timestamp'].iloc[-1]:
+        if not self.ready:
             return 180.0, 0.0, 180.0, 0.0, 0.0, False
 
-        # if not self.ready or query_time < self.roll_dict['timestamp'].iloc[0]:
-        #     return 180.0, 0.0, 180.0, 0.0, False
+        t = float(query_time) + self.offset
 
-        # print(f"Img Time: {query_time}")
+        # fast O(1) bound checks using NumPy arrays
+        if t < self.att_t[0] or t > self.att_t[-1]:
+            return 180.0, 0.0, 180.0, 0.0, 0.0, False
 
-        # print(f"GPS Time: {query_time}\n")
+        # all-NumPy interpolation (x arrays are strictly ascending)
+        spd        = np.interp(t, self.spd_t, self.spd_v)
+        roll       = np.interp(t, self.att_t, self.roll)
+        cmd_roll   = np.interp(t, self.att_t, self.desroll)
+        pitch      = np.interp(t, self.att_t, self.pitch)
+        cmd_pitch  = np.interp(t, self.att_t, self.despitch)
+        thr_perc   = np.interp(t, self.cmd_t, self.cmd_throttle_perc)  # already mapped to %
 
-        # Handle out-of-bounds
-        # if query_time < self.roll_dict['timestamp'].iloc[0]:
-        #     print('Beginning of file...\n')
-        #     return self.roll_dict['Roll'][0], self.roll_dict['DesRoll'][0], self.roll_dict['Pitch'][0], \
-        #     self.roll_dict['DesPitch'][0], self.cmd_dict['C8'][0]
+        mode_pwm   = np.interp(t, self.cmd_t, self.c8)
+        mode       = bool(950 < mode_pwm < 1400)
 
-        # if query_time > self.roll_dict['timestamp'].iloc[-1]:
-        #     print('End of file...\n')
-        #     return self.roll_dict['Roll'].iloc[-1], self.roll_dict['DesRoll'].iloc[-1], self.roll_dict['Pitch'].iloc[-1], \
-        #     self.roll_dict['DesPitch'].iloc[-1], self.cmd_dict['C8'].iloc[-1]
+        return roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
 
-
-
-        # Use numpy to interpolate
-        interpolated_roll = np.interp(
-            query_time,
-            self.roll_dict['timestamp'],
-            self.roll_dict['Roll']
-        )
-
-        interpolated_cmd_roll = np.interp(
-            query_time,
-            self.roll_dict['timestamp'],
-            self.roll_dict['DesRoll']
-        )
-
-        interpolated_pitch = np.interp(
-            query_time,
-            self.roll_dict['timestamp'],
-            self.roll_dict['Pitch']
-        )
-
-        interpolated_cmd_pitch = np.interp(
-            query_time,
-            self.roll_dict['timestamp'],
-            self.roll_dict['DesPitch']
-        )
-
-        interpolated_cmd_throttle = self.throttle_pwm_to_perc(
-            np.interp(
-            query_time,
-            self.cmd_dict['timestamp'],
-            self.cmd_dict['C3']
-        ))
-
-        interpolated_mode = np.interp(
-            query_time,
-            self.cmd_dict['timestamp'],
-            self.cmd_dict['C8']
-        )
-        mode = 950 < interpolated_mode < 1400
-
-        return interpolated_roll, interpolated_cmd_roll, interpolated_pitch, interpolated_cmd_pitch, interpolated_cmd_throttle, mode
-
-    def throttle_pwm_to_perc(self, throttle_pwm: np.array) -> np.array:
+    @staticmethod
+    def throttle_pwm_to_perc(throttle_pwm: np.ndarray) -> np.ndarray:
+        # same mapping, vectorized
         return (throttle_pwm - 1300.0) / (1880.0 - 1330.0) * 100.0
-# file = filedialog.askopenfilename(initialdir='./')
-# print(file)
-# file = 'C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/LOGS/00000064/XKF1.csv'
-# RR = AttitudeReader(file)
-# for i in range(1000):
-#     print(RR.get_roll_at(1748534621.7987978 + i))

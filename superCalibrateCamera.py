@@ -65,17 +65,17 @@ class ImageSliderBar:
         self.curr_img_idx = 0
 
         # --- UI ---
-        self.pop_up = ctk.CTkToplevel()
-        self.pop_up.title('Playback control')
-        self.pop_up.geometry('400x200')
-        self.pop_up.grid_columnconfigure(0, weight=1)
-        self.pop_up.grid_rowconfigure([0, 1], weight=1)
-        self.pop_up.protocol("WM_DELETE_WINDOW", self.close)
+        # self.pop_up = ctk.CTkToplevel()
+        # self.pop_up.title('Playback control')
+        # self.pop_up.geometry('400x200')
+        # self.pop_up.grid_columnconfigure(0, weight=1)
+        # self.pop_up.grid_rowconfigure([0, 1], weight=1)
+        # self.pop_up.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=self.num_images,
-                                    command=self.update_img_id, height=40)
-        self.slider.grid(sticky='ew')
-        self.slider.set(0)
+        # self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=self.num_images,
+        #                             command=self.update_img_id, height=40)
+        # self.slider.grid(sticky='ew')
+        # self.slider.set(0)
 
         # --- Throttle config/state ---
         self.refresh_interval = 1.0 / max(1.0, float(refresh_hz))  # seconds
@@ -114,38 +114,38 @@ class ImageSliderBar:
             # Runs on Tk thread
             self._after_id = None
             self._ui_pending = False
-            if self.alive and self.slider.winfo_exists():
+            # if self.alive and self.slider.winfo_exists():
                 # Note: this set() won't recurse into next_id() because it's bound to UI drag only
-                self.slider.set(self.curr_img_idx)
-                self._last_ui_ts = time.monotonic()
+                # self.slider.set(self.curr_img_idx)
+                # self._last_ui_ts = time.monotonic()
 
-        try:
-            self._ui_pending = True
-            if due_in <= 0.0:
-                self._after_id = self.slider.after(0, _do_set)
-            else:
-                # One trailing update scheduled; any intervening next_id() calls are coalesced
-                self._after_id = self.slider.after(int(due_in * 1000), _do_set)
-        except Exception:
-            # Tk is probably tearing down; ignore
-            self._ui_pending = False
-            self._after_id = None
+        # try:
+        #     self._ui_pending = True
+        #     if due_in <= 0.0:
+        #         self._after_id = self.slider.after(0, _do_set)
+        #     else:
+        #         # One trailing update scheduled; any intervening next_id() calls are coalesced
+        #         self._after_id = self.slider.after(int(due_in * 1000), _do_set)
+        # except Exception:
+        #     # Tk is probably tearing down; ignore
+        #     self._ui_pending = False
+        #     self._after_id = None
 
     def close(self):
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
         self.alive = False
-        try:
-            if self._after_id is not None:
-                try:
-                    self.slider.after_cancel(self._after_id)
-                except Exception:
-                    pass
-                self._after_id = None
-                self._ui_pending = False
-            if self.pop_up and self.pop_up.winfo_exists():
-                self.pop_up.destroy()
-        except Exception:
-            pass
+        # try:
+        #     if self._after_id is not None:
+        #         try:
+        #             self.slider.after_cancel(self._after_id)
+        #         except Exception:
+        #             pass
+        #         self._after_id = None
+        #         self._ui_pending = False
+        #     if self.pop_up and self.pop_up.winfo_exists():
+        #         self.pop_up.destroy()
+        # except Exception:
+        #     pass
 
 
 class GifMaker:
@@ -1229,6 +1229,11 @@ class CameraGui():
                 break
         self.startStreamOff()
 
+    @staticmethod
+    def _stride_for_speed(speed_abs: int) -> int:
+        s = max(0, int(speed_abs))
+        return 1 if s <= 1 else min(8, s)
+
     def run_folder_reader(self):
         import os, glob, cv2, pandas as pd
 
@@ -1237,7 +1242,7 @@ class CameraGui():
 
         directory = os.path.dirname(self.camConfig.imageFilepath)
 
-        # --- build ImageTimeReader exactly like before ---
+        # --- populate idsTimes (unchanged) ---
         if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
             self.ImageTimeReader.idsTimes = []
             imageList = glob.glob(os.path.join(directory, '*.bmp')) + glob.glob(os.path.join(directory, '*.png'))
@@ -1245,135 +1250,209 @@ class CameraGui():
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
-        # Absolute paths list for the buffered loader (same order as idsTimes)
         paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
         num_images = len(paths)
 
         img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
-        img_slider.play_speed = 1
+        img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
         pause = False
         temp_unpause = False
 
-        # time offset, exactly as before
+        last_stride = None
+        last_speed = img_slider.play_speed
+
+        # --- PAUSED CACHE: keep 1 frame while paused to avoid refetch spam ---
+        paused_cached_idx = None
+        paused_cached_frame = None
+        printed_missing = set()  # avoid spamming the same missing file message
+
+        # time offset (unchanged)
         try:
             offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
             special_img_time_offset = offset_dict['offset'][0]
         except FileNotFoundError:
             special_img_time_offset = 0
 
-        # --- NEW: start the background buffered loader ---
+        # --- start background loader ---
         loader = imgBuf(
             filepaths=paths,
             max_buffer=32,
-            preprocess=None,  # e.g., pass a resize/undistort(img) if you want it off-UI thread
+            preprocess=None,
             start_index=0,
             loop=True,
             read_flags=cv2.IMREAD_COLOR,
         ).start()
 
-        prev_idx = 0
+        # one-shot key handling
+        pressed = set()
+
+        curr_idx = 0
+
         try:
             while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
 
-                # Decide next image index (unchanged logic)
-                if not pause or temp_unpause:
-                    temp_unpause = False
-                    img_id = img_slider.next_id()
-                else:
-                    # When paused, keep current index
-                    img_id = img_slider.curr_img_idx
+                # ===== react to speed changes (incl. direction) =====
+                if img_slider.play_speed != last_speed:
+                    s_abs = self._stride_for_speed(abs(img_slider.play_speed))
+                    signed_stride = (s_abs if img_slider.play_speed >= 0 else -s_abs) if s_abs > 0 else 1
 
-                # Keep slider and our local cursor consistent
-                img_slider.curr_img_idx = max(0, min(img_id, num_images - 1))
+                    if signed_stride != last_stride:
+                        loader.set_stride(signed_stride)
+                        last_stride = signed_stride
 
-                # --- buffered fetch logic ---
-                # If we’re playing linearly (+1), let the loader stream naturally.
-                # On a jump/step, seek & clear buffer so we land exactly on img_id.
-                is_sequential = (not pause) and (img_id == (prev_idx + 1) % max(1, num_images))
-                if not is_sequential:
-                    loader.seek(img_id, clear_buffer=True)
-                    # give the worker a moment on big jumps
-                    got = loader.get_next(timeout=0.25)
-                else:
+                    if img_slider.play_speed == 0:
+                        pause = True
+                    else:
+                        pause = False
+
+                    # re-align once on any transition (incl. direction flip)
+                    curr_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
+                    loader.seek(curr_idx, clear_buffer=True)
+
+                    # reset paused cache on transitions
+                    paused_cached_idx = None
+                    paused_cached_frame = None
+
+                    last_speed = img_slider.play_speed
+
+                # ===== fetch a frame =====
+                if not pause:
+                    # streaming mode: loader drives index
                     got = loader.get_next(timeout=0.02)
 
-                frame = None
-                got_idx = None
-                if got is not None:
-                    got_idx, frame = got
+                    # if skipping (|stride|>1), drain extras so we show freshest
+                    if last_stride and abs(last_stride) > 1 and got is not None:
+                        latest = got
+                        while True:
+                            nxt = loader.get_next(timeout=0.0)
+                            if nxt is None:
+                                break
+                            latest = nxt
+                        got = latest
 
-                    # If we didn’t seek (sequential play), got_idx should match the stream’s next index.
-                    # If we did seek, we already cleared the buffer; first frame should be our target.
-                    # As a safety, if indices mismatched due to a race, try once more with a short wait.
-                    if got_idx != img_id:
-                        # Try to catch up quickly
-                        got2 = loader.get_next(timeout=0.05)
-                        if got2 is not None:
-                            got_idx, frame = got2
+                    frame = None
+                    if got is not None:
+                        got_idx, frame = got
+                        curr_idx = got_idx
+                        img_slider.curr_img_idx = curr_idx
 
-                curr_filepath = paths[img_id]
+                    # leaving pause → invalidate paused cache
+                    paused_cached_idx = None
+                    paused_cached_frame = None
 
-                if frame is not None and os.path.exists(curr_filepath):
-                    # Preserve your timestamp/offset logic exactly
-                    ts = self.ImageTimeReader.idsTimes[img_id][1]
+                else:
+                    # ===== PAUSED MODE with CACHE =====
+                    target_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
+
+                    # If cache is invalid or user moved (z/c), fetch once; otherwise reuse cached frame
+                    if paused_cached_frame is None or paused_cached_idx != target_idx:
+                        # Seek ONCE; do NOT keep seeking every loop
+                        loader.seek(target_idx, clear_buffer=True)
+
+                        got = loader.get_next(timeout=0.5)  # give worker a bit more time while paused
+                        if got is not None:
+                            got_idx, frame = got
+                            paused_cached_idx = got_idx
+                            paused_cached_frame = frame
+                            curr_idx = got_idx
+                            img_slider.curr_img_idx = curr_idx
+                        else:
+                            # If file truly missing, print once; otherwise keep last cached frame (if any)
+                            p = paths[target_idx]
+                            if not os.path.exists(p):
+                                if p not in printed_missing:
+                                    print(
+                                        f"Log File Error: {self.ImageTimeReader.idsTimes[target_idx][0]} doesn't exist.")
+                                    printed_missing.add(p)
+                                paused_cached_frame = None
+                                paused_cached_idx = None
+                            # If file exists but frame not ready yet, DON'T print; keep previous cached frame
+                    frame = paused_cached_frame
+
+                # ===== display / HUD =====
+                if frame is not None and os.path.exists(paths[curr_idx]):
+                    ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     if ts is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[img_id][0])
+                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0])
                     else:
                         self.analyze_image(frame, ts + special_img_time_offset,
-                                           self.ImageTimeReader.idsTimes[img_id][0])
+                                           self.ImageTimeReader.idsTimes[curr_idx][0])
+                elif frame is None:
+                    # Nothing to draw this iteration; just keep window responsive
+                    pass
                 else:
-                    print(
-                        f"Log File Error: {self.ImageTimeReader.idsTimes[img_id][0]} doesn't exist or failed to load.")
+                    # path doesn’t exist (already printed in paused path; print here for streaming once)
+                    p = paths[curr_idx]
+                    if p not in printed_missing:
+                        print(
+                            f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
+                        printed_missing.add(p)
 
-                prev_idx = img_id  # track for next loop
+                # ===== one-shot key handling =====
+                key = cv2.waitKey(1) & 0xFF
 
-                key = cv2.waitKey(1)
+                def on_key(kcode):
+                    if kcode == 255:
+                        return False
+                    if kcode in pressed:
+                        return False
+                    pressed.add(kcode)
+                    return True
 
-                if key == 99:  # c
-                    img_slider.curr_img_idx += 1
+                if key == 255 or key == 0xFF or key == 0:
+                    pressed.clear()
+
+                # controls (edge-triggered)
+                if key == 99 and on_key(99):  # 'c' step forward
+                    img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
                     img_slider.play_speed = 0
                     temp_unpause = True
                     pause = True
-                    # ensure buffer jumps exactly to requested frame
+                    paused_cached_idx = None
+                    paused_cached_frame = None
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                if key == 122:  # z
-                    img_slider.curr_img_idx -= 1
+                if key == 122 and on_key(122):  # 'z' step back
+                    img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
                     img_slider.play_speed = 0
                     temp_unpause = True
                     pause = True
+                    paused_cached_idx = None
+                    paused_cached_frame = None
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                if key == 32:  # space
+                if key == 32 and on_key(32):  # space toggle pause
                     pause = not pause
-                    img_slider.play_speed = 0
-                    if not pause:
-                        img_slider.play_speed = 1
-                        # nudge loader to where slider is resuming from
-                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+                    img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
+                    paused_cached_idx = None
+                    paused_cached_frame = None
+                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                if key == 100:  # d
-                    img_slider.play_speed += 1
-                    pause = False
-                    # no seek needed; let stream run
+                if key == 100 and on_key(100):  # 'd' faster (forward)
+                    if img_slider.play_speed < 0:
+                        img_slider.play_speed += 1
+                    else:
+                        img_slider.play_speed += 1
+                    pause = False  # streaming; cache cleared on speed change
 
-                if key == 97:  # a
-                    img_slider.play_speed -= 1
-                    pause = False
-                    # no seek needed; let stream run
+                if key == 97 and on_key(97):  # 'a' slower / rewind
+                    if img_slider.play_speed > 0:
+                        img_slider.play_speed -= 1
+                    else:
+                        img_slider.play_speed -= 1
+                    pause = (img_slider.play_speed == 0)  # freeze at zero
 
-                if key == 119:  # w
+                if key == 119 and on_key(119):  # 'w'
                     self.toggleUndistort()
                     self.toggleYoloInference()
                     self.toggleDetectHorizon()
                     self.toggleHyperFocus()
                     self.toggleFactorgraph()
 
-                if key == 27:
+                if key == 27 and on_key(27):  # ESC
                     break
 
         finally:
-            # close UI and background thread exactly like before
             if not self.shutting_down:
                 img_slider.close()
             loader.stop()

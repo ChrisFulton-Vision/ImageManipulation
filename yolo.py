@@ -91,7 +91,7 @@ class YOLO:
         # sess_options.intra_op_num_threads = 1
         # sess_options.inter_op_num_threads = 1
         # sess_options.execution_mode = ort.ExecutionMode.ORT_PARALLEL
-        # sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
@@ -158,59 +158,57 @@ class YOLO:
         :param output:  onnxruntime session outputs
         :return: cleaner outputs for interpretation
         '''
+        best_detections = {}
+        if output is None:
+            return [], [], [], []
 
-        best_detections = {}  # class_id: (confidence, center, box)
+        preds = np.squeeze(output[0])  # [N, 5+numClasses]
+        if preds.ndim != 2 or preds.size == 0:
+            return [], [], [], []
 
-        if output is not None:
-            predictions = np.squeeze(output[0])
-        else:
-            predictions = []
+        xywhc = preds[:, :5]  # (x,y,w,h,conf)
+        classp = preds[:, 5:]  # class probs
 
-        for detection in predictions:
-            x, y, w_box, h_box, confidence = detection[:5]
-            class_probs = detection[5:]
+        conf_mask = xywhc[:, 4] > self.conf
+        if not np.any(conf_mask):
+            return [], [], [], []
 
-            if confidence > self.conf:
-                class_id = int(np.argmax(class_probs))
-                max_class_conf = class_probs[class_id]
+        xywhc = xywhc[conf_mask]
+        classp = classp[conf_mask]
 
-                # You can choose to factor in class confidence or use the object confidence
-                combined_conf = confidence * max_class_conf
+        class_id = classp.argmax(axis=1)
+        max_class = classp.max(axis=1)
+        combined = xywhc[:, 4] * max_class
 
-                x1 = (x - w_box / 2)
-                y1 = (y - h_box / 2)
-                x2 = (x + w_box / 2)
-                y2 = (y + h_box / 2)
+        x, y, w, h = xywhc[:, 0], xywhc[:, 1], xywhc[:, 2], xywhc[:, 3]
+        x1, y1, x2, y2 = x - w / 2, y - h / 2, x + w / 2, y + h / 2
 
-                buffer = 10
-                width, height = self.yoloSize
+        W, H = self.yoloSize[0], self.yoloSize[1]
+        buf = 10
+        in_bounds = (x1 - buf >= 0) & (y1 - buf >= 0) & (x2 + buf <= W) & (y2 + buf <= H)
 
-                # Assume that the bounding box continues outside the image, and do not use since the bounding
-                # box may be cut off!
-                if x1 - buffer < 0 or y1 - buffer < 0 or x2 + buffer > width or y2 + buffer > height:
-                    continue
+        x = x[in_bounds];
+        y = y[in_bounds]
+        x1 = x1[in_bounds];
+        y1 = y1[in_bounds];
+        x2 = x2[in_bounds];
+        y2 = y2[in_bounds]
+        class_id = class_id[in_bounds];
+        combined = combined[in_bounds]
+        score_obj = xywhc[in_bounds, 4]  # objectness as your "score"
 
-                if (class_id not in best_detections) or (combined_conf > best_detections[class_id][0]):
-                    best_detections[class_id] = (
-                        combined_conf,
-                        [x, y],
-                        [x1, y1, x2, y2],
-                        float(confidence)
-                    )
+        # keep best per class
+        keep = {}
+        for i, cid in enumerate(class_id):
+            s = combined[i]
+            if (cid not in keep) or (s > keep[cid][0]):
+                keep[cid] = (s, [x[i], y[i]], [x1[i], y1[i], x2[i], y2[i]], float(score_obj[i]))
 
-        # Decompose detections into return format
-        centers = []
-        boxes = []
-        scores = []
-        class_ids = []
-
-        for class_id, (_, center, box, score) in best_detections.items():
-            centers.append(center)
-            boxes.append(box)
-            scores.append(score)
-            class_ids.append(class_id)
-
-        return centers, boxes, scores, class_ids
+        centers = [v[1] for v in keep.values()]
+        boxes = [v[2] for v in keep.values()]  # still x1,y1,x2,y2 as you expect
+        scores = [v[3] for v in keep.values()]
+        classes = [int(k) for k in keep.keys()]
+        return centers, boxes, scores, classes
 
     def markUpImage(self, image: np.array, output: (list, list, list, list)) -> tuple[np.array, tuple[np.array, np.array]]:
         '''

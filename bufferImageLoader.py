@@ -75,11 +75,14 @@ class BufferedImageLoader:
         self.seek(self._idx)  # reuse logic
 
     def set_stride(self, stride: int):
-        """For fast scrubbing; worker advances by 'stride' each decode."""
+        """Allow rewind with negative strides; abs(stride) >= 1."""
+        s = int(stride)
+        if s == 0:
+            s = 1
+        self.stride = -max(1, abs(s)) if s < 0 else max(1, abs(s))
         with self._lock:
-            self.stride = max(1, int(stride))
             self._generation += 1
-            self._drain_queue_unlocked()
+            # Do NOT forcibly drain here; re-align is handled via seek() on direction changes
             self._cv.notify_all()
 
     def get_next(self, timeout: Optional[float] = 0.2) -> Optional[Tuple[int, np.ndarray]]:
@@ -139,10 +142,9 @@ class BufferedImageLoader:
                 if gen == self._generation:
                     next_idx = idx + stride
                     if next_idx >= self.N:
-                        if self.loop:
-                            next_idx = next_idx % self.N
-                        else:
-                            next_idx = self.N - 1
+                        next_idx = next_idx % self.N if self.loop else self.N - 1
+                    elif next_idx < 0:
+                        next_idx = (next_idx + self.N) % self.N if self.loop else 0
                     self._idx = next_idx
 
             # small cooperative yield

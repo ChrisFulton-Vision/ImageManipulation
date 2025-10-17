@@ -6,12 +6,6 @@ real (scalar) part, and ``x, y, z`` are the complex (vector) part.
 Note - rotation matrices here apply to column vectors, that is,
 they are applied on the left of the vector.  For example:
 
->>> import numpy as np
->>> q = [0, 1, 0, 0] # 180 degree rotation around axis 0
->>> M = quat2mat(q) # from this module
->>> vec = np.array([1, 2, 3]).reshape((3,1)) # column vector
->>> tvec = np.dot(M, vec)
-
 Terms used in function names:
 
 * *mat* : array shape (3, 3) (3D non-homogenous coordinates)

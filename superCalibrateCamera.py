@@ -1276,7 +1276,7 @@ class CameraGui():
         # --- start background loader ---
         loader = imgBuf(
             filepaths=paths,
-            max_buffer=32,
+            max_buffer=96,
             preprocess=None,
             start_index=0,
             loop=True,
@@ -2171,8 +2171,11 @@ class CameraGui():
         color = (120, 255, 120)
 
         if self.last_yolo_3d_estimate is not None:
-            self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
-            self.last_time_update = time
+            if time < self.last_time_update:
+                self.FG.reset()
+            elif time > self.last_time_update:
+                self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
+                self.last_time_update = time
             if self.FG.numMeas > 20:
                 self.FG.popOldestMeas()
             if self.FG.numMeas > 2:

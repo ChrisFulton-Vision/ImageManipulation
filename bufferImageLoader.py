@@ -97,7 +97,7 @@ class BufferedImageLoader:
         # sentinel or shutdown
         if idx < 0 or img is None:
             return None
-        return (idx, img)
+        return idx, img
 
     # ----------------- worker logic -----------------
     def _worker(self):

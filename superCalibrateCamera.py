@@ -12,6 +12,7 @@ from enum import Enum
 from PIL import Image
 import pandas as pd
 from AttitudeInterpreter import AttitudeReader as AttRdr
+from AttitudeInterpreter import ControlMode
 from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
 from quaternions import Quaternion as q
 from quaternions import *
@@ -1520,7 +1521,7 @@ class CameraGui():
             cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
                         cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
         if img_time is not None:
-            time_str = f"Flight Time: {img_time + 173.11338 - 11.658461:.2f}"
+            time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
             (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
@@ -1591,7 +1592,7 @@ class CameraGui():
         cv2.polylines(self.markup_frame, [lines],
                       False, (0, 255, 0), 2)
 
-        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_roll_at(img_time + 173.11338 - 11.658461)
+        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(img_time) # + 173.11338 - 11.658461)
 
         # bank_angle = 0.0 + 60.0 * sin(img_time)
         bank_pts = []
@@ -1671,11 +1672,19 @@ class CameraGui():
                     (int(center[0] - width/2), int(center[1] - height/2)),
                      cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
 
-        # vision system on
-        if mode:
-            tl = np.array([.40 * x, .80 * y]).astype(int)
-            br = np.array([.60 * x, .95 * y]).astype(int)
-            cv2.rectangle(self.markup_frame, tl, br, (0, 255, 0))
+        text_loc = np.array([.65 * x, .90 * y]).astype(int)
+        if mode == ControlMode.controller:
+            cv2.putText(self.markup_frame, "MODE: CNTL", text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (255, 0, 0), 2)
+        if mode == ControlMode.manual:
+            cv2.putText(self.markup_frame, "MODE: MAN", text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (255, 255, 0), 2)
+        if mode == ControlMode.auto:
+            cv2.putText(self.markup_frame, "MODE: AUTO", text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
+        if mode == ControlMode.error:
+            cv2.putText(self.markup_frame, "MODE: ERR", text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 0, 255), 2)
 
     def update_cube_map_vectors(self):
         """Return direction vectors for each cube face, shape: (6, H, W, 3)"""

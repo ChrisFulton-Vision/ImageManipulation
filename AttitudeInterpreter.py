@@ -2,6 +2,13 @@
 import pandas as pd
 import numpy as np
 from os.path import join
+from enum import Enum
+
+class ControlMode(Enum):
+    auto = 'auto'
+    manual = 'manual'
+    controller = 'controller'
+    error = 'error'
 
 class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
@@ -68,12 +75,14 @@ class AttitudeReader:
         self.ready = True
         return True
 
-    def get_roll_at(self, query_time):
+    def get_attitude_at(self, query_time):
         if not self.ready:
             return 180.0, 0.0, 180.0, 0.0, 0.0, False
 
         t = float(query_time) + self.offset
 
+        # print(f'Query_time: {query_time}\nOffset: {self.offset}\nt: {t}\nZero: {self.att_t[0]}\nMax: {self.att_t[-1]}\n\n')
+        
         # fast O(1) bound checks using NumPy arrays
         if t < self.att_t[0] or t > self.att_t[-1]:
             return 180.0, 0.0, 180.0, 0.0, 0.0, False
@@ -86,10 +95,22 @@ class AttitudeReader:
         cmd_pitch  = np.interp(t, self.att_t, self.despitch)
         thr_perc   = np.interp(t, self.cmd_t, self.cmd_throttle_perc)  # already mapped to %
 
-        mode_pwm   = np.interp(t, self.cmd_t, self.c8)
-        mode       = bool(950 < mode_pwm < 1400)
+        # mode_pwm   = np.interp(t, self.cmd_t, self.c8)
+        mode       = self.ch8_pwm_to_mode(np.interp(t, self.cmd_t, self.c8))
 
         return roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
+
+    @staticmethod
+    def ch8_pwm_to_mode(ch8):
+        if (950 < ch8 < 1250):
+            return ControlMode.controller
+        if (1250 <= ch8 < 1750):
+            return ControlMode.auto
+        if (1750 <= ch8 < 2050):
+            return ControlMode.manual
+        else:
+            return ControlMode.error
+
 
     @staticmethod
     def throttle_pwm_to_perc(throttle_pwm: np.ndarray) -> np.ndarray:

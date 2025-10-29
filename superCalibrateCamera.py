@@ -18,7 +18,6 @@ from quaternions import Quaternion as q
 from quaternions import *
 from TwoD_to_ThreeD import solveQnP
 from bufferImageLoader import BufferedImageLoader as imgBuf
-from convertToGif import make_gif
 
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
@@ -1018,10 +1017,28 @@ class CameraGui():
                                             name=self.ImageTimeReader.idsTimes[idx][0], display=False)
                 cv_imgs.append(cv_img)
 
-            make_gif(cv_imgs, 10, infinite=True)
+            self.make_gif(cv_imgs, 10, infinite=True)
         finally:
             # schedule UI reset back on Tk thread
             self.gui.after(0, self._exportToGifOrVid_done)
+
+    def make_gif(self, images, fps=10, name='output', infinite: bool = False):
+        # dirList = sorted(os.listdir('ImagesToGif'), key=numerical_sort)
+        pil_images = []
+        # for idx, filename in enumerate(dirList):
+
+        for idx, cv_img in enumerate(images):
+            pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+            pil_images.append(pil_img)
+
+        dur = int(1000 / fps)
+        pil_images[0].save(
+            "output.gif",
+            save_all=True,
+            append_images=pil_images[1:],
+            duration=dur,  # Duration in milliseconds between frames
+            loop=0 if infinite else 1,  # 0 for infinite loop
+        )
 
     def exportToVid(self):
         if self.making_gifOrVid:

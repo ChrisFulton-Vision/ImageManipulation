@@ -34,7 +34,6 @@ class ImageTimeReader:
                     image_time = datetime.datetime.strptime(rowList[0][0:-7], '%Y.%b.%d_%H.%M.%S.%f')
                     if self.startTimeUTC is None:
                         self.startTimeUTC = image_time
-                        print(image_time)
                     id = int(rowList[1])
                     imgName = rowList[2]
                     self.idsTimes.append([imgName, (image_time-self.startTimeUTC).total_seconds()])

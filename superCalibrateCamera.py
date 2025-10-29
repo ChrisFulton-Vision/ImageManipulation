@@ -18,6 +18,7 @@ from quaternions import Quaternion as q
 from quaternions import *
 from TwoD_to_ThreeD import solveQnP
 from bufferImageLoader import BufferedImageLoader as imgBuf
+from convertToGif import make_gif
 
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
@@ -29,6 +30,12 @@ from ImageTimeReader import ImageTimeReader
 
 GREEN = '#2FA572'
 CAM_CONFIG_CACHE = 'Caches/camConfig_cache.pkl'
+
+def numerical_sort(file_name):
+    try:
+        return int(file_name.split('.')[0])
+    except (ValueError, IndexError):
+        return float('inf')
 
 class thread_with_exception(Thread):
     def __init__(self, name, func):
@@ -147,40 +154,6 @@ class ImageSliderBar:
         #         self.pop_up.destroy()
         # except Exception:
         #     pass
-
-
-class GifMaker:
-    def __init__(self, gif_name: str = "Output",
-                 width_height: tuple[int, int] = (864, 864),
-                 img_duration: int = 100,
-                 loop: int = 0):
-        self.pop_up = ctk.CTkToplevel()
-        self.pop_up.lift()
-        self.file_path = ''
-        self.width, self.height = width_height
-        self.output_name = gif_name + ".gif"
-        self.img_duration = img_duration
-        self.loop = loop
-        self.thread = thread_with_exception("GifMaker Thread", self.make_gif)
-        self.is_threading = False
-        self.execute_thread()
-
-    def execute_thread(self):
-        if not self.is_threading:
-            self.is_threading = True
-            self.thread.start()
-
-    def make_gif(self):
-        time.sleep(1)
-        self.is_threading = False
-        self.thread.raise_exception()
-
-    def numerical_sort(self, file_name):
-        try:
-            return int(file_name.split('.')[0])
-        except (ValueError, IndexError):
-            return float('inf')
-
 
 class Gabor:
     def __init__(self):
@@ -322,6 +295,8 @@ class CameraConfig():
         self.cubemap = False
         self.hud = False
         self.hud_data_filepath = ''
+        self.start_export_idx = 0
+        self.end_export_idx = 1
 
         self.yolo_conf = 0.75
         self.yolo_iou = 1.00
@@ -457,6 +432,11 @@ class CameraGui():
         self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
         self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
 
+        self.exportToGifButton = ctk.CTkButton(self.cam_frame, text="Export to Gif", command=self.exportToGif)
+        self.exportToVidButton = ctk.CTkButton(self.cam_frame, text="Export to Vid", command=self.exportToVid)
+        self.making_gifOrVid = False
+
+
         self.loadFromCache()
         self.confSliderBar.set(self.camConfig.yolo_conf)
         self.iouSliderBar.set(self.camConfig.yolo_iou)
@@ -473,7 +453,7 @@ class CameraGui():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x770'
+        self.camFrameGeometry = '455x825'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -959,6 +939,12 @@ class CameraGui():
         self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
+
+        self.exportToGifButton.grid(row=rowID, column=0, padx=5, pady=5)
+        self.exportToVidButton.grid(row=rowID, column=1, padx=5, pady=5)
+
+        rowID += 1
+
         goBackButton = ctk.CTkButton(self.cam_frame, text="Return to Main", command=self.releaseCamReturnToMain)
         goBackButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
 
@@ -997,6 +983,104 @@ class CameraGui():
             self.timeBetweenImgsEntry.delete(0, ctk.END)
             self.timeBetweenImgsEntry.configure(placeholder_text='1')
             self.camConfig.secondsBetweenImages = 1.0
+
+    def exportToGif(self):
+        if self.making_gifOrVid:
+            return
+
+        self.exportToGifButton.configure(text="Making gif...", state='disabled', fg_color="blue")
+        self.exportToVidButton.configure(text="Making gif...", state='disabled', fg_color="blue")
+        self.making_gifOrVid = True
+
+        t = threading.Thread(target=self.exportToGif_worker, daemon=True)
+        t.start()
+
+    def exportToGif_worker(self):
+        try:
+            # === original guts, minus any widget.configure calls ===
+            cv_images = []
+            directory = os.path.dirname(self.camConfig.imageFilepath)
+            self.populate_idsTimes(directory)
+            paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+
+            try:
+                offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
+                special_img_time_offset = offset_dict['offset'][0]
+            except FileNotFoundError:
+                special_img_time_offset = 0
+
+            cv_imgs = []
+            for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
+                                paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
+                frame = cv2.imread(img)
+                ts = self.ImageTimeReader.idsTimes[idx][1]
+                cv_img = self.analyze_image(frame, img_time=(ts + special_img_time_offset if ts is not None else None),
+                                            name=self.ImageTimeReader.idsTimes[idx][0], display=False)
+                cv_imgs.append(cv_img)
+
+            make_gif(cv_imgs, 10, infinite=True)
+        finally:
+            # schedule UI reset back on Tk thread
+            self.gui.after(0, self._exportToGifOrVid_done)
+
+    def exportToVid(self):
+        if self.making_gifOrVid:
+            return
+
+        self.exportToGifButton.configure(text="Making vid...", state='disabled', fg_color="blue")
+        self.exportToVidButton.configure(text="Making vid...", state='disabled', fg_color="blue")
+        self.making_gifOrVid = True
+
+        t = threading.Thread(target=self.exportToVid_worker, daemon=True)
+        t.start()
+
+    def exportToVid_worker(self):
+        try:
+            # === original guts, minus any widget.configure calls ===
+            cv_images = []
+            directory = os.path.dirname(self.camConfig.imageFilepath)
+            self.populate_idsTimes(directory)
+            paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+
+            try:
+                offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
+                special_img_time_offset = offset_dict['offset'][0]
+            except FileNotFoundError:
+                special_img_time_offset = 0
+
+            cv_imgs = []
+            for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
+                                paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
+                frame = cv2.imread(img)
+                ts = self.ImageTimeReader.idsTimes[idx][1]
+                cv_img = self.analyze_image(frame, img_time=(ts + special_img_time_offset if ts is not None else None),
+                                            name=self.ImageTimeReader.idsTimes[idx][0], display=False)
+                cv_imgs.append(cv_img)
+
+            height, width, layers = cv_imgs[0].shape
+
+            # === Define the video codec and create VideoWriter object ===
+            output_video_path = 'output_video.mp4'
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')  # You can also use 'MJPG' or 'mp4v'
+            video = cv2.VideoWriter(output_video_path, fourcc, 10, (width, height))
+
+            cur = 0
+            total = len(cv_imgs) - 1
+            for idx, img in enumerate(cv_imgs):
+                video.write(img)
+                cur += 1
+
+            # === Release everything ===
+            video.release()
+            print(f"\nVideo saved to {output_video_path}")
+        finally:
+            # schedule UI reset back on Tk thread
+            self.gui.after(0, self._exportToGifOrVid_done)
+
+    def _exportToGifOrVid_done(self):
+        self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=GREEN)
+        self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=GREEN)
+        self.making_gifOrVid = False
 
     def startStreamOn(self):
         self.showWindow = True
@@ -1235,14 +1319,7 @@ class CameraGui():
         s = max(0, int(speed_abs))
         return 1 if s <= 1 else min(8, s)
 
-    def run_folder_reader(self):
-        import os, glob, cv2, pandas as pd
-
-        cv2.destroyAllWindows()
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-
-        directory = os.path.dirname(self.camConfig.imageFilepath)
-
+    def populate_idsTimes(self, directory):
         # --- populate idsTimes (unchanged) ---
         if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
             self.ImageTimeReader.idsTimes = []
@@ -1250,6 +1327,14 @@ class CameraGui():
             imageList = natural_sort(imageList)
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
+
+    def run_folder_reader(self):
+        cv2.destroyAllWindows()
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+
+        directory = os.path.dirname(self.camConfig.imageFilepath)
+
+        self.populate_idsTimes(directory)
 
         paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
         num_images = len(paths)
@@ -1267,7 +1352,7 @@ class CameraGui():
         paused_cached_frame = None
         printed_missing = set()  # avoid spamming the same missing file message
 
-        # time offset (unchanged)
+        # time offset
         try:
             offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
             special_img_time_offset = offset_dict['offset'][0]
@@ -1371,23 +1456,26 @@ class CameraGui():
                     frame = paused_cached_frame
 
                 # ===== display / HUD =====
-                if frame is not None and os.path.exists(paths[curr_idx]):
+                if frame is not None and os.path.exists(paths[curr_idx]) and len(self.ImageTimeReader.idsTimes) > 0:
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
+                    boxAround = False
+                    if self.camConfig.start_export_idx <= curr_idx <= self.camConfig.end_export_idx:
+                        boxAround = True
                     if ts is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0])
+                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
                     else:
                         self.analyze_image(frame, ts + special_img_time_offset,
-                                           self.ImageTimeReader.idsTimes[curr_idx][0])
+                                           self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
-                else:
-                    # path doesn’t exist (already printed in paused path; print here for streaming once)
-                    p = paths[curr_idx]
-                    if p not in printed_missing:
-                        print(
-                            f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
-                        printed_missing.add(p)
+                # else:
+                #     # path doesn’t exist (already printed in paused path; print here for streaming once)
+                #     p = paths[curr_idx]
+                #     if p not in printed_missing:
+                #         print(
+                #             f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
+                #         printed_missing.add(p)
 
                 # ===== one-shot key handling =====
                 key = cv2.waitKey(1) & 0xFF
@@ -1429,29 +1517,46 @@ class CameraGui():
                     paused_cached_frame = None
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                if key == 100 and on_key(100):  # 'd' faster (forward)
+                if key == ord('d') and on_key(ord('d')):  # 'd' faster (forward)
                     if img_slider.play_speed < 0:
                         img_slider.play_speed += 1
                     else:
                         img_slider.play_speed += 1
                     pause = False  # streaming; cache cleared on speed change
 
-                if key == 97 and on_key(97):  # 'a' slower / rewind
+                if key == ord('a') and on_key(ord('a')):  # 'a' slower / rewind
                     if img_slider.play_speed > 0:
                         img_slider.play_speed -= 1
                     else:
                         img_slider.play_speed -= 1
                     pause = (img_slider.play_speed == 0)  # freeze at zero
 
-                if key == 119 and on_key(119):  # 'w'
+                if key == ord('w') and on_key(ord('w')):  # 'w'
                     self.toggleUndistort()
                     self.toggleYoloInference()
                     self.toggleDetectHorizon()
                     self.toggleHyperFocus()
                     self.toggleFactorgraph()
 
+                if key == ord('s') and on_key(ord('s')):
+                    self.camConfig.start_export_idx = img_slider.curr_img_idx
+                    if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+                        self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
+
+                if key == ord('e') and on_key(ord('e')):
+                    self.camConfig.end_export_idx = img_slider.curr_img_idx
+                    if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+                        self.camConfig.start_export_idx = self.camConfig.end_export_idx - 1
+                        if self.camConfig.start_export_idx < 0:
+                            self.camConfig.start_export_idx += 1
+                            self.camConfig.end_export_idx += 1
+
                 if key == 27 and on_key(27):  # ESC
                     break
+
+                while self.making_gifOrVid:
+                    time.sleep(0.1)
+
 
         finally:
             if not self.shutting_down:
@@ -1459,7 +1564,8 @@ class CameraGui():
             loader.stop()
             self.startStreamOff()
 
-    def analyze_image(self, frame, img_time=None, name=None, print_params=False):
+    def analyze_image(self, frame, img_time=None, name=None, display=True, box_around=False):
+
         if frame is None:
             return
 
@@ -1527,10 +1633,18 @@ class CameraGui():
             cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
-        self.cleanup()
+        if box_around:
+            (h, w) = self.markup_frame.shape[:2]
+            cv2.rectangle(self.markup_frame, (0,0), (w-1, h-1), (0, 255, 255), 10)
+
+        if display:
+            self.cleanup()
 
         if self.printLidar:
             self.print_pnp_results()
+
+        if not display:
+            return self.markup_frame
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=np.inf, suppress=True)
@@ -1592,7 +1706,14 @@ class CameraGui():
         cv2.polylines(self.markup_frame, [lines],
                       False, (0, 255, 0), 2)
 
-        bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(img_time) # + 173.11338 - 11.658461)
+        speed, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(img_time) # + 173.11338 - 11.658461)
+
+        cos_negBank = np.cos(-deg2rad(bank_angle))
+        sin_negBank = np.sin(-deg2rad(bank_angle))
+
+        # speed
+        cv2.putText(self.markup_frame, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         # bank_angle = 0.0 + 60.0 * sin(img_time)
         bank_pts = []
@@ -1622,28 +1743,74 @@ class CameraGui():
         cv2.fillPoly(self.markup_frame, [cmd_lines], (0, 255, 0))
 
         # Pitch Cmd
-        left_tri = np.array([[x * 0.49, y * 0.70 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                             [x * 0.47, y * 0.69 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                             [x * 0.47, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]]).astype(int)
+        # base center of the ladder (your HUD anchor)
+        cx = x * 0.50
+        cy = y * 0.50
+
+        left_tri = np.array([[cx + x * (- 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank ),
+                              cy + y * (- 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank )],
+                             [cx + x * (- 0.03 * cos_negBank + (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                              cy + y * (- 0.03 * sin_negBank - (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                             [cx + x * (- 0.03 * cos_negBank + (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                              cy + y * (- 0.03 * sin_negBank - (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
 
         cv2.polylines(self.markup_frame, [left_tri],True, (0, 255, 0), 2)
-        right_tri = np.array([[x * 0.51, y * 0.70 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                              [x * 0.53, y * 0.69 - y * (cmd_pitch_angle - pitch_angle) / 200.0],
-                              [x * 0.53, y * 0.71 - y * (cmd_pitch_angle - pitch_angle) / 200.0]]).astype(int)
+        right_tri = np.array([[cx + x * ( 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank ),
+                               cy + y * ( 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank )],
+                              [cx + x * ( 0.03 * cos_negBank + (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                               cy + y * ( 0.03 * sin_negBank - (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                              [cx + x * ( 0.03 * cos_negBank + (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                               cy + y * ( 0.03 * sin_negBank - (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
 
         cv2.polylines(self.markup_frame, [right_tri], True, (0, 255, 0), 2)
 
         # Pitch Response
         for i in [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0]:
-            if np.abs(pitch_angle - i) < 20.0:
-                cv2.line(self.markup_frame, (int(x * 0.40), int(y * 0.7 + y * (pitch_angle - i) / 200.0)),
-                     (int(x * 0.46), int(y * 0.7 + y * (pitch_angle - i) / 200.0)), (0, 255, 0), 2)
-                cv2.line(self.markup_frame, (int(x * 0.54), int(y * 0.7 + y * (pitch_angle - i) / 200.0)),
-                     (int(x * 0.60), int(y * 0.7 + y * (pitch_angle - i) / 200.0)), (0, 255, 0), 2)
+            if abs(pitch_angle - i) < 25.0:
+                # vertical spacing factor (tune this)
+                pitch_spacing = 16.0
+                dy = -(pitch_angle - i) * pitch_spacing
+
+                # trig shorthands
+                sin_b = np.sin(deg2rad(bank_angle))
+                cos_b = np.cos(deg2rad(bank_angle))
+
+
+
+                # left/right extents, similar to your 0.04–0.15 scaling
+                inner = 0.04 * x
+                outer = 0.15 * x
+
+                # vertical offset by pitch, rotated by bank
+                x_offset = dy * sin_b
+                y_offset = dy * cos_b
+
+                # left line segment (outer to inner)
+                x1 = cx - outer * cos_b - x_offset
+                y1 = cy + outer * sin_b - y_offset
+                x2 = cx - inner * cos_b - x_offset
+                y2 = cy + inner * sin_b - y_offset
+
+                cv2.line(self.markup_frame,
+                         (int(x1), int(y1)),
+                         (int(x2), int(y2)),
+                         (0, 255, 0), 2)
+
+                # right line segment (inner to outer)
+                x3 = cx + inner * cos_b - x_offset
+                y3 = cy - inner * sin_b - y_offset
+                x4 = cx + outer * cos_b - x_offset
+                y4 = cy - outer * sin_b - y_offset
+
+                cv2.line(self.markup_frame,
+                         (int(x3), int(y3)),
+                         (int(x4), int(y4)),
+                         (0, 255, 0), 2)
+
                 cv2.putText(self.markup_frame, f'{i:.0f}',
-                            (int(x * 0.62), int(y * 0.7 + y * (pitch_angle - i) / 200.0)),
+                            (int(x4 + x*0.02), int(y4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
-        cv2.circle(self.markup_frame, (int(x*0.5), int(y*0.7)), 5, (0,255,0), 2)
+        cv2.circle(self.markup_frame, (int(cx), int(cy)), 5, (0,255,0), 2)
 
 
 
@@ -1653,7 +1820,7 @@ class CameraGui():
 
         # Throttle response
         num = 20
-        center = (int(x * 0.75), int(y * 0.75))
+        center = (int(x * 0.8), int(y * 0.50))
         thetas = np.linspace(0.0, 245.0, num)
         theta = cmd_throttle * 2.450
         points = np.zeros((num,2), int)
@@ -1670,21 +1837,78 @@ class CameraGui():
         (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), 2)
         cv2.putText(self.markup_frame, f'{cmd_throttle:.1f}%',
                     (int(center[0] - width/2), int(center[1] - height/2)),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
+                     cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         text_loc = np.array([.65 * x, .90 * y]).astype(int)
         if mode == ControlMode.controller:
             cv2.putText(self.markup_frame, "MODE: CNTL", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (255, 0, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (255, 150, 0), 2)
         if mode == ControlMode.manual:
             cv2.putText(self.markup_frame, "MODE: MAN", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (255, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (255, 255, 0), 2)
         if mode == ControlMode.auto:
             cv2.putText(self.markup_frame, "MODE: AUTO", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
         if mode == ControlMode.error:
             cv2.putText(self.markup_frame, "MODE: ERR", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 0, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 255), 2)
+
+    import numpy as np
+    import cv2
+
+    def draw_pitch_ladder(img, bank_deg, pitch_deg,
+                          marks=(-30, -20, -10, 0, 10, 20, 30),
+                          pixels_per_deg=8.0):
+        """
+        img: BGR image (H,W,3)
+        bank_deg: aircraft bank (right wing down positive, deg)
+        pitch_deg: aircraft pitch (deg)
+        marks: which pitch lines to draw (deg)
+        pixels_per_deg: vertical spacing of ladder (pixels per degree)
+        """
+        h, w = img.shape[:2]
+
+        # Choose HUD center similar to your code (mid-x, 70% down y)
+        cx, cy = 0.50 * w, 0.70 * h
+
+        # Ladder half-widths (match your 0.15*w and 0.04*w)
+        L_outer = 0.15 * w
+        L_inner = 0.04 * w
+
+        # Rotate by -bank to make the ladder roll with the horizon
+        theta = -np.deg2rad(bank_deg)
+        c, s = np.cos(theta), np.sin(theta)
+        R = np.array([[c, -s],
+                      [s, c]], dtype=float)
+
+        green = (0, 255, 0)
+
+        for m in marks:
+            # Draw only nearby lines (like your |pitch - i| < 25)
+            if abs(pitch_deg - m) >= 25.0:
+                continue
+
+            # In the local HUD frame: +v is "up", +u is "right"
+            # Vertical offset in pixels between current pitch and this mark
+            v = (pitch_deg - m) * pixels_per_deg  # positive -> mark below current attitude
+
+            # Left segment: from (-L_outer, v) to (-L_inner, v)
+            p1_local = np.array([-L_outer, v])
+            p2_local = np.array([-L_inner, v])
+
+            # Right segment: from (L_inner, v) to (L_outer, v)
+            p3_local = np.array([L_inner, v])
+            p4_local = np.array([L_outer, v])
+
+            for a_local, b_local in [(p1_local, p2_local), (p3_local, p4_local)]:
+                a = R @ a_local
+                b = R @ b_local
+
+                # Convert to image coords (note: image y grows downward, so subtract v-component)
+                ax, ay = int(round(cx + a[0])), int(round(cy - a[1]))
+                bx, by = int(round(cx + b[0])), int(round(cy - b[1]))
+
+                cv2.line(img, (ax, ay), (bx, by), green, 2)
 
     def update_cube_map_vectors(self):
         """Return direction vectors for each cube face, shape: (6, H, W, 3)"""

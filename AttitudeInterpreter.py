@@ -98,7 +98,7 @@ class AttitudeReader:
         # mode_pwm   = np.interp(t, self.cmd_t, self.c8)
         mode       = self.ch8_pwm_to_mode(np.interp(t, self.cmd_t, self.c8))
 
-        return roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
+        return spd, roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
 
     @staticmethod
     def ch8_pwm_to_mode(ch8):
@@ -115,4 +115,6 @@ class AttitudeReader:
     @staticmethod
     def throttle_pwm_to_perc(throttle_pwm: np.ndarray) -> np.ndarray:
         # same mapping, vectorized
-        return (throttle_pwm - 1300.0) / (1880.0 - 1330.0) * 100.0
+        MIN_THROTTLE = 1000.0  # 1300
+        MAX_THROTTLE = 1935.0  # 1880
+        return (throttle_pwm - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE) * 100.0

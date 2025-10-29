@@ -61,7 +61,6 @@ class TruthPoints:
     def saveToCache(self):
         with open('LIDAR_Truth_Points.pkl', 'wb') as f:
             pickle.dump(self, f)
-            print(f'Saved as LIDAR_Truth_Points.pkl')
 
     def copy(self, classToCopy):
         self.__dict__.update(copy.deepcopy(classToCopy.__dict__))

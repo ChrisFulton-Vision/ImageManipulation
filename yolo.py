@@ -304,8 +304,6 @@ class YOLO:
                 x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
                 object_points.append([x, y, z])
                 image_points.append(y_centers[idx])
-            else:
-                print(f'Future Debug here:')
 
         object_points = np.array(object_points)
         image_points = np.array(image_points)

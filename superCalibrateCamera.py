@@ -11,6 +11,7 @@ from LidarTruth import TruthPoints
 from enum import Enum
 from PIL import Image
 import pandas as pd
+from itertools import cycle
 from AttitudeInterpreter import AttitudeReader as AttRdr
 from AttitudeInterpreter import ControlMode
 from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
@@ -251,6 +252,15 @@ class ImageSource(Enum):
     Static_Image = 'Static Image'
     Stream_from_Folder = 'Stream from Folder'
 
+class PlaybackSpeed(Enum):
+    Fixed_fps = 'fixed_fps'
+    Real_time = 'realtime'
+
+    def next(self):
+        iterator = cycle(self.__class__)
+        for member in iterator:
+            if member is self:
+                return next(iterator)
 
 class ImageKernels(Enum):
     Unfiltered = 'Unfiltered'  #None
@@ -297,6 +307,10 @@ class CameraConfig():
         self.start_export_idx = 0
         self.end_export_idx = 1
         self.cam_to_log_time_offset = 0.0
+
+        self.playback_mode = PlaybackSpeed.Fixed_fps
+        self.target_fps = 20.0  # used when playback_mode == 'fixed_fps'
+        self.rt_speed = 1.0  # 1.0 = real-time, 0.5 = half-speed, 2.0 = double-speed
 
         self.yolo_conf = 0.75
         self.yolo_iou = 1.00
@@ -362,6 +376,9 @@ class CameraGui():
         self.attReader = AttRdr()
         self.pnpResult = None
         self.qnpResult = None
+
+        self.fps_time_log = time.time()
+        self.curr_fps = 20.0
 
         self.imageProcessingKernelCombobox = None
 
@@ -1365,10 +1382,35 @@ class CameraGui():
         paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
         num_images = len(paths)
 
+        # after: paths = [...]
+        num_images = len(paths)
+
+        # timestamps (seconds), None -> infer at fixed spacing later
+        ts_raw = []
+        for name, ts in self.ImageTimeReader.idsTimes:
+            ts_raw.append(None if ts is None else float(ts) + float(self.camConfig.cam_to_log_time_offset))
+
+        # make a monotone increasing timebase:
+        # - if all None: synthesize from target_fps so 'realtime' still works
+        # - else: fill Nones by linear interpolate between neighbors; ends by nearest neighbor
+        t = np.array([np.nan if v is None else v for v in ts_raw], dtype='float64')
+        if np.all(np.isnan(t)):
+            step = 1.0 / max(1e-6, self.camConfig.target_fps)
+            t = np.arange(num_images, dtype='float64') * step
+        else:
+            # fill gaps
+            nans = np.isnan(t)
+            if nans.any():
+                notn = ~nans
+                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
+        # normalize so first frame is t=0
+        t0 = float(t[0])
+        t = t - t0
+
+
         img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
         img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
         pause = False
-        temp_unpause = False
 
         last_stride = None
         last_speed = img_slider.play_speed
@@ -1400,8 +1442,25 @@ class CameraGui():
 
         curr_idx = 0
 
+        wall_start = time.monotonic()
+        next_deadline = wall_start
+
+        def sleep_until(deadline):
+            now = time.monotonic()
+            remain = deadline - now
+            if remain > 0:
+                # small sleeps to keep UI responsive
+                time.sleep(remain)
+
         try:
             while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+
+                curr_time = time.time()
+                if (curr_time - self.fps_time_log) > 0.000001:
+                    self.curr_fps = 1.0 / abs(curr_time - self.fps_time_log)
+                else:
+                    self.curr_fps = 0.0
+                self.fps_time_log = curr_time
 
                 # ===== react to speed changes (incl. direction) =====
                 if img_slider.play_speed != last_speed:
@@ -1483,6 +1542,36 @@ class CameraGui():
 
                 # ===== display / HUD =====
                 if frame is not None and os.path.exists(paths[curr_idx]) and len(self.ImageTimeReader.idsTimes) > 0:
+
+                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                        try:
+                            loader.set_stride(1)  # ignore play_speed-based negative/zero stride here
+                        except Exception as e:
+                            print("Error: ", e)
+
+                        self.camConfig.target_fps = max(0.001, float(self.camConfig.target_fps))  # never 0
+                        period = 1.0 / self.camConfig.target_fps
+                        target_time = wall_start + curr_idx * period
+                        sleep_until(target_time)
+
+                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+                        # map wall time → desired log time
+                        elapsed = (time.monotonic() - wall_start) * max(1e-6, self.camConfig.rt_speed)
+                        # find the frame index whose log time is just <= elapsed
+                        # (Assumes t is sorted & normalized to 0 at first frame)
+                        idx_target = int(np.searchsorted(t, elapsed, side='right') - 1)
+                        idx_target = max(0, min(idx_target, num_images - 1))
+
+                        # if our current buffer index is behind/ahead, seek smartly:
+                        if idx_target != curr_idx:
+                            loader.seek(idx_target, clear_buffer=True)  # instant re-align
+                            # fetch the aligned frame immediately if available
+                            got = loader.get_next(timeout=0.02)
+                            if got is not None:
+                                curr_idx, frame = got
+                        # small wait to avoid hot spinning when we're at the correct time
+                        time.sleep(0.0005)
+
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     boxAround = False
                     if self.camConfig.start_export_idx <= curr_idx <= self.camConfig.end_export_idx:
@@ -1495,13 +1584,13 @@ class CameraGui():
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
-                # else:
-                #     # path doesn’t exist (already printed in paused path; print here for streaming once)
-                #     p = paths[curr_idx]
-                #     if p not in printed_missing:
-                #         print(
-                #             f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
-                #         printed_missing.add(p)
+                else:
+                    # path doesn’t exist (already printed in paused path; print here for streaming once)
+                    p = paths[curr_idx]
+                    if p not in printed_missing:
+                        print(
+                            f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
+                        printed_missing.add(p)
 
                 # ===== one-shot key handling =====
                 key = cv2.waitKey(1) & 0xFF
@@ -1517,23 +1606,34 @@ class CameraGui():
                 if key == 255 or key == 0xFF or key == 0:
                     pressed.clear()
 
+                #used keys:
+                # c, z, space, d, a, w, s, e, {, }, [, ], p, esc
+
                 # controls (edge-triggered)
-                if key == 99 and on_key(99):  # 'c' step forward
+
+                if key == ord('f') and on_key(ord('f')): # swap from FPS-limit to real-time
+                    self.camConfig.playback_mode = self.camConfig.playback_mode.next()
+                    wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                    if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+                        img_slider.play_speed = 1
+                    self.saveToCache()
+
+                if key == ord('c') and on_key(ord('c')):  # 'c' step forward
                     img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
                     img_slider.play_speed = 0
-                    temp_unpause = True
                     pause = True
                     paused_cached_idx = None
                     paused_cached_frame = None
+                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                if key == 122 and on_key(122):  # 'z' step back
+                if key == ord('z') and on_key(ord('z')):  # 'z' step back
                     img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
                     img_slider.play_speed = 0
-                    temp_unpause = True
                     pause = True
                     paused_cached_idx = None
                     paused_cached_frame = None
+                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
                 if key == 32 and on_key(32):  # space toggle pause
@@ -1541,21 +1641,46 @@ class CameraGui():
                     img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
                     paused_cached_idx = None
                     paused_cached_frame = None
+                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                     loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
                 if key == ord('d') and on_key(ord('d')):  # 'd' faster (forward)
-                    if img_slider.play_speed < 0:
-                        img_slider.play_speed += 1
+                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                        # step up by ~25%, but cap to something sane (e.g., 240 fps)
+                        if self.camConfig.target_fps < 20.0 < self.camConfig.target_fps * 1.25:
+                            self.camConfig.target_fps = 20.0
+                        elif self.camConfig.target_fps < 10.0 < self.camConfig.target_fps * 1.25:
+                            self.camConfig.target_fps = 10.0
+                        else:
+                            self.camConfig.target_fps = min(240.0, round(self.camConfig.target_fps * 1.25, 4))
+                        wall_start = time.monotonic() - curr_idx / max(0.001, self.camConfig.target_fps)
                     else:
-                        img_slider.play_speed += 1
-                    pause = False  # streaming; cache cleared on speed change
+                        # realtime mode: speed up time scale
+                        if self.camConfig.rt_speed < 1.0 < self.camConfig.rt_speed * 2.0:
+                            self.camConfig.rt_speed = 1.0
+                        else:
+                            self.camConfig.rt_speed = min(16.0, round(self.camConfig.rt_speed * 2.0, 4))
+                        wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                    self.saveToCache()
 
                 if key == ord('a') and on_key(ord('a')):  # 'a' slower / rewind
-                    if img_slider.play_speed > 0:
-                        img_slider.play_speed -= 1
+                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                        # step down by ~20%, but never below 0.5 fps
+                        if self.camConfig.target_fps * 0.8 < 20.0 < self.camConfig.target_fps:
+                            self.camConfig.target_fps = 20.0
+                        elif self.camConfig.target_fps * 0.8 < 10.0 < self.camConfig.target_fps:
+                            self.camConfig.target_fps = 10.0
+                        else:
+                            self.camConfig.target_fps = max(0.5, round(self.camConfig.target_fps * 0.8, 4))
+                        wall_start = time.monotonic() - curr_idx / max(0.001, self.camConfig.target_fps)
                     else:
-                        img_slider.play_speed -= 1
-                    pause = (img_slider.play_speed == 0)  # freeze at zero
+                        # realtime mode: slow down time scale
+                        if self.camConfig.rt_speed * 0.5 < 1.0 < self.camConfig.rt_speed:
+                            self.camConfig.rt_speed = 1.0
+                        else:
+                            self.camConfig.rt_speed = max(0.1, round(self.camConfig.rt_speed * 0.5, 4))
+                        wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                    self.saveToCache()
 
                 if key == ord('w') and on_key(ord('w')):  # 'w'
                     self.toggleUndistort()
@@ -1584,6 +1709,10 @@ class CameraGui():
                     self.saveToCache()
 
                 # edge-triggered handlers (inside your key-handling area)
+                if key == ord(";") and on_key(ord(";")):
+                    self.camConfig.cam_to_log_time_offset -= 0.01
+                if key == ord("'") and on_key(ord("'")):
+                    self.camConfig.cam_to_log_time_offset += 0.01
                 if key == ord('[') and on_key(ord('[')):
                     self.camConfig.cam_to_log_time_offset -= 0.10
                 if key == ord(']') and on_key(ord(']')):
@@ -1689,8 +1818,11 @@ class CameraGui():
             cv2.rectangle(self.markup_frame, (0,0), (w-1, h-1), (0, 255, 255), 10)
 
         if display:
+            cv2.putText(self.markup_frame,
+                        f'Realtime: {self.camConfig.rt_speed}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.curr_fps:.2f}/{self.camConfig.target_fps:.2f}',
+                        (15, 50), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 255), 1)
             cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                        (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+                        (15, 15), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 255), 1)
             self.cleanup()
 
         if self.printLidar:

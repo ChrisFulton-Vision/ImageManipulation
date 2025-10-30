@@ -19,7 +19,7 @@ from quaternions import Quaternion as q
 from quaternions import *
 from TwoD_to_ThreeD import solveQnP
 from bufferImageLoader import BufferedImageLoader as imgBuf
-
+from convertToGif import make_gif
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
 
@@ -1043,28 +1043,10 @@ class CameraGui():
                                             name=self.ImageTimeReader.idsTimes[idx][0], display=False)
                 cv_imgs.append(cv_img)
 
-            self.make_gif(cv_imgs, 10, infinite=True)
+            make_gif(cv_imgs, 10, infinite=True, quality='l')
         finally:
             # schedule UI reset back on Tk thread
             self.gui.after(0, self._exportToGifOrVid_done)
-
-    def make_gif(self, images, fps=10, name='output', infinite: bool = False):
-        # dirList = sorted(os.listdir('ImagesToGif'), key=numerical_sort)
-        pil_images = []
-        # for idx, filename in enumerate(dirList):
-
-        for idx, cv_img in enumerate(images):
-            pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-            pil_images.append(pil_img)
-
-        dur = int(1000 / fps)
-        pil_images[0].save(
-            "output.gif",
-            save_all=True,
-            append_images=pil_images[1:],
-            duration=dur,  # Duration in milliseconds between frames
-            loop=0 if infinite else 1,  # 0 for infinite loop
-        )
 
     def exportToVid(self):
         if self.making_gifOrVid:
@@ -1375,14 +1357,13 @@ class CameraGui():
         cv2.destroyAllWindows()
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
 
+        reverse_playback = False
+
         directory = os.path.dirname(self.camConfig.imageFilepath)
 
         self.populate_idsTimes(directory)
 
         paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
-        num_images = len(paths)
-
-        # after: paths = [...]
         num_images = len(paths)
 
         # timestamps (seconds), None -> infer at fixed spacing later
@@ -1439,21 +1420,36 @@ class CameraGui():
 
         # one-shot key handling
         pressed = set()
+        pending_keys = []
 
         curr_idx = 0
 
         wall_start = time.monotonic()
-        next_deadline = wall_start
 
         def sleep_until(deadline):
-            now = time.monotonic()
-            remain = deadline - now
-            if remain > 0:
-                # small sleeps to keep UI responsive
-                time.sleep(remain)
+            # Keep GUI responsive and capture bursts
+            while True:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
 
+                # small chunks: 1–5 ms; finer polling = fewer missed keys
+                chunk_ms = int(max(1, remain * 1000.0))
+                k = cv2.waitKey(chunk_ms) & 0xFF
+
+                if k not in (0, 0xFF, 255, -1):
+                    # push the key we saw
+                    pending_keys.append(k)
+                    # aggressively drain any *additional* queued keys
+                    for _ in range(8):  # short burst drain
+                        k2 = cv2.waitKey(1) & 0xFF
+                        if k2 in (0, 0xFF, 255, -1): break
+                        pending_keys.append(k2)
+                    break
+
+        end = False
         try:
-            while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+            while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow and not end and not self.making_gifOrVid:
 
                 curr_time = time.time()
                 if (curr_time - self.fps_time_log) > 0.000001:
@@ -1544,22 +1540,26 @@ class CameraGui():
                 if frame is not None and os.path.exists(paths[curr_idx]) and len(self.ImageTimeReader.idsTimes) > 0:
 
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                        try:
-                            loader.set_stride(1)  # ignore play_speed-based negative/zero stride here
-                        except Exception as e:
-                            print("Error: ", e)
-
-                        self.camConfig.target_fps = max(0.001, float(self.camConfig.target_fps))  # never 0
                         period = 1.0 / self.camConfig.target_fps
-                        target_time = wall_start + curr_idx * period
+                        target_time = wall_start + period * (curr_idx if not reverse_playback else num_images - curr_idx)
+                        if target_time < time.monotonic():
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                                curr_idx if not reverse_playback else num_images - curr_idx)
                         sleep_until(target_time)
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
                         # map wall time → desired log time
-                        elapsed = (time.monotonic() - wall_start) * max(1e-6, self.camConfig.rt_speed)
+                        elapsed = (time.monotonic() - wall_start) * self.camConfig.rt_speed
                         # find the frame index whose log time is just <= elapsed
                         # (Assumes t is sorted & normalized to 0 at first frame)
                         idx_target = int(np.searchsorted(t, elapsed, side='right') - 1)
+
+                        if elapsed < t[0]:
+                            idx_target = num_images - 1
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / self.camConfig.rt_speed)
+                        if elapsed > t[-1]:
+                            idx_target = 0
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / self.camConfig.rt_speed)
                         idx_target = max(0, min(idx_target, num_images - 1))
 
                         # if our current buffer index is behind/ahead, seek smartly:
@@ -1570,7 +1570,9 @@ class CameraGui():
                             if got is not None:
                                 curr_idx, frame = got
                         # small wait to avoid hot spinning when we're at the correct time
-                        time.sleep(0.0005)
+                        k = cv2.waitKey(1)
+                        if k != 255 and k != 0xFF and k != 0 and k != -1:  # got a key; queue it for the main handler
+                            pending_keys.append(k)
 
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     boxAround = False
@@ -1592,145 +1594,187 @@ class CameraGui():
                             f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
                         printed_missing.add(p)
 
-                # ===== one-shot key handling =====
-                key = cv2.waitKey(1) & 0xFF
 
-                def on_key(kcode):
-                    if kcode == 255:
-                        return False
-                    if kcode in pressed:
-                        return False
-                    pressed.add(kcode)
-                    return True
+                # Prefer any keys captured during sleep_until(...)
+                k = cv2.waitKey(1) & 0xFF
+                if k != 255 and k != 0xFF and k != 0 and k != -1:
+                    pending_keys.append(k)
 
-                if key == 255 or key == 0xFF or key == 0:
-                    pressed.clear()
 
-                #used keys:
-                # c, z, space, d, a, w, s, e, {, }, [, ], p, esc
+                while pending_keys:
+                    key = pending_keys.pop(0)
+                    def on_key(kcode):
+                        if kcode == 255:
+                            return False
+                        if kcode in pressed:
+                            return False
+                        pressed.add(kcode)
+                        return True
 
-                # controls (edge-triggered)
+                    if key == 255 or key == 0xFF or key == 0:
+                        pressed.clear()
 
-                if key == ord('f') and on_key(ord('f')): # swap from FPS-limit to real-time
-                    self.camConfig.playback_mode = self.camConfig.playback_mode.next()
-                    wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
-                    if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-                        img_slider.play_speed = 1
-                    self.saveToCache()
+                    #used keys:
+                    # c, z, space, d, a, w, s, e, {, }, [, ], p, esc
 
-                if key == ord('c') and on_key(ord('c')):  # 'c' step forward
-                    img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
-                    img_slider.play_speed = 0
-                    pause = True
-                    paused_cached_idx = None
-                    paused_cached_frame = None
-                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+                    # controls (edge-triggered)
 
-                if key == ord('z') and on_key(ord('z')):  # 'z' step back
-                    img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
-                    img_slider.play_speed = 0
-                    pause = True
-                    paused_cached_idx = None
-                    paused_cached_frame = None
-                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
-
-                if key == 32 and on_key(32):  # space toggle pause
-                    pause = not pause
-                    img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
-                    paused_cached_idx = None
-                    paused_cached_frame = None
-                    self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                    loader.seek(img_slider.curr_img_idx, clear_buffer=True)
-
-                if key == ord('d') and on_key(ord('d')):  # 'd' faster (forward)
-                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                        # step up by ~25%, but cap to something sane (e.g., 240 fps)
-                        if self.camConfig.target_fps < 20.0 < self.camConfig.target_fps * 1.25:
-                            self.camConfig.target_fps = 20.0
-                        elif self.camConfig.target_fps < 10.0 < self.camConfig.target_fps * 1.25:
-                            self.camConfig.target_fps = 10.0
-                        else:
-                            self.camConfig.target_fps = min(240.0, round(self.camConfig.target_fps * 1.25, 4))
-                        wall_start = time.monotonic() - curr_idx / max(0.001, self.camConfig.target_fps)
-                    else:
-                        # realtime mode: speed up time scale
-                        if self.camConfig.rt_speed < 1.0 < self.camConfig.rt_speed * 2.0:
+                    if key == ord('f') and on_key(ord('f')): # swap from FPS-limit to real-time
+                        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
+                        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+                            img_slider.play_speed = 1
                             self.camConfig.rt_speed = 1.0
+                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
                         else:
-                            self.camConfig.rt_speed = min(16.0, round(self.camConfig.rt_speed * 2.0, 4))
-                        wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
-                    self.saveToCache()
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
+                        self.saveToCache()
 
-                if key == ord('a') and on_key(ord('a')):  # 'a' slower / rewind
-                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                        # step down by ~20%, but never below 0.5 fps
-                        if self.camConfig.target_fps * 0.8 < 20.0 < self.camConfig.target_fps:
-                            self.camConfig.target_fps = 20.0
-                        elif self.camConfig.target_fps * 0.8 < 10.0 < self.camConfig.target_fps:
-                            self.camConfig.target_fps = 10.0
+                    if key == ord('c') and on_key(ord('c')):  # 'c' step forward
+                        img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
+                        img_slider.play_speed = 0
+                        pause = True
+                        paused_cached_idx = None
+                        paused_cached_frame = None
+                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
+                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                    if key == ord('z') and on_key(ord('z')):  # 'z' step back
+                        img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
+                        img_slider.play_speed = 0
+                        pause = True
+                        paused_cached_idx = None
+                        paused_cached_frame = None
+                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
+                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                    if key == 32 and on_key(32):  # space toggle pause
+                        pause = not pause
+                        img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
+                        paused_cached_idx = None
+                        paused_cached_frame = None
+                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
+                        wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                            curr_idx if not reverse_playback else num_images - curr_idx)
+                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+
+                    if key == ord('d') and on_key(ord('d')):  # 'd' faster (forward)
+                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                            # step up by ~25%, but cap to something sane (e.g., 240 fps)
+                            if self.camConfig.target_fps < 20.0 < self.camConfig.target_fps * 1.25:
+                                self.camConfig.target_fps = 20.0
+                            elif self.camConfig.target_fps < 10.0 < self.camConfig.target_fps * 1.25:
+                                self.camConfig.target_fps = 10.0
+                            else:
+                                self.camConfig.target_fps = min(64.0, round(self.camConfig.target_fps * 1.25, 4))
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
                         else:
-                            self.camConfig.target_fps = max(0.5, round(self.camConfig.target_fps * 0.8, 4))
-                        wall_start = time.monotonic() - curr_idx / max(0.001, self.camConfig.target_fps)
-                    else:
-                        # realtime mode: slow down time scale
-                        if self.camConfig.rt_speed * 0.5 < 1.0 < self.camConfig.rt_speed:
-                            self.camConfig.rt_speed = 1.0
+                            # realtime mode: speed up time scale
+                            if self.camConfig.rt_speed < 1.0 < self.camConfig.rt_speed * 2.0:
+                                self.camConfig.rt_speed = 1.0
+                            else:
+                                self.camConfig.rt_speed = min(64.0, round(self.camConfig.rt_speed * 2.0, 4))
+                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                        self.saveToCache()
+
+                    if key == ord('a') and on_key(ord('a')):  # 'a' slower / rewind
+                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                            # step down by ~20%, but never below 0.5 fps
+                            if self.camConfig.target_fps * 0.8 < 20.0 < self.camConfig.target_fps:
+                                self.camConfig.target_fps = 20.0
+                            elif self.camConfig.target_fps * 0.8 < 10.0 < self.camConfig.target_fps:
+                                self.camConfig.target_fps = 10.0
+                            else:
+                                self.camConfig.target_fps = round(self.camConfig.target_fps * 0.8, 4)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
                         else:
-                            self.camConfig.rt_speed = max(0.1, round(self.camConfig.rt_speed * 0.5, 4))
-                        wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
-                    self.saveToCache()
+                            # realtime mode: slow down time scale
+                            if self.camConfig.rt_speed * 0.5 < 1.0 < self.camConfig.rt_speed:
+                                self.camConfig.rt_speed = 1.0
+                            else:
+                                self.camConfig.rt_speed = round(self.camConfig.rt_speed * 0.5, 4)
+                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                        self.saveToCache()
 
-                if key == ord('w') and on_key(ord('w')):  # 'w'
-                    self.toggleUndistort()
-                    self.toggleYoloInference()
-                    self.toggleDetectHorizon()
-                    self.toggleHyperFocus()
-                    self.toggleFactorgraph()
+                    # 'r' reverse direction of playback
+                    if key == ord('r') and on_key(ord('r')):  # toggle reverse
+                        reverse_playback = not reverse_playback
+                        # If paused, give it a nudge so you can see direction immediately
+                        if img_slider.play_speed == 0:
+                            img_slider.play_speed = -1  # start stepping backward
+                            pause = False
 
-                if key == ord('s') and on_key(ord('s')):
-                    self.camConfig.start_export_idx = img_slider.curr_img_idx
-                    if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-                        self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
-                    self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-                    self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-                    self.saveToCache()
+                        # Flip direction of the current playback
+                        img_slider.play_speed = -img_slider.play_speed
 
-                if key == ord('e') and on_key(ord('e')):
-                    self.camConfig.end_export_idx = img_slider.curr_img_idx
-                    if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-                        self.camConfig.start_export_idx = self.camConfig.end_export_idx - 1
-                        if self.camConfig.start_export_idx < 0:
-                            self.camConfig.start_export_idx += 1
-                            self.camConfig.end_export_idx += 1
-                    self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-                    self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-                    self.saveToCache()
+                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                            # Respect the new sign by updating the loader stride now
+                            try:
+                                s_abs = self._stride_for_speed(abs(img_slider.play_speed))
+                                loader.set_stride(-s_abs if img_slider.play_speed < 0 else s_abs)
+                            except Exception as e:
+                                print("Error setting reverse stride:", e)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
 
-                # edge-triggered handlers (inside your key-handling area)
-                if key == ord(";") and on_key(ord(";")):
-                    self.camConfig.cam_to_log_time_offset -= 0.01
-                if key == ord("'") and on_key(ord("'")):
-                    self.camConfig.cam_to_log_time_offset += 0.01
-                if key == ord('[') and on_key(ord('[')):
-                    self.camConfig.cam_to_log_time_offset -= 0.10
-                if key == ord(']') and on_key(ord(']')):
-                    self.camConfig.cam_to_log_time_offset += 0.10
-                if key == ord('{') and on_key(ord('{')):  # shift+[ on most keyboards
-                    self.camConfig.cam_to_log_time_offset -= 1.00
-                if key == ord('}') and on_key(ord('}')):  # shift+] on most keyboards
-                    self.camConfig.cam_to_log_time_offset += 1.00
-                if key == ord('p') and on_key(ord('p')):  # persist
-                    self.write_offset_csv()
-                    print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
+                        elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+                            # Make real-time run backward by flipping rt_speed and
+                            # aligning wall_start so the current frame stays continuous.
+                            # wall_start exists in your loop already.
+                            self.camConfig.rt_speed = -self.camConfig.rt_speed
+                            # Align so elapsed = t[curr_idx] at the toggle moment:
+                            # elapsed = (now - wall_start) * rt_speed  ==> set wall_start accordingly
+                            now = time.monotonic()
+                            # t is your normalized timebase (t[0] == 0), curr_idx is the shown frame
+                            wall_start = now - ((t[curr_idx] - t[0]) / self.camConfig.rt_speed)
 
-                if key == 27 and on_key(27):  # ESC
-                    break
+                    if key == ord('w') and on_key(ord('w')):  # 'w'
+                        self.toggleUndistort()
+                        self.toggleYoloInference()
+                        self.toggleDetectHorizon()
+                        self.toggleHyperFocus()
+                        self.toggleFactorgraph()
 
-                while self.making_gifOrVid:
-                    time.sleep(0.1)
+                    if key == ord('s') and on_key(ord('s')):
+                        self.camConfig.start_export_idx = img_slider.curr_img_idx
+                        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+                            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
+                        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+                        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+                        self.saveToCache()
 
+                    if key == ord('e') and on_key(ord('e')):
+                        self.camConfig.end_export_idx = img_slider.curr_img_idx
+                        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+                            self.camConfig.start_export_idx = self.camConfig.end_export_idx - 1
+                            if self.camConfig.start_export_idx < 0:
+                                self.camConfig.start_export_idx += 1
+                                self.camConfig.end_export_idx += 1
+                        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+                        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+                        self.saveToCache()
+
+                    # edge-triggered handlers (inside your key-handling area)
+                    if key == ord(";") and on_key(ord(";")):
+                        self.camConfig.cam_to_log_time_offset -= 0.01
+                    if key == ord("'") and on_key(ord("'")):
+                        self.camConfig.cam_to_log_time_offset += 0.01
+                    if key == ord('[') and on_key(ord('[')):
+                        self.camConfig.cam_to_log_time_offset -= 0.10
+                    if key == ord(']') and on_key(ord(']')):
+                        self.camConfig.cam_to_log_time_offset += 0.10
+                    if key == ord('{') and on_key(ord('{')):  # shift+[ on most keyboards
+                        self.camConfig.cam_to_log_time_offset -= 1.00
+                    if key == ord('}') and on_key(ord('}')):  # shift+] on most keyboards
+                        self.camConfig.cam_to_log_time_offset += 1.00
+                    if key == ord('p') and on_key(ord('p')):  # persist
+                        self.write_offset_csv()
+                        print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
+
+                    if key == 27 and on_key(27):  # ESC
+                        end = True
+
+                    while self.making_gifOrVid:
+                        time.sleep(0.1)
+                pressed.clear()
 
         finally:
             if not self.shutting_down:
@@ -2697,6 +2741,9 @@ class CameraGui():
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
         aspectRatio = self.curr_frame.shape[1] / self.curr_frame.shape[0]
+        if not cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
+            return
+
         if not self.lastHeight == height and height != 0:
             cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
             self.lastHeight = height

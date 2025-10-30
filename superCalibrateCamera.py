@@ -27,7 +27,7 @@ from ImageTimeReader import ImageTimeReader
 #or
 #pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
-GREEN = '#2FA572'
+CTK_GREEN = '#2FA572'
 CAM_CONFIG_CACHE = 'Caches/camConfig_cache.pkl'
 
 def numerical_sort(file_name):
@@ -296,6 +296,7 @@ class CameraConfig():
         self.hud_data_filepath = ''
         self.start_export_idx = 0
         self.end_export_idx = 1
+        self.cam_to_log_time_offset = 0.0
 
         self.yolo_conf = 0.75
         self.yolo_iou = 1.00
@@ -400,7 +401,7 @@ class CameraGui():
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
 
         self.lidarTruthPoints = TruthPoints()
-        self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=GREEN,
+        self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=CTK_GREEN,
                                                      command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = ctk.CTkLabel(self.cam_frame,
                                                    text='../' + os.path.basename(
@@ -435,8 +436,11 @@ class CameraGui():
         self.exportToVidButton = ctk.CTkButton(self.cam_frame, text="Export to Vid", command=self.exportToVid)
         self.making_gifOrVid = False
 
-
         self.loadFromCache()
+
+        self.exportStartFrame = ctk.CTkLabel(self.cam_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame = ctk.CTkLabel(self.cam_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
+
         self.confSliderBar.set(self.camConfig.yolo_conf)
         self.iouSliderBar.set(self.camConfig.yolo_iou)
 
@@ -452,7 +456,7 @@ class CameraGui():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '455x825'
+        self.camFrameGeometry = '445x855'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -944,6 +948,11 @@ class CameraGui():
 
         rowID += 1
 
+        self.exportStartFrame.grid(row=rowID, column=0, padx=5, pady=5)
+        self.exportEndFrame.grid(row=rowID, column=1, padx=5, pady=5)
+
+        rowID += 1
+
         goBackButton = ctk.CTkButton(self.cam_frame, text="Return to Main", command=self.releaseCamReturnToMain)
         goBackButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
 
@@ -1004,16 +1013,16 @@ class CameraGui():
 
             try:
                 offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-                special_img_time_offset = offset_dict['offset'][0]
+                self.cam_to_log_time_offset = offset_dict['offset'][0]
             except FileNotFoundError:
-                special_img_time_offset = 0
+                self.cam_to_log_time_offset = 0.0
 
             cv_imgs = []
             for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
                                 paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
                 frame = cv2.imread(img)
                 ts = self.ImageTimeReader.idsTimes[idx][1]
-                cv_img = self.analyze_image(frame, img_time=(ts + special_img_time_offset if ts is not None else None),
+                cv_img = self.analyze_image(frame, img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
                                             name=self.ImageTimeReader.idsTimes[idx][0], display=False)
                 cv_imgs.append(cv_img)
 
@@ -1061,16 +1070,16 @@ class CameraGui():
 
             try:
                 offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-                special_img_time_offset = offset_dict['offset'][0]
+                self.camConfig.cam_to_log_time_offset = offset_dict['offset'][0]
             except FileNotFoundError:
-                special_img_time_offset = 0
+                self.camConfig.cam_to_log_time_offset = 0.0
 
             cv_imgs = []
             for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
                                 paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
                 frame = cv2.imread(img)
                 ts = self.ImageTimeReader.idsTimes[idx][1]
-                cv_img = self.analyze_image(frame, img_time=(ts + special_img_time_offset if ts is not None else None),
+                cv_img = self.analyze_image(frame, img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
                                             name=self.ImageTimeReader.idsTimes[idx][0], display=False)
                 cv_imgs.append(cv_img)
 
@@ -1095,17 +1104,17 @@ class CameraGui():
             self.gui.after(0, self._exportToGifOrVid_done)
 
     def _exportToGifOrVid_done(self):
-        self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=GREEN)
-        self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=GREEN)
+        self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=CTK_GREEN)
+        self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=CTK_GREEN)
         self.making_gifOrVid = False
 
     def startStreamOn(self):
         self.showWindow = True
-        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying', fg_color=GREEN,
+        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying', fg_color=CTK_GREEN,
                                              hover_color='navy')
-        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=GREEN,
+        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=CTK_GREEN,
                                          hover_color='navy')
-        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=GREEN, hover_color='navy')
+        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=CTK_GREEN, hover_color='navy')
 
         self.selectCameraCombo.configure(state='disabled')
 
@@ -1372,9 +1381,9 @@ class CameraGui():
         # time offset
         try:
             offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-            special_img_time_offset = offset_dict['offset'][0]
+            self.camConfig.cam_to_log_time_offset = offset_dict['offset'][0]
         except FileNotFoundError:
-            special_img_time_offset = 0
+            self.camConfig.cam_to_log_time_offset = 0.0
 
         # --- start background loader ---
         loader = imgBuf(
@@ -1481,7 +1490,7 @@ class CameraGui():
                     if ts is None:
                         self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
                     else:
-                        self.analyze_image(frame, ts + special_img_time_offset,
+                        self.analyze_image(frame, ts + self.camConfig.cam_to_log_time_offset,
                                            self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
@@ -1559,6 +1568,9 @@ class CameraGui():
                     self.camConfig.start_export_idx = img_slider.curr_img_idx
                     if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
                         self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
+                    self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+                    self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+                    self.saveToCache()
 
                 if key == ord('e') and on_key(ord('e')):
                     self.camConfig.end_export_idx = img_slider.curr_img_idx
@@ -1567,6 +1579,22 @@ class CameraGui():
                         if self.camConfig.start_export_idx < 0:
                             self.camConfig.start_export_idx += 1
                             self.camConfig.end_export_idx += 1
+                    self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+                    self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+                    self.saveToCache()
+
+                # edge-triggered handlers (inside your key-handling area)
+                if key == ord('[') and on_key(ord('[')):
+                    self.camConfig.cam_to_log_time_offset -= 0.10
+                if key == ord(']') and on_key(ord(']')):
+                    self.camConfig.cam_to_log_time_offset += 0.10
+                if key == ord('{') and on_key(ord('{')):  # shift+[ on most keyboards
+                    self.camConfig.cam_to_log_time_offset -= 1.00
+                if key == ord('}') and on_key(ord('}')):  # shift+] on most keyboards
+                    self.camConfig.cam_to_log_time_offset += 1.00
+                if key == ord('p') and on_key(ord('p')):  # persist
+                    self.write_offset_csv()
+                    print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
 
                 if key == 27 and on_key(27):  # ESC
                     break
@@ -1580,6 +1608,12 @@ class CameraGui():
                 img_slider.close()
             loader.stop()
             self.startStreamOff()
+
+    def write_offset_csv(self):
+        self.attReader.offset += self.camConfig.cam_to_log_time_offset
+        pd.DataFrame({"offset": [self.attReader.offset]}).to_csv(
+            os.path.join(self.camConfig.hud_data_filepath, "__TIME_OFFSET.csv"), index=False)
+        self.camConfig.cam_to_log_time_offset = 0.0
 
     def analyze_image(self, frame, img_time=None, name=None, display=True, box_around=False):
 
@@ -1655,6 +1689,8 @@ class CameraGui():
             cv2.rectangle(self.markup_frame, (0,0), (w-1, h-1), (0, 255, 255), 10)
 
         if display:
+            cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                        (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             self.cleanup()
 
         if self.printLidar:
@@ -1869,9 +1905,6 @@ class CameraGui():
         if mode == ControlMode.error:
             cv2.putText(self.markup_frame, "MODE: ERR", text_loc,
                         cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 255), 2)
-
-    import numpy as np
-    import cv2
 
     def draw_pitch_ladder(img, bank_deg, pitch_deg,
                           marks=(-30, -20, -10, 0, 10, 20, 30),

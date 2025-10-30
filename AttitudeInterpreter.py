@@ -34,7 +34,6 @@ class AttitudeReader:
             self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
             self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
-            offset_dict    = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
         except FileNotFoundError:
             return False
 
@@ -43,12 +42,18 @@ class AttitudeReader:
         if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns): return False
         if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns): return False
 
-        self.offset = float(offset_dict['offset'][0])
-
         # stable ascending time -> better for np.interp
-        self.spd_dict  = self.spd_dict.sort_values('timestamp').reset_index(drop=True)
+        self.spd_dict = self.spd_dict.sort_values('timestamp').reset_index(drop=True)
         self.roll_dict = self.roll_dict.sort_values('timestamp').reset_index(drop=True)
-        self.cmd_dict  = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
+        self.cmd_dict = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
+
+        offset_dict = {}
+        try:
+            offset_dict    = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
+        except FileNotFoundError:
+            offset_dict['offset'] = [self.spd_dict['timestamp'][0].to_numpy(np.float64)]
+
+        self.offset = float(offset_dict['offset'][0])
 
         # ---- one-time conversion to NumPy (choose dtypes deliberately) ----
         # timestamps as float64 (interp domain), signals as float32 (fast + compact)

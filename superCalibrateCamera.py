@@ -31,11 +31,13 @@ from ImageTimeReader import ImageTimeReader
 CTK_GREEN = '#2FA572'
 CAM_CONFIG_CACHE = 'Caches/camConfig_cache.pkl'
 
+
 def numerical_sort(file_name):
     try:
         return int(file_name.split('.')[0])
     except (ValueError, IndexError):
         return float('inf')
+
 
 class thread_with_exception(Thread):
     def __init__(self, name, func):
@@ -71,19 +73,6 @@ class ImageSliderBar:
         self.num_images = int(num_images)
         self.play_speed = 1
         self.curr_img_idx = 0
-
-        # --- UI ---
-        # self.pop_up = ctk.CTkToplevel()
-        # self.pop_up.title('Playback control')
-        # self.pop_up.geometry('400x200')
-        # self.pop_up.grid_columnconfigure(0, weight=1)
-        # self.pop_up.grid_rowconfigure([0, 1], weight=1)
-        # self.pop_up.protocol("WM_DELETE_WINDOW", self.close)
-
-        # self.slider = ctk.CTkSlider(self.pop_up, from_=0, to=self.num_images,
-        #                             command=self.update_img_id, height=40)
-        # self.slider.grid(sticky='ew')
-        # self.slider.set(0)
 
         # --- Throttle config/state ---
         self.refresh_interval = 1.0 / max(1.0, float(refresh_hz))  # seconds
@@ -123,9 +112,9 @@ class ImageSliderBar:
             self._after_id = None
             self._ui_pending = False
             # if self.alive and self.slider.winfo_exists():
-                # Note: this set() won't recurse into next_id() because it's bound to UI drag only
-                # self.slider.set(self.curr_img_idx)
-                # self._last_ui_ts = time.monotonic()
+            # Note: this set() won't recurse into next_id() because it's bound to UI drag only
+            # self.slider.set(self.curr_img_idx)
+            # self._last_ui_ts = time.monotonic()
 
         # try:
         #     self._ui_pending = True
@@ -154,6 +143,7 @@ class ImageSliderBar:
         #         self.pop_up.destroy()
         # except Exception:
         #     pass
+
 
 class Gabor:
     def __init__(self):
@@ -252,6 +242,7 @@ class ImageSource(Enum):
     Static_Image = 'Static Image'
     Stream_from_Folder = 'Stream from Folder'
 
+
 class PlaybackSpeed(Enum):
     Fixed_fps = 'fixed_fps'
     Real_time = 'realtime'
@@ -261,6 +252,7 @@ class PlaybackSpeed(Enum):
         for member in iterator:
             if member is self:
                 return next(iterator)
+
 
 class ImageKernels(Enum):
     Unfiltered = 'Unfiltered'  #None
@@ -395,7 +387,7 @@ class CameraGui():
         self.recordButton = ctk.CTkButton(master=self.cam_frame, text='Saving Imagery', fg_color='green',
                                           hover_color='navy', command=self.recordOff)
         self.printButton = ctk.CTkButton(master=self.cam_frame, text='Print LiDAR', fg_color='green',
-                                          hover_color='navy', command=self.printLidarOnce)
+                                         hover_color='navy', command=self.printLidarOnce)
         self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                                  command=self.selectCamera)
         self.selectFolderLabel = ctk.CTkLabel(self.cam_frame,
@@ -403,7 +395,7 @@ class CameraGui():
         self.selectTruthPointsButton = ctk.CTkButton(master=self.cam_frame, text='Select LIDAR Points',
                                                      hover_color='blue', command=self.selectLidarFile)
         self.selectFlightLogButton = ctk.CTkButton(master=self.cam_frame, text='Select Flight Log File',
-                                                     hover_color='blue', command=self.selectLogFile)
+                                                   hover_color='blue', command=self.selectLogFile)
 
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(
@@ -430,7 +422,7 @@ class CameraGui():
         self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image',
                                                      command=self.toggleYoloInference)
         self.yoloBiasCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO Bias Tracking',
-                                                    command=self.toggleYoloBiasTracking)
+                                                command=self.toggleYoloBiasTracking)
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
         self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.cam_frame, text='PhaseCorrelation')
@@ -552,17 +544,16 @@ class CameraGui():
     def selectLogFile(self):
         if self.camConfig.hud_data_filepath == '':
             poss_filepath = filedialog.askdirectory(initialdir=self.filepath + '/..',
-                                                       title='Select Flight Log Data')
+                                                    title='Select Flight Log Data')
         else:
             poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.hud_data_filepath + '/..',
-                                                       title='Select Flight Log Data')
+                                                    title='Select Flight Log Data')
         if poss_filepath != '':
             self.camConfig.hud_data_filepath = poss_filepath
             self.attReader = AttRdr()
             self.attReader.read_files(poss_filepath)
             self.updateFlightLogLabel()
             self.saveToCache()
-
 
     def selectYoloFolder(self):
         if self.camConfig.yoloFilepath is None:
@@ -596,8 +587,8 @@ class CameraGui():
                     test = pickle.load(f)
                     self.lidarTruthPoints.copy(test)
             else:
-                print(f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
-
+                print(
+                    f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
 
     def confSlider(self, confValue):
         self.camConfig.yolo_conf = confValue
@@ -930,7 +921,8 @@ class CameraGui():
 
         imageProcessingKernelLabel = ctk.CTkLabel(self.cam_frame, text='Image Filter: ')
         imageProcessingKernelLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
-        self.imageProcessingKernelCombobox = ctk.CTkComboBox(self.cam_frame, values=list(ImageKernels.__members__.keys()))
+        self.imageProcessingKernelCombobox = ctk.CTkComboBox(self.cam_frame,
+                                                             values=list(ImageKernels.__members__.keys()))
         self.imageProcessingKernelCombobox.set(self.camConfig.processingKernel.name)
         self.imageProcessingKernelCombobox.configure(command=self.updateImageProcessingKernel)
         self.updateImageProcessingKernel(self.camConfig.processingKernel.name)
@@ -958,7 +950,6 @@ class CameraGui():
                                                  placeholder_text=str(self.camConfig.secondsBetweenImages))
         self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
-
 
         self.exportToGifButton.grid(row=rowID, column=0, padx=5, pady=5)
         self.exportToVidButton.grid(row=rowID, column=1, padx=5, pady=5)
@@ -1009,6 +1000,32 @@ class CameraGui():
             self.timeBetweenImgsEntry.configure(placeholder_text='1')
             self.camConfig.secondsBetweenImages = 1.0
 
+    def _gather_annotated_frames(self) -> list[np.ndarray]:
+        directory = os.path.dirname(self.camConfig.imageFilepath)
+        self.populate_idsTimes(directory)
+        paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+
+        try:
+            offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
+            self.cam_to_log_time_offset = offset_dict['offset'][0]
+        except FileNotFoundError:
+            self.cam_to_log_time_offset = 0.0
+
+        cv_imgs = []
+        for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
+                            paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
+            frame = cv2.imread(img)
+            ts = self.ImageTimeReader.idsTimes[idx][1]
+            cv_img = self.analyze_image(
+                frame,
+                img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
+                name=self.ImageTimeReader.idsTimes[idx][0],
+                display=False
+            )
+            if cv_img is not None:
+                cv_imgs.append(cv_img)
+        return cv_imgs
+
     def exportToGif(self):
         if self.making_gifOrVid:
             return
@@ -1019,34 +1036,6 @@ class CameraGui():
 
         t = threading.Thread(target=self.exportToGif_worker, daemon=True)
         t.start()
-
-    def exportToGif_worker(self):
-        try:
-            # === original guts, minus any widget.configure calls ===
-            cv_images = []
-            directory = os.path.dirname(self.camConfig.imageFilepath)
-            self.populate_idsTimes(directory)
-            paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
-
-            try:
-                offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-                self.cam_to_log_time_offset = offset_dict['offset'][0]
-            except FileNotFoundError:
-                self.cam_to_log_time_offset = 0.0
-
-            cv_imgs = []
-            for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
-                                paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
-                frame = cv2.imread(img)
-                ts = self.ImageTimeReader.idsTimes[idx][1]
-                cv_img = self.analyze_image(frame, img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
-                                            name=self.ImageTimeReader.idsTimes[idx][0], display=False)
-                cv_imgs.append(cv_img)
-
-            make_gif(cv_imgs, 10, infinite=True, quality='l')
-        finally:
-            # schedule UI reset back on Tk thread
-            self.gui.after(0, self._exportToGifOrVid_done)
 
     def exportToVid(self):
         if self.making_gifOrVid:
@@ -1059,47 +1048,23 @@ class CameraGui():
         t = threading.Thread(target=self.exportToVid_worker, daemon=True)
         t.start()
 
+    def exportToGif_worker(self):
+        try:
+            frames = self._gather_annotated_frames()
+            make_gif(frames, 10, infinite=True, quality='l')
+        finally:
+            self.gui.after(0, self._exportToGifOrVid_done)
+
     def exportToVid_worker(self):
         try:
-            # === original guts, minus any widget.configure calls ===
-            cv_images = []
-            directory = os.path.dirname(self.camConfig.imageFilepath)
-            self.populate_idsTimes(directory)
-            paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
-
-            try:
-                offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-                self.camConfig.cam_to_log_time_offset = offset_dict['offset'][0]
-            except FileNotFoundError:
-                self.camConfig.cam_to_log_time_offset = 0.0
-
-            cv_imgs = []
-            for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
-                                paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
-                frame = cv2.imread(img)
-                ts = self.ImageTimeReader.idsTimes[idx][1]
-                cv_img = self.analyze_image(frame, img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
-                                            name=self.ImageTimeReader.idsTimes[idx][0], display=False)
-                cv_imgs.append(cv_img)
-
-            height, width, layers = cv_imgs[0].shape
-
-            # === Define the video codec and create VideoWriter object ===
-            output_video_path = 'output_video.mp4'
-            fourcc = cv2.VideoWriter.fourcc(*'mp4v')  # You can also use 'MJPG' or 'mp4v'
-            video = cv2.VideoWriter(output_video_path, fourcc, 10, (width, height))
-
-            cur = 0
-            total = len(cv_imgs) - 1
-            for idx, img in enumerate(cv_imgs):
-                video.write(img)
-                cur += 1
-
-            # === Release everything ===
-            video.release()
-            print(f"\nVideo saved to {output_video_path}")
+            frames = self._gather_annotated_frames()
+            h, w = frames[0].shape[:2]
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+            out = cv2.VideoWriter('output_video.mp4', fourcc, 10, (w, h))
+            for f in frames:
+                out.write(f)
+            out.release()
         finally:
-            # schedule UI reset back on Tk thread
             self.gui.after(0, self._exportToGifOrVid_done)
 
     def _exportToGifOrVid_done(self):
@@ -1109,7 +1074,8 @@ class CameraGui():
 
     def startStreamOn(self):
         self.showWindow = True
-        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying', fg_color=CTK_GREEN,
+        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying',
+                                             fg_color=CTK_GREEN,
                                              hover_color='navy')
         self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=CTK_GREEN,
                                          hover_color='navy')
@@ -1135,7 +1101,7 @@ class CameraGui():
         if not self.shutting_down:
             if self.camConfig.imageFilepath is not None:
                 self.singleImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue',
-                                                 text=os.path.basename(self.camConfig.imageFilepath))
+                                                     text=os.path.basename(self.camConfig.imageFilepath))
             self.startStreamButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
             self.multiImageTextButton.configure(command=self.startStreamOn, fg_color='red', hover_color='blue')
 
@@ -1144,7 +1110,6 @@ class CameraGui():
             self.streamOrImgCombo.configure(state='normal')
 
             self.showWindow = False
-
 
         # if self.t1 is not None:
         #     self.t1.raise_exception()
@@ -1164,6 +1129,13 @@ class CameraGui():
     def printLidarOnce(self):
         self.printLidar = True
 
+    def _toggle(self, attr: str, checkbox: ctk.CTkCheckBox | None = None):
+        val = not getattr(self.camConfig, attr)
+        setattr(self.camConfig, attr, val)
+        if checkbox is not None:
+            (checkbox.select() if val else checkbox.deselect())
+        self.saveToCache()
+
     def togglePnpLidarPoints(self):
         self.camConfig.pnpLidarPoints = not self.camConfig.pnpLidarPoints
         self.saveToCache()
@@ -1172,87 +1144,36 @@ class CameraGui():
         self.camConfig.qnpLidarPoints = not self.camConfig.qnpLidarPoints
         self.saveToCache()
 
-    def toggleYoloInference(self):
-        self.camConfig.yoloInference = not self.camConfig.yoloInference
-        if self.camConfig.yoloInference:
-            self.yoloInferenceCheckbox.select()
-        else:
-            self.yoloInferenceCheckbox.deselect()
-        self.saveToCache()
-
-    def toggleYoloBiasTracking(self):
-        self.camConfig.yoloBiasTracking = not self.camConfig.yoloBiasTracking
-        if self.camConfig.yoloBiasTracking:
-            self.yoloBiasCheckbox.select()
-        else:
-            self.yoloBiasCheckbox.deselect()
-        self.saveToCache()
-
     def toggleDetectCorners(self):
         self.camConfig.detect_corners = not self.camConfig.detect_corners
         self.saveToCache()
 
+    def toggleYoloInference(self):
+        self._toggle('yoloInference', self.yoloInferenceCheckbox)
+
+    def toggleYoloBiasTracking(self):
+        self._toggle('yoloBiasTracking', self.yoloBiasCheckbox)
+
     def toggleDetectHorizon(self):
-        self.camConfig.detect_horizon = not self.camConfig.detect_horizon
-        if self.camConfig.detect_horizon:
-            self.detectHorizonCheckbox.select()
-        else:
-            self.detectHorizonCheckbox.deselect()
-        self.saveToCache()
-
-    def toggleFactorgraph(self):
-        self.camConfig.factor_graph = not self.camConfig.factor_graph
-        if self.camConfig.factor_graph:
-            self.factorgraphCheckbox.select()
-        else:
-            self.factorgraphCheckbox.deselect()
-        self.saveToCache()
-
-    def toggleHyperFocus(self):
-        self.camConfig.hyper_focus = not self.camConfig.hyper_focus
-
-        if self.camConfig.hyper_focus:
-            self.hyperfocusCheckbox.select()
-        else:
-            self.hyperfocusCheckbox.deselect()
-
-        self.saveToCache()
+        self._toggle('detect_horizon', self.detectHorizonCheckbox)
 
     def togglePhaseCorrelation(self):
-        self.camConfig.phase_correlation = not self.camConfig.phase_correlation
-        if self.camConfig.phase_correlation:
-            self.phaseCorrelationCheckbox.select()
-        else:
-            self.phaseCorrelationCheckbox.deselect()
-
-        self.saveToCache()
+        self._toggle('phase_correlation', self.phaseCorrelationCheckbox)
 
     def toggleCrosshairs(self):
-        self.camConfig.crosshairs = not self.camConfig.crosshairs
-        if self.camConfig.crosshairs:
-            self.crosshairsCheckbox.select()
-        else:
-            self.crosshairsCheckbox.deselect()
-
-        self.saveToCache()
+        self._toggle('crosshairs', self.crosshairsCheckbox)
 
     def toggleCubemap(self):
-        self.camConfig.cubemap = not self.camConfig.cubemap
-        if self.camConfig.cubemap:
-            self.cubemapCheckbox.select()
-        else:
-            self.cubemapCheckbox.deselect()
-
-        self.saveToCache()
+        self._toggle('cubemap', self.cubemapCheckbox)
 
     def toggleHud(self):
-        self.camConfig.hud = not self.camConfig.hud
-        if self.camConfig.hud:
-            self.hudCheckbox.select()
-        else:
-            self.hudCheckbox.deselect()
+        self._toggle('hud', self.hudCheckbox)
 
-        self.saveToCache()
+    def toggleFactorgraph(self):
+        self._toggle('factor_graph', self.factorgraphCheckbox)
+
+    def toggleHyperFocus(self):
+        self._toggle('hyper_focus', self.hyperfocusCheckbox)
 
     def updateImageProcessingKernel(self, newValue):
         self.camConfig.processingKernel = ImageKernels(newValue)
@@ -1353,6 +1274,18 @@ class CameraGui():
             for image in imageList:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
+    def _poll_keys(self, max_ms: int = 1) -> list[int]:
+        keys = []
+        k = cv2.waitKey(max_ms) & 0xFF
+        if k not in (0, 0xFF, 255, -1):
+            keys.append(k)
+            for _ in range(8):  # drain a short burst
+                k2 = cv2.waitKey(1) & 0xFF
+                if k2 in (0, 0xFF, 255, -1):
+                    break
+                keys.append(k2)
+        return keys
+
     def run_folder_reader(self):
         cv2.destroyAllWindows()
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
@@ -1388,7 +1321,6 @@ class CameraGui():
         t0 = float(t[0])
         t = t - t0
 
-
         img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
         img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
         pause = False
@@ -1421,35 +1353,24 @@ class CameraGui():
         # one-shot key handling
         pressed = set()
         pending_keys = []
-
         curr_idx = 0
 
         wall_start = time.monotonic()
 
-        def sleep_until(deadline):
+        def sleep_until(deadline) -> list[int]:
             # Keep GUI responsive and capture bursts
+            keys = []
             while True:
                 remain = deadline - time.monotonic()
                 if remain <= 0:
                     break
-
-                # small chunks: 1–5 ms; finer polling = fewer missed keys
-                chunk_ms = int(max(1, remain * 1000.0))
-                k = cv2.waitKey(chunk_ms) & 0xFF
-
-                if k not in (0, 0xFF, 255, -1):
-                    # push the key we saw
-                    pending_keys.append(k)
-                    # aggressively drain any *additional* queued keys
-                    for _ in range(8):  # short burst drain
-                        k2 = cv2.waitKey(1) & 0xFF
-                        if k2 in (0, 0xFF, 255, -1): break
-                        pending_keys.append(k2)
-                    break
+                keys.extend(self._poll_keys(int(max(1, remain * 100))))
+            return keys
 
         end = False
         try:
-            while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow and not end and not self.making_gifOrVid:
+            while cv2.getWindowProperty(self.windowName,
+                                        cv2.WND_PROP_VISIBLE) and self.showWindow and not end and not self.making_gifOrVid:
 
                 curr_time = time.time()
                 if (curr_time - self.fps_time_log) > 0.000001:
@@ -1541,11 +1462,12 @@ class CameraGui():
 
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
                         period = 1.0 / self.camConfig.target_fps
-                        target_time = wall_start + period * (curr_idx if not reverse_playback else num_images - curr_idx)
+                        target_time = wall_start + period * (
+                            curr_idx if not reverse_playback else num_images - curr_idx)
                         if target_time < time.monotonic():
                             wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
                                 curr_idx if not reverse_playback else num_images - curr_idx)
-                        sleep_until(target_time)
+                        pending_keys = sleep_until(target_time)
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
                         # map wall time → desired log time
@@ -1570,16 +1492,15 @@ class CameraGui():
                             if got is not None:
                                 curr_idx, frame = got
                         # small wait to avoid hot spinning when we're at the correct time
-                        k = cv2.waitKey(1)
-                        if k != 255 and k != 0xFF and k != 0 and k != -1:  # got a key; queue it for the main handler
-                            pending_keys.append(k)
+                        pending_keys.extend(self._poll_keys(1))
 
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     boxAround = False
                     if self.camConfig.start_export_idx <= curr_idx <= self.camConfig.end_export_idx:
                         boxAround = True
                     if ts is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
+                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0],
+                                           box_around=boxAround)
                     else:
                         self.analyze_image(frame, ts + self.camConfig.cam_to_log_time_offset,
                                            self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
@@ -1594,15 +1515,13 @@ class CameraGui():
                             f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
                         printed_missing.add(p)
 
-
-                # Prefer any keys captured during sleep_until(...)
-                k = cv2.waitKey(1) & 0xFF
-                if k != 255 and k != 0xFF and k != 0 and k != -1:
-                    pending_keys.append(k)
-
+                pending_keys.extend(self._poll_keys(1))
 
                 while pending_keys:
                     key = pending_keys.pop(0)
+                    if pending_keys is None:
+                        pending_keys = []
+
                     def on_key(kcode):
                         if kcode == 255:
                             return False
@@ -1619,14 +1538,15 @@ class CameraGui():
 
                     # controls (edge-triggered)
 
-                    if key == ord('f') and on_key(ord('f')): # swap from FPS-limit to real-time
+                    if key == ord('f') and on_key(ord('f')):  # swap from FPS-limit to real-time
                         self.camConfig.playback_mode = self.camConfig.playback_mode.next()
                         if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
                             img_slider.play_speed = 1
                             self.camConfig.rt_speed = 1.0
                             wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
                         else:
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                                curr_idx if not reverse_playback else num_images - curr_idx)
                         self.saveToCache()
 
                     if key == ord('c') and on_key(ord('c')):  # 'c' step forward
@@ -1649,7 +1569,8 @@ class CameraGui():
 
                     if key == 32 and on_key(32):  # space toggle pause
                         pause = not pause
-                        img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
+                        img_slider.play_speed = 0 if pause else (
+                            1 if img_slider.play_speed == 0 else img_slider.play_speed)
                         paused_cached_idx = None
                         paused_cached_frame = None
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
@@ -1666,7 +1587,8 @@ class CameraGui():
                                 self.camConfig.target_fps = 10.0
                             else:
                                 self.camConfig.target_fps = min(64.0, round(self.camConfig.target_fps * 1.25, 4))
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                                curr_idx if not reverse_playback else num_images - curr_idx)
                         else:
                             # realtime mode: speed up time scale
                             if self.camConfig.rt_speed < 1.0 < self.camConfig.rt_speed * 2.0:
@@ -1685,7 +1607,8 @@ class CameraGui():
                                 self.camConfig.target_fps = 10.0
                             else:
                                 self.camConfig.target_fps = round(self.camConfig.target_fps * 0.8, 4)
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                                curr_idx if not reverse_playback else num_images - curr_idx)
                         else:
                             # realtime mode: slow down time scale
                             if self.camConfig.rt_speed * 0.5 < 1.0 < self.camConfig.rt_speed:
@@ -1713,7 +1636,8 @@ class CameraGui():
                                 loader.set_stride(-s_abs if img_slider.play_speed < 0 else s_abs)
                             except Exception as e:
                                 print("Error setting reverse stride:", e)
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (curr_idx if not reverse_playback else num_images - curr_idx)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
+                                curr_idx if not reverse_playback else num_images - curr_idx)
 
                         elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
                             # Make real-time run backward by flipping rt_speed and
@@ -1825,7 +1749,7 @@ class CameraGui():
             self.detectHorizon()
 
         if self.camConfig.hyper_focus:
-            self.hyper_focus(img_time)
+            self.hyper_focus()
 
         if self.camConfig.yoloInference:
             self.run_yolo(img_time)
@@ -1859,7 +1783,7 @@ class CameraGui():
 
         if box_around:
             (h, w) = self.markup_frame.shape[:2]
-            cv2.rectangle(self.markup_frame, (0,0), (w-1, h-1), (0, 255, 255), 10)
+            cv2.rectangle(self.markup_frame, (0, 0), (w - 1, h - 1), (0, 255, 255), 10)
 
         if display:
             cv2.putText(self.markup_frame,
@@ -1935,7 +1859,8 @@ class CameraGui():
         cv2.polylines(self.markup_frame, [lines],
                       False, (0, 255, 0), 2)
 
-        speed, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(img_time) # + 173.11338 - 11.658461)
+        speed, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(
+            img_time)  # + 173.11338 - 11.658461)
 
         cos_negBank = np.cos(-deg2rad(bank_angle))
         sin_negBank = np.sin(-deg2rad(bank_angle))
@@ -1945,23 +1870,20 @@ class CameraGui():
                     cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         # bank_angle = 0.0 + 60.0 * sin(img_time)
-        bank_pts = []
-        bank_pts.append((0.5 + 0.079 * sin(deg2rad(cmd_bank_angle)),
-                             0.8 + 0.079 * cos(deg2rad(cmd_bank_angle))))
-        bank_pts.append((0.5 + 0.050 * sin(deg2rad(cmd_bank_angle + 15.0)),
-                             0.8 + 0.050 * cos(deg2rad(cmd_bank_angle + 15.0))))
-        bank_pts.append((0.5 + 0.050 * sin(deg2rad(cmd_bank_angle - 15.0)),
-                             0.8 + 0.050 * cos(deg2rad(cmd_bank_angle - 15.0))))
+        bank_pts = [(0.5 + 0.079 * sin(deg2rad(cmd_bank_angle)),
+                     0.8 + 0.079 * cos(deg2rad(cmd_bank_angle))),
+                    (0.5 + 0.050 * sin(deg2rad(cmd_bank_angle + 15.0)),
+                     0.8 + 0.050 * cos(deg2rad(cmd_bank_angle + 15.0))),
+                    (0.5 + 0.050 * sin(deg2rad(cmd_bank_angle - 15.0)),
+                     0.8 + 0.050 * cos(deg2rad(cmd_bank_angle - 15.0)))]
 
         # cmd_bank_angle = 0.0 + 60.0 * cos(img_time)
-        cmd_bank_pts = []
-        cmd_bank_pts.append(
-            (0.5 + 0.079 * sin(deg2rad(bank_angle)),
-             0.8 + 0.079 * cos(deg2rad(bank_angle))))
-        cmd_bank_pts.append((0.5 + 0.065 * sin(deg2rad(bank_angle + 10.0)),
-                         0.8 + 0.065 * cos(deg2rad(bank_angle + 10.0))))
-        cmd_bank_pts.append((0.5 + 0.065 * sin(deg2rad(bank_angle - 10.0)),
-                         0.8 + 0.065 * cos(deg2rad(bank_angle - 10.0))))
+        cmd_bank_pts = [(0.5 + 0.079 * sin(deg2rad(bank_angle)),
+                         0.8 + 0.079 * cos(deg2rad(bank_angle))),
+                        (0.5 + 0.065 * sin(deg2rad(bank_angle + 10.0)),
+                         0.8 + 0.065 * cos(deg2rad(bank_angle + 10.0))),
+                        (0.5 + 0.065 * sin(deg2rad(bank_angle - 10.0)),
+                         0.8 + 0.065 * cos(deg2rad(bank_angle - 10.0)))]
 
         lines = (np.array([x, y]) * np.array(bank_pts)).astype(int)
         cmd_lines = (np.array([x, y]) * np.array(cmd_bank_pts)).astype(int)
@@ -1976,20 +1898,29 @@ class CameraGui():
         cx = x * 0.50
         cy = y * 0.50
 
-        left_tri = np.array([[cx + x * (- 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank ),
-                              cy + y * (- 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank )],
-                             [cx + x * (- 0.03 * cos_negBank + (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                              cy + y * (- 0.03 * sin_negBank - (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
-                             [cx + x * (- 0.03 * cos_negBank + (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                              cy + y * (- 0.03 * sin_negBank - (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
+        left_tri = np.array([[cx + x * (- 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
+                              cy + y * (- 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
+                             [cx + x * (- 0.03 * cos_negBank + (
+                                         0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                              cy + y * (- 0.03 * sin_negBank - (
+                                          0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                             [cx + x * (- 0.03 * cos_negBank + (
+                                         -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                              cy + y * (- 0.03 * sin_negBank - (
+                                          -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
 
-        cv2.polylines(self.markup_frame, [left_tri],True, (0, 255, 0), 2)
-        right_tri = np.array([[cx + x * ( 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank ),
-                               cy + y * ( 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank )],
-                              [cx + x * ( 0.03 * cos_negBank + (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                               cy + y * ( 0.03 * sin_negBank - (0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
-                              [cx + x * ( 0.03 * cos_negBank + (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                               cy + y * ( 0.03 * sin_negBank - (-0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
+        cv2.polylines(self.markup_frame, [left_tri], True, (0, 255, 0), 2)
+        right_tri = np.array([[cx + x * (0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
+                               cy + y * (0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
+                              [cx + x * (0.03 * cos_negBank + (
+                                          0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                               cy + y * (0.03 * sin_negBank - (
+                                           0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                              [cx + x * (0.03 * cos_negBank + (
+                                          -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                               cy + y * (0.03 * sin_negBank - (
+                                           -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(
+            int)
 
         cv2.polylines(self.markup_frame, [right_tri], True, (0, 255, 0), 2)
 
@@ -2003,8 +1934,6 @@ class CameraGui():
                 # trig shorthands
                 sin_b = np.sin(deg2rad(bank_angle))
                 cos_b = np.cos(deg2rad(bank_angle))
-
-
 
                 # left/right extents, similar to your 0.04–0.15 scaling
                 inner = 0.04 * x
@@ -2037,36 +1966,37 @@ class CameraGui():
                          (0, 255, 0), 2)
 
                 cv2.putText(self.markup_frame, f'{i:.0f}',
-                            (int(x4 + x*0.02), int(y4)),
+                            (int(x4 + x * 0.02), int(y4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), (0, 255, 0), 2)
-        cv2.circle(self.markup_frame, (int(cx), int(cy)), 5, (0,255,0), 2)
-
-
+        cv2.circle(self.markup_frame, (int(cx), int(cy)), 5, (0, 255, 0), 2)
 
         # cv2.putText(self.markup_frame, f'{pitch_angle:.2f}', (int(x * 0.51), int(y * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 1,
         #             (0, 255, 0))
-
 
         # Throttle response
         num = 20
         center = (int(x * 0.8), int(y * 0.50))
         thetas = np.linspace(0.0, 245.0, num)
         theta = cmd_throttle * 2.450
-        points = np.zeros((num,2), int)
+        points = np.zeros((num, 2), int)
         r = 0.06
         points[:, 0] = center[0] + (np.sin(np.deg2rad(thetas)) * x * r).astype(int)
         points[:, 1] = center[1] - (np.cos(np.deg2rad(thetas)) * x * r).astype(int)
 
-        tri = np.array([[center[0] + (np.sin(np.deg2rad(theta)) * x * (r*0.95)), center[1] - (np.cos(np.deg2rad(theta)) * x * (r*0.95))],
-                        [center[0] + (np.sin(np.deg2rad(theta + 5.0)) * x * (r*0.8)), center[1] - (np.cos(np.deg2rad(theta + 5.0)) * x * (r*0.6))],
-                        [center[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r*0.8)), center[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r*0.6))]], np.int32)
+        tri = np.array([[center[0] + (np.sin(np.deg2rad(theta)) * x * (r * 0.95)),
+                         center[1] - (np.cos(np.deg2rad(theta)) * x * (r * 0.95))],
+                        [center[0] + (np.sin(np.deg2rad(theta + 5.0)) * x * (r * 0.8)),
+                         center[1] - (np.cos(np.deg2rad(theta + 5.0)) * x * (r * 0.6))],
+                        [center[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r * 0.8)),
+                         center[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r * 0.6))]], np.int32)
 
         cv2.polylines(self.markup_frame, [points], False, (0, 255, 0), 2)  # Arc
         cv2.fillPoly(self.markup_frame, [tri], (0, 255, 0))  # Triangle Pointer
-        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), 2)
+        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX,
+                                                    0.5 * font_scale(self.markup_frame.shape[1]), 2)
         cv2.putText(self.markup_frame, f'{cmd_throttle:.1f}%',
-                    (int(center[0] - width/2), int(center[1] - height/2)),
-                     cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
+                    (int(center[0] - width / 2), int(center[1] - height / 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 255, 0), 2)
 
         text_loc = np.array([.65 * x, .90 * y]).astype(int)
         if mode == ControlMode.controller:
@@ -2081,60 +2011,6 @@ class CameraGui():
         if mode == ControlMode.error:
             cv2.putText(self.markup_frame, "MODE: ERR", text_loc,
                         cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 255), 2)
-
-    def draw_pitch_ladder(img, bank_deg, pitch_deg,
-                          marks=(-30, -20, -10, 0, 10, 20, 30),
-                          pixels_per_deg=8.0):
-        """
-        img: BGR image (H,W,3)
-        bank_deg: aircraft bank (right wing down positive, deg)
-        pitch_deg: aircraft pitch (deg)
-        marks: which pitch lines to draw (deg)
-        pixels_per_deg: vertical spacing of ladder (pixels per degree)
-        """
-        h, w = img.shape[:2]
-
-        # Choose HUD center similar to your code (mid-x, 70% down y)
-        cx, cy = 0.50 * w, 0.70 * h
-
-        # Ladder half-widths (match your 0.15*w and 0.04*w)
-        L_outer = 0.15 * w
-        L_inner = 0.04 * w
-
-        # Rotate by -bank to make the ladder roll with the horizon
-        theta = -np.deg2rad(bank_deg)
-        c, s = np.cos(theta), np.sin(theta)
-        R = np.array([[c, -s],
-                      [s, c]], dtype=float)
-
-        green = (0, 255, 0)
-
-        for m in marks:
-            # Draw only nearby lines (like your |pitch - i| < 25)
-            if abs(pitch_deg - m) >= 25.0:
-                continue
-
-            # In the local HUD frame: +v is "up", +u is "right"
-            # Vertical offset in pixels between current pitch and this mark
-            v = (pitch_deg - m) * pixels_per_deg  # positive -> mark below current attitude
-
-            # Left segment: from (-L_outer, v) to (-L_inner, v)
-            p1_local = np.array([-L_outer, v])
-            p2_local = np.array([-L_inner, v])
-
-            # Right segment: from (L_inner, v) to (L_outer, v)
-            p3_local = np.array([L_inner, v])
-            p4_local = np.array([L_outer, v])
-
-            for a_local, b_local in [(p1_local, p2_local), (p3_local, p4_local)]:
-                a = R @ a_local
-                b = R @ b_local
-
-                # Convert to image coords (note: image y grows downward, so subtract v-component)
-                ax, ay = int(round(cx + a[0])), int(round(cy - a[1]))
-                bx, by = int(round(cx + b[0])), int(round(cy - b[1]))
-
-                cv2.line(img, (ax, ay), (bx, by), green, 2)
 
     def update_cube_map_vectors(self):
         """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -2282,7 +2158,6 @@ class CameraGui():
 
                 self.apply_fisheye_faces(frame)
 
-                layout = {'front': (0, 0)}
                 # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
                 self.curr_frame = self.cubemap_faces['front']
         else:
@@ -2350,17 +2225,17 @@ class CameraGui():
         if corners is None or ids is None:
             return
 
-        for corners, id in zip(corners, ids):
+        for corners, idx in zip(corners, ids):
             corners = np.squeeze(np.array(corners))
             polyline = [np.array(corners, np.int32).reshape((-1, 1, 2))]
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
             cv2.polylines(self.markup_frame, polyline, True, (0, 255, 0), 4, lineType=cv2.FILLED)
-            cv2.putText(self.markup_frame, str(id[0]), pixCenter,
+            cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
                         cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 255, 0), 4)
-            cv2.putText(self.markup_frame, str(id[0]), pixCenter,
+            cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
                         cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 0, 0), 1)
 
-            self.detectIDS.append(id)
+            self.detectIDS.append(idx)
 
             if self.centers is None:
                 self.centers = np.array(pixCenter).astype('float32')
@@ -2369,7 +2244,6 @@ class CameraGui():
 
     def pnpLidarPoints(self):
 
-        ret = False
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
             points = []
@@ -2409,7 +2283,7 @@ class CameraGui():
 
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
-                
+
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
                 self.pnpResult = (quatPnP, vectPnP)
@@ -2423,10 +2297,6 @@ class CameraGui():
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
 
-        # if self.projectProbe is not None and self.camConfig.projectLidarPoints:
-        #     cv2.circle(self.markup_frame, self.projectProbe[0, 0, :].astype(int), 6, (255, 0, 0), 6)
-        #     cv2.putText(self.markup_frame, "Probe Tip", self.projectProbe[0, 0, :].astype(int) - [50, 50],
-        #                 cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 6)
     def qnpLidarPoints(self):
 
         ret = False
@@ -2460,9 +2330,7 @@ class CameraGui():
 
             vect = q_aftr_from_cv * vect
 
-
             quat = q_aftr_from_cv * quat
-
 
             us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
             us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 0] / xyz_proj[:, 2] + self.calibration.cx
@@ -2471,11 +2339,13 @@ class CameraGui():
             self.plotOnImg(us_vs_s_proj.astype(int),
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
             self.qnpResult = (quat, vect)
-            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225), cv2.FONT_HERSHEY_DUPLEX,
+            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
+                        cv2.FONT_HERSHEY_DUPLEX,
                         self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300), cv2.FONT_HERSHEY_DUPLEX,
+            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
+                        cv2.FONT_HERSHEY_DUPLEX,
                         self.small_text,
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
@@ -2540,7 +2410,7 @@ class CameraGui():
         x1, y1, x2, y2 = self.horizon_line
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
-    def hyper_focus(self, time=None):
+    def hyper_focus(self):
 
         if not self.camConfig.factor_graph:
             if self.last_bounding_box_size is not None:
@@ -2552,7 +2422,7 @@ class CameraGui():
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.50)
 
-            self.radius = min(800, self.radius + 12)
+            self.radius = min(800.0, self.radius + 12.0)
             self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
             self.confSliderBar.set(self.yoloSession.conf)
         else:
@@ -2580,13 +2450,14 @@ class CameraGui():
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
-        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame, self.camConfig.yoloBiasTracking)
+        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame,
+                                                                               self.camConfig.yoloBiasTracking)
 
         centers, boxes, scores, class_ids, time = output
-        
+
         if rvec_tvec is not None:
             self.last_yolo_3d_estimate = np.squeeze(rvec_tvec[1])
-        
+
         elif len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
@@ -2615,7 +2486,9 @@ class CameraGui():
                 w, h, _ = self.curr_frame.shape
                 cv2.putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                             0.75, (50, 255, 255), 1)
-                cv2.putText(self.markup_frame, f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}', (25, w - 50),
+                cv2.putText(self.markup_frame,
+                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
+                            (25, w - 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.75, (50, 255, 255), 1)
                 # cv2.circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                 #            3, (255, 0, 255), 3)
@@ -2734,9 +2607,11 @@ class CameraGui():
         for idx, pxPt in enumerate(points):
             cv2.circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 0), 12,
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 0),
+                        12,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, color, 3, cv2.LINE_AA)
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, color, 3,
+                        cv2.LINE_AA)
 
     def potentialResize(self):
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
@@ -2817,8 +2692,10 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
     return frame
 
-def font_scale(dim: float|int) -> float:
-    return float(dim/640)
+
+def font_scale(dim: float | int) -> float:
+    return float(dim / 640)
+
 
 def dim_entirely(frame, center, radius):
     """

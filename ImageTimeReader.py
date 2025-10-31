@@ -9,7 +9,7 @@ class ImageTimeReader:
         self.endTimeUTC = None
 
         if self.filename is not None:
-            self.loadLog(self.filename)
+            self.loadLog([self.filename])
 
     def loadLog(self, filename_list: list[str] = None):
         if len(filename_list) < 1:

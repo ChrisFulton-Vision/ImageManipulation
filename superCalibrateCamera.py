@@ -1,6 +1,5 @@
 import pickle, copy, os, time, threading, cv2, glob, re, yolo, ctypes, vmbpy.c_binding
 
-import numpy as np
 import customtkinter as ctk
 from vmbpy import *
 from tkinter import filedialog
@@ -14,7 +13,6 @@ import pandas as pd
 from itertools import cycle
 from AttitudeInterpreter import AttitudeReader as AttRdr
 from AttitudeInterpreter import ControlMode
-from numpy import sin, cos, tan, atan2, deg2rad, rad2deg, pi as PI
 from quaternions import Quaternion as q
 from quaternions import *
 from TwoD_to_ThreeD import solveQnP
@@ -32,7 +30,7 @@ from SupportModules.FilterImage import ImageKernel, Gabor, applyConvolutionFilte
 CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
 HUD_YELLOW = (0, 255, 255)
-BUTTON_RED = 'red4'
+BUTTON_RED = 'red3'
 CAM_CONFIG_CACHE = 'Caches/camConfig_cache.pkl'
 
 
@@ -433,7 +431,7 @@ class CameraGui():
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '445x900'
+        self.camFrameGeometry = '445x915'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.t1 = None
@@ -467,6 +465,7 @@ class CameraGui():
         self.confSliderLabel.configure(text='Conf: ' + f'{self.camConfig.yolo_conf:.2f}')
         self.yoloSession.iou = self.camConfig.yolo_iou
         self.iouSliderLabel.configure(text='IOU: ' + f'{self.camConfig.yolo_iou:.2f}')
+        self.exportQualityCombo.set(self.camConfig.export_quality.value)
 
         self.loadTruthPoints()
 
@@ -560,6 +559,7 @@ class CameraGui():
 
     def updateQuality(self, qualityValue: str):
         self.camConfig.export_quality = ExportQuality(qualityValue)
+        self.saveToCache()
 
     def confSlider(self, confValue):
         self.camConfig.yolo_conf = confValue
@@ -674,23 +674,23 @@ class CameraGui():
 
             self.startStreamOff()
             if not self.startStreamButton.grid_info():
-                self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5)
+                self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
             if not self.selectCameraCombo.grid_info():
-                self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5)
+                self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
 
         elif self.camConfig.imageSource == ImageSource.Static_Image:
 
             if not self.singleImageFolderSelect.grid_info():
-                self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5)
+                self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.singleImageTextButton.grid_info():
-                self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5)
+                self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
 
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
 
             if not self.multiImageFolderSelect.grid_info():
-                self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5)
+                self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.multiImageTextButton.grid_info():
-                self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5)
+                self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
 
         else:
             raise ValueError(f'Unknown Image selection mode: {self.camConfig.imageSource}')
@@ -717,7 +717,7 @@ class CameraGui():
         self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame,
                                                 values=['Camera Stream', 'Static Image', 'Stream from Folder'],
                                                 command=self.sourceUpdate)
-        self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5)
+        self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         self.startStreamOff()
@@ -736,37 +736,37 @@ class CameraGui():
         rowID += 1
 
         selectFolderButton = ctk.CTkButton(self.cam_frame, text='Select Save Folder', command=self.selectFolder)
-        selectFolderButton.grid(row=rowID, column=0, padx=5, pady=5)
+        selectFolderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
-        self.selectFolderLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        self.selectFolderLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         selectCalibButton = ctk.CTkButton(self.cam_frame, text='Select Calibration', command=self.loadCalibration)
-        selectCalibButton.grid(row=rowID, column=0, padx=5, pady=5)
+        selectCalibButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.selectCalibLabel = ctk.CTkLabel(self.cam_frame,
                                              text="../" + os.path.basename(os.path.normpath(self.calibFile)))
-        self.selectCalibLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        self.selectCalibLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.selectTruthPointsButton.grid(row=rowID, column=0, padx=5, pady=5)
-        self.selectTruthPointsLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        self.selectTruthPointsButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.selectTruthPointsLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.selectYOLO_folderButton.grid(row=rowID, column=0, padx=5, pady=5)
-        self.selectYOLO_folderLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        self.selectYOLO_folderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.selectYOLO_folderLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.selectFlightLogButton.grid(row=rowID, column=0, padx=5, pady=5)
-        self.selectFlightLogLabel.grid(row=rowID, column=1, padx=5, pady=5)
+        self.selectFlightLogButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.selectFlightLogLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.confSliderBar.grid(row=rowID, column=1, padx=5, pady=5)
+        self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.confSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.iouSliderLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5)
+        self.iouSliderLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         # detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
@@ -776,7 +776,7 @@ class CameraGui():
             self.detectAprilTagsCheckbox.select()
             self.createDetector()
         self.detectAprilTagsCheckbox.configure(command=self.toggleDetectTags)
-        self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
+        self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         # self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         if not self.calibration.validCal:
@@ -788,7 +788,7 @@ class CameraGui():
             self.undistortCheckbox.select()
 
         self.undistortCheckbox.configure(command=self.toggleUndistort)
-        self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+        self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         pnpLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='SolvePnP LiDAR Into Image')
@@ -902,10 +902,10 @@ class CameraGui():
 
         aprilTagSizeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
                                                 command=self.setAprilTagSize)
-        aprilTagSizeEntryButton.grid(row=rowID, column=0, padx=5, pady=5)
+        aprilTagSizeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.aprilTagSizeEntry = ctk.CTkEntry(self.cam_frame, placeholder_text=str(self.camConfig.aprilTagSize))
-        self.aprilTagSizeEntry.grid(row=rowID, column=1, padx=5, pady=5)
+        self.aprilTagSizeEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         self.recordOff()
@@ -915,11 +915,11 @@ class CameraGui():
 
         activeEntryButton = ctk.CTkButton(self.cam_frame, text="Time Between Saved Frames",
                                           command=self.getEntryValue)
-        activeEntryButton.grid(row=rowID, column=0, padx=5, pady=5)
+        activeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.timeBetweenImgsEntry = ctk.CTkEntry(self.cam_frame,
                                                  placeholder_text=str(self.camConfig.secondsBetweenImages))
-        self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5)
+        self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
         qualityLabel = ctk.CTkLabel(self.cam_frame, text="Export Quality: ")

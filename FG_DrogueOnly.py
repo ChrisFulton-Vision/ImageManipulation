@@ -73,9 +73,9 @@ class FactorGraph:
         # self.cam_cov = np.array([0.6, 5.0, 5.0]) * 4.0 ** 2
         # self.V_cov = np.array([1.0, 1.0, 1.0]) * 2.0 ** 2
         # self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * 1.0 ** 2
-        self.cam_cov = np.array([5.0, 5.0, 1.0]) * (5.0 ** 2)
-        self.V_cov = np.array([0.1, 0.1, 0.1]) * (1.00 ** 2)
-        self.Vdot_cov = np.array([0.1, 0.1, 0.1]) * (1.00 ** 2)
+        self.cam_cov = np.array([10.0, 10.0, 1.0]) * (5.0 ** 2)
+        self.V_cov = np.array([1.0, 1.0, 1.0]) * (5.00)
+        self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * (10.00)
 
         self.numMeas = 0
 

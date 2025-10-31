@@ -1,6 +1,13 @@
 from PIL import Image, ImageDraw
 from dataclasses import dataclass
-import os, cv2
+import cv2
+from enum import Enum
+
+
+class ExportQuality(Enum):
+    low_quality = 'Low Quality'
+    med_quality = 'Medium Quality'
+    hgh_quality = 'High Quality'
 
 
 @dataclass
@@ -51,16 +58,21 @@ def numerical_sort(file_name):
     except (ValueError, IndexError):
         return float('inf')
 
-def make_gif(images, fps = 10, name='output', infinite: bool = False, quality='h'):
+
+def make_gif(images, fps=10, name='output', infinite: bool = False,
+             quality: ExportQuality = ExportQuality.med_quality):
     # dirList = sorted(os.listdir('ImagesToGif'), key=numerical_sort)
     pil_images = []
 
-    match(quality):
-        case 'h':
+    match quality:
+        case ExportQuality.hgh_quality:
+            print("high res")
             compress = CompressionSettings.high_res()
-        case 'm':
+        case ExportQuality.med_quality:
+            print("med res")
             compress = CompressionSettings.med_res()
-        case 'l':
+        case ExportQuality.low_quality:
+            print("low res")
             compress = CompressionSettings.low_res()
         case _:
             compress = CompressionSettings.low_res()
@@ -79,6 +91,6 @@ def make_gif(images, fps = 10, name='output', infinite: bool = False, quality='h
         save_all=True,
         append_images=pil_images[1:],
         duration=dur,  # Duration in milliseconds between frames
-        loop= 0 if infinite else 1,  # 0 for infinite loop
+        loop=0 if infinite else 1,  # 0 for infinite loop
         optimize=compress.optimize
     )

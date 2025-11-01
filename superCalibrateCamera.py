@@ -1,26 +1,51 @@
-import pickle, copy, os, time, threading, cv2, glob, re, yolo, ctypes, vmbpy.c_binding
+import copy
+import cv2
+import os
+import pickle
+import re
+import threading
+import time
+import vmbpy.c_binding
+import yolo
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+from enum import Enum
+from itertools import cycle
+from tkinter import filedialog
 
 import customtkinter as ctk
-from vmbpy import *
-from tkinter import filedialog
-from threading import Thread
-from cv2_enumerate_cameras import enumerate_cameras
-from Calibration import Calibration
-from LidarTruth import TruthPoints
-from enum import Enum
-from PIL import Image
 import pandas as pd
-from itertools import cycle
+from PIL import Image
+from cv2_enumerate_cameras import enumerate_cameras
+from vmbpy import *
+
 from AttitudeInterpreter import AttitudeReader as AttRdr
 from AttitudeInterpreter import ControlMode
-from quaternions import Quaternion as q
-from quaternions import *
+from Calibration import Calibration
+from FG_DrogueOnly import FactorGraph
+from ImageTimeReader import ImageTimeReader
+from LidarTruth import TruthPoints
+from SupportModules.FilterImage import ImageKernel, Gabor, applyConvolutionFilter
 from TwoD_to_ThreeD import solveQnP
 from bufferImageLoader import BufferedImageLoader as imgBuf
 from convertToGif import make_gif, ExportQuality
-from FG_DrogueOnly import FactorGraph
-from ImageTimeReader import ImageTimeReader
-from SupportModules.FilterImage import ImageKernel, Gabor, applyConvolutionFilter
+from quaternions import *
+from quaternions import Quaternion as q
+
+import logging
+
+LOG = logging.getLogger("superCalibrate")
+
+if not LOG.handlers:
+    handler = logging.StreamHandler()
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
+    handler.setFormatter(fmt)
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
+    # LOG.setLevel(logging.DEBUG)
+    # LOG.setLevel(logging.WARNING)
+
 
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
@@ -31,7 +56,7 @@ CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
 HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
-CAM_CONFIG_CACHE = 'Caches/camConfig_cache.pkl'
+CAM_CONFIG_CACHE = str(Path.home() / ".superCalibrateCamera" / "cam_config.pkl")
 
 
 def numerical_sort(file_name):
@@ -40,34 +65,13 @@ def numerical_sort(file_name):
     except (ValueError, IndexError):
         return float('inf')
 
-
-class thread_with_exception(Thread):
-    def __init__(self, name, func):
-        Thread.__init__(self)
-        self.name = name
-        self.func = func
-
-    def run(self):
-        try:
-            while True:
-                self.func()
-        finally:
-            pass
-
-    def get_id(self):
-        if hasattr(self, '_thread_id'):
-            return self._thread_id
-        for id, thread in threading._active.items():
-            if thread is self:
-                return id
-
-    def raise_exception(self):
-        thread_id = self.get_id()
-        res = ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, ctypes.py_object(SystemExit))
-        if res > 1:
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
-            print('Exception Raise Failure')
-
+class ThreadStopper:
+    def __init__(self):
+        self._ev = threading.Event()
+    def set(self):
+        self._ev.set()
+    def is_set(self) -> bool:
+        return self._ev.is_set()
 
 class ImageSliderBar:
     def __init__(self, num_images: int, refresh_hz: float = 20.0):
@@ -97,22 +101,15 @@ class ImageSliderBar:
     # ---------------- internal helpers ----------------
 
     def _schedule_throttled_set(self):
-        """Coalesce slider.set() calls to ~refresh_hz on the Tk thread."""
+        """Coalesce updates to ~refresh_hz without Tk coupling."""
         if not self.alive:
             return
-
         now = time.monotonic()
-        elapsed = now - self._last_ui_ts
-        due_in = max(0.0, self.refresh_interval - elapsed)
-
-        # If an update is already scheduled, don't enqueue another
-        if self._ui_pending:
+        if (now - self._last_ui_ts) < self.refresh_interval:
+            self._ui_pending = True
             return
-
-        def _do_set():
-            # Runs on Tk thread
-            self._after_id = None
-            self._ui_pending = False
+        self._ui_pending = False
+        self._last_ui_ts = now
 
     def close(self):
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
@@ -149,7 +146,7 @@ class GaborGUI:
         self.theta_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         rowID += 1
         theta_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=360, command=self.update_theta)
-        theta_slider.set(self.gaborFilter.theta)
+        theta_slider.set(rad2deg(self.gaborFilter.theta))
         theta_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
@@ -173,7 +170,7 @@ class GaborGUI:
         self.psi_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         rowID += 1
         psi_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=360, command=self.update_psi)
-        psi_slider.set(self.gaborFilter.psi)
+        psi_slider.set(rad2deg(self.gaborFilter.psi))
         psi_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
 
     def update_sigma(self, new_sigma: float):
@@ -182,19 +179,19 @@ class GaborGUI:
 
     def update_theta(self, new_thetaD: float):
         self.gaborFilter.theta = deg2rad(new_thetaD)
-        self.theta_label.configure(text=f'Sigma: {rad2deg(self.gaborFilter.theta):.2f}')
+        self.theta_label.configure(text=f'Theta: {rad2deg(self.gaborFilter.theta):.2f}')
 
     def update_lambd(self, new_lambd: float):
         self.gaborFilter.lambd = new_lambd
-        self.lambd_label.configure(text=f'Sigma: {self.gaborFilter.lambd:.2f}')
+        self.lambd_label.configure(text=f'Lambda: {self.gaborFilter.lambd:.2f}')
 
     def update_gamma(self, new_gamma: float):
         self.gaborFilter.gamma = new_gamma
-        self.gamma_label.configure(text=f'Sigma: {self.gaborFilter.gamma:.2f}')
+        self.gamma_label.configure(text=f'Gamma: {self.gaborFilter.gamma:.2f}')
 
     def update_psi(self, new_psiD: float):
         self.gaborFilter.psi = deg2rad(new_psiD)
-        self.psi_label.configure(text=f'Sigma: {rad2deg(self.gaborFilter.psi):.2f}')
+        self.psi_label.configure(text=f'Psi: {rad2deg(self.gaborFilter.psi):.2f}')
 
     def filter_kernel(self):
         if not self.pop_up.winfo_exists():
@@ -234,44 +231,59 @@ class PlaybackSpeed(Enum):
             if member is self:
                 return next(iterator)
 
+@dataclass
 class CameraConfig():
-    def __init__(self):
-        self.imageFilepath = None
-        self.cam_index = 0
-        self.detectTags = False
-        self.undistort = False
-        self.pnpLidarPoints = False
-        self.qnpLidarPoints = False
-        self.yoloInference = False
-        self.yoloBiasTracking = False
-        self.secondsBetweenImages = 1.0
-        self.recording = False
-        self.aprilTagSize = 0.168
-        self.imageSource = ImageSource.Camera_Stream
-        self.lidarFilepath = None
-        self.yoloFilepath = ''
-        self.detect_corners = False
-        self.detect_horizon = False
-        self.factor_graph = False
-        self.hyper_focus = False
-        self.phase_correlation = False
-        self.crosshairs = False
-        self.cubemap = False
-        self.hud = False
-        self.hud_data_filepath = ''
-        self.export_quality = ExportQuality.med_quality
-        self.start_export_idx = 0
-        self.end_export_idx = 1
-        self.cam_to_log_time_offset = 0.0
+    imageFilepath: Optional[str] = None
+    cam_index: int = 0
 
-        self.playback_mode = PlaybackSpeed.Fixed_fps
-        self.target_fps = 20.0  # used when playback_mode == 'fixed_fps'
-        self.rt_speed = 1.0  # 1.0 = real-time, 0.5 = half-speed, 2.0 = double-speed
+    # feature flags
+    detectTags: bool = False
+    undistort: bool = False
+    pnpLidarPoints: bool = False
+    qnpLidarPoints: bool = False
+    yoloInference: bool = False
+    yoloBiasTracking: bool = False
+    detect_corners: bool = False
+    detect_horizon: bool = False
+    factor_graph: bool = False
+    hyper_focus: bool = False
+    phase_correlation: bool = False
+    crosshairs: bool = False
+    cubemap: bool = False
+    hud: bool = False
 
-        self.yolo_conf = 0.75
-        self.yolo_iou = 1.00
+    # numeric params
+    secondsBetweenImages: float = 1.0
+    aprilTagSize: float = 0.168
+    cam_to_log_time_offset: float = 0.0
+    yolo_conf: float = 0.75
+    yolo_iou: float = 1.00
+    target_fps: float = 20.0
+    rt_speed: float = 1.0
 
-        self.processingKernel = ImageKernel.Unfiltered
+    # sources
+    imageSource: 'ImageSource' = None  # set default below in __post_init__
+    lidarFilepath: Optional[str] = None
+    yoloFilepath: str = ''
+    hud_data_filepath: str = ''
+
+    # export range
+    export_quality: ExportQuality = ExportQuality.med_quality
+    start_export_idx: int = 0
+    end_export_idx: int = 1
+
+    # playback / processing
+    playback_mode: 'PlaybackSpeed' = None
+    processingKernel: 'ImageKernel' = None
+
+    def __post_init__(self):
+        # Keep existing defaults if not provided
+        if self.imageSource is None:
+            self.imageSource = ImageSource.Camera_Stream
+        if self.playback_mode is None:
+            self.playback_mode = PlaybackSpeed.Fixed_fps
+        if self.processingKernel is None:
+            self.processingKernel = ImageKernel.Unfiltered
 
     def copy(self, configToCopy):
         for obj in configToCopy.__dict__:
@@ -279,7 +291,7 @@ class CameraConfig():
                 self.__dict__[obj] = configToCopy.__dict__[obj]
             except KeyError as e:
                 # Allows for versioning issues, changed naming conventions.
-                print(f"Old cache loaded. Observe: {e}")
+                LOG.info(f"Old cache loaded. Observe: {e}")
                 pass
 
 
@@ -333,6 +345,9 @@ class CameraGui():
         self.pnpResult = None
         self.qnpResult = None
 
+        self.threadStopper = ThreadStopper()
+        self._thread = None
+
         self.fps_time_log = time.time()
         self.curr_fps = 20.0
 
@@ -355,30 +370,30 @@ class CameraGui():
         self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                                  command=self.selectCamera)
         self.selectFolderLabel = ctk.CTkLabel(self.cam_frame,
-                                              text="../" + os.path.basename(os.path.normpath(self.filepath)))
+                                              text="../" + Path(self.filepath).name if self.filepath else "../")
         self.selectTruthPointsButton = ctk.CTkButton(master=self.cam_frame, text='Select LIDAR Points',
                                                      hover_color='blue', command=self.selectLidarFile)
         self.selectFlightLogButton = ctk.CTkButton(master=self.cam_frame, text='Select Flight Log File',
                                                    hover_color='blue', command=self.selectLogFile)
 
         if self.camConfig.lidarFilepath is not None:
-            self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(
-                os.path.normpath(self.camConfig.lidarFilepath)))
+            self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame,
+                                    text="../" + Path(self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
         else:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
 
         if self.camConfig.hud_data_filepath is not None:
-            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text="../" + os.path.basename(
-                os.path.normpath(self.camConfig.hud_data_filepath)))
+            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text="../" + Path(self.camConfig.hud_data_filepath).name if self.camConfig.hud_data_filepath else "../")
         else:
-            self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
+            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text='No Flight Log Loaded')
 
         self.lidarTruthPoints = TruthPoints()
         self.selectYOLO_folderButton = ctk.CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=CTK_GREEN,
                                                      command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = ctk.CTkLabel(self.cam_frame,
-                                                   text='../' + os.path.basename(
-                                                       os.path.normpath(self.camConfig.yoloFilepath)))
+                                                   text="../" + Path(
+                                                       self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
+)
         self.selectCalibLabel = None
         self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
@@ -434,128 +449,246 @@ class CameraGui():
         self.camFrameGeometry = '445x915'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
-        self.t1 = None
         self.lastWidth = 1
         self.lastHeight = 1
         self.saveToCache()
 
     def loadFromCache(self):
+        """
+        Load UI/config cache from CAM_CONFIG_CACHE, supporting:
+          1) Legacy 3-pickle format:   [camConfig][filepath][calibFile]
+          2) Dict format:               {"version": int, "config": dict|CameraConfig, "filepath": str, "calibFile": str}
 
-        if not os.path.exists(CAM_CONFIG_CACHE):
-            self.filepath = os.getcwd()
+        After load:
+          - All path-like fields are normalized to *strings* ('' when unset)
+          - UI labels are updated if widgets already exist
+        """
+        from pathlib import Path
+        import pickle
+        import logging
+        import os
+
+        def _to_str(p):
+            if p is None:
+                return ''
+            return str(p)
+
+        def _normalize_cached_paths():
+            # Top-level
+            self.filepath = _to_str(getattr(self, 'filepath', ''))
+            self.calibFile = _to_str(getattr(self, 'calibFile', ''))
+
+            # Config paths
+            cfg = self.camConfig
+            # Some configs may not have all attrs (older caches) -> use getattr defaults
+            cfg.imageFilepath = _to_str(getattr(cfg, 'imageFilepath', None))
+            cfg.lidarFilepath = _to_str(getattr(cfg, 'lidarFilepath', None))
+            cfg.hud_data_filepath = _to_str(getattr(cfg, 'hud_data_filepath', ''))
+            cfg.yoloFilepath = _to_str(getattr(cfg, 'yoloFilepath', ''))
+
+        cache_path = Path(CAM_CONFIG_CACHE)
+
+        # Sensible defaults if cache missing
+        if not cache_path.exists():
+            # Initialize defaults if not already set
+            if not hasattr(self, 'camConfig'):
+                try:
+                    self.camConfig = CameraConfig()  # dataclass path
+                except Exception:
+                    pass
+            self.filepath = _to_str(getattr(self, 'filepath', Path.cwd()))
+            self.calibFile = _to_str(getattr(self, 'calibFile', ''))
+
+            # Update labels if UI is ready
+            if hasattr(self, 'selectFolderLabel'):
+                try:
+                    folder_text = "./" + os.path.basename(os.path.normpath(self.filepath)) if self.filepath else "./"
+                    self.selectFolderLabel.configure(text=folder_text)
+                except Exception:
+                    pass
             return
 
-        with open(CAM_CONFIG_CACHE, 'rb') as camConfigOpen:
-            self.camConfig.copy(pickle.load(camConfigOpen))
-            self.filepath = copy.copy(pickle.load(camConfigOpen))
-            self.calibFile = copy.copy(pickle.load(camConfigOpen))
+        try:
+            with cache_path.open('rb') as f:
+                first_obj = pickle.load(f)
 
-        self.selectFolderLabel.configure(text="../" + os.path.basename(os.path.normpath(self.filepath)))
+                # Case 2: dict format (versioned)
+                if isinstance(first_obj, dict) and ('config' in first_obj or 'version' in first_obj):
+                    data = first_obj
+                    cfg_obj = data.get('config', {})
+                    # Accept dict or CameraConfig
+                    if isinstance(cfg_obj, dict):
+                        try:
+                            self.camConfig = CameraConfig(**cfg_obj)
+                        except Exception:
+                            # Be tolerant of extra keys from older caches
+                            self.camConfig = CameraConfig(
+                                **{k: v for k, v in cfg_obj.items() if k in CameraConfig().__dict__})
+                    else:
+                        # Already a CameraConfig (pickled)
+                        self.camConfig = cfg_obj
 
-        self.ingestCalibration()
+                    self.filepath = _to_str(data.get('filepath', Path.cwd()))
+                    self.calibFile = _to_str(data.get('calibFile', ''))
 
-        if not self.camConfig.hud_data_filepath == '':
-            self.attReader.read_files(self.camConfig.hud_data_filepath)
-        self.updateLidarLabel()
-        self.updateYOLOLabel()
-        self.updateFlightLogLabel()
+                else:
+                    # Case 1: legacy 3-pickle stream
+                    # first_obj is camConfig (legacy class or dataclass instance)
+                    cam_cfg_loaded = first_obj
+                    # If your old class had .copy, keep using it for migration; otherwise assign directly
+                    try:
+                        # Try dataclass-style construction first
+                        if isinstance(cam_cfg_loaded, dict):
+                            self.camConfig = CameraConfig(**cam_cfg_loaded)
+                        else:
+                            # If CameraConfig (or old class), prefer direct assignment
+                            self.camConfig = cam_cfg_loaded
+                    except Exception:
+                        # Fallback for very old caches with a custom copy()
+                        try:
+                            self.camConfig.copy(cam_cfg_loaded)  # old migration path, if available
+                        except Exception:
+                            # Last resort: new empty config
+                            self.camConfig = CameraConfig()
 
-        self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
-        self.yoloSession.conf = self.camConfig.yolo_conf
-        self.confSliderLabel.configure(text='Conf: ' + f'{self.camConfig.yolo_conf:.2f}')
-        self.yoloSession.iou = self.camConfig.yolo_iou
-        self.iouSliderLabel.configure(text='IOU: ' + f'{self.camConfig.yolo_iou:.2f}')
-        self.exportQualityCombo.set(self.camConfig.export_quality.value)
+                    # Next two pickles: filepath, calibFile
+                    try:
+                        self.filepath = pickle.load(f)
+                    except Exception:
+                        self.filepath = str(Path.cwd())
+                    try:
+                        self.calibFile = pickle.load(f)
+                    except Exception:
+                        self.calibFile = ''
 
-        self.loadTruthPoints()
+            # Normalize path-like fields to strings for UI code that expects str/''.
+            _normalize_cached_paths()
+
+            # --- UI refresh (only if widgets exist already) ---
+            # Folder label
+            if hasattr(self, 'selectFolderLabel'):
+                try:
+                    folder_text = "./" + os.path.basename(os.path.normpath(self.filepath)) if self.filepath else "./"
+                    self.selectFolderLabel.configure(text=folder_text)
+                except Exception:
+                    pass
+
+            # Calibration ingest + label (if you have helper)
+            try:
+                if hasattr(self, 'ingestCalibration') and self.calibFile:
+                    self.ingestCalibration()
+            except Exception:
+                pass
+
+            # Flight log: if set, let the reader ingest
+            try:
+                if getattr(self.camConfig, 'hud_data_filepath', ''):
+                    if hasattr(self, 'attReader'):
+                        self.attReader.read_files(self.camConfig.hud_data_filepath)
+            except Exception:
+                pass
+
+            # Per-source labels
+            for fn in ('updateLidarLabel', 'updateYOLOLabel', 'updateFlightLogLabel'):
+                if hasattr(self, fn):
+                    try:
+                        getattr(self, fn)()
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            import logging
+            logging.warning("Failed to load cache %s: %s", cache_path, e)
+            # Fall back to defaults
+            try:
+                self.camConfig = CameraConfig()
+            except Exception:
+                pass
+            self.filepath = str(Path.cwd())
+            self.calibFile = ''
 
     def saveToCache(self):
-        with open(CAM_CONFIG_CACHE, 'wb') as f:
+        cache_path = Path(CAM_CONFIG_CACHE)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # coerce to strings in case fields were set to Path elsewhere
+        cam_cfg = self.camConfig
+        for attr in ('imageFilepath', 'lidarFilepath', 'hud_data_filepath', 'yoloFilepath'):
+            if hasattr(cam_cfg, attr):
+                val = getattr(cam_cfg, attr)
+                if val is not None and not isinstance(val, str):
+                    setattr(cam_cfg, attr, str(val))
+        if not isinstance(self.filepath, str):  self.filepath = str(self.filepath)
+        if not isinstance(self.calibFile, str): self.calibFile = str(self.calibFile)
+
+        with cache_path.open('wb') as f:
             pickle.dump(self.camConfig, f)
             pickle.dump(self.filepath, f)
             pickle.dump(self.calibFile, f)
 
     def selectFolder(self):
-        fp = self.askFilepath(self.filepath + "/..", "Select Imagery Folder")
-        if fp is not None:
+        init_dir = Path(self.filepath).parent if self.filepath else Path.cwd()
+        fp = self.askFilepath(str(init_dir), "Select Imagery Folder")
+        if fp:
             self.filepath = fp
             self.saveToCache()
             self.loadFromCache()
 
     def loadCalibration(self):
-        if self.calibFile != '':
-            initial_dir = self.calibFile
-        else:
-            initial_dir = self.filepath
-
-        poss_filepath = filedialog.askopenfilename(initialdir=initial_dir + '/..',
-                                                   title='Select Folder of Calibration')
-
-        if poss_filepath != '':
+        init_dir = Path(self.calibFile or self.filepath or Path.cwd()).parent
+        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select Calibration File')
+        if poss_filepath:
             self.calibFile = poss_filepath
             self.ingestCalibration()
 
     def selectLidarFile(self):
-        if self.camConfig.lidarFilepath is None:
-            poss_filepath = filedialog.askopenfilename(initialdir=self.filepath + '/..',
-                                                       title='Select LIDAR Truth Points')
-        else:
-            poss_filepath = filedialog.askopenfilename(initialdir=self.camConfig.lidarFilepath + '/..',
-                                                       title='Select LIDAR Truth Points')
-        if poss_filepath != '':
+        init_dir = Path(self.camConfig.lidarFilepath or self.filepath or Path.cwd()).parent
+        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select LIDAR Truth Points')
+        if poss_filepath:
             self.camConfig.lidarFilepath = poss_filepath
             self.updateLidarLabel()
             self.loadTruthPoints()
             self.saveToCache()
 
     def selectLogFile(self):
-        if self.camConfig.hud_data_filepath == '':
-            poss_filepath = filedialog.askdirectory(initialdir=self.filepath + '/..',
-                                                    title='Select Flight Log Data')
-        else:
-            poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.hud_data_filepath + '/..',
-                                                    title='Select Flight Log Data')
-        if poss_filepath != '':
-            self.camConfig.hud_data_filepath = poss_filepath
+        init_dir = Path(self.camConfig.hud_data_filepath or self.filepath or Path.cwd())
+        poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select Flight Log Data')
+        if poss_dir:
+            self.camConfig.hud_data_filepath = poss_dir
             self.attReader = AttRdr()
-            self.attReader.read_files(poss_filepath)
+            self.attReader.read_files(poss_dir)
             self.updateFlightLogLabel()
             self.saveToCache()
 
     def selectYoloFolder(self):
-        if self.camConfig.yoloFilepath is None:
-            poss_filepath = filedialog.askdirectory(initialdir=os.getcwd() + '/..',
-                                                    title='Select YOLO Folder')
-        else:
-            poss_filepath = filedialog.askdirectory(initialdir=self.camConfig.yoloFilepath + '/..',
-                                                    title='Select YOLO Folder')
-        if poss_filepath != '':
-            self.camConfig.yoloFilepath = poss_filepath
+        init_dir = Path(self.camConfig.yoloFilepath or Path.cwd())
+        poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select YOLO Folder')
+        if poss_dir:
+            self.camConfig.yoloFilepath = poss_dir
             self.updateYOLOLabel()
             self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
             self.saveToCache()
 
     def updateLidarLabel(self):
-        if self.camConfig.lidarFilepath is not None:
-            self.selectTruthPointsLabel.configure(text=os.path.basename(self.camConfig.lidarFilepath))
+        if self.camConfig.lidarFilepath:
+            self.selectTruthPointsLabel.configure(text=Path(self.camConfig.lidarFilepath).name)
 
     def updateFlightLogLabel(self):
-        if self.camConfig.hud_data_filepath is not None:
-            self.selectFlightLogLabel.configure(text=os.path.basename(self.camConfig.hud_data_filepath))
+        if self.camConfig.hud_data_filepath:
+            self.selectFlightLogLabel.configure(text=Path(self.camConfig.hud_data_filepath).name)
 
     def updateYOLOLabel(self):
-        if self.camConfig.yoloFilepath is not None:
-            self.selectYOLO_folderLabel.configure(text=os.path.basename(self.camConfig.yoloFilepath))
+        if self.camConfig.yoloFilepath:
+            self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
 
     def loadTruthPoints(self):
         if self.camConfig.lidarFilepath is not None:
-            if os.path.exists(self.camConfig.lidarFilepath):
-                with open(self.camConfig.lidarFilepath, 'rb') as f:
+            lidar_path = Path(self.camConfig.lidarFilepath)
+            if lidar_path.exists():
+                with lidar_path.open('rb') as f:
                     test = pickle.load(f)
                     self.lidarTruthPoints.copy(test)
             else:
-                print(
-                    f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
+                LOG.error(f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
 
     def updateQuality(self, qualityValue: str):
         self.camConfig.export_quality = ExportQuality(qualityValue)
@@ -591,7 +724,7 @@ class CameraGui():
             self.calibration.scaleCalibration(2848)
 
         if self.selectCalibLabel is not None:
-            self.selectCalibLabel.configure(text=os.path.basename(os.path.normpath(self.calibFile)),
+            self.selectCalibLabel.configure(text="../" + Path(self.calibFile).name if self.calibFile else "../",
                                             bg_color=self.selectCalibLabel.cget("bg_color"))
             self.cam_frame.update()
             self.gui.update()
@@ -620,7 +753,7 @@ class CameraGui():
                 try:
                     cam._open()
                 except vmbpy.c_binding.VmbError as e:
-                    print(f'Could not open camera: {e}')
+                    LOG.warning(f'Could not open camera: {e}')
                     return
                 try:
                     cam.start_streaming(
@@ -640,7 +773,7 @@ class CameraGui():
             cv2.imshow(title, cv2.resize(numpy_buffer, (864, 864)))
             cv2.waitKey(1)
         except vmbpy.c_binding.VmbError as e:
-            print(f'Error processing frame: {e}')
+            LOG.error("Error processing frame: %s", e)
 
     def selectCamera(self, key):
         self.camConfig.cam_index = self.indexDict[key]
@@ -699,16 +832,15 @@ class CameraGui():
 
     def selectImagesFilepath(self):
         if self.camConfig.imageFilepath is None:
-            initDir = self.filepath + '/..'
+            initDir = str(Path(self.filepath).parent)
         else:
             initDir = self.camConfig.imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':
             self.camConfig.imageFilepath = poss_file
-            self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
-            self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
-
+            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
+            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
             self.saveToCache()
 
     def setupFrame(self):
@@ -724,11 +856,11 @@ class CameraGui():
 
         self.singleImageTextButton.configure(command=self.startStreamOn)
         if self.camConfig.imageFilepath is not None:
-            self.singleImageTextButton.configure(text=os.path.basename(self.camConfig.imageFilepath))
+            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
 
         self.multiImageTextButton.configure(command=self.startStreamOn)
         if self.camConfig.imageFilepath is not None:
-            self.multiImageTextButton.configure(text=os.path.basename(os.path.dirname(self.camConfig.imageFilepath)))
+            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
 
         self.streamOrImgCombo.set(self.camConfig.imageSource.value)
         self.sourceUpdate(self.camConfig.imageSource.value)
@@ -946,11 +1078,15 @@ class CameraGui():
         self.shutting_down = True
         self.recordOff()
         self.startStreamOffBool()
-
-        # check to make sure window is closed
-        # trying to shut down while window is open causes crash
-        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
-            time.sleep(1)
+        # Safely wait for window to be gone
+        while True:
+            try:
+                vis = cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
+                if vis <= 0:
+                    break
+            except Exception:
+                break
+            time.sleep(0.1)
 
     def releaseCamReturnToMain(self):
         self.startStreamOffBool()
@@ -977,20 +1113,25 @@ class CameraGui():
             self.camConfig.secondsBetweenImages = 1.0
 
     def _gather_annotated_frames(self) -> list[np.ndarray]:
-        directory = os.path.dirname(self.camConfig.imageFilepath)
-        self.populate_idsTimes(directory)
-        paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+        directory = Path(self.camConfig.imageFilepath).parent
+        self.populate_idsTimes(str(directory))
+
+        paths = []
+        for rec in self.ImageTimeReader.idsTimes:
+            p = Path(rec[0])
+            paths.append(p if p.is_absolute() else (directory / p))
 
         try:
-            offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-            self.cam_to_log_time_offset = offset_dict['offset'][0]
+            offset_dict = pd.read_csv(directory / '__TIME_OFFSET.csv')
+            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
         except FileNotFoundError:
-            self.cam_to_log_time_offset = 0.0
+            self.camConfig.cam_to_log_time_offset = 0.0
 
         cv_imgs = []
-        for idx, img in zip(range(self.camConfig.start_export_idx, self.camConfig.end_export_idx + 1),
-                            paths[self.camConfig.start_export_idx:self.camConfig.end_export_idx + 1]):
-            frame = cv2.imread(img)
+        start = self.camConfig.start_export_idx
+        end = self.camConfig.end_export_idx + 1
+        for idx, img_path in zip(range(start, end), paths[start:end]):
+            frame = cv2.imread(str(img_path))
             ts = self.ImageTimeReader.idsTimes[idx][1]
             cv_img = self.analyze_image(
                 frame,
@@ -1061,8 +1202,9 @@ class CameraGui():
 
         self.streamOrImgCombo.configure(state='disabled')
 
-        self.t1 = thread_with_exception("CameraGui Thread", self.run)
-        self.t1.start()
+        self.threadStopper = ThreadStopper()
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
 
     def startStreamOffBool(self):
         self.showWindow = False
@@ -1070,14 +1212,24 @@ class CameraGui():
     def startStreamOff(self):
         cv2.waitKey(1)
 
+        self.threadStopper.set()
+        cv2.destroyAllWindows()
+
         if self.vc is not None and self.vc.isOpened():
             self.vc.release()
             self.vc = None
 
+        # Only join if we're on a different thread than the worker.
+        if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
         if not self.shutting_down:
             if self.camConfig.imageFilepath is not None:
-                self.singleImageTextButton.configure(command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue',
-                                                     text=os.path.basename(self.camConfig.imageFilepath))
+                self.singleImageTextButton.configure(
+                    command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue',
+                    text=os.path.basename(self.camConfig.imageFilepath)
+                )
             self.startStreamButton.configure(command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue')
             self.multiImageTextButton.configure(command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue')
 
@@ -1086,10 +1238,6 @@ class CameraGui():
             self.streamOrImgCombo.configure(state='normal')
 
             self.showWindow = False
-
-        # if self.t1 is not None:
-        #     self.t1.raise_exception()
-        #     self.t1.join()
 
         cv2.destroyAllWindows()
 
@@ -1190,16 +1338,20 @@ class CameraGui():
 
     def run_detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        frame = cv2.imread(self.camConfig.imageFilepath)
-        while cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) and self.showWindow:
+        frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
+        while (not self.threadStopper.is_set()
+               and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0
+               and self.showWindow):
 
             self.analyze_image(frame)
 
             key = cv2.waitKey(1)
             if key == 27:
-                cv2.destroyAllWindows()
+                self.threadStopper.set()
                 break
-        self.startStreamOff()
+
+        cv2.destroyAllWindows()
+        self.gui.after(0, self._on_worker_exit)
 
     @staticmethod
     def convert_cv_to_pil(img):
@@ -1214,9 +1366,6 @@ class CameraGui():
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
-        self.t1.raise_exception()
-        self.t1.join()
-
     def run_video_stream(self):
 
         self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
@@ -1230,13 +1379,23 @@ class CameraGui():
             self.lastHeight = self.curr_frame.shape[0]
             self.lastWidth = self.curr_frame.shape[1]
 
-        while rval and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0 and self.showWindow:
+        while (rval and not self.threadStopper.is_set() and
+               cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0 and
+               self.showWindow and not self.making_gifOrVid):
             rval, frame = self.vc.read()
             self.analyze_image(frame)
             key = cv2.waitKey(1)
             if key == 27:  # exit on ESC
+                self.threadStopper.set()
                 break
-        self.startStreamOff()
+
+        # Minimal teardown in the worker; the UI thread will handle buttons/state.
+        if self.vc is not None and self.vc.isOpened():
+            self.vc.release()
+            self.vc = None
+        cv2.destroyAllWindows()
+        self.gui.after(0, self._on_worker_exit)
+        return
 
     @staticmethod
     def _stride_for_speed(speed_abs: int) -> int:
@@ -1244,12 +1403,15 @@ class CameraGui():
         return 1 if s <= 1 else min(8, s)
 
     def populate_idsTimes(self, directory):
-        # --- populate idsTimes (unchanged) ---
-        if not self.ImageTimeReader.loadLog(glob.glob(os.path.join(directory, '*.log'))):
+        d = Path(directory)
+        # load logs (keep API: list[str])
+        log_list = [str(p) for p in d.glob("*.log")]
+        if not self.ImageTimeReader.loadLog(log_list):
             self.ImageTimeReader.idsTimes = []
-            imageList = glob.glob(os.path.join(directory, '*.bmp')) + glob.glob(os.path.join(directory, '*.png'))
-            imageList = natural_sort(imageList)
-            for image in imageList:
+            image_list = list(d.glob("*.bmp")) + list(d.glob("*.png"))
+            # natural_sort expects strings:
+            image_list = natural_sort([str(p) for p in image_list])
+            for image in image_list:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
     def _poll_keys(self, max_ms: int = 1) -> list[int]:
@@ -1270,11 +1432,15 @@ class CameraGui():
 
         reverse_playback = False
 
-        directory = os.path.dirname(self.camConfig.imageFilepath)
+        directory = Path(self.camConfig.imageFilepath).parent
 
-        self.populate_idsTimes(directory)
+        self.populate_idsTimes(str(directory))
 
-        paths = [os.path.join(directory, rec[0]) for rec in self.ImageTimeReader.idsTimes]
+        paths = []
+        for rec in self.ImageTimeReader.idsTimes:
+            p = Path(rec[0])
+            paths.append(p if p.is_absolute() else (directory / p))
+
         num_images = len(paths)
 
         # timestamps (seconds), None -> infer at fixed spacing later
@@ -1282,22 +1448,7 @@ class CameraGui():
         for name, ts in self.ImageTimeReader.idsTimes:
             ts_raw.append(None if ts is None else float(ts) + float(self.camConfig.cam_to_log_time_offset))
 
-        # make a monotone increasing timebase:
-        # - if all None: synthesize from target_fps so 'realtime' still works
-        # - else: fill Nones by linear interpolate between neighbors; ends by nearest neighbor
-        t = np.array([np.nan if v is None else v for v in ts_raw], dtype='float64')
-        if np.all(np.isnan(t)):
-            step = 1.0 / max(1e-6, self.camConfig.target_fps)
-            t = np.arange(num_images, dtype='float64') * step
-        else:
-            # fill gaps
-            nans = np.isnan(t)
-            if nans.any():
-                notn = ~nans
-                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
-        # normalize so first frame is t=0
-        t0 = float(t[0])
-        t = t - t0
+        t = self._make_timebase(ts_raw, self.camConfig.target_fps, num_images)
 
         img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
         img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
@@ -1313,14 +1464,14 @@ class CameraGui():
 
         # time offset
         try:
-            offset_dict = pd.read_csv(os.path.join(directory, '__TIME_OFFSET.csv'))
-            self.camConfig.cam_to_log_time_offset = offset_dict['offset'][0]
+            offset_dict = pd.read_csv(directory / "__TIME_OFFSET.csv")
+            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
         except FileNotFoundError:
             self.camConfig.cam_to_log_time_offset = 0.0
 
         # --- start background loader ---
         loader = imgBuf(
-            filepaths=paths,
+            filepaths=[str(p) for p in paths],
             max_buffer=96,
             preprocess=None,
             start_index=0,
@@ -1345,10 +1496,11 @@ class CameraGui():
                 keys.extend(self._poll_keys(int(max(1, remain * 100))))
             return keys
 
-        end = False
         try:
-            while cv2.getWindowProperty(self.windowName,
-                                        cv2.WND_PROP_VISIBLE) and self.showWindow and not end and not self.making_gifOrVid:
+            while (not self.threadStopper.is_set()
+                   and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
+                   and self.showWindow
+                   and not self.making_gifOrVid):
 
                 curr_time = time.time()
                 if (curr_time - self.fps_time_log) > 0.000001:
@@ -1425,10 +1577,9 @@ class CameraGui():
                         else:
                             # If file truly missing, print once; otherwise keep last cached frame (if any)
                             p = paths[target_idx]
-                            if not os.path.exists(p):
+                            if not Path(p).exists():
                                 if p not in printed_missing:
-                                    print(
-                                        f"Log File Error: {self.ImageTimeReader.idsTimes[target_idx][0]} doesn't exist.")
+                                    LOG.warning("Log file missing/failed: %s", self.ImageTimeReader.idsTimes[curr_idx][0])
                                     printed_missing.add(p)
                                 paused_cached_frame = None
                                 paused_cached_idx = None
@@ -1436,7 +1587,7 @@ class CameraGui():
                     frame = paused_cached_frame
 
                 # ===== display / HUD =====
-                if frame is not None and os.path.exists(paths[curr_idx]) and len(self.ImageTimeReader.idsTimes) > 0:
+                if frame is not None and Path(paths[curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
 
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
                         period = 1.0 / self.camConfig.target_fps
@@ -1489,18 +1640,17 @@ class CameraGui():
                     # path doesn’t exist (already printed in paused path; print here for streaming once)
                     p = paths[curr_idx]
                     if p not in printed_missing:
-                        print(
-                            f"Log File Error: {self.ImageTimeReader.idsTimes[curr_idx][0]} doesn't exist or failed to load.")
+                        LOG.warning("Log file missing/failed: %s", self.ImageTimeReader.idsTimes[curr_idx][0])
                         printed_missing.add(p)
 
                 pending_keys.extend(self._poll_keys(1))
 
+                # --- Key handling: edge-triggered dispatcher ---
                 while pending_keys:
                     key = pending_keys.pop(0)
-                    if pending_keys is None:
-                        pending_keys = []
 
-                    def on_key(kcode):
+                    # edge-detect helper (same semantics as your current on_key)
+                    def on_key(kcode: int) -> bool:
                         if kcode == 255:
                             return False
                         if kcode in pressed:
@@ -1508,186 +1658,206 @@ class CameraGui():
                         pressed.add(kcode)
                         return True
 
-                    if key == 255 or key == 0xFF or key == 0:
+                    # reset edge-state on "no key"
+                    if key in (255, 0xFF, 0):
                         pressed.clear()
+                        continue
 
-                    #used keys:
-                    # c, z, space, d, a, w, s, e, {, }, [, ], p, esc
-
-                    # controls (edge-triggered)
-
-                    if key == ord('f') and on_key(ord('f')):  # swap from FPS-limit to real-time
-                        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
-                        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-                            img_slider.play_speed = 1
-                            self.camConfig.rt_speed = 1.0
-                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
+                    # Map keys to actions (edge-triggered)
+                    if key == ord('f') and on_key(ord('f')):
+                        maybe_ws = self._on_toggle_fps_mode(t, curr_idx)
+                        if maybe_ws is not None:
+                            wall_start = maybe_ws
                         else:
                             wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx)
+                                curr_idx if not reverse_playback else num_images - curr_idx
+                            )
                         self.saveToCache()
 
-                    if key == ord('c') and on_key(ord('c')):  # 'c' step forward
-                        img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
-                        img_slider.play_speed = 0
+                    elif key == ord('c') and on_key(ord('c')):
+                        self._on_step_forward(img_slider, loader, num_images)
                         pause = True
                         paused_cached_idx = None
                         paused_cached_frame = None
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                         loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                    if key == ord('z') and on_key(ord('z')):  # 'z' step back
-                        img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
-                        img_slider.play_speed = 0
+                    elif key == ord('z') and on_key(ord('z')):
+                        self._on_step_back(img_slider, loader, num_images)
                         pause = True
                         paused_cached_idx = None
                         paused_cached_frame = None
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                         loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                    if key == 32 and on_key(32):  # space toggle pause
-                        pause = not pause
-                        img_slider.play_speed = 0 if pause else (
-                            1 if img_slider.play_speed == 0 else img_slider.play_speed)
-                        paused_cached_idx = None
-                        paused_cached_frame = None
-                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                        wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                            curr_idx if not reverse_playback else num_images - curr_idx)
-                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+                    elif key == 32 and on_key(32):  # space
+                        pause = self._on_toggle_pause(img_slider, pause)
 
-                    if key == ord('d') and on_key(ord('d')):  # 'd' faster (forward)
-                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                            # step up by ~25%, but cap to something sane (e.g., 240 fps)
-                            if self.camConfig.target_fps < 20.0 < self.camConfig.target_fps * 1.25:
-                                self.camConfig.target_fps = 20.0
-                            elif self.camConfig.target_fps < 10.0 < self.camConfig.target_fps * 1.25:
-                                self.camConfig.target_fps = 10.0
-                            else:
-                                self.camConfig.target_fps = min(64.0, round(self.camConfig.target_fps * 1.25, 4))
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx)
-                        else:
-                            # realtime mode: speed up time scale
-                            if self.camConfig.rt_speed < 1.0 < self.camConfig.rt_speed * 2.0:
-                                self.camConfig.rt_speed = 1.0
-                            else:
-                                self.camConfig.rt_speed = min(256.0, round(self.camConfig.rt_speed * 2.0, 4))
-                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
-                        self.saveToCache()
+                    elif key == ord('d') and on_key(ord('d')):
+                        self._on_speed_up(img_slider)
 
-                    if key == ord('a') and on_key(ord('a')):  # 'a' slower / rewind
-                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                            # step down by ~20%, but never below 0.5 fps
-                            if self.camConfig.target_fps * 0.8 < 20.0 < self.camConfig.target_fps:
-                                self.camConfig.target_fps = 20.0
-                            elif self.camConfig.target_fps * 0.8 < 10.0 < self.camConfig.target_fps:
-                                self.camConfig.target_fps = 10.0
-                            else:
-                                self.camConfig.target_fps = round(self.camConfig.target_fps * 0.8, 4)
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx)
-                        else:
-                            # realtime mode: slow down time scale
-                            if self.camConfig.rt_speed * 0.5 < 1.0 < self.camConfig.rt_speed:
-                                self.camConfig.rt_speed = 1.0
-                            else:
-                                self.camConfig.rt_speed = round(self.camConfig.rt_speed * 0.5, 4)
-                            wall_start = time.monotonic() - (t[curr_idx] - t[0]) / self.camConfig.rt_speed
-                        self.saveToCache()
+                    elif key == ord('a') and on_key(ord('a')):
+                        self._on_speed_down(img_slider)
 
-                    # 'r' reverse direction of playback
-                    if key == ord('r') and on_key(ord('r')):  # toggle reverse
-                        reverse_playback = not reverse_playback
-                        # If paused, give it a nudge so you can see direction immediately
-                        if img_slider.play_speed == 0:
-                            img_slider.play_speed = -1  # start stepping backward
-                            pause = False
+                    elif key == ord('w') and on_key(ord('w')):
+                        self._on_toggle_overlays()
 
-                        # Flip direction of the current playback
-                        img_slider.play_speed = -img_slider.play_speed
+                    elif key == ord('s') and on_key(ord('s')):
+                        self._on_mark_start(img_slider)
 
-                        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-                            # Respect the new sign by updating the loader stride now
-                            try:
-                                s_abs = self._stride_for_speed(abs(img_slider.play_speed))
-                                loader.set_stride(-s_abs if img_slider.play_speed < 0 else s_abs)
-                            except Exception as e:
-                                print("Error setting reverse stride:", e)
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx)
+                    elif key == ord('e') and on_key(ord('e')):
+                        self._on_mark_end(img_slider)
 
-                        elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-                            # Make real-time run backward by flipping rt_speed and
-                            # aligning wall_start so the current frame stays continuous.
-                            # wall_start exists in your loop already.
-                            self.camConfig.rt_speed = -self.camConfig.rt_speed
-                            # Align so elapsed = t[curr_idx] at the toggle moment:
-                            # elapsed = (now - wall_start) * rt_speed  ==> set wall_start accordingly
-                            now = time.monotonic()
-                            # t is your normalized timebase (t[0] == 0), curr_idx is the shown frame
-                            wall_start = now - ((t[curr_idx] - t[0]) / self.camConfig.rt_speed)
+                    # time offset nudges (small/medium/large)
+                    elif key == ord(";") and on_key(ord(";")):
+                        self._on_adjust_offset(-0.01)
+                    elif key == ord("'") and on_key(ord("'")):
+                        self._on_adjust_offset(+0.01)
+                    elif key == ord('[') and on_key(ord('[')):
+                        self._on_adjust_offset(-0.10)
+                    elif key == ord(']') and on_key(ord(']')):
+                        self._on_adjust_offset(+0.10)
+                    elif key == ord('{') and on_key(ord('{')):
+                        self._on_adjust_offset(-1.00)
+                    elif key == ord('}') and on_key(ord('}')):
+                        self._on_adjust_offset(+1.00)
+                    elif key == ord('p') and on_key(ord('p')):
+                        self._on_persist_offset()
 
-                    if key == ord('w') and on_key(ord('w')):  # 'w'
-                        self.toggleUndistort()
-                        self.toggleYoloInference()
-                        self.toggleDetectHorizon()
-                        self.toggleHyperFocus()
-                        self.toggleFactorgraph()
-
-                    if key == ord('s') and on_key(ord('s')):
-                        self.camConfig.start_export_idx = img_slider.curr_img_idx
-                        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-                            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
-                        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-                        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-                        self.saveToCache()
-
-                    if key == ord('e') and on_key(ord('e')):
-                        self.camConfig.end_export_idx = img_slider.curr_img_idx
-                        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-                            self.camConfig.start_export_idx = self.camConfig.end_export_idx - 1
-                            if self.camConfig.start_export_idx < 0:
-                                self.camConfig.start_export_idx += 1
-                                self.camConfig.end_export_idx += 1
-                        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-                        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-                        self.saveToCache()
-
-                    # edge-triggered handlers (inside your key-handling area)
-                    if key == ord(";") and on_key(ord(";")):
-                        self.camConfig.cam_to_log_time_offset -= 0.01
-                    if key == ord("'") and on_key(ord("'")):
-                        self.camConfig.cam_to_log_time_offset += 0.01
-                    if key == ord('[') and on_key(ord('[')):
-                        self.camConfig.cam_to_log_time_offset -= 0.10
-                    if key == ord(']') and on_key(ord(']')):
-                        self.camConfig.cam_to_log_time_offset += 0.10
-                    if key == ord('{') and on_key(ord('{')):  # shift+[ on most keyboards
-                        self.camConfig.cam_to_log_time_offset -= 1.00
-                    if key == ord('}') and on_key(ord('}')):  # shift+] on most keyboards
-                        self.camConfig.cam_to_log_time_offset += 1.00
-                    if key == ord('p') and on_key(ord('p')):  # persist
-                        self.write_offset_csv()
-                        print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
-
-                    if key == 27 and on_key(27):  # ESC
-                        end = True
+                    elif key == 27 and on_key(27):  # ESC
+                        self.threadStopper.set()
+                        break
 
                     while self.making_gifOrVid:
                         time.sleep(0.1)
                 pressed.clear()
 
         finally:
+            cv2.destroyAllWindows()
+            self.gui.after(0, self._on_worker_exit)
             if not self.shutting_down:
                 img_slider.close()
             loader.stop()
-            self.startStreamOff()
+
+    def _make_timebase(self, ts_raw: list[float | None], fallback_fps: float, n: int) -> np.ndarray:
+        """
+        Build a monotone, normalized timebase (seconds) from possibly-missing timestamps.
+        - If all timestamps are None: synthesize from fallback_fps.
+        - Else: linearly interpolate gaps; normalize to t[0] == 0.0.
+        """
+        t = np.array([np.nan if v is None else float(v) for v in ts_raw], dtype='float64')
+        if np.all(np.isnan(t)):
+            step = 1.0 / max(1e-6, float(fallback_fps))
+            t = np.arange(n, dtype='float64') * step
+        else:
+            nans = np.isnan(t)
+            if nans.any():
+                notn = ~nans
+                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
+        t -= float(t[0])
+        return t
+
+    def _on_worker_exit(self):
+        # Mark no live worker and reset run-state
+        self._thread = None
+        self.showWindow = False
+
+        # Rewire buttons back to "start"
+        if self.camConfig.imageFilepath is not None:
+            self.singleImageTextButton.configure(
+                command=self.startStreamOn,
+                fg_color=BUTTON_RED, hover_color='blue',
+                text=os.path.basename(self.camConfig.imageFilepath)
+            )
+        else:
+            self.singleImageTextButton.configure(
+                command=self.startStreamOn,
+                fg_color=BUTTON_RED, hover_color='blue',
+                text='No Image Selected'
+            )
+
+        self.startStreamButton.configure(
+            command=self.startStreamOn,
+            fg_color=BUTTON_RED, hover_color='blue',
+            text='Start Stream'
+        )
+        self.multiImageTextButton.configure(
+            command=self.startStreamOn,
+            fg_color=BUTTON_RED, hover_color='blue'
+        )
+
+        # Re-enable selectors
+        self.selectCameraCombo.configure(state='normal')
+        self.streamOrImgCombo.configure(state='normal')
+
+    # --- Key action helpers (CameraGui) ---
+
+    def _on_toggle_fps_mode(self, t, curr_idx):
+        """Swap Fixed_fps <-> Real_time, preserving perceived position."""
+        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
+        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+            self.camConfig.rt_speed = 1.0
+            # align wall clock to current frame's time
+            return time.monotonic() - (t[curr_idx] - t[0]) / max(1e-9, self.camConfig.rt_speed)
+        else:
+            # fall back to fixed-fps; let caller recompute the synthetic wall_start
+            return None
+
+    def _on_step_forward(self, img_slider, loader, num_images):
+        img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
+        img_slider.play_speed = 0
+
+    def _on_step_back(self, img_slider, loader, num_images):
+        img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
+        img_slider.play_speed = 0
+
+    def _on_toggle_pause(self, img_slider, pause):
+        pause = not pause
+        img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
+        return pause
+
+    def _on_speed_up(self, img_slider):
+        img_slider.play_speed = min(img_slider.play_speed + 1, 8)
+
+    def _on_speed_down(self, img_slider):
+        img_slider.play_speed = max(img_slider.play_speed - 1, -8)
+
+    def _on_toggle_overlays(self):
+        self.toggleUndistort()
+        self.toggleYoloInference()
+        self.toggleDetectHorizon()
+        self.toggleHyperFocus()
+        self.toggleFactorgraph()
+
+    def _on_mark_start(self, img_slider):
+        self.camConfig.start_export_idx = img_slider.curr_img_idx
+        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
+        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.saveToCache()
+
+    def _on_mark_end(self, img_slider):
+        self.camConfig.end_export_idx = img_slider.curr_img_idx
+        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+            self.camConfig.start_export_idx = max(0, self.camConfig.end_export_idx - 1)
+        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.saveToCache()
+
+    def _on_adjust_offset(self, delta: float):
+        self.camConfig.cam_to_log_time_offset += float(delta)
+
+    def _on_persist_offset(self):
+        self.write_offset_csv()
+        # if you added logging already, this becomes LOG.info(...)
+        print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
 
     def write_offset_csv(self):
         self.attReader.offset += self.camConfig.cam_to_log_time_offset
-        pd.DataFrame({"offset": [self.attReader.offset]}).to_csv(
-            os.path.join(self.camConfig.hud_data_filepath, "__TIME_OFFSET.csv"), index=False)
+        out_csv = Path(self.camConfig.hud_data_filepath) / "__TIME_OFFSET.csv"
+        pd.DataFrame({"offset": [self.attReader.offset]}).to_csv(out_csv, index=False)
+
         self.camConfig.cam_to_log_time_offset = 0.0
 
     def analyze_image(self, frame, img_time=None, name=None, display=True, box_around=False):

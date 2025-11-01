@@ -46,7 +46,6 @@ if not LOG.handlers:
     # LOG.setLevel(logging.DEBUG)
     # LOG.setLevel(logging.WARNING)
 
-
 # import superCalibrate as superCal
 #pip install cv2_enumerate_cameras
 #or
@@ -65,13 +64,17 @@ def numerical_sort(file_name):
     except (ValueError, IndexError):
         return float('inf')
 
+
 class ThreadStopper:
     def __init__(self):
         self._ev = threading.Event()
+
     def set(self):
         self._ev.set()
+
     def is_set(self) -> bool:
         return self._ev.is_set()
+
 
 class ImageSliderBar:
     def __init__(self, num_images: int, refresh_hz: float = 20.0):
@@ -114,6 +117,7 @@ class ImageSliderBar:
     def close(self):
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
         self.alive = False
+
 
 class GaborGUI:
     def __init__(self):
@@ -220,7 +224,6 @@ class ImageSource(Enum):
     Stream_from_Folder = 'Stream from Folder'
 
 
-
 class PlaybackSpeed(Enum):
     Fixed_fps = 'fixed_fps'
     Real_time = 'realtime'
@@ -230,6 +233,7 @@ class PlaybackSpeed(Enum):
         for member in iterator:
             if member is self:
                 return next(iterator)
+
 
 @dataclass
 class CameraConfig():
@@ -378,12 +382,14 @@ class CameraGui():
 
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame,
-                                    text="../" + Path(self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
+                                                       text="../" + Path(
+                                                           self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
         else:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame, text='No Truth Loaded')
 
         if self.camConfig.hud_data_filepath is not None:
-            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text="../" + Path(self.camConfig.hud_data_filepath).name if self.camConfig.hud_data_filepath else "../")
+            self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text="../" + Path(
+                self.camConfig.hud_data_filepath).name if self.camConfig.hud_data_filepath else "../")
         else:
             self.selectFlightLogLabel = ctk.CTkLabel(self.cam_frame, text='No Flight Log Loaded')
 
@@ -393,7 +399,7 @@ class CameraGui():
         self.selectYOLO_folderLabel = ctk.CTkLabel(self.cam_frame,
                                                    text="../" + Path(
                                                        self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
-)
+                                                   )
         self.selectCalibLabel = None
         self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
@@ -688,7 +694,8 @@ class CameraGui():
                     test = pickle.load(f)
                     self.lidarTruthPoints.copy(test)
             else:
-                LOG.error(f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
+                LOG.error(
+                    f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
 
     def updateQuality(self, qualityValue: str):
         self.camConfig.export_quality = ExportQuality(qualityValue)
@@ -1453,6 +1460,7 @@ class CameraGui():
         img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
         img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
         pause = False
+        last_nonzero_sign = 1
 
         last_stride = None
         last_speed = img_slider.play_speed
@@ -1512,24 +1520,26 @@ class CameraGui():
                 # ===== react to speed changes (incl. direction) =====
                 if img_slider.play_speed != last_speed:
                     s_abs = self._stride_for_speed(abs(img_slider.play_speed))
-                    signed_stride = (s_abs if img_slider.play_speed >= 0 else -s_abs) if s_abs > 0 else 1
 
-                    if signed_stride != last_stride:
-                        loader.set_stride(signed_stride)
-                        last_stride = signed_stride
+                    if img_slider.play_speed != 0:
+                        last_nonzero_sign = (1 if img_slider.play_speed > 0 else -1)
 
-                    if img_slider.play_speed == 0:
+                    if s_abs == 0:
                         pause = True
                     else:
                         pause = False
+                        signed_stride = last_nonzero_sign * s_abs
+                        if signed_stride != last_stride:
+                            loader.set_stride(signed_stride)
+                            last_stride = signed_stride
 
-                    # re-align once on any transition (incl. direction flip)
-                    curr_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
-                    loader.seek(curr_idx, clear_buffer=True)
+                        curr_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
+                        loader.seek(curr_idx, clear_buffer=True)
+                        reverse_playback = (last_nonzero_sign < 0)
 
-                    # reset paused cache on transitions
-                    paused_cached_idx = None
-                    paused_cached_frame = None
+                        # leaving pause → invalidate paused cache
+                        paused_cached_idx = None
+                        paused_cached_frame = None
 
                     last_speed = img_slider.play_speed
 
@@ -1579,7 +1589,8 @@ class CameraGui():
                             p = paths[target_idx]
                             if not Path(p).exists():
                                 if p not in printed_missing:
-                                    LOG.warning("Log file missing/failed: %s", self.ImageTimeReader.idsTimes[curr_idx][0])
+                                    LOG.warning("Log file missing/failed: %s",
+                                                self.ImageTimeReader.idsTimes[curr_idx][0])
                                     printed_missing.add(p)
                                 paused_cached_frame = None
                                 paused_cached_idx = None
@@ -1599,29 +1610,45 @@ class CameraGui():
                         pending_keys = sleep_until(target_time)
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-                        # map wall time → desired log time
-                        elapsed = (time.monotonic() - wall_start) * self.camConfig.rt_speed
-                        # find the frame index whose log time is just <= elapsed
-                        # (Assumes t is sorted & normalized to 0 at first frame)
-                        idx_target = int(np.searchsorted(t, elapsed, side='right') - 1)
+                        # elapsed wall time scaled by speed (always non-negative)
+                        rs = float(self.camConfig.rt_speed)
+                        if rs <= 0:
+                            rs = 1e-6
+                        elapsed = (time.monotonic() - wall_start) * rs
 
-                        if elapsed < t[0]:
+                        # Map to a target time on the log timeline
+                        # Forward: elapsed_ref = elapsed
+                        # Reverse: elapsed_ref = (t[-1] - elapsed)
+                        if reverse_playback:
+                            elapsed_ref = (t[-1] - elapsed)
+                        else:
+                            elapsed_ref = elapsed
+
+                        # Wrap-around handling with re-anchoring so playback loops continuously
+                        if elapsed_ref < t[0]:
+                            # Wrapped before start -> show last frame and re-anchor wall_start so we stay continuous
                             idx_target = num_images - 1
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / self.camConfig.rt_speed)
-                        if elapsed > t[-1]:
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
+                                                             else ((t[-1] - t[idx_target]) / rs))
+                        elif elapsed_ref > t[-1]:
+                            # Wrapped past end -> show first frame and re-anchor
                             idx_target = 0
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / self.camConfig.rt_speed)
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
+                                                             else ((t[-1] - t[idx_target]) / rs))
+                        else:
+                            # Inside range: pick the frame whose time is just <= elapsed_ref
+                            idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
+
                         idx_target = max(0, min(idx_target, num_images - 1))
 
-                        # if our current buffer index is behind/ahead, seek smartly:
                         if idx_target != curr_idx:
                             loader.seek(idx_target, clear_buffer=True)  # instant re-align
-                            # fetch the aligned frame immediately if available
                             got = loader.get_next(timeout=0.02)
                             if got is not None:
                                 curr_idx, frame = got
+
                         # small wait to avoid hot spinning when we're at the correct time
-                        pending_keys.extend(self._poll_keys(1))
+                        pending_keys.extend(self._poll_keys(10))
 
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     boxAround = False
@@ -1663,17 +1690,21 @@ class CameraGui():
                         pressed.clear()
                         continue
 
-                    # Map keys to actions (edge-triggered)
-                    if key == ord('f') and on_key(ord('f')):
+                    elif key == ord('f') and on_key(ord('f')):
+                        # Switch between Fixed_fps and Real_time
+                        old_mode = self.camConfig.playback_mode
                         maybe_ws = self._on_toggle_fps_mode(t, curr_idx)
-                        if maybe_ws is not None:
-                            wall_start = maybe_ws
-                        else:
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx
-                            )
-                        self.saveToCache()
 
+                        # --- Re-anchor to keep the current frame fixed ---
+                        self.camConfig.playback_mode = self.camConfig.playback_mode  # ensure updated
+                        wall_start = self._reanchor_on_mode_change(
+                            new_mode=self.camConfig.playback_mode,
+                            curr_idx=curr_idx,
+                            t=t,
+                            last_nonzero_sign=last_nonzero_sign
+                        )
+                        self.saveToCache()
+                    
                     elif key == ord('c') and on_key(ord('c')):
                         self._on_step_forward(img_slider, loader, num_images)
                         pause = True
@@ -1690,14 +1721,27 @@ class CameraGui():
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                         loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
-                    elif key == 32 and on_key(32):  # space
-                        pause = self._on_toggle_pause(img_slider, pause)
+                    elif key == ord(' ') and on_key(ord(' ')):  # space
+                        # Toggle pause/play with clean re-anchoring on resume
+                        wall_start = self._on_toggle_pause(img_slider, curr_idx, t, wall_start, last_nonzero_sign)
 
                     elif key == ord('d') and on_key(ord('d')):
-                        self._on_speed_up(img_slider)
+                        wall_start = self._on_speed_up(
+                            img_slider=img_slider,
+                            curr_idx=curr_idx,
+                            t=t,
+                            wall_start=wall_start,
+                            last_nonzero_sign=last_nonzero_sign,
+                        )
 
                     elif key == ord('a') and on_key(ord('a')):
-                        self._on_speed_down(img_slider)
+                        wall_start = self._on_speed_down(
+                            img_slider=img_slider,
+                            curr_idx=curr_idx,
+                            t=t,
+                            wall_start=wall_start,
+                            last_nonzero_sign=last_nonzero_sign,
+                        )
 
                     elif key == ord('w') and on_key(ord('w')):
                         self._on_toggle_overlays()
@@ -1707,6 +1751,17 @@ class CameraGui():
 
                     elif key == ord('e') and on_key(ord('e')):
                         self._on_mark_end(img_slider)
+
+                    elif key == ord('r') and on_key(ord('r')):
+                        last_nonzero_sign, wall_start = self._on_reverse(
+                            img_slider=img_slider,
+                            loader=loader,
+                            last_nonzero_sign=last_nonzero_sign,
+                            curr_idx=curr_idx,
+                            t=t,
+                            wall_start=wall_start,
+                        )
+                        reverse_playback = (last_nonzero_sign < 0)
 
                     # time offset nudges (small/medium/large)
                     elif key == ord(";") and on_key(ord(";")):
@@ -1738,6 +1793,93 @@ class CameraGui():
             if not self.shutting_down:
                 img_slider.close()
             loader.stop()
+
+    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t, last_nonzero_sign: int) -> float:
+        """
+        Re-anchor wall_start so the current frame stays fixed when switching modes,
+        including while reversing. Uses time.monotonic() to match the main loop.
+        """
+        now = time.monotonic()
+
+        if new_mode == PlaybackSpeed.Real_time:
+            # Map wall clock to log time (direction-aware)
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if last_nonzero_sign < 0:
+                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
+                return now - (tN - t[curr_idx]) / rs
+            else:
+                # forward: (now - wall_start)*rs == t[curr_idx] - t0
+                return now - (t[curr_idx] - t0) / rs
+
+        else:
+            # Fixed-FPS: anchor to the correct phase for direction
+            fps = max(0.001, float(self.camConfig.target_fps))
+            num_images = len(t)
+            phase = (num_images - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            return now - (phase / fps)
+
+    def _rt_reanchor(self, now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
+        """Return a new wall_start so that the effective RT timeline still maps to t[curr_idx]."""
+        rt_rate = max(1e-6, float(rt_rate))
+        t0, tN = t[0], t[-1]
+        if sign < 0:
+            # reverse: tN - (now - wall_start)*rt_rate == t[curr_idx]
+            return now - (tN - t[curr_idx]) / rt_rate
+        else:
+            # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
+            return now - (t[curr_idx] - t0) / rt_rate
+
+    def _on_reverse(self, img_slider, loader, last_nonzero_sign: int, curr_idx: int, t, wall_start: float):
+        """
+        Toggle playback direction without jumping the current frame.
+        Returns: (new_last_nonzero_sign, new_wall_start)
+        """
+        # New direction (+1 forward, -1 reverse)
+        new_sign = -1 if last_nonzero_sign > 0 else 1
+
+        # If actively playing, flip speed sign and update stride, then realign buffer at current index.
+        if getattr(img_slider, "play_speed", 0) != 0:
+            img_slider.play_speed = -img_slider.play_speed
+            try:
+                s_abs = self._stride_for_speed(abs(img_slider.play_speed))
+            except AttributeError:
+                s_abs = max(1, int(round(abs(img_slider.play_speed))))
+            if s_abs > 0:
+                loader.set_stride(new_sign * s_abs)
+                loader.seek(curr_idx, clear_buffer=True)
+
+        now = time.monotonic()
+
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            # --- Real-time: direction-aware re-anchor on the log timeline ---
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if new_sign < 0:
+                # reverse:  tN - (now - wall_start)*rs == t[curr_idx]
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                # forward:  (now - wall_start)*rs == t[curr_idx] - t0
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            # --- Fixed-FPS: anchor MUST match the phase used in the loop ---
+            # In forward, phase = curr_idx; in reverse, phase = num_images - curr_idx.
+            fps = max(0.001, float(self.camConfig.target_fps))
+            period = 1.0 / fps
+            num_images = len(t)  # or use your existing num_images variable if already in scope
+            phase = (num_images - curr_idx) if new_sign < 0 else curr_idx
+            wall_start = now - period * phase
+
+        return new_sign, wall_start
+
+    def _reanchor_wall_start_rt(self, curr_idx: int, t: np.ndarray, wall_start: float) -> float:
+        """Keep the current frame stationary when rt_speed changes."""
+        rs = float(self.camConfig.rt_speed)
+        if abs(rs) < 1e-6:  # avoid div-by-zero; treat as tiny forward speed
+            rs = 1e-6
+        now = time.monotonic()
+        # Align so: (now - wall_start) * rt_speed == t[curr_idx] - t[0]
+        return now - ((t[curr_idx] - t[0]) / rs)
 
     def _make_timebase(self, ts_raw: list[float | None], fallback_fps: float, n: int) -> np.ndarray:
         """
@@ -1811,16 +1953,88 @@ class CameraGui():
         img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
         img_slider.play_speed = 0
 
-    def _on_toggle_pause(self, img_slider, pause):
-        pause = not pause
-        img_slider.play_speed = 0 if pause else (1 if img_slider.play_speed == 0 else img_slider.play_speed)
-        return pause
+    def _on_toggle_pause(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+        """
+        Toggle pause/play.
+        - If playing: pause (play_speed -> 0) and keep wall_start (no jump on still frame).
+        - If paused: resume with last_nonzero_sign and re-anchor so current frame is preserved.
+        Returns new wall_start.
+        """
+        playing = getattr(img_slider, "play_speed", 0) != 0
 
-    def _on_speed_up(self, img_slider):
-        img_slider.play_speed = min(img_slider.play_speed + 1, 8)
+        if playing:
+            # Pause: freeze on the current frame without touching anchors
+            img_slider.play_speed = 0.0
+            return wall_start
 
-    def _on_speed_down(self, img_slider):
-        img_slider.play_speed = max(img_slider.play_speed - 1, -8)
+        # Resume: pick a reasonable magnitude (keep previous abs speed if you store it)
+        prev_mag = getattr(self, "_resume_speed_mag", None)
+        if prev_mag is None:
+            prev_mag = 1.0
+        img_slider.play_speed = float(last_nonzero_sign or 1) * prev_mag
+
+        now = time.monotonic()
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if last_nonzero_sign < 0:
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            fps = max(0.001, float(self.camConfig.target_fps))
+            wall_start = now - (curr_idx / fps)
+
+        return wall_start
+
+    def _on_speed_up(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+        """
+        Increase playback speed.
+        - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
+        - Fixed-FPS: increase target_fps, then re-anchor to current frame index.
+        Returns new wall_start.
+        """
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            # adjust rate
+            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * 1.25, 128.0)
+            # direction-aware reanchor
+            now = time.monotonic()
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if last_nonzero_sign < 0:
+                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                # forward: (now - wall_start)*rs == t[curr_idx] - t0
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            # Fixed-FPS
+            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * 1.25, 240.0)
+            fps = max(0.001, float(self.camConfig.target_fps))
+            wall_start = time.perf_counter() - (curr_idx / fps)
+        return wall_start
+
+    def _on_speed_down(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+        """
+        Decrease playback speed.
+        - RT mode: divide rt_speed, then re-anchor so current frame stays put.
+        - Fixed-FPS: decrease target_fps, then re-anchor to current frame index.
+        Returns new wall_start.
+        """
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) / 1.25, 0.01)
+            now = time.monotonic()
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if last_nonzero_sign < 0:
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            self.camConfig.target_fps = max(float(self.camConfig.target_fps) / 1.25, 0.1)
+            fps = max(0.001, float(self.camConfig.target_fps))
+            wall_start = time.perf_counter() - (curr_idx / fps)
+        return wall_start
 
     def _on_toggle_overlays(self):
         self.toggleUndistort()
@@ -1936,10 +2150,10 @@ class CameraGui():
         if display:
             (h, w) = self.markup_frame.shape[:2]
             cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                        (int(0.015*w), int(0.015*h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
+                        (int(0.015 * w), int(0.015 * h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
             cv2.putText(self.markup_frame,
                         f'Realtime: {self.camConfig.rt_speed}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.curr_fps:.2f}/{self.camConfig.target_fps:.2f}',
-                        (int(0.015*w), int(0.030*h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
+                        (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
             self.cleanup()
 
         if self.printLidar:
@@ -2050,25 +2264,25 @@ class CameraGui():
         left_tri = np.array([[cx + x * (- 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
                               cy + y * (- 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
                              [cx + x * (- 0.03 * cos_negBank + (
-                                         0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                                     0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
                               cy + y * (- 0.03 * sin_negBank - (
-                                          0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                                      0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
                              [cx + x * (- 0.03 * cos_negBank + (
-                                         -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                                     -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
                               cy + y * (- 0.03 * sin_negBank - (
-                                          -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
+                                      -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
 
         cv2.polylines(self.markup_frame, [left_tri], True, HUD_GREEN, 2)
         right_tri = np.array([[cx + x * (0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
                                cy + y * (0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
                               [cx + x * (0.03 * cos_negBank + (
-                                          0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                                      0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
                                cy + y * (0.03 * sin_negBank - (
-                                           0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
+                                       0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
                               [cx + x * (0.03 * cos_negBank + (
-                                          -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
+                                      -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
                                cy + y * (0.03 * sin_negBank - (
-                                           -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(
+                                       -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(
             int)
 
         cv2.polylines(self.markup_frame, [right_tri], True, HUD_GREEN, 2)

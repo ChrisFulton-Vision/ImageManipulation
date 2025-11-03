@@ -27,11 +27,13 @@ from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
 from LidarTruth import TruthPoints
 from SupportModules.FilterImage import ImageKernel, Gabor, applyConvolutionFilter
+from SupportModules.HUD_draw import HUD_Marker
 from TwoD_to_ThreeD import solveQnP
 from bufferImageLoader import BufferedImageLoader as imgBuf
 from convertToGif import make_gif, ExportQuality
 from quaternions import *
 from quaternions import Quaternion as q
+from SupportModules.CVFontScaling import small_text, med_text, lrg_text
 
 import logging
 
@@ -345,7 +347,9 @@ class CameraGui():
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
+        self.hud_marker = HUD_Marker()
         self.attReader = AttRdr()
+        self.lowPassFPS = 20.0
         self.pnpResult = None
         self.qnpResult = None
 
@@ -591,6 +595,7 @@ class CameraGui():
                 if getattr(self.camConfig, 'hud_data_filepath', ''):
                     if hasattr(self, 'attReader'):
                         self.attReader.read_files(self.camConfig.hud_data_filepath)
+                        self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
             except Exception:
                 pass
 
@@ -660,6 +665,7 @@ class CameraGui():
         poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select Flight Log Data')
         if poss_dir:
             self.camConfig.hud_data_filepath = poss_dir
+            self.hud_marker.read_attitude_files(poss_dir)
             self.attReader = AttRdr()
             self.attReader.read_files(poss_dir)
             self.updateFlightLogLabel()
@@ -1704,7 +1710,7 @@ class CameraGui():
                             last_nonzero_sign=last_nonzero_sign
                         )
                         self.saveToCache()
-                    
+
                     elif key == ord('c') and on_key(ord('c')):
                         self._on_step_forward(img_slider, loader, num_images)
                         pause = True
@@ -2068,9 +2074,10 @@ class CameraGui():
         print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
 
     def write_offset_csv(self):
+        self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
         self.attReader.offset += self.camConfig.cam_to_log_time_offset
         out_csv = Path(self.camConfig.hud_data_filepath) / "__TIME_OFFSET.csv"
-        pd.DataFrame({"offset": [self.attReader.offset]}).to_csv(out_csv, index=False)
+        pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
 
         self.camConfig.cam_to_log_time_offset = 0.0
 
@@ -2128,20 +2135,20 @@ class CameraGui():
             self.phase_correlation()
 
         if self.camConfig.hud and img_time is not None:
-            self.draw_hud(img_time)
+            self.hud_marker.draw_HUD(self.markup_frame, img_time)
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
+            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX, med_text(), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, HUD_GREEN, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
         if img_time is not None:
             time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-            (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, 4)
+            (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX, med_text(), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, HUD_GREEN, 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
         if box_around:
             (h, w) = self.markup_frame.shape[:2]
@@ -2149,11 +2156,12 @@ class CameraGui():
 
         if display:
             (h, w) = self.markup_frame.shape[:2]
+            self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
             cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                        (int(0.015 * w), int(0.015 * h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
+                        (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
             cv2.putText(self.markup_frame,
-                        f'Realtime: {self.camConfig.rt_speed}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.curr_fps:.2f}/{self.camConfig.target_fps:.2f}',
-                        (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_YELLOW, 1)
+                        f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                        (int(0.015 * w), int(0.060 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
             self.cleanup()
 
         if self.printLidar:
@@ -2194,186 +2202,6 @@ class CameraGui():
             print(f'QnP Result: \ncam_R_tgt:\n{self.qnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.qnpResult[1]}')
         print()
         self.printLidar = False
-
-    def draw_hud(self, img_time):
-        if self.bank_indicator_points is None:
-            self.bank_indicator_points = []
-            last_angle = -60
-            for new_angle in np.linspace(-50, 60, 12):
-                max_rad = 0.10
-                if last_angle % 30.0 == 0.0:
-                    max_rad = 0.11
-                normal_ang = 0.08
-                self.bank_indicator_points.append((0.5 + max_rad * sin(deg2rad(last_angle)),
-                                                   0.8 + max_rad * cos(deg2rad(last_angle))))
-                self.bank_indicator_points.append((0.5 + normal_ang * sin(deg2rad(last_angle)),
-                                                   0.8 + normal_ang * cos(deg2rad(last_angle))))
-                self.bank_indicator_points.append((0.5 + normal_ang * sin(deg2rad(new_angle)),
-                                                   0.8 + normal_ang * cos(deg2rad(new_angle))))
-                last_angle = new_angle
-
-            self.bank_indicator_points.append((0.5 + 0.11 * sin(deg2rad(60)),
-                                               0.8 + 0.11 * cos(deg2rad(60))))
-
-        x, y, _ = self.markup_frame.shape
-
-        # Static Bank Indicator
-        lines = (np.array([x, y]) * np.array(self.bank_indicator_points)).astype(int)
-        cv2.polylines(self.markup_frame, [lines],
-                      False, HUD_GREEN, 2)
-
-        speed, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attReader.get_attitude_at(
-            img_time)  # + 173.11338 - 11.658461)
-
-        cos_negBank = np.cos(-deg2rad(bank_angle))
-        sin_negBank = np.sin(-deg2rad(bank_angle))
-
-        # speed
-        cv2.putText(self.markup_frame, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, self.med_text, HUD_GREEN, 2)
-
-        # bank_angle = 0.0 + 60.0 * sin(img_time)
-        bank_pts = [(0.5 + 0.079 * sin(deg2rad(cmd_bank_angle)),
-                     0.8 + 0.079 * cos(deg2rad(cmd_bank_angle))),
-                    (0.5 + 0.050 * sin(deg2rad(cmd_bank_angle + 15.0)),
-                     0.8 + 0.050 * cos(deg2rad(cmd_bank_angle + 15.0))),
-                    (0.5 + 0.050 * sin(deg2rad(cmd_bank_angle - 15.0)),
-                     0.8 + 0.050 * cos(deg2rad(cmd_bank_angle - 15.0)))]
-
-        # cmd_bank_angle = 0.0 + 60.0 * cos(img_time)
-        cmd_bank_pts = [(0.5 + 0.079 * sin(deg2rad(bank_angle)),
-                         0.8 + 0.079 * cos(deg2rad(bank_angle))),
-                        (0.5 + 0.065 * sin(deg2rad(bank_angle + 10.0)),
-                         0.8 + 0.065 * cos(deg2rad(bank_angle + 10.0))),
-                        (0.5 + 0.065 * sin(deg2rad(bank_angle - 10.0)),
-                         0.8 + 0.065 * cos(deg2rad(bank_angle - 10.0)))]
-
-        lines = (np.array([x, y]) * np.array(bank_pts)).astype(int)
-        cmd_lines = (np.array([x, y]) * np.array(cmd_bank_pts)).astype(int)
-
-        # Bank Cmd
-        cv2.polylines(self.markup_frame, [lines], True, HUD_GREEN, 2)
-        # Bank Response
-        cv2.fillPoly(self.markup_frame, [cmd_lines], HUD_GREEN)
-
-        # Pitch Cmd
-        # base center of the ladder (your HUD anchor)
-        cx = x * 0.50
-        cy = y * 0.50
-
-        left_tri = np.array([[cx + x * (- 0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
-                              cy + y * (- 0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
-                             [cx + x * (- 0.03 * cos_negBank + (
-                                     0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                              cy + y * (- 0.03 * sin_negBank - (
-                                      0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
-                             [cx + x * (- 0.03 * cos_negBank + (
-                                     -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                              cy + y * (- 0.03 * sin_negBank - (
-                                      -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(int)
-
-        cv2.polylines(self.markup_frame, [left_tri], True, HUD_GREEN, 2)
-        right_tri = np.array([[cx + x * (0.01 * cos_negBank + (cmd_pitch_angle - pitch_angle) / 200.0 * sin_negBank),
-                               cy + y * (0.01 * sin_negBank - (cmd_pitch_angle - pitch_angle) / 200.0 * cos_negBank)],
-                              [cx + x * (0.03 * cos_negBank + (
-                                      0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                               cy + y * (0.03 * sin_negBank - (
-                                       0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)],
-                              [cx + x * (0.03 * cos_negBank + (
-                                      -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * sin_negBank),
-                               cy + y * (0.03 * sin_negBank - (
-                                       -0.01 + (cmd_pitch_angle - pitch_angle) / 200.0) * cos_negBank)]]).astype(
-            int)
-
-        cv2.polylines(self.markup_frame, [right_tri], True, HUD_GREEN, 2)
-
-        # Pitch Response
-        for i in [-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0]:
-            if abs(pitch_angle - i) < 25.0:
-                # vertical spacing factor (tune this)
-                pitch_spacing = 16.0
-                dy = -(pitch_angle - i) * pitch_spacing
-
-                # trig shorthands
-                sin_b = np.sin(deg2rad(bank_angle))
-                cos_b = np.cos(deg2rad(bank_angle))
-
-                # left/right extents, similar to your 0.04–0.15 scaling
-                inner = 0.04 * x
-                outer = 0.15 * x
-
-                # vertical offset by pitch, rotated by bank
-                x_offset = dy * sin_b
-                y_offset = dy * cos_b
-
-                # left line segment (outer to inner)
-                x1 = cx - outer * cos_b - x_offset
-                y1 = cy + outer * sin_b - y_offset
-                x2 = cx - inner * cos_b - x_offset
-                y2 = cy + inner * sin_b - y_offset
-
-                cv2.line(self.markup_frame,
-                         (int(x1), int(y1)),
-                         (int(x2), int(y2)),
-                         HUD_GREEN, 2)
-
-                # right line segment (inner to outer)
-                x3 = cx + inner * cos_b - x_offset
-                y3 = cy - inner * sin_b - y_offset
-                x4 = cx + outer * cos_b - x_offset
-                y4 = cy - outer * sin_b - y_offset
-
-                cv2.line(self.markup_frame,
-                         (int(x3), int(y3)),
-                         (int(x4), int(y4)),
-                         HUD_GREEN, 2)
-
-                cv2.putText(self.markup_frame, f'{i:.0f}',
-                            (int(x4 + x * 0.02), int(y4)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * font_scale(self.markup_frame.shape[1]), HUD_GREEN, 2)
-        cv2.circle(self.markup_frame, (int(cx), int(cy)), 5, HUD_GREEN, 2)
-
-        # cv2.putText(self.markup_frame, f'{pitch_angle:.2f}', (int(x * 0.51), int(y * 0.7)), cv2.FONT_HERSHEY_SIMPLEX, 1,
-        #             HUD_GREEN)
-
-        # Throttle response
-        num = 20
-        center = (int(x * 0.8), int(y * 0.50))
-        thetas = np.linspace(0.0, 245.0, num)
-        theta = cmd_throttle * 2.450
-        points = np.zeros((num, 2), int)
-        r = 0.06
-        points[:, 0] = center[0] + (np.sin(np.deg2rad(thetas)) * x * r).astype(int)
-        points[:, 1] = center[1] - (np.cos(np.deg2rad(thetas)) * x * r).astype(int)
-
-        tri = np.array([[center[0] + (np.sin(np.deg2rad(theta)) * x * (r * 0.95)),
-                         center[1] - (np.cos(np.deg2rad(theta)) * x * (r * 0.95))],
-                        [center[0] + (np.sin(np.deg2rad(theta + 5.0)) * x * (r * 0.8)),
-                         center[1] - (np.cos(np.deg2rad(theta + 5.0)) * x * (r * 0.6))],
-                        [center[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r * 0.8)),
-                         center[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r * 0.6))]], np.int32)
-
-        cv2.polylines(self.markup_frame, [points], False, HUD_GREEN, 2)  # Arc
-        cv2.fillPoly(self.markup_frame, [tri], HUD_GREEN)  # Triangle Pointer
-        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX,
-                                                    0.5 * font_scale(self.markup_frame.shape[1]), 2)
-        cv2.putText(self.markup_frame, f'{cmd_throttle:.1f}%',
-                    (int(center[0] - width / 2), int(center[1] - height / 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, self.med_text, HUD_GREEN, 2)
-
-        text_loc = np.array([.65 * x, .90 * y]).astype(int)
-        if mode == ControlMode.controller:
-            cv2.putText(self.markup_frame, "MODE: CNTL", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (255, 150, 0), 2)
-        if mode == ControlMode.manual:
-            cv2.putText(self.markup_frame, "MODE: MAN", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (255, 255, 0), 2)
-        if mode == ControlMode.auto:
-            cv2.putText(self.markup_frame, "MODE: AUTO", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, HUD_GREEN, 2)
-        if mode == ControlMode.error:
-            cv2.putText(self.markup_frame, "MODE: ERR", text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 255), 2)
 
     def update_cube_map_vectors(self):
         """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -2568,9 +2396,9 @@ class CameraGui():
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
             cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
             cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, HUD_GREEN, 4)
+                        cv2.FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
             cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, self.small_text, (0, 0, 0), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 
@@ -2626,11 +2454,11 @@ class CameraGui():
                 self.pnpResult = (quatPnP, vectPnP)
 
                 cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
-                            cv2.FONT_HERSHEY_DUPLEX, self.small_text,
+                            cv2.FONT_HERSHEY_DUPLEX, small_text(),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
                 cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
-                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, self.small_text,
+                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
 
@@ -2678,12 +2506,12 @@ class CameraGui():
             self.qnpResult = (quat, vect)
             cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
                         cv2.FONT_HERSHEY_DUPLEX,
-                        self.small_text,
+                        small_text(),
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
             cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
                         cv2.FONT_HERSHEY_DUPLEX,
-                        self.small_text,
+                        small_text(),
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
 
@@ -2944,10 +2772,10 @@ class CameraGui():
         for idx, pxPt in enumerate(points):
             cv2.circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, (0, 0, 0),
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 0),
                         12,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, self.med_text, color, 3,
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, med_text(), color, 3,
                         cv2.LINE_AA)
 
     def potentialResize(self):
@@ -2971,18 +2799,6 @@ class CameraGui():
         if poss_filepath == '':
             return None
         return poss_filepath
-
-    @property
-    def small_text(self) -> float:
-        return 0.25 * font_scale(self.curr_frame.shape[1])
-
-    @property
-    def med_text(self) -> float:
-        return .5 * font_scale(self.curr_frame.shape[1])
-
-    @property
-    def lrg_text(self) -> float:
-        return .75 * font_scale(self.curr_frame.shape[1])
 
 
 def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
@@ -3028,11 +2844,6 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     frame = cv2.add(masked_circle, masked_dimmed)
 
     return frame
-
-
-def font_scale(dim: float | int) -> float:
-    return float(dim / 640)
-
 
 def dim_entirely(frame, center, radius):
     """

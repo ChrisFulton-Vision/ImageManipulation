@@ -73,7 +73,7 @@ class HUD_Marker:
     def offset(self):
         return self.attRdr.offset
 
-    def draw_HUD(self, image: NDArray, img_time: float):
+    def draw_HUD(self, image: NDArray, img_time: float, box_around: bool):
         x, y, _ = image.shape
 
         # If image size changes
@@ -94,6 +94,9 @@ class HUD_Marker:
         self.draw_throttleResponse(image, cmd_throttle)
 
         self.draw_controlMode(image, mode)
+
+        if box_around:
+            cv2.rectangle(image, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy

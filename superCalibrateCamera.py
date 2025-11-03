@@ -20,8 +20,6 @@ from PIL import Image
 from cv2_enumerate_cameras import enumerate_cameras
 from vmbpy import *
 
-from AttitudeInterpreter import AttitudeReader as AttRdr
-from AttitudeInterpreter import ControlMode
 from Calibration import Calibration
 from FG_DrogueOnly import FactorGraph
 from ImageTimeReader import ImageTimeReader
@@ -89,7 +87,6 @@ class ImageSliderBar:
         self.refresh_interval = 1.0 / max(1.0, float(refresh_hz))  # seconds
         self._last_ui_ts = 0.0
         self._ui_pending = False
-        self._after_id = None
 
     def update_img_id(self, new_img_idx):
         self.curr_img_idx = int(new_img_idx)
@@ -100,22 +97,9 @@ class ImageSliderBar:
             return self.curr_img_idx
 
         self.curr_img_idx = (self.curr_img_idx + self.play_speed) % self.num_images
-        self._schedule_throttled_set()
         return self.curr_img_idx
 
     # ---------------- internal helpers ----------------
-
-    def _schedule_throttled_set(self):
-        """Coalesce updates to ~refresh_hz without Tk coupling."""
-        if not self.alive:
-            return
-        now = time.monotonic()
-        if (now - self._last_ui_ts) < self.refresh_interval:
-            self._ui_pending = True
-            return
-        self._ui_pending = False
-        self._last_ui_ts = now
-
     def close(self):
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
         self.alive = False
@@ -320,8 +304,6 @@ class CameraGui():
         self.showWindow = False
         self.GaborGUI = None
         self.radius = 800
-        self.ellipse_x_axis = 800
-        self.ellipse_y_axis = 800
         self.last_bounding_box_size = (800, 800)
         self.last_yolo_center = (400, 400)
         self.last_yolo_3d_estimate = (10, 0, 0)
@@ -348,7 +330,6 @@ class CameraGui():
         self.map_x = None
         self.map_y = None
         self.hud_marker = HUD_Marker()
-        self.attReader = AttRdr()
         self.lowPassFPS = 20.0
         self.pnpResult = None
         self.qnpResult = None
@@ -593,8 +574,7 @@ class CameraGui():
             # Flight log: if set, let the reader ingest
             try:
                 if getattr(self.camConfig, 'hud_data_filepath', ''):
-                    if hasattr(self, 'attReader'):
-                        self.attReader.read_files(self.camConfig.hud_data_filepath)
+                    if hasattr(self, 'hud_marker'):
                         self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
             except Exception:
                 pass
@@ -666,8 +646,6 @@ class CameraGui():
         if poss_dir:
             self.camConfig.hud_data_filepath = poss_dir
             self.hud_marker.read_attitude_files(poss_dir)
-            self.attReader = AttRdr()
-            self.attReader.read_files(poss_dir)
             self.updateFlightLogLabel()
             self.saveToCache()
 
@@ -2075,7 +2053,6 @@ class CameraGui():
 
     def write_offset_csv(self):
         self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
-        self.attReader.offset += self.camConfig.cam_to_log_time_offset
         out_csv = Path(self.camConfig.hud_data_filepath) / "__TIME_OFFSET.csv"
         pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
 
@@ -2135,7 +2112,7 @@ class CameraGui():
             self.phase_correlation()
 
         if self.camConfig.hud and img_time is not None:
-            self.hud_marker.draw_HUD(self.markup_frame, img_time)
+            self.hud_marker.draw_HUD(self.markup_frame, img_time, box_around)
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
@@ -2149,10 +2126,6 @@ class CameraGui():
             img_w, img_h, *_ = self.curr_frame.shape
             cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
-
-        if box_around:
-            (h, w) = self.markup_frame.shape[:2]
-            cv2.rectangle(self.markup_frame, (0, 0), (w - 1, h - 1), HUD_YELLOW, 10)
 
         if display:
             (h, w) = self.markup_frame.shape[:2]

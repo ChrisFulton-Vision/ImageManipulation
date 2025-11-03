@@ -5,8 +5,11 @@ import pickle
 import re
 import threading
 import time
+import sys
+
 import vmbpy.c_binding
-from SupportModules import yolo
+from vmbpy import *
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -18,13 +21,13 @@ import customtkinter as ctk
 import pandas as pd
 from PIL import Image
 from cv2_enumerate_cameras import enumerate_cameras
-from vmbpy import *
 
+from SupportModules import yolo
 from SupportModules.Calibration import Calibration
 from SupportModules.FG_DrogueOnly import FactorGraph
 from SupportModules.ImageTimeReader import ImageTimeReader
 from SupportModules.LidarTruth import TruthPoints
-from SupportModules.FilterImage import ImageKernel, Gabor, GaborGUI, applyConvolutionFilter
+from SupportModules.FilterImage import ImageKernel, GaborGUI, applyConvolutionFilter
 from SupportModules.HUD_draw import HUD_Marker
 from SupportModules.TwoD_to_ThreeD import solveQnP
 from SupportModules.bufferImageLoader import BufferedImageLoader as imgBuf
@@ -34,6 +37,10 @@ from SupportModules.quaternions import Quaternion as q
 from SupportModules.CVFontScaling import small_text, med_text
 
 import logging
+import math
+
+SPEED_STEP = math.pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
+SPEED_STEP_INV = 1.0 / SPEED_STEP
 
 LOG = logging.getLogger("superCalibrate")
 
@@ -46,10 +53,10 @@ if not LOG.handlers:
     # LOG.setLevel(logging.DEBUG)
     # LOG.setLevel(logging.WARNING)
 
-# import superCalibrate as superCal
-#pip install cv2_enumerate_cameras
-#or
-#pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
+#  import superCalibrate as superCal
+#  pip install cv2_enumerate_cameras
+#  or
+#  pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
 CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
@@ -104,6 +111,7 @@ class ImageSliderBar:
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
         self.alive = False
 
+
 class ImageSource(Enum):
     Camera_Stream = 'Camera Stream'
     Static_Image = 'Static Image'
@@ -122,7 +130,7 @@ class PlaybackSpeed(Enum):
 
 
 @dataclass
-class CameraConfig():
+class CameraConfig:
     imageFilepath: Optional[str] = None
     cam_index: int = 0
 
@@ -185,9 +193,10 @@ class CameraConfig():
                 pass
 
 
-class CameraGui():
+class CameraGui:
     def __init__(self, gui):
         # self.GifMaker = GifMaker()
+        self.recording = False
         self.gui = gui
         self.yoloSession = yolo.YOLO()
         self.camConfig = CameraConfig()
@@ -310,7 +319,8 @@ class CameraGui():
                                                     command=self.selectImagesFilepath)
         self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
         self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
-        self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider, from_=0.15)
+        self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider,
+                                           from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
         self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
         self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
 
@@ -330,8 +340,6 @@ class CameraGui():
 
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
         self.vc = None
-        # self.vc.setExceptionMode(True)
-        # self.detector = Detector(refine_edges=1, decode_sharpening=0.0)
 
         self.detector = None
         self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
@@ -388,7 +396,8 @@ class CameraGui():
                 try:
                     self.camConfig = CameraConfig()  # dataclass path
                 except Exception:
-                    pass
+                    LOG.exception("Failed to initialize CameraConfig()")
+                    raise
             self.filepath = _to_str(getattr(self, 'filepath', Path.cwd()))
             self.calibFile = _to_str(getattr(self, 'calibFile', ''))
 
@@ -398,7 +407,8 @@ class CameraGui():
                     folder_text = "./" + os.path.basename(os.path.normpath(self.filepath)) if self.filepath else "./"
                     self.selectFolderLabel.configure(text=folder_text)
                 except Exception:
-                    pass
+                    LOG.exception("Failed to initialize Folder Label")
+                    raise
             return
 
         try:
@@ -601,12 +611,11 @@ class CameraGui():
 
     def ingestCalibration(self):
 
-        if not self.calibration.fromBinFile(self.calibFile):
-            if not self.calibration.fromFile(self.calibFile):
-                if self.selectCalibLabel is not None:
-                    self.selectCalibLabel.configure(text='No Calibration Found')
-                    self.gui.after(100, self.gui.update())
-                return
+        if not self.calibration.fromBinFile(self.calibFile) and not self.calibration.fromFile(self.calibFile):
+            if self.selectCalibLabel is not None:
+                self.selectCalibLabel.configure(text='No Calibration Found')
+                self.gui.after(10, self.gui.update())
+            return
 
         if not self.calibration.validCal:
             return
@@ -638,7 +647,7 @@ class CameraGui():
         K = self.calibration.getCameraMatrix()
         D = self.calibration.getDistortion()
 
-        newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w,h), alpha=0)
+        newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
 
         self.map1, self.map2 = cv2.initUndistortRectifyMap(
             K, D, R=None, newCameraMatrix=newK, size=(w, h), m1type=cv2.CV_16SC2
@@ -1304,7 +1313,11 @@ class CameraGui():
     @staticmethod
     def _stride_for_speed(speed_abs: int) -> int:
         s = max(0, int(speed_abs))
-        return 1 if s <= 1 else min(8, s)
+        if s == 0:
+            return 0
+        if s == 1:
+            return 1
+        return min(8, s)
 
     def populate_idsTimes(self, directory):
         d = Path(directory)
@@ -1318,7 +1331,8 @@ class CameraGui():
             for image in image_list:
                 self.ImageTimeReader.idsTimes.append([image, None])
 
-    def _poll_keys(self, max_ms: int = 1) -> list[int]:
+    @staticmethod
+    def _poll_keys(max_ms: int = 1) -> list[int]:
         keys = []
         k = cv2.waitKey(max_ms) & 0xFF
         if k not in (0, 0xFF, 255, -1):
@@ -1589,8 +1603,7 @@ class CameraGui():
 
                     elif key == ord('f') and on_key(ord('f')):
                         # Switch between Fixed_fps and Real_time
-                        old_mode = self.camConfig.playback_mode
-                        maybe_ws = self._on_toggle_fps_mode(t, curr_idx)
+                        self._on_toggle_fps_mode()
 
                         # --- Re-anchor to keep the current frame fixed ---
                         self.camConfig.playback_mode = self.camConfig.playback_mode  # ensure updated
@@ -1603,7 +1616,7 @@ class CameraGui():
                         self.saveToCache()
 
                     elif key == ord('c') and on_key(ord('c')):
-                        self._on_step_forward(img_slider, loader, num_images)
+                        self._on_step_forward(img_slider, num_images)
                         pause = True
                         paused_cached_idx = None
                         paused_cached_frame = None
@@ -1611,7 +1624,7 @@ class CameraGui():
                         loader.seek(img_slider.curr_img_idx, clear_buffer=True)
 
                     elif key == ord('z') and on_key(ord('z')):
-                        self._on_step_back(img_slider, loader, num_images)
+                        self._on_step_back(img_slider)
                         pause = True
                         paused_cached_idx = None
                         paused_cached_frame = None
@@ -1624,19 +1637,15 @@ class CameraGui():
 
                     elif key == ord('d') and on_key(ord('d')):
                         wall_start = self._on_speed_up(
-                            img_slider=img_slider,
                             curr_idx=curr_idx,
                             t=t,
-                            wall_start=wall_start,
                             last_nonzero_sign=last_nonzero_sign,
                         )
 
                     elif key == ord('a') and on_key(ord('a')):
                         wall_start = self._on_speed_down(
-                            img_slider=img_slider,
                             curr_idx=curr_idx,
                             t=t,
-                            wall_start=wall_start,
                             last_nonzero_sign=last_nonzero_sign,
                         )
 
@@ -1656,7 +1665,6 @@ class CameraGui():
                             last_nonzero_sign=last_nonzero_sign,
                             curr_idx=curr_idx,
                             t=t,
-                            wall_start=wall_start,
                         )
                         reverse_playback = (last_nonzero_sign < 0)
 
@@ -1716,7 +1724,8 @@ class CameraGui():
             phase = (num_images - curr_idx) if last_nonzero_sign < 0 else curr_idx
             return now - (phase / fps)
 
-    def _rt_reanchor(self, now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
+    @staticmethod
+    def _rt_reanchor(now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
         """Return a new wall_start so that the effective RT timeline still maps to t[curr_idx]."""
         rt_rate = max(1e-6, float(rt_rate))
         t0, tN = t[0], t[-1]
@@ -1727,7 +1736,7 @@ class CameraGui():
             # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
             return now - (t[curr_idx] - t0) / rt_rate
 
-    def _on_reverse(self, img_slider, loader, last_nonzero_sign: int, curr_idx: int, t, wall_start: float):
+    def _on_reverse(self, img_slider, loader, last_nonzero_sign: int, curr_idx: int, t):
         """
         Toggle playback direction without jumping the current frame.
         Returns: (new_last_nonzero_sign, new_wall_start)
@@ -1769,16 +1778,8 @@ class CameraGui():
 
         return new_sign, wall_start
 
-    def _reanchor_wall_start_rt(self, curr_idx: int, t: np.ndarray, wall_start: float) -> float:
-        """Keep the current frame stationary when rt_speed changes."""
-        rs = float(self.camConfig.rt_speed)
-        if abs(rs) < 1e-6:  # avoid div-by-zero; treat as tiny forward speed
-            rs = 1e-6
-        now = time.monotonic()
-        # Align so: (now - wall_start) * rt_speed == t[curr_idx] - t[0]
-        return now - ((t[curr_idx] - t[0]) / rs)
-
-    def _make_timebase(self, ts_raw: list[float | None], fallback_fps: float, n: int) -> np.ndarray:
+    @staticmethod
+    def _make_timebase(ts_raw: list[float | None], fallback_fps: float, n: int) -> np.ndarray:
         """
         Build a monotone, normalized timebase (seconds) from possibly-missing timestamps.
         - If all timestamps are None: synthesize from fallback_fps.
@@ -1831,22 +1832,17 @@ class CameraGui():
 
     # --- Key action helpers (CameraGui) ---
 
-    def _on_toggle_fps_mode(self, t, curr_idx):
+    def _on_toggle_fps_mode(self):
         """Swap Fixed_fps <-> Real_time, preserving perceived position."""
         self.camConfig.playback_mode = self.camConfig.playback_mode.next()
         if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
             self.camConfig.rt_speed = 1.0
-            # align wall clock to current frame's time
-            return time.monotonic() - (t[curr_idx] - t[0]) / max(1e-9, self.camConfig.rt_speed)
-        else:
-            # fall back to fixed-fps; let caller recompute the synthetic wall_start
-            return None
 
-    def _on_step_forward(self, img_slider, loader, num_images):
+    def _on_step_forward(self, img_slider, num_images):
         img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
         img_slider.play_speed = 0
 
-    def _on_step_back(self, img_slider, loader, num_images):
+    def _on_step_back(self, img_slider):
         img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
         img_slider.play_speed = 0
 
@@ -1884,7 +1880,7 @@ class CameraGui():
 
         return wall_start
 
-    def _on_speed_up(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+    def _on_speed_up(self, curr_idx: int, t, last_nonzero_sign: int) -> float:
         """
         Increase playback speed.
         - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
@@ -1893,7 +1889,10 @@ class CameraGui():
         """
         if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
             # adjust rate
-            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * 1.25, 128.0)
+            prev_rt = self.camConfig.rt_speed
+            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * SPEED_STEP, 128.0)
+            if prev_rt < 0.99 and self.camConfig.rt_speed > 1.0:
+                self.camConfig.rt_speed = 1.0
             # direction-aware reanchor
             now = time.monotonic()
             rs = max(1e-6, float(self.camConfig.rt_speed))
@@ -1906,12 +1905,16 @@ class CameraGui():
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
             # Fixed-FPS
-            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * 1.25, 240.0)
+            prev_tgt = self.camConfig.target_fps
+            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * SPEED_STEP, 320.0)
+            if prev_tgt < 19.9 and self.camConfig.target_fps > 20.0:
+                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
             fps = max(0.001, float(self.camConfig.target_fps))
-            wall_start = time.perf_counter() - (curr_idx / fps)
+            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    def _on_speed_down(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+    def _on_speed_down(self, curr_idx: int, t, last_nonzero_sign: int) -> float:
         """
         Decrease playback speed.
         - RT mode: divide rt_speed, then re-anchor so current frame stays put.
@@ -1919,7 +1922,10 @@ class CameraGui():
         Returns new wall_start.
         """
         if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) / 1.25, 0.01)
+            prev_rt = self.camConfig.rt_speed
+            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) * SPEED_STEP_INV, 0.01)
+            if prev_rt > 1.01 and self.camConfig.rt_speed < 1.0:
+                self.camConfig.rt_speed = 1.0
             now = time.monotonic()
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
@@ -1928,9 +1934,13 @@ class CameraGui():
             else:
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
-            self.camConfig.target_fps = max(float(self.camConfig.target_fps) / 1.25, 0.1)
+            prev_tgt = self.camConfig.target_fps
+            self.camConfig.target_fps = max(float(self.camConfig.target_fps) * SPEED_STEP_INV, 0.1)
+            if prev_tgt > 20.1 and self.camConfig.target_fps < 20.0:
+                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
             fps = max(0.001, float(self.camConfig.target_fps))
-            wall_start = time.perf_counter() - (curr_idx / fps)
+            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
     def _on_toggle_overlays(self):
@@ -2011,7 +2021,7 @@ class CameraGui():
             self.hyper_focus()
 
         if self.camConfig.yoloInference:
-            self.run_yolo(img_time)
+            self.run_yolo()
         else:
             self.last_bounding_box_size = None
             self.last_yolo_center = None
@@ -2057,13 +2067,12 @@ class CameraGui():
             return self.markup_frame
 
     def print_pnp_results(self):
-        np.set_printoptions(precision=5, threshold=np.inf, suppress=True)
+        np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
 
         points = None
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
             points = []
-            distParams = np.zeros((5,))  # use image undistort instead
 
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
@@ -2090,7 +2099,7 @@ class CameraGui():
         self.printLidar = False
 
     def update_cube_map_vectors(self):
-        """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
+        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
         axes = {
             'right': ([1, 0, 0], [0, -1, 0]),
             'left': ([-1, 0, 0], [0, -1, 0]),
@@ -2107,6 +2116,7 @@ class CameraGui():
         for name, (center, up) in axes.items():
             center = np.array(center)
             up = np.array(up)
+            # noinspection PyUnreachableCode
             right = np.cross(center, up)
 
             dirs = (
@@ -2121,7 +2131,7 @@ class CameraGui():
         self.fisheye_to_cubemap_vectorized()
 
     def update_frontFace_vector(self):
-        """Return direction vectors for each cube face, shape: (6, H, W, 3)"""
+        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
         axes = {
             'front': ([0, 0, 1], [0, -1, 0])
         }
@@ -2133,6 +2143,7 @@ class CameraGui():
         for name, (center, up) in axes.items():
             center = np.array(center)
             up = np.array(up)
+            # noinspection PyUnreachableCode
             right = np.cross(center, up)
 
             dirs = (
@@ -2240,12 +2251,6 @@ class CameraGui():
         else:
             self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
                                         borderMode=cv2.BORDER_CONSTANT)
-            # self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_NEAREST,
-            #                             borderMode=cv2.BORDER_CONSTANT)
-
-            # self.curr_frame = cv2.undistort(src=frame,
-            #                                 cameraMatrix=self.calibration.getCameraMatrix(),
-            #                                 distCoeffs=self.calibration.getDistortion())
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernel.Gabor and self.GaborGUI is not None:
@@ -2325,10 +2330,6 @@ class CameraGui():
                                            cameraMatrix=self.calibration.getCameraMatrix(),
                                            distCoeffs=distParams,
                                            flags=cv2.SOLVEPNP_ITERATIVE)
-            # probeTip_3d = np.array([[0.0], [0.0], [0.0]])
-            # self.projectProbe, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec,
-            #                                          cameraMatrix=self.calibration.getCameraMatrix(),
-            #                                          distCoeffs=distParams)
 
             if ret:
                 projectedPoints_orig, _ = cv2.projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
@@ -2355,12 +2356,11 @@ class CameraGui():
 
     def qnpLidarPoints(self):
 
-        ret = False
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
 
             points = []
-            distParams = np.zeros((5,))  # use image undistort instead
+            # distParams = np.zeros((5,))  # use image undistort instead
 
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
@@ -2370,8 +2370,8 @@ class CameraGui():
                     removeIDs.append(idx)
 
             centers = self.centers.copy()
-            for id in reversed(removeIDs):
-                centers = np.delete(centers, id, axis=0)
+            for idx in reversed(removeIDs):
+                centers = np.delete(centers, idx, axis=0)
             points = np.array(points)
 
             if len(points) < 6:
@@ -2500,7 +2500,7 @@ class CameraGui():
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
                                                   y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
-    def run_yolo(self, img_time):
+    def run_yolo(self):
         '''
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
@@ -2697,9 +2697,8 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     Dims an image everywhere except inside a circle.
 
     Args:
-        image_path (np.array): the image
+        frame (np.array): the image
         center (tuple): (x, y) coordinates of the circle's center.
-        radius (int): Radius of the circle.
         dim_factor (float): Dimming factor (0 to 1, 0 for black, 1 for no dimming).
     """
 
@@ -2710,14 +2709,14 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
         # 1. Create a mask
         mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
-        cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+        cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
 
     else:
         mask = np.zeros(frame.shape[:2], dtype='uint8')
         # cv2.rectangle(mask, (int(center[0]-x_axes),int(center[1]-y_axes)),(int(center[0]+x_axes),int(center[1]+y_axes)),
         #               color=255, thickness=-1)
         cv2.ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
-                    angle=0, startAngle=0, endAngle=360, color=255, thickness=-1)
+                    angle=0, startAngle=0, endAngle=360, color=(255, 255, 255), thickness=-1)
 
     # 2. Dim the entire image
     dimmed_img = (frame * dim_factor).astype("uint8")
@@ -2736,20 +2735,20 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
     return frame
 
+
 def dim_entirely(frame, center, radius):
     """
     Dims an image everywhere except inside a circle.
 
     Args:
-        image_path (np.array): the image
+        frame (np.array): the image
         center (tuple): (x, y) coordinates of the circle's center.
         radius (int): Radius of the circle.
-        dim_factor (float): Dimming factor (0 to 1, 0 for black, 1 for no dimming).
     """
 
     # 1. Create a mask
     mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
-    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), 255, -1)  # White circle on mask
+    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
 
     # 3. Copy the original circle area back to the dimmed image
     return cv2.bitwise_and(frame, frame, mask=mask)

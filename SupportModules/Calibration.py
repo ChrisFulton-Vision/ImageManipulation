@@ -6,7 +6,6 @@ from os.path import join
 
 import numpy as np
 
-
 class Calibration:
     def __init__(self, filepath=None):
         self.fx = None
@@ -189,15 +188,40 @@ class Calibration:
             pkl.dump(self, file)
 
     def fromBinFile(self, fileDirectory):
-        if os.path.exists(join(fileDirectory, 'calibration.pkl')):
-            with open(join(fileDirectory, 'calibration.pkl'), 'rb') as file:
-                self.copy(pkl.load(file))
-                return True
-        if os.path.basename(fileDirectory) == 'calibration.pkl':
-            with open(fileDirectory, 'rb') as file:
-                self.copy(pkl.load(file))
-                return True
-        return False
+        import sys, io, types, pickle as _pkl
+
+        # Resolve the .pkl path (supports either a directory or direct .pkl file)
+        if os.path.isdir(fileDirectory):
+            filepath = join(fileDirectory, 'calibration.pkl')
+        else:
+            filepath = fileDirectory
+
+        if not (os.path.exists(filepath) and filepath.lower().endswith('.pkl')):
+            return False
+
+        class _CompatUnpickler(_pkl.Unpickler):
+            def find_class(self, module, name):
+                # Old location recorded in the pickle
+                if module in ('Calibration', '__main__') and name == 'Calibration':
+                    return Calibration  # current class in this module
+                # New location (if you ever rename/move again, add more mappings here)
+                if module.endswith('SupportModules.Calibration') and name == 'Calibration':
+                    return Calibration
+                return super().find_class(module, name)
+
+        with open(filepath, 'rb') as f:
+            try:
+                obj = _CompatUnpickler(f).load()
+            except ModuleNotFoundError:
+                # Fallback: quickly shim a fake module named "Calibration" that points here
+                shim = types.ModuleType('Calibration')
+                shim.Calibration = Calibration
+                sys.modules.setdefault('Calibration', shim)
+                f.seek(0)
+                obj = _pkl.load(f)
+
+        self.copy(obj)
+        return True
 
     def toFile(self, fileDirectory):
         with open(join(fileDirectory, 'calibration.txt'), 'w') as file:
@@ -206,7 +230,7 @@ class Calibration:
     def fromFile(self, fileDirectory):
         if os.path.exists(join(fileDirectory, 'calibration.txt')):
             filepath = join(fileDirectory, 'calibration.txt')
-        elif os.path.exists(fileDirectory) and fileDirectory[-4:] == '.txt':
+        elif os.path.exists(fileDirectory) and fileDirectory.lower().endswith('.txt'):
             filepath = fileDirectory
         else:
             return False

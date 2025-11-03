@@ -5,10 +5,10 @@ from os.path import join
 from enum import Enum
 
 class ControlMode(Enum):
-    auto = 'auto'
-    manual = 'manual'
+    auto       = 'auto'
+    manual     = 'manual'
     controller = 'controller'
-    error = 'error'
+    error      = 'error'
 
 class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
@@ -20,8 +20,8 @@ class AttitudeReader:
         # numpy caches
         self.spd_t = self.spd_v = None                  # ARSP.csv
         self.att_t = self.roll = self.desroll = None    # ATT.csv
-        self.pitch = self.despitch = None
-        self.cmd_t = self.c1 = self.c3 = self.c8 = None # RCOU.csv
+        self.pitch = self.despitch = None               # ATT.csv
+        self.cmd_t = self.c3 = self.c8 = None           # RCOU.csv
         self.cmd_throttle_perc = None                   # pre-mapped throttle %
 
         self.offset = 0.0
@@ -67,9 +67,9 @@ class AttitudeReader:
         self.despitch = self.roll_dict['DesPitch'].to_numpy(np.float32)
 
         self.cmd_t = self.cmd_dict['timestamp'].to_numpy(np.float64)
-        self.c1    = self.cmd_dict['C1'].to_numpy(np.float32)
-        self.c3    = self.cmd_dict['C3'].to_numpy(np.float32)  # throttle pwm
-        self.c8    = self.cmd_dict['C8'].to_numpy(np.float32)  # mode pwm
+        # self.c1 = self.cmd_dict['C1'].to_numpy(np.float32)
+        self.c3 = self.cmd_dict['C3'].to_numpy(np.float32)  # throttle pwm
+        self.c8 = self.cmd_dict['C8'].to_numpy(np.float32)  # mode pwm
 
         # pre-map throttle → percent now so per-frame work is only one interp
         self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c3).astype(np.float32)

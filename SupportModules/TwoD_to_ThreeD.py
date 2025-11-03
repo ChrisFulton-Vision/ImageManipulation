@@ -33,9 +33,9 @@ with noisy measurements, the initializer results, and the final optimized pose.
 """
 
 from sys import maxsize
-from quaternions import Quaternion as q
-from quaternions import *
-from Calibration import Calibration
+from SupportModules.quaternions import Quaternion as q
+from SupportModules.quaternions import *
+from SupportModules.Calibration import Calibration
 import numpy as np
 from numpy import square as sq
 from numpy.linalg import norm

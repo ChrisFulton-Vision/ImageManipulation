@@ -1,13 +1,9 @@
 import cv2
-import numpy as np
-import onnxruntime as ort
 import os, glob, re, datetime
-from Calibration import Calibration
-from metaYoloReader import MetaYoloReader
+from SupportModules.Calibration import Calibration
+from SupportModules.metaYoloReader import MetaYoloReader
 import copy
-import matplotlib.pyplot as plt
-from quaternions import Quaternion as q
-from quaternions import *
+from SupportModules.quaternions import *
 
 for key in ("CUDA_PATH", "CUDNN_PATH"):
     p = os.environ.get(key)

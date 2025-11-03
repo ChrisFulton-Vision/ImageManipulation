@@ -8,7 +8,7 @@ from threading import Thread
 from PIL import Image
 from enum import Enum
 
-from Calibration import Calibration
+from SupportModules.Calibration import Calibration
 import superCalibrateCamera as cam
 
 sys.path.append(os.getcwd())

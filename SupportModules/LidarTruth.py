@@ -59,7 +59,7 @@ class TruthPoints:
         return truthPointsArray
 
     def saveToCache(self):
-        with open('LIDAR_Truth_Points.pkl', 'wb') as f:
+        with open('../LIDAR_Truth_Points.pkl', 'wb') as f:
             pickle.dump(self, f)
 
     def copy(self, classToCopy):

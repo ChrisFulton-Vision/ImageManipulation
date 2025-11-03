@@ -1,9 +1,9 @@
 import cv2
 import numpy as np
-from numpy import sin, cos, deg2rad, rad2deg
-from AttitudeInterpreter import AttitudeReader as AttRdr
-from AttitudeInterpreter import ControlMode
-from SupportModules.CVFontScaling import small_text, med_text, lrg_text
+from numpy import sin, cos, deg2rad
+from SupportModules.AttitudeInterpreter import AttitudeReader as AttRdr
+from SupportModules.AttitudeInterpreter import ControlMode
+from SupportModules.CVFontScaling import med_text
 from numpy.typing import NDArray
 from math import sin, cos, radians
 

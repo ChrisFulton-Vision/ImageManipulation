@@ -6,8 +6,8 @@ import re
 import threading
 import time
 import vmbpy.c_binding
-import yolo
-from dataclasses import dataclass, asdict
+from SupportModules import yolo
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from enum import Enum
@@ -20,18 +20,18 @@ from PIL import Image
 from cv2_enumerate_cameras import enumerate_cameras
 from vmbpy import *
 
-from Calibration import Calibration
-from FG_DrogueOnly import FactorGraph
-from ImageTimeReader import ImageTimeReader
-from LidarTruth import TruthPoints
-from SupportModules.FilterImage import ImageKernel, Gabor, applyConvolutionFilter
+from SupportModules.Calibration import Calibration
+from SupportModules.FG_DrogueOnly import FactorGraph
+from SupportModules.ImageTimeReader import ImageTimeReader
+from SupportModules.LidarTruth import TruthPoints
+from SupportModules.FilterImage import ImageKernel, Gabor, GaborGUI, applyConvolutionFilter
 from SupportModules.HUD_draw import HUD_Marker
-from TwoD_to_ThreeD import solveQnP
-from bufferImageLoader import BufferedImageLoader as imgBuf
-from convertToGif import make_gif, ExportQuality
-from quaternions import *
-from quaternions import Quaternion as q
-from SupportModules.CVFontScaling import small_text, med_text, lrg_text
+from SupportModules.TwoD_to_ThreeD import solveQnP
+from SupportModules.bufferImageLoader import BufferedImageLoader as imgBuf
+from SupportModules.convertToGif import make_gif, ExportQuality
+from SupportModules.quaternions import *
+from SupportModules.quaternions import Quaternion as q
+from SupportModules.CVFontScaling import small_text, med_text
 
 import logging
 
@@ -103,106 +103,6 @@ class ImageSliderBar:
     def close(self):
         """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
         self.alive = False
-
-
-class GaborGUI:
-    def __init__(self):
-        self.pop_up = ctk.CTkToplevel()
-        self.pop_up.title('Gabor Controls')
-        self.pop_up.lift()
-        self.gaborFilter = Gabor()
-
-        self.sigma_label = None
-        self.theta_label = None
-        self.lambd_label = None
-        self.gamma_label = None
-        self.psi_label = None
-
-        self.pop_up.geometry('200x350')
-        self.pop_up.grid_columnconfigure([0, 1], weight=1)
-        self.configure_pop_up()
-
-    def configure_pop_up(self):
-        rowID = 0
-        self.sigma_label = ctk.CTkLabel(self.pop_up, text=f'Sigma: {self.gaborFilter.sigma:.2f}')
-        self.sigma_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-        sigma_slider = ctk.CTkSlider(self.pop_up, from_=0.01, to=10.0, command=self.update_sigma)
-        sigma_slider.set(self.gaborFilter.sigma)
-        sigma_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
-        self.theta_label = ctk.CTkLabel(self.pop_up, text=f'Theta: {rad2deg(self.gaborFilter.theta):.2f}')
-        self.theta_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-        theta_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=360, command=self.update_theta)
-        theta_slider.set(rad2deg(self.gaborFilter.theta))
-        theta_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
-        self.lambd_label = ctk.CTkLabel(self.pop_up, text=f'Lambda: {self.gaborFilter.lambd:.2f}')
-        self.lambd_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-        lambd_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=10.0, command=self.update_lambd)
-        lambd_slider.set(self.gaborFilter.lambd)
-        lambd_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
-        self.gamma_label = ctk.CTkLabel(self.pop_up, text=f'Gamma: {self.gaborFilter.gamma:.2f}')
-        self.gamma_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-        gamma_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=1.0, command=self.update_gamma)
-        gamma_slider.set(self.gaborFilter.gamma)
-        gamma_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
-        self.psi_label = ctk.CTkLabel(self.pop_up, text=f'Psi: {self.gaborFilter.psi:.2f}')
-        self.psi_label.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-        psi_slider = ctk.CTkSlider(self.pop_up, from_=0.0, to=360, command=self.update_psi)
-        psi_slider.set(rad2deg(self.gaborFilter.psi))
-        psi_slider.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
-
-    def update_sigma(self, new_sigma: float):
-        self.gaborFilter.sigma = new_sigma
-        self.sigma_label.configure(text=f'Sigma: {self.gaborFilter.sigma:.2f}')
-
-    def update_theta(self, new_thetaD: float):
-        self.gaborFilter.theta = deg2rad(new_thetaD)
-        self.theta_label.configure(text=f'Theta: {rad2deg(self.gaborFilter.theta):.2f}')
-
-    def update_lambd(self, new_lambd: float):
-        self.gaborFilter.lambd = new_lambd
-        self.lambd_label.configure(text=f'Lambda: {self.gaborFilter.lambd:.2f}')
-
-    def update_gamma(self, new_gamma: float):
-        self.gaborFilter.gamma = new_gamma
-        self.gamma_label.configure(text=f'Gamma: {self.gaborFilter.gamma:.2f}')
-
-    def update_psi(self, new_psiD: float):
-        self.gaborFilter.psi = deg2rad(new_psiD)
-        self.psi_label.configure(text=f'Psi: {rad2deg(self.gaborFilter.psi):.2f}')
-
-    def filter_kernel(self):
-        if not self.pop_up.winfo_exists():
-            self.pop_up = ctk.CTkToplevel()
-            self.pop_up.title('Gabor Filter Controls')
-            self.pop_up.focus_force()
-            self.pop_up.geometry('200x500')
-            self.pop_up.grid_columnconfigure([0, 1], weight=1)
-            self.configure_pop_up()
-
-        return cv2.getGaborKernel(self.gaborFilter.ksize,
-                                  self.gaborFilter.sigma,
-                                  self.gaborFilter.theta,
-                                  self.gaborFilter.lambd,
-                                  self.gaborFilter.gamma,
-                                  self.gaborFilter.psi)
-
-    def close(self):
-        self.pop_up.destroy()
-        self.pop_up.update()
-
 
 class ImageSource(Enum):
     Camera_Stream = 'Camera Stream'
@@ -334,6 +234,9 @@ class CameraGui():
         self.pnpResult = None
         self.qnpResult = None
 
+        # Optimization for undistort
+        self.map1, self.map2 = None, None
+
         self.threadStopper = ThreadStopper()
         self._thread = None
 
@@ -456,7 +359,6 @@ class CameraGui():
         """
         from pathlib import Path
         import pickle
-        import logging
         import os
 
         def _to_str(p):
@@ -731,6 +633,17 @@ class CameraGui():
         self.cubemapCheckbox.configure(state=cube_state)
 
         self.yoloSession.set_calibration(self.calibration)
+
+        w, h = self.calibration.width, self.calibration.height
+        K = self.calibration.getCameraMatrix()
+        D = self.calibration.getDistortion()
+
+        newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w,h), alpha=0)
+
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            K, D, R=None, newCameraMatrix=newK, size=(w, h), m1type=cv2.CV_16SC2
+        )
+
         self.saveToCache()
 
     def scanForCameras(self):
@@ -2325,9 +2238,14 @@ class CameraGui():
                 # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
                 self.curr_frame = self.cubemap_faces['front']
         else:
-            self.curr_frame = cv2.undistort(src=frame,
-                                            cameraMatrix=self.calibration.getCameraMatrix(),
-                                            distCoeffs=self.calibration.getDistortion())
+            self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_CONSTANT)
+            # self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_NEAREST,
+            #                             borderMode=cv2.BORDER_CONSTANT)
+
+            # self.curr_frame = cv2.undistort(src=frame,
+            #                                 cameraMatrix=self.calibration.getCameraMatrix(),
+            #                                 distCoeffs=self.calibration.getDistortion())
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernel.Gabor and self.GaborGUI is not None:

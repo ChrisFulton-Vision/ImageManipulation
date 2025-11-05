@@ -80,7 +80,7 @@ class HUD_Marker:
         if x != self.last_xy[0] or y != self.last_xy[1]:
             self.update_storage(x, y)
 
-        speed, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
+        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
             img_time)  # + 173.11338 - 11.658461)
 
         # Speed
@@ -90,6 +90,8 @@ class HUD_Marker:
         self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
 
         self.draw_pitchAngle(image, pitch_angle, bank_angle)
+
+        self.draw_altitude(image, alt)
 
         self.draw_throttleResponse(image, cmd_throttle)
 
@@ -241,6 +243,18 @@ class HUD_Marker:
             )
 
         cv2.circle(image, (int(cx), int(cy)), 5, green, 2)
+
+    def draw_altitude(self, image, alt):
+        x, y = self.last_xy
+
+        alt_text = f'{alt:.0f}'
+
+        (width, height), baseline = cv2.getTextSize(alt_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                    med_text(), 2)
+
+        cv2.putText(image, alt_text,
+                    (int(0.75 * x - width / 2), int(0.4 * y - height / 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
     def draw_throttleResponse(self, image, cmd_throttle):
         # Throttle response

@@ -14,12 +14,14 @@ class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
         # raw dfs (only used during load)
         self.spd_dict = None
+        self.alt_dict = None
         self.roll_dict = None
         self.cmd_dict = None
 
         # numpy caches
         self.spd_t = self.spd_v = None                  # ARSP.csv
         self.att_t = self.roll = self.desroll = None    # ATT.csv
+        self.alt_t = self.alt = None                    # BARO.csv
         self.pitch = self.despitch = None               # ATT.csv
         self.cmd_t = self.c3 = self.c8 = None           # RCOU.csv
         self.cmd_throttle_perc = None                   # pre-mapped throttle %
@@ -30,35 +32,65 @@ class AttitudeReader:
             self.read_files(csv_folder_path)
 
     def read_files(self, csv_folder_path: str):
+
         try:
             self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
+            self.alt_dict = pd.read_csv(join(csv_folder_path, 'BARO.csv'))
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
             self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
         except FileNotFoundError:
+            print("Error... file not found")
             return False
 
         # validate columns (same checks you had)
-        if not {'timestamp', 'Airspeed'}.issubset(self.spd_dict.columns): return False
-        if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns): return False
-        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns): return False
+        if not {'timestamp', 'Airspeed'}.issubset(self.spd_dict.columns):
+            print("ARSP.csv file not in expected format.")
+            return False
+        if not {'timestamp', 'Alt'}.issubset(self.alt_dict.columns):
+            print("BARO.csv file not in expected format.")
+            return False
+        if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch'}.issubset(self.roll_dict.columns):
+            print("ATT.csv file not in expected format.")
+            return False
+        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns):
+            print("RCOU.csv file not in expected format.")
+            return False
 
         # stable ascending time -> better for np.interp
         self.spd_dict = self.spd_dict.sort_values('timestamp').reset_index(drop=True)
+        self.alt_dict = self.alt_dict.sort_values('timestamp').reset_index(drop=True)
         self.roll_dict = self.roll_dict.sort_values('timestamp').reset_index(drop=True)
         self.cmd_dict = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
 
-        offset_dict = {}
+        # --- Read or synthesize time offset as a DataFrame consistently ---
         try:
-            offset_dict    = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
+            offset_df = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
+            # Be forgiving about column naming
+            if 'offset' not in offset_df.columns:
+                # Try common alternatives; add your own as needed
+                for cand in ('time_offset', 'Offset', 'OFFSET'):
+                    if cand in offset_df.columns:
+                        offset_df = offset_df.rename(columns={cand: 'offset'})
+                        break
+            if 'offset' not in offset_df.columns:
+                raise ValueError("__TIME_OFFSET.csv missing required 'offset' column")
         except FileNotFoundError:
-            offset_dict['offset'] = [self.spd_dict['timestamp'][0].to_numpy(np.float64)]
+            print("No __TIME_OFFSET.csv found; defaulting offset to first ARSP timestamp.")
+            t0 = float(self.spd_dict['timestamp'].iloc[0])
+            offset_df = pd.DataFrame({'offset': [t0]})
+        except Exception as e:
+            print("Unexpected error while reading __TIME_OFFSET.csv:\n", e)
+            return False
 
-        self.offset = float(offset_dict['offset'][0])
+        self.offset = float(offset_df['offset'][0])
 
         # ---- one-time conversion to NumPy (choose dtypes deliberately) ----
         # timestamps as float64 (interp domain), signals as float32 (fast + compact)
         self.spd_t = self.spd_dict['timestamp'].to_numpy(np.float64)
         self.spd_v = self.spd_dict['Airspeed' ].to_numpy(np.float32)
+
+        self.alt_t = self.alt_dict['timestamp'].to_numpy(np.float64)
+        self.alt = self.alt_dict['Alt'].to_numpy(np.float32)
 
         self.att_t    = self.roll_dict['timestamp'].to_numpy(np.float64)
         self.roll     = self.roll_dict['Roll'    ].to_numpy(np.float32)
@@ -81,19 +113,24 @@ class AttitudeReader:
         return True
 
     def get_attitude_at(self, query_time):
-        if not self.ready:
-            return 180.0, 0.0, 180.0, 0.0, 0.0, False
 
         t = float(query_time) + self.offset
 
-        # print(f'Query_time: {query_time}\nOffset: {self.offset}\nt: {t}\nZero: {self.att_t[0]}\nMax: {self.att_t[-1]}\n\n')
-        
+        # print(f'Query_time: {query_time}')
+        # print(f'Offset: {self.offset}')
+        # print(f't: {t}\nZero: {self.att_t[0]}\nMax: {self.att_t[-1]}\n\n')
+
+        if not self.ready:
+            return 180.0, 0.0, 0.0, 180.0, 0.0, 0.0, 0.0, False
+
+
         # fast O(1) bound checks using NumPy arrays
         if t < self.att_t[0] or t > self.att_t[-1]:
-            return 180.0, 0.0, 180.0, 0.0, 0.0, False
+            return 180.0, 0.0, 0.0, 180.0, 0.0, 0.0, 0.0, False
 
         # all-NumPy interpolation (x arrays are strictly ascending)
         spd        = np.interp(t, self.spd_t, self.spd_v)
+        alt        = np.interp(t, self.alt_t, self.alt)
         roll       = np.interp(t, self.att_t, self.roll)
         cmd_roll   = np.interp(t, self.att_t, self.desroll)
         pitch      = np.interp(t, self.att_t, self.pitch)
@@ -103,7 +140,7 @@ class AttitudeReader:
         # mode_pwm   = np.interp(t, self.cmd_t, self.c8)
         mode       = self.ch8_pwm_to_mode(np.interp(t, self.cmd_t, self.c8))
 
-        return spd, roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
+        return spd, alt, roll, cmd_roll, pitch, cmd_pitch, float(thr_perc), mode
 
     @staticmethod
     def ch8_pwm_to_mode(ch8):

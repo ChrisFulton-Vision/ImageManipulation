@@ -533,8 +533,10 @@ class CameraGui:
         fp = self.askFilepath(str(init_dir), "Select Imagery Folder")
         if fp:
             self.filepath = fp
+            self.camConfig.hud_data_filepath = fp
             self.saveToCache()
             self.loadFromCache()
+
 
     def loadCalibration(self):
         init_dir = Path(self.calibFile or self.filepath or Path.cwd()).parent
@@ -1511,7 +1513,7 @@ class CameraGui:
                 # ===== display / HUD =====
                 if frame is not None and Path(paths[curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
 
-                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not pause:
                         period = 1.0 / self.camConfig.target_fps
                         target_time = wall_start + period * (
                             curr_idx if not reverse_playback else num_images - curr_idx)
@@ -1520,45 +1522,29 @@ class CameraGui:
                                 curr_idx if not reverse_playback else num_images - curr_idx)
                         pending_keys = sleep_until(target_time)
 
-                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-                        # elapsed wall time scaled by speed (always non-negative)
-                        rs = float(self.camConfig.rt_speed)
-                        if rs <= 0:
-                            rs = 1e-6
+                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not pause:
+                        rs = float(self.camConfig.rt_speed) or 1e-6
                         elapsed = (time.monotonic() - wall_start) * rs
+                        elapsed_ref = (t[-1] - elapsed) if reverse_playback else elapsed
 
-                        # Map to a target time on the log timeline
-                        # Forward: elapsed_ref = elapsed
-                        # Reverse: elapsed_ref = (t[-1] - elapsed)
-                        if reverse_playback:
-                            elapsed_ref = (t[-1] - elapsed)
-                        else:
-                            elapsed_ref = elapsed
-
-                        # Wrap-around handling with re-anchoring so playback loops continuously
                         if elapsed_ref < t[0]:
-                            # Wrapped before start -> show last frame and re-anchor wall_start so we stay continuous
                             idx_target = num_images - 1
                             wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
                                                              else ((t[-1] - t[idx_target]) / rs))
                         elif elapsed_ref > t[-1]:
-                            # Wrapped past end -> show first frame and re-anchor
                             idx_target = 0
                             wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
                                                              else ((t[-1] - t[idx_target]) / rs))
                         else:
-                            # Inside range: pick the frame whose time is just <= elapsed_ref
                             idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
 
                         idx_target = max(0, min(idx_target, num_images - 1))
-
                         if idx_target != curr_idx:
-                            loader.seek(idx_target, clear_buffer=True)  # instant re-align
+                            loader.seek(idx_target, clear_buffer=True)
                             got = loader.get_next(timeout=0.02)
                             if got is not None:
                                 curr_idx, frame = got
 
-                        # small wait to avoid hot spinning when we're at the correct time
                         pending_keys.extend(self._poll_keys(10))
 
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
@@ -1673,14 +1659,18 @@ class CameraGui:
                         self._on_adjust_offset(-0.01)
                     elif key == ord("'") and on_key(ord("'")):
                         self._on_adjust_offset(+0.01)
-                    elif key == ord('[') and on_key(ord('[')):
+                    elif key == ord(':') and on_key(ord(':')):
                         self._on_adjust_offset(-0.10)
-                    elif key == ord(']') and on_key(ord(']')):
+                    elif key == ord('"') and on_key(ord('"')):
                         self._on_adjust_offset(+0.10)
-                    elif key == ord('{') and on_key(ord('{')):
+                    elif key == ord('[') and on_key(ord('[')):
                         self._on_adjust_offset(-1.00)
-                    elif key == ord('}') and on_key(ord('}')):
+                    elif key == ord(']') and on_key(ord(']')):
                         self._on_adjust_offset(+1.00)
+                    elif key == ord('{') and on_key(ord('{')):
+                        self._on_adjust_offset(-10.00)
+                    elif key == ord('}') and on_key(ord('}')):
+                        self._on_adjust_offset(+10.00)
                     elif key == ord('p') and on_key(ord('p')):
                         self._on_persist_offset()
 
@@ -1856,6 +1846,8 @@ class CameraGui:
         playing = getattr(img_slider, "play_speed", 0) != 0
 
         if playing:
+            # Remember magnitude so resume uses prior |speed|
+            self._resume_speed_mag = max(1.0, abs(getattr(img_slider, "play_speed", 1.0)))
             # Pause: freeze on the current frame without touching anchors
             img_slider.play_speed = 0.0
             return wall_start
@@ -1876,7 +1868,8 @@ class CameraGui:
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
             fps = max(0.001, float(self.camConfig.target_fps))
-            wall_start = now - (curr_idx / fps)
+            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
 
         return wall_start
 
@@ -1970,9 +1963,9 @@ class CameraGui:
         self.camConfig.cam_to_log_time_offset += float(delta)
 
     def _on_persist_offset(self):
+        offset = deepcopy(self.camConfig.cam_to_log_time_offset)
         self.write_offset_csv()
-        # if you added logging already, this becomes LOG.info(...)
-        print(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
+        print(f"Saved offset {offset:+.3f}s to __TIME_OFFSET.csv")
 
     def write_offset_csv(self):
         self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)

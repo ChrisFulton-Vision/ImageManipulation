@@ -26,7 +26,7 @@ class Quaternion:
     __array_priority__ = 10_000  # overrides numpy priority for right mult
 
     def __init__(self, s: float = None, vec: np.array = None, quat: np.array = None, makeUnitQuat: bool = True) -> None:
-        # These two parameters form the definition of the quaternion. self.s is a scalar asscoiated with the
+        # These two parameters form the definition of the quaternion. self.s is a scalar associated with the
         # real component of the quaternion, while self.vec is the vector, associated with i, j, k / x, y, z components
         self.s: float = 1.0
         self.vec: np.array = np.zeros((3,))
@@ -513,6 +513,20 @@ class Quaternion:
         return (power * self.ln).exp.normalize()
 
     @staticmethod
+    def from_axis_angle(axis: np.ndarray, angle: float) -> Self:
+        axis = np.asarray(axis, dtype=float)
+        axis /= np.linalg.norm(axis)
+        half = 0.5 * angle
+        return Quaternion(s=np.cos(half), vec=axis * np.sin(half))
+
+    def to_axis_angle(self) -> tuple[np.ndarray, float]:
+        if np.linalg.norm(self.vec) < 1e-12:
+            return np.array([1.0, 0.0, 0.0]), 0.0
+        axis = self.vec / np.linalg.norm(self.vec)
+        angle = 2.0 * np.arctan2(np.linalg.norm(self.vec), self.s)
+        return axis, angle
+
+    @staticmethod
     def from_rodrigues(rod_vec: np.ndarray) -> Self:
         r = np.asarray(rod_vec, dtype=float).reshape(3)
         theta = float(np.linalg.norm(r))
@@ -575,8 +589,15 @@ def interpolate(q1: Quaternion, q2: Quaternion, t: float):
     return interp
 
 
-def randomQuat(unit=True):
-    return Quaternion(quat=np.random.rand(4, ), makeUnitQuat=unit)
+def randomQuat():
+    u1, u2, u3 = np.random.rand(3)
+    q = Quaternion(quat=np.array([
+        np.sqrt(1 - u1) * np.sin(2 * np.pi * u2),
+        np.sqrt(1 - u1) * np.cos(2 * np.pi * u2),
+        np.sqrt(u1) * np.sin(2 * np.pi * u3),
+        np.sqrt(u1) * np.cos(2 * np.pi * u3),
+        ]))
+    return q
 
 
 def left_quat_productDeriv(quatL, quatR, isTargetConjugated):
@@ -968,81 +989,14 @@ def mat2quat(M):
     return Quaternion(s=float(q[0]), vec=q[1:])
 
 
-def mat2quat_jumbled(M):
-    ''' Calculate quaternion corresponding to given rotation matrix
+def mats2quats(mats: np.ndarray) -> np.ndarray:
+    """Convert array of Nx3x3 matrices to Nx4 quaternions."""
+    return np.array([mat2quat(M).ndarray for M in mats])
 
-    Method claimed to be robust to numerical errors in `M`.
 
-    Constructs quaternion by calculating maximum eigenvector for matrix
-    ``K`` (constructed from input `M`).  Although this is not tested, a maximum
-    eigenvalue of 1 corresponds to a valid rotation.
-
-    A quaternion ``q*-1`` corresponds to the same rotation as ``q``; thus the
-    sign of the reconstructed quaternion is arbitrary, and we return
-    quaternions with positive w (q[0]).
-
-    See notes.
-
-    Parameters
-    ----------
-    M : array-like
-      3x3 rotation matrix
-
-    Returns
-    -------
-    q : (4,) array
-      closest quaternion to input matrix, having positive q[0]
-
-    References
-    ----------
-    * http://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
-    * Bar-Itzhack, Itzhack Y. (2000), "New method for extracting the
-      quaternion from a rotation matrix", AIAA Journal of Guidance,
-      Control and Dynamics 23(6):1085-1087 (Engineering Note), ISSN
-      0731-5090
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> q = mat2quat(np.eye(3)) # Identity rotation
-    >>> np.allclose(q.ndarray, [1, 0, 0, 0])
-    True
-    >>> q = mat2quat(np.diag([1, -1, -1]))
-    >>> np.allclose(q.ndarray, [0, 1, 0, 0]) # 180 degree rotn around axis 0
-    True
-
-    Notes
-    -----
-    http://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
-
-    Bar-Itzhack, Itzhack Y. (2000), "New method for extracting the
-    quaternion from a rotation matrix", AIAA Journal of Guidance,
-    Control and Dynamics 23(6):1085-1087 (Engineering Note), ISSN
-    0731-5090
-
-    '''
-    # Qyx refers to the contribution of the y input vector component to
-    # the x output vector component.  Qyx is therefore the same as
-    # M[0,1].  The notation is from the Wikipedia article.
-    Qxx, Qyx, Qzx, Qxy, Qyy, Qzy, Qxz, Qyz, Qzz = M.flat
-    # Fill only lower half of symmetric matrix
-    K = np.array([
-        [Qxx + Qyy + Qzz, 0, 0, 0],
-        [Qyz - Qzy, Qxx - Qyy - Qzz, 0, 0],
-        [Qzx - Qxz, Qyx + Qxy, Qyy - Qxx - Qzz, 0],
-        [Qxy - Qyx, Qzx + Qxz, Qzy + Qyz, Qzz - Qxx - Qyy],
-    ]
-    ) / 3.0
-    # Use Hermitian eigenvectors, values for speed
-    vals, vecs = np.linalg.eigh(K)
-    # Select largest eigenvector, reorder to x,y,z,w quaternion
-    q = vecs[:, np.argmax(vals)]
-    # Prefer quaternion with positive w
-    # (q * -1 corresponds to same rotation as q)
-    if q[3] < 0:
-        q *= -1
-    return Quaternion(s=q[3], vec=np.diag(np.array([1.0, 1.0, -1.0])) @ q[0:3][::-1], makeUnitQuat=True)
-
+def quats2mats(quats: np.ndarray) -> np.ndarray:
+    """Convert array of Nx4 quaternions to Nx3x3 rotation matrices."""
+    return np.array([quat2mat(q) for q in quats])
 
 def qmult(q1, q2):
     ''' Multiply two quaternions

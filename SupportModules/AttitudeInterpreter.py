@@ -12,6 +12,7 @@ class ControlMode(Enum):
 
 class AttitudeReader:
     def __init__(self, csv_folder_path: str = None):
+
         # raw dfs (only used during load)
         self.spd_dict = None
         self.alt_dict = None

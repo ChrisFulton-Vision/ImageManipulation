@@ -13,6 +13,7 @@ HUD_YELLOW = (0, 255, 255)
 
 class HUD_Marker:
     def __init__(self):
+        self.cam_bank_offset = 2.5  # deg
         self.attRdr = AttRdr()
         self.bank_indicator_points = self.create_bank_indicator()
         self.last_xy = (864, 864)
@@ -97,8 +98,11 @@ class HUD_Marker:
 
         self.draw_controlMode(image, mode)
 
+        cv2.putText(image, f'{self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+
         if box_around:
             cv2.rectangle(image, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
+
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy
@@ -192,8 +196,8 @@ class HUD_Marker:
         pitch_spacing = 16.0
         inner = 0.04 * x
         outer = 0.15 * x
-        s_b = sin(radians(bank_angle))
-        c_b = cos(radians(bank_angle))
+        s_b = sin(radians(bank_angle + self.cam_bank_offset))
+        c_b = cos(radians(bank_angle + self.cam_bank_offset))
         putText = cv2.putText
         drawLine = cv2.line
         to_int = int  # local alias is slightly faster than global lookup
@@ -247,14 +251,20 @@ class HUD_Marker:
     def draw_altitude(self, image, alt):
         x, y = self.last_xy
 
-        alt_text = f'{alt:.0f}'
+        alt_text = f'ALT: {alt:.0f}'
 
         (width, height), baseline = cv2.getTextSize(alt_text, cv2.FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)
 
         cv2.putText(image, alt_text,
-                    (int(0.75 * x - width / 2), int(0.4 * y - height / 2)),
+                    (int(0.775 * x - width / 2.0), int(0.4 * y - height / 2.0)),
                     cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+
+        # cv2.rectangle(image,
+        #               (int(0.773 * x - width / 2.0 ), int(0.4 * y - height * 2.0 )),
+        #               (int(0.777 * x + width / 2.0 ), int(0.4 * y + height / 2.0)),
+        #               HUD_GREEN,
+        #               2)
 
     def draw_throttleResponse(self, image, cmd_throttle):
         # Throttle response

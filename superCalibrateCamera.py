@@ -64,6 +64,18 @@ HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
 CAM_CONFIG_CACHE = str(Path.home() / ".superCalibrateCamera" / "cam_config.pkl")
 
+class PausedCache:
+    def __init__(self): self.idx = None; self.frame = None
+    def set(self, i, f): self.idx, self.frame = i, f
+    def get(self, i): return self.frame if self.idx == i else None
+    def clear(self): self.idx = self.frame = None
+
+@dataclass
+class PlaybackState:
+    """Single source of truth for playback state."""
+    speed: float = 1.0          # signed: <0 reverse, 0 paused, >0 forward
+    last_nonzero_sign: int = 1  # +1 or -1, used when resuming from pause
+    stride: int = 1             # cached stride we last told the loader
 
 def numerical_sort(file_name):
     try:
@@ -81,35 +93,6 @@ class ThreadStopper:
 
     def is_set(self) -> bool:
         return self._ev.is_set()
-
-
-class ImageSliderBar:
-    def __init__(self, num_images: int, refresh_hz: float = 20.0):
-        self.alive = True
-        self.num_images = int(num_images)
-        self.play_speed = 1
-        self.curr_img_idx = 0
-
-        # --- Throttle config/state ---
-        self.refresh_interval = 1.0 / max(1.0, float(refresh_hz))  # seconds
-        self._last_ui_ts = 0.0
-        self._ui_pending = False
-
-    def update_img_id(self, new_img_idx):
-        self.curr_img_idx = int(new_img_idx)
-
-    def next_id(self):
-        """Called from worker thread: advances index AND schedules a throttled UI update."""
-        if not self.alive or self.num_images <= 0:
-            return self.curr_img_idx
-
-        self.curr_img_idx = (self.curr_img_idx + self.play_speed) % self.num_images
-        return self.curr_img_idx
-
-    # ---------------- internal helpers ----------------
-    def close(self):
-        """Safe shutdown: mark dead, cancel pending UI, then destroy window."""
-        self.alive = False
 
 
 class ImageSource(Enum):
@@ -242,6 +225,9 @@ class CameraGui:
         self.lowPassFPS = 20.0
         self.pnpResult = None
         self.qnpResult = None
+
+        self.pauseCache = PausedCache()
+        self.playback = PlaybackState()
 
         # Optimization for undistort
         self.map1, self.map2 = None, None
@@ -1346,14 +1332,15 @@ class CameraGui:
                 keys.append(k2)
         return keys
 
-    def run_folder_reader(self):
-        cv2.destroyAllWindows()
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+    @staticmethod
+    def load_time_offset(directory):
+        try:
+            offset_dict = pd.read_csv(directory / "__TIME_OFFSET.csv")
+            return float(offset_dict['offset'][0])
+        except FileNotFoundError:
+            return 0.0
 
-        reverse_playback = False
-
-        directory = Path(self.camConfig.imageFilepath).parent
-
+    def _build_sequence_and_timebase(self, directory):
         self.populate_idsTimes(str(directory))
 
         paths = []
@@ -1361,34 +1348,35 @@ class CameraGui:
             p = Path(rec[0])
             paths.append(p if p.is_absolute() else (directory / p))
 
-        num_images = len(paths)
-
-        # timestamps (seconds), None -> infer at fixed spacing later
         ts_raw = []
         for name, ts in self.ImageTimeReader.idsTimes:
             ts_raw.append(None if ts is None else float(ts) + float(self.camConfig.cam_to_log_time_offset))
 
-        t = self._make_timebase(ts_raw, self.camConfig.target_fps, num_images)
+        t = self._make_timebase(ts_raw, self.camConfig.target_fps, len(paths))
 
-        img_slider = ImageSliderBar(num_images, refresh_hz=30.0)
-        img_slider.play_speed = 1  # negative=rewind, 0=freeze, positive=forward
+        return paths, t
+
+    def run_folder_reader(self):
+        cv2.destroyAllWindows()
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+
+        directory = Path(self.camConfig.imageFilepath).parent
+
+        paths, t = self._build_sequence_and_timebase(directory)
+
+        num_images = len(paths)
+
+        self.playback.speed = 1  # negative=rewind, 0=freeze, positive=forward
         pause = False
         last_nonzero_sign = 1
-
-        last_stride = None
-        last_speed = img_slider.play_speed
+        last_speed = self.playback.speed
+        curr_idx = 0
 
         # --- PAUSED CACHE: keep 1 frame while paused to avoid refetch spam ---
-        paused_cached_idx = None
-        paused_cached_frame = None
-        printed_missing = set()  # avoid spamming the same missing file message
+        self.pauseCache.clear()
 
         # time offset
-        try:
-            offset_dict = pd.read_csv(directory / "__TIME_OFFSET.csv")
-            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
-        except FileNotFoundError:
-            self.camConfig.cam_to_log_time_offset = 0.0
+        self.camConfig.cam_to_log_time_offset = self.load_time_offset(directory)
 
         # --- start background loader ---
         loader = imgBuf(
@@ -1403,7 +1391,6 @@ class CameraGui:
         # one-shot key handling
         pressed = set()
         pending_keys = []
-        curr_idx = 0
 
         wall_start = time.monotonic()
 
@@ -1431,30 +1418,26 @@ class CameraGui:
                 self.fps_time_log = curr_time
 
                 # ===== react to speed changes (incl. direction) =====
-                if img_slider.play_speed != last_speed:
-                    s_abs = self._stride_for_speed(abs(img_slider.play_speed))
+                if self.playback.speed != last_speed:
+                    s_abs = self._stride_for_speed(abs(self.playback.speed))
 
-                    if img_slider.play_speed != 0:
-                        last_nonzero_sign = (1 if img_slider.play_speed > 0 else -1)
+                    if self.playback.speed != 0:
+                        last_nonzero_sign = (1 if self.playback.speed > 0 else -1)
 
                     if s_abs == 0:
                         pause = True
                     else:
                         pause = False
                         signed_stride = last_nonzero_sign * s_abs
-                        if signed_stride != last_stride:
+                        if signed_stride != self.playback.stride:
                             loader.set_stride(signed_stride)
-                            last_stride = signed_stride
+                            self.playback.stride = signed_stride
 
-                        curr_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
+                        curr_idx = max(0, min(curr_idx, num_images - 1))
                         loader.seek(curr_idx, clear_buffer=True)
-                        reverse_playback = (last_nonzero_sign < 0)
+                        self.pauseCache.clear()
 
-                        # leaving pause → invalidate paused cache
-                        paused_cached_idx = None
-                        paused_cached_frame = None
-
-                    last_speed = img_slider.play_speed
+                    last_speed = self.playback.speed
 
                 # ===== fetch a frame =====
                 if not pause:
@@ -1462,7 +1445,7 @@ class CameraGui:
                     got = loader.get_next(timeout=0.02)
 
                     # if skipping (|stride|>1), drain extras so we show freshest
-                    if last_stride and abs(last_stride) > 1 and got is not None:
+                    if abs(self.playback.stride) > 1 and got is not None:
                         latest = got
                         while True:
                             nxt = loader.get_next(timeout=0.0)
@@ -1475,40 +1458,31 @@ class CameraGui:
                     if got is not None:
                         got_idx, frame = got
                         curr_idx = got_idx
-                        img_slider.curr_img_idx = curr_idx
 
                     # leaving pause → invalidate paused cache
-                    paused_cached_idx = None
-                    paused_cached_frame = None
+                    self.pauseCache.clear()
 
                 else:
                     # ===== PAUSED MODE with CACHE =====
-                    target_idx = max(0, min(img_slider.curr_img_idx, num_images - 1))
+                    target_idx = max(0, min(curr_idx, num_images - 1))
 
                     # If cache is invalid or user moved (z/c), fetch once; otherwise reuse cached frame
-                    if paused_cached_frame is None or paused_cached_idx != target_idx:
+                    if self.pauseCache.frame is None or self.pauseCache.idx != target_idx:
                         # Seek ONCE; do NOT keep seeking every loop
                         loader.seek(target_idx, clear_buffer=True)
 
                         got = loader.get_next(timeout=0.5)  # give worker a bit more time while paused
                         if got is not None:
                             got_idx, frame = got
-                            paused_cached_idx = got_idx
-                            paused_cached_frame = frame
+                            self.pauseCache.set(got_idx, frame)
                             curr_idx = got_idx
-                            img_slider.curr_img_idx = curr_idx
                         else:
                             # If file truly missing, print once; otherwise keep last cached frame (if any)
                             p = paths[target_idx]
                             if not Path(p).exists():
-                                if p not in printed_missing:
-                                    LOG.warning("Log file missing/failed: %s",
-                                                self.ImageTimeReader.idsTimes[curr_idx][0])
-                                    printed_missing.add(p)
-                                paused_cached_frame = None
-                                paused_cached_idx = None
+                                self.pauseCache.clear()
                             # If file exists but frame not ready yet, DON'T print; keep previous cached frame
-                    frame = paused_cached_frame
+                    frame = self.pauseCache.frame
 
                 # ===== display / HUD =====
                 if frame is not None and Path(paths[curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
@@ -1516,24 +1490,24 @@ class CameraGui:
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not pause:
                         period = 1.0 / self.camConfig.target_fps
                         target_time = wall_start + period * (
-                            curr_idx if not reverse_playback else num_images - curr_idx)
+                            curr_idx if not last_nonzero_sign < 0 else num_images - curr_idx)
                         if target_time < time.monotonic():
                             wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not reverse_playback else num_images - curr_idx)
+                                curr_idx if not last_nonzero_sign < 0 else num_images - curr_idx)
                         pending_keys = sleep_until(target_time)
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not pause:
                         rs = float(self.camConfig.rt_speed) or 1e-6
                         elapsed = (time.monotonic() - wall_start) * rs
-                        elapsed_ref = (t[-1] - elapsed) if reverse_playback else elapsed
+                        elapsed_ref = (t[-1] - elapsed) if last_nonzero_sign < 0 else elapsed
 
                         if elapsed_ref < t[0]:
                             idx_target = num_images - 1
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not last_nonzero_sign < 0
                                                              else ((t[-1] - t[idx_target]) / rs))
                         elif elapsed_ref > t[-1]:
                             idx_target = 0
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not reverse_playback
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not last_nonzero_sign < 0
                                                              else ((t[-1] - t[idx_target]) / rs))
                         else:
                             idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
@@ -1560,12 +1534,6 @@ class CameraGui:
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
-                else:
-                    # path doesn’t exist (already printed in paused path; print here for streaming once)
-                    p = paths[curr_idx]
-                    if p not in printed_missing:
-                        LOG.warning("Log file missing/failed: %s", self.ImageTimeReader.idsTimes[curr_idx][0])
-                        printed_missing.add(p)
 
                 pending_keys.extend(self._poll_keys(1))
 
@@ -1601,25 +1569,23 @@ class CameraGui:
                         )
                         self.saveToCache()
 
+                    # AFTER
                     elif key == ord('c') and on_key(ord('c')):
-                        self._on_step_forward(img_slider, num_images)
+                        curr_idx = self._on_step_forward(curr_idx, num_images)
                         pause = True
-                        paused_cached_idx = None
-                        paused_cached_frame = None
+                        self.pauseCache.clear()
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+                        loader.seek(curr_idx, clear_buffer=True)
 
                     elif key == ord('z') and on_key(ord('z')):
-                        self._on_step_back(img_slider)
+                        curr_idx = self._on_step_back(curr_idx)
                         pause = True
-                        paused_cached_idx = None
-                        paused_cached_frame = None
+                        self.pauseCache.clear()
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                        loader.seek(img_slider.curr_img_idx, clear_buffer=True)
+                        loader.seek(curr_idx, clear_buffer=True)
 
-                    elif key == ord(' ') and on_key(ord(' ')):  # space
-                        # Toggle pause/play with clean re-anchoring on resume
-                        wall_start = self._on_toggle_pause(img_slider, curr_idx, t, wall_start, last_nonzero_sign)
+                    elif key == ord(' ') and on_key(ord(' ')):
+                        wall_start = self._on_toggle_pause(curr_idx, t, wall_start, last_nonzero_sign)
 
                     elif key == ord('d') and on_key(ord('d')):
                         wall_start = self._on_speed_up(
@@ -1639,20 +1605,23 @@ class CameraGui:
                         self._on_toggle_overlays()
 
                     elif key == ord('s') and on_key(ord('s')):
-                        self._on_mark_start(img_slider)
+                        self._on_mark_start(curr_idx)
 
                     elif key == ord('e') and on_key(ord('e')):
-                        self._on_mark_end(img_slider)
+                        self._on_mark_end(curr_idx)
 
                     elif key == ord('r') and on_key(ord('r')):
                         last_nonzero_sign, wall_start = self._on_reverse(
-                            img_slider=img_slider,
                             loader=loader,
                             last_nonzero_sign=last_nonzero_sign,
                             curr_idx=curr_idx,
                             t=t,
                         )
-                        reverse_playback = (last_nonzero_sign < 0)
+
+                    elif key == ord('b') and on_key(ord('b')):
+                        self.hud_marker.cam_bank_offset -= 0.1
+                    elif key == ord('n') and on_key(ord('n')):
+                        self.hud_marker.cam_bank_offset += 0.1
 
                     # time offset nudges (small/medium/large)
                     elif key == ord(";") and on_key(ord(";")):
@@ -1685,8 +1654,6 @@ class CameraGui:
         finally:
             cv2.destroyAllWindows()
             self.gui.after(0, self._on_worker_exit)
-            if not self.shutting_down:
-                img_slider.close()
             loader.stop()
 
     def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t, last_nonzero_sign: int) -> float:
@@ -1726,7 +1693,7 @@ class CameraGui:
             # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
             return now - (t[curr_idx] - t0) / rt_rate
 
-    def _on_reverse(self, img_slider, loader, last_nonzero_sign: int, curr_idx: int, t):
+    def _on_reverse(self, loader, last_nonzero_sign: int, curr_idx: int, t):
         """
         Toggle playback direction without jumping the current frame.
         Returns: (new_last_nonzero_sign, new_wall_start)
@@ -1735,12 +1702,9 @@ class CameraGui:
         new_sign = -1 if last_nonzero_sign > 0 else 1
 
         # If actively playing, flip speed sign and update stride, then realign buffer at current index.
-        if getattr(img_slider, "play_speed", 0) != 0:
-            img_slider.play_speed = -img_slider.play_speed
-            try:
-                s_abs = self._stride_for_speed(abs(img_slider.play_speed))
-            except AttributeError:
-                s_abs = max(1, int(round(abs(img_slider.play_speed))))
+        if self.playback.speed != 0:
+            self.playback.speed = -self.playback.speed
+            s_abs = self._stride_for_speed(abs(self.playback.speed))
             if s_abs > 0:
                 loader.set_stride(new_sign * s_abs)
                 loader.seek(curr_idx, clear_buffer=True)
@@ -1828,35 +1792,25 @@ class CameraGui:
         if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
             self.camConfig.rt_speed = 1.0
 
-    def _on_step_forward(self, img_slider, num_images):
-        img_slider.curr_img_idx = min(img_slider.curr_img_idx + 1, num_images - 1)
-        img_slider.play_speed = 0
+    def _on_step_forward(self, curr_idx: int, num_images: int) -> int:
+        curr_idx = min(curr_idx + 1, num_images - 1)
+        self.playback.speed = 0.0
+        return curr_idx
 
-    def _on_step_back(self, img_slider):
-        img_slider.curr_img_idx = max(img_slider.curr_img_idx - 1, 0)
-        img_slider.play_speed = 0
+    def _on_step_back(self, curr_idx: int) -> int:
+        curr_idx = max(curr_idx - 1, 0)
+        self.playback.speed = 0.0
+        return curr_idx
 
-    def _on_toggle_pause(self, img_slider, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
-        """
-        Toggle pause/play.
-        - If playing: pause (play_speed -> 0) and keep wall_start (no jump on still frame).
-        - If paused: resume with last_nonzero_sign and re-anchor so current frame is preserved.
-        Returns new wall_start.
-        """
-        playing = getattr(img_slider, "play_speed", 0) != 0
-
+    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+        playing = (self.playback.speed != 0)
         if playing:
-            # Remember magnitude so resume uses prior |speed|
-            self._resume_speed_mag = max(1.0, abs(getattr(img_slider, "play_speed", 1.0)))
-            # Pause: freeze on the current frame without touching anchors
-            img_slider.play_speed = 0.0
+            self._resume_speed_mag = max(1.0, abs(self.playback.speed))
+            self.playback.speed = 0.0
             return wall_start
 
-        # Resume: pick a reasonable magnitude (keep previous abs speed if you store it)
-        prev_mag = getattr(self, "_resume_speed_mag", None)
-        if prev_mag is None:
-            prev_mag = 1.0
-        img_slider.play_speed = float(last_nonzero_sign or 1) * prev_mag
+        prev_mag = getattr(self, "_resume_speed_mag", 1.0)
+        self.playback.speed = float(last_nonzero_sign or 1) * prev_mag
 
         now = time.monotonic()
         if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
@@ -1870,7 +1824,6 @@ class CameraGui:
             fps = max(0.001, float(self.camConfig.target_fps))
             phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
             wall_start = time.monotonic() - (phase / fps)
-
         return wall_start
 
     def _on_speed_up(self, curr_idx: int, t, last_nonzero_sign: int) -> float:
@@ -1943,16 +1896,16 @@ class CameraGui:
         self.toggleHyperFocus()
         self.toggleFactorgraph()
 
-    def _on_mark_start(self, img_slider):
-        self.camConfig.start_export_idx = img_slider.curr_img_idx
+    def _on_mark_start(self, curr_idx: int):
+        self.camConfig.start_export_idx = curr_idx
         if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
             self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
         self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
         self.saveToCache()
 
-    def _on_mark_end(self, img_slider):
-        self.camConfig.end_export_idx = img_slider.curr_img_idx
+    def _on_mark_end(self, curr_idx):
+        self.camConfig.start_export_idx = curr_idx
         if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
             self.camConfig.start_export_idx = max(0, self.camConfig.end_export_idx - 1)
         self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')

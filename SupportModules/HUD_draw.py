@@ -13,7 +13,7 @@ HUD_YELLOW = (0, 255, 255)
 
 class HUD_Marker:
     def __init__(self):
-        self.cam_bank_offset = 2.5  # deg
+        self.cam_bank_offset = 0.0  # deg
         self.attRdr = AttRdr()
         self.bank_indicator_points = self.create_bank_indicator()
         self.last_xy = (864, 864)

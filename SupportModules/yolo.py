@@ -59,6 +59,10 @@ class YOLO:
 
         self.setNewFolder(model_path)
 
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
     def setNewFolder(self, directory: str) -> None:
         '''
         This function changes all the necessary settings for selecting a new YOLO folder. The folder should have

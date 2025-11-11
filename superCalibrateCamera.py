@@ -176,11 +176,12 @@ class CameraConfig:
                 pass
 
 
-class CameraGui:
-    def __init__(self, gui):
+class CameraGui(ctk.CTkFrame):
+    def __init__(self, master, *args, **kwargs):
+        # Super class init, necessary for customTkinter
+        super().__init__(master, *args, **kwargs)
         # self.GifMaker = GifMaker()
         self.recording = False
-        self.gui = gui
         self.yoloSession = yolo.YOLO()
         self.camConfig = CameraConfig()
         self.calibration = Calibration()
@@ -192,7 +193,9 @@ class CameraGui:
         self.scanForCameras()
         self.windowName = 'webcam'
         self.filepath = ''
-        self.cam_frame = ctk.CTkFrame(master=self.gui)
+        self.cam_frame = ctk.CTkFrame(master=master)
+        self.config_frame = ctk.CTkFrame(master=master)
+        self.export_frame = ctk.CTkFrame(master=master)
         self.showWindow = False
         self.GaborGUI = None
         self.radius = 800
@@ -250,9 +253,9 @@ class CameraGui:
                                                 command=self.sourceUpdate)
         self.startStreamButton = ctk.CTkButton(master=self.cam_frame, text='Start Stream', fg_color=BUTTON_RED,
                                                hover_color='blue')
-        self.recordButton = ctk.CTkButton(master=self.cam_frame, text='Saving Imagery', fg_color='green',
+        self.recordButton = ctk.CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
                                           hover_color='navy', command=self.recordOff)
-        self.printButton = ctk.CTkButton(master=self.cam_frame, text='Print LiDAR', fg_color='green',
+        self.printButton = ctk.CTkButton(master=self.export_frame, text='Print LiDAR', fg_color='green',
                                          hover_color='navy', command=self.printLidarOnce)
         self.selectCameraCombo = ctk.CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                                  command=self.selectCamera)
@@ -284,19 +287,19 @@ class CameraGui:
                                                        self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
                                                    )
         self.selectCalibLabel = None
-        self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
-        self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
-        self.detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
-        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image',
+        self.undistortCheckbox = ctk.CTkCheckBox(self.config_frame, text='Undistort')
+        self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect April Tags')
+        self.detectHorizonCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Horizon')
+        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO on image',
                                                      command=self.toggleYoloInference)
-        self.yoloBiasCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO Bias Tracking',
+        self.yoloBiasCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
                                                 command=self.toggleYoloBiasTracking)
-        self.factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
-        self.hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
-        self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.cam_frame, text='PhaseCorrelation')
-        self.crosshairsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Crosshairs')
-        self.cubemapCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Cubemap')
-        self.hudCheckbox = ctk.CTkCheckBox(self.cam_frame, text='HUD')
+        self.factorgraphCheckbox = ctk.CTkCheckBox(self.config_frame, text='Factor Graph')
+        self.hyperfocusCheckbox = ctk.CTkCheckBox(self.config_frame, text='Hyper Focus')
+        self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.config_frame, text='PhaseCorrelation')
+        self.crosshairsCheckbox = ctk.CTkCheckBox(self.config_frame, text='Crosshairs')
+        self.cubemapCheckbox = ctk.CTkCheckBox(self.config_frame, text='Cubemap')
+        self.hudCheckbox = ctk.CTkCheckBox(self.config_frame, text='HUD')
 
         self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img',
                                                      command=self.selectImagesFilepath)
@@ -304,22 +307,22 @@ class CameraGui:
         self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder',
                                                     command=self.selectImagesFilepath)
         self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
-        self.confSliderLabel = ctk.CTkLabel(self.cam_frame, text='Conf: 0.75')
-        self.confSliderBar = ctk.CTkSlider(self.cam_frame, command=self.confSlider,
+        self.confSliderLabel = ctk.CTkLabel(self.config_frame, text='Conf: 0.75')
+        self.confSliderBar = ctk.CTkSlider(self.config_frame, command=self.confSlider,
                                            from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
-        self.iouSliderLabel = ctk.CTkLabel(self.cam_frame, text='IOU: 1.00')
-        self.iouSliderBar = ctk.CTkSlider(self.cam_frame, command=self.iouSlider)
+        self.iouSliderLabel = ctk.CTkLabel(self.config_frame, text='IOU: 1.00')
+        self.iouSliderBar = ctk.CTkSlider(self.config_frame, command=self.iouSlider)
 
-        self.exportQualityCombo = ctk.CTkComboBox(self.cam_frame, values=[member.value for member in ExportQuality],
+        self.exportQualityCombo = ctk.CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
                                                   command=self.updateQuality)
-        self.exportToGifButton = ctk.CTkButton(self.cam_frame, text="Export to Gif", command=self.exportToGif)
-        self.exportToVidButton = ctk.CTkButton(self.cam_frame, text="Export to Vid", command=self.exportToVid)
+        self.exportToGifButton = ctk.CTkButton(self.export_frame, text="Export to Gif", command=self.exportToGif)
+        self.exportToVidButton = ctk.CTkButton(self.export_frame, text="Export to Vid", command=self.exportToVid)
         self.making_gifOrVid = False
 
         self.loadFromCache()
 
-        self.exportStartFrame = ctk.CTkLabel(self.cam_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame = ctk.CTkLabel(self.cam_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
 
         self.confSliderBar.set(self.camConfig.yolo_conf)
         self.iouSliderBar.set(self.camConfig.yolo_iou)
@@ -340,6 +343,8 @@ class CameraGui:
         self.lastWidth = 1
         self.lastHeight = 1
         self.saveToCache()
+
+        self.setupFrame()
 
     def loadFromCache(self):
         """
@@ -602,7 +607,7 @@ class CameraGui:
         if not self.calibration.fromBinFile(self.calibFile) and not self.calibration.fromFile(self.calibFile):
             if self.selectCalibLabel is not None:
                 self.selectCalibLabel.configure(text='No Calibration Found')
-                self.gui.after(10, self.gui.update())
+                self.after(10, self.update())
             return
 
         if not self.calibration.validCal:
@@ -617,10 +622,10 @@ class CameraGui:
             self.selectCalibLabel.configure(text="../" + Path(self.calibFile).name if self.calibFile else "../",
                                             bg_color=self.selectCalibLabel.cget("bg_color"))
             self.cam_frame.update()
-            self.gui.update()
+            self.update()
             self.selectCalibLabel.update()
             self.cam_frame.update()
-            self.gui.update()
+            self.update()
 
         self.undistortCheckbox.configure(state='normal')
         if self.calibration.fisheye:
@@ -824,7 +829,7 @@ class CameraGui:
         self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        pnpLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='SolvePnP LiDAR Into Image')
+        pnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image')
         if self.camConfig.pnpLidarPoints is False:
             pnpLidarPoints.deselect()
         else:
@@ -832,7 +837,7 @@ class CameraGui:
         pnpLidarPoints.configure(command=self.togglePnpLidarPoints)
         pnpLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        qnpLidarPoints = ctk.CTkCheckBox(self.cam_frame, text='SolveQnP LiDAR Into Image')
+        qnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolveQnP LiDAR Into Image')
         if self.camConfig.qnpLidarPoints is False:
             qnpLidarPoints.deselect()
         else:
@@ -856,7 +861,7 @@ class CameraGui:
         self.yoloBiasCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
-        detectCornersCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Corners')
+        detectCornersCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Corners')
         if self.camConfig.detect_corners is False:
             detectCornersCheckbox.deselect()
         else:
@@ -923,9 +928,9 @@ class CameraGui:
 
         rowID += 1
 
-        imageProcessingKernelLabel = ctk.CTkLabel(self.cam_frame, text='Image Filter: ')
+        imageProcessingKernelLabel = ctk.CTkLabel(self.config_frame, text='Image Filter: ')
         imageProcessingKernelLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
-        self.imageProcessingKernelCombobox = ctk.CTkComboBox(self.cam_frame,
+        self.imageProcessingKernelCombobox = ctk.CTkComboBox(self.config_frame,
                                                              values=list(ImageKernel.__members__.keys()))
         self.imageProcessingKernelCombobox.set(self.camConfig.processingKernel.name)
         self.imageProcessingKernelCombobox.configure(command=self.updateImageProcessingKernel)
@@ -946,16 +951,16 @@ class CameraGui:
         self.printButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        activeEntryButton = ctk.CTkButton(self.cam_frame, text="Time Between Saved Frames",
+        activeEntryButton = ctk.CTkButton(self.export_frame, text="Time Between Saved Frames",
                                           command=self.getEntryValue)
         activeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
-        self.timeBetweenImgsEntry = ctk.CTkEntry(self.cam_frame,
+        self.timeBetweenImgsEntry = ctk.CTkEntry(self.export_frame,
                                                  placeholder_text=str(self.camConfig.secondsBetweenImages))
         self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        qualityLabel = ctk.CTkLabel(self.cam_frame, text="Export Quality: ")
+        qualityLabel = ctk.CTkLabel(self.export_frame, text="Export Quality: ")
         qualityLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.exportQualityCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
         rowID += 1
@@ -967,11 +972,6 @@ class CameraGui:
 
         self.exportStartFrame.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.exportEndFrame.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
-
-        rowID += 1
-
-        goBackButton = ctk.CTkButton(self.cam_frame, text="Return to Main", command=self.releaseCamReturnToMain)
-        goBackButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
 
         self.cam_frame.pack()
 
@@ -988,10 +988,6 @@ class CameraGui:
             except Exception:
                 break
             time.sleep(0.1)
-
-    def releaseCamReturnToMain(self):
-        self.startStreamOffBool()
-        self.gui.returnToMain()
 
     def setAprilTagSize(self):
 
@@ -1071,7 +1067,7 @@ class CameraGui:
             frames = self._gather_annotated_frames()
             make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
         finally:
-            self.gui.after(0, self._exportToGifOrVid_done)
+            self.after(0, self._exportToGifOrVid_done)
 
     def exportToVid_worker(self):
         try:
@@ -1083,7 +1079,7 @@ class CameraGui:
                 out.write(f)
             out.release()
         finally:
-            self.gui.after(0, self._exportToGifOrVid_done)
+            self.after(0, self._exportToGifOrVid_done)
 
     def _exportToGifOrVid_done(self):
         self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=CTK_GREEN)
@@ -1252,7 +1248,7 @@ class CameraGui:
                 break
 
         cv2.destroyAllWindows()
-        self.gui.after(0, self._on_worker_exit)
+        self.after(0, self._on_worker_exit)
 
     @staticmethod
     def convert_cv_to_pil(img):
@@ -1295,7 +1291,7 @@ class CameraGui:
             self.vc.release()
             self.vc = None
         cv2.destroyAllWindows()
-        self.gui.after(0, self._on_worker_exit)
+        self.after(0, self._on_worker_exit)
         return
 
     @staticmethod
@@ -1653,7 +1649,7 @@ class CameraGui:
 
         finally:
             cv2.destroyAllWindows()
-            self.gui.after(0, self._on_worker_exit)
+            self.after(0, self._on_worker_exit)
             loader.stop()
 
     def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t, last_nonzero_sign: int) -> float:
@@ -1733,13 +1729,10 @@ class CameraGui:
         return new_sign, wall_start
 
     @staticmethod
-    def _make_timebase(ts_raw: list[float | None], fallback_fps: float, n: int) -> np.ndarray:
-        """
-        Build a monotone, normalized timebase (seconds) from possibly-missing timestamps.
-        - If all timestamps are None: synthesize from fallback_fps.
-        - Else: linearly interpolate gaps; normalize to t[0] == 0.0.
-        """
+    def _make_timebase(ts_raw, fallback_fps, n):
         t = np.array([np.nan if v is None else float(v) for v in ts_raw], dtype='float64')
+        if n == 0:  # <-- guard
+            return t
         if np.all(np.isnan(t)):
             step = 1.0 / max(1e-6, float(fallback_fps))
             t = np.arange(n, dtype='float64') * step
@@ -1905,9 +1898,9 @@ class CameraGui:
         self.saveToCache()
 
     def _on_mark_end(self, curr_idx):
-        self.camConfig.start_export_idx = curr_idx
+        self.camConfig.end_export_idx = curr_idx
         if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-            self.camConfig.start_export_idx = max(0, self.camConfig.end_export_idx - 1)
+            self.camConfig.end_export_idx = max(0, self.camConfig.end_export_idx - 1)
         self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
         self.saveToCache()
@@ -2616,6 +2609,8 @@ class CameraGui:
                         cv2.LINE_AA)
 
     def potentialResize(self):
+        if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
+            return
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
         aspectRatio = self.curr_frame.shape[1] / self.curr_frame.shape[0]
         if not cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):

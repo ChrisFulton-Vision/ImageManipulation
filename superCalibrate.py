@@ -122,36 +122,23 @@ class ImageData:
         self.sharpness = None
 
 
-class FrontEndGui(ctk.CTk):
+class CalibrateGui(ctk.CTkFrame):
     '''
     This is the main GUI that the user interacts with when running the program. This class manages the main loop,
     displays the main buttons, creates the submenus (but waits to show them until asked), and generally maintains
     system state.
     '''
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, master, *args, **kwargs):
 
         # Super class init, necessary for customTkinter
-        super().__init__(*args, **kwargs)
-
-        # "Nicely" closes camera, if it is active
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-        # Stores calibration times
-        self.startTime = time.time()
-        self.endTime = time.time()
+        super().__init__(master, *args, **kwargs)
 
         # Stores calibration configuration states
         self.imageConfig = ImageryCalibrationConfig()
 
         # Bool for calibration state
         self.calculating = False
-
-        # Default Geometries for window and subwindows
-        self.mainGeometry = '255x560'
-        self.imageWinGeometry = '1250x550'
-        self.calGeometry = '250x650'
-        self.configGeometry = '500x225'
 
         # Various helper variable NONE-initialization
         self.displayImagePointsButton = None
@@ -174,38 +161,17 @@ class FrontEndGui(ctk.CTk):
         # Custom TKinter Main Window Configuration
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("green")
-        self.title("Camera Calibrater")
-        self.geometry(self.mainGeometry)
-
-        self.mainFrame = ctk.CTkFrame(master=self)
-        self.mainFrame.grid_rowconfigure([0, 1, 2], weight=1)  # configure grid system
-        self.mainFrame.grid_columnconfigure([0, 1, 2], weight=1)
-        self.mainFrame.pack()
 
         ##########################################################################
         # Image Management Frame Setup
-        self.imageFrame = ctk.CTkFrame(master=self)
-        self.imageFrame.grid_rowconfigure(list(range(10)), weight=1)  # configure grid system
-        self.imageFrame.grid_columnconfigure(list(range(11)), weight=1)
-        self.subImageFrame = ctk.CTkScrollableFrame(master=self.imageFrame)
-        self.subImageFrame.grid(row=2, rowspan=5, column=0, columnspan=12, sticky='NSEW')
 
         self.leftArrow = ctk.CTkImage(light_image=Image.open('leftArrow.png'), size=(20, 20))
         self.rightArrow = ctk.CTkImage(light_image=Image.open('rightArrow.png'), size=(20, 20))
 
-        self.imgInvertProtectedButton = ctk.CTkButton(master=self.imageFrame, text='Invert All', hover_color='navy',
-                                                      fg_color='blue', width=100, command=self.unprotectInvert)
-
-        self.imgRotateCCWProtectedButton = ctk.CTkButton(master=self.imageFrame, image=self.leftArrow, text='All',
-                                                         hover_color='navy',
-                                                         fg_color='blue', width=100, command=self.unprotectRotateCCW)
-
-        self.imgRotateCWProtectedButton = ctk.CTkButton(master=self.imageFrame, image=self.rightArrow, text='All',
-                                                        hover_color='navy',
-                                                        fg_color='blue', width=100, command=self.unprotectRotateCW)
-
-        self.imgGrayProtectedButton = ctk.CTkButton(master=self.imageFrame, text='Grayscale All', hover_color='navy',
-                                                    fg_color='blue', width=100, command=self.unprotectAllGrayscale)
+        self.imgInvertProtectedButton = None
+        self.imgRotateCCWProtectedButton = None
+        self.imgRotateCWProtectedButton = None
+        self.imgGrayProtectedButton = None
 
         ##########################################################################
         # Calibration Frame Setup
@@ -213,6 +179,7 @@ class FrontEndGui(ctk.CTk):
 
         self.calFrame.grid_rowconfigure([0, 1], weight=1)
         self.calFrame.grid_columnconfigure([0], weight=1)
+        self.calLabel = None
 
         ##########################################################################
         # Custom TKinter Configuration Setup
@@ -225,137 +192,143 @@ class FrontEndGui(ctk.CTk):
                                                        command=self.stoppingCritMinStepSizeUpdate)
         ##########################################################################
         # Now Initialize the buttons on the main frame
-        # Use rowID to keep track of which row each object is placed. Allows for easy code integration of new objects
+        self.selectFolderButton = None
+        self.availImagesLabel = None
+        self.selectModeLabel = None
+        self.selectModeCombo = None
+        self.selectImgTypeLabel = None
+        self.selectImgTypeCombo = None
+        self.folderLabel = None
+        self.invertImagesCheckbox = None
+        self.fisheyeLensCheckbox = None
+        self.cornerInputLabel = None
+        self.widthLabel = self.heightLabel = self.widthComboEntry = self.heightComboEntry = None
+        self.SUBcornerInputLabel = None
+        self.SUBwidthLabel = self.SUBheightLabel = self.SUBwidthComboEntry = self.SUBheightComboEntry = None
+        self.calibrateButton = None
+        self.displayCal = None
+
+        # # Once a calibration is active, allow user to display a window that manages the calibration
+        self.displayCal = None
+        # self.createCalibrationDisplay(rowID)
+        # rowID += 1
+        #
+        # # Once a calibration is active, allow user to display a window that manages the calibration
+        self.configWindowButton = None
+        # self.createConfigWindowButton(rowID)
+        # rowID += 1
+        #
+        # # Create a button that allows a user to clear the cache, but they must select it twice
+        # self.clearCacheRow = rowID
+        # self.protectClearCache()
+        #
+        # # Now that necessary starting variables are created, load states from cache
+        #
+        # self.restoreFromImageConfig()
+        # self.updateConfigWindow()
+        # self.updateCalWindow()
+
+    def setup_configFrame(self, master_frame):
+        f = ctk.CTkFrame(master_frame)
         rowID = 0
 
-        self.openCameraButton = ctk.CTkButton(master=self.mainFrame, text='Open Camera', command=self.openCamera,
-                                              fg_color='navy')
-        self.openCameraButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
-        rowID += 1
+        f.grid_rowconfigure([0, 1, 2], weight=1)  # configure grid system
+        f.grid_columnconfigure([0, 1, 2], weight=1)
 
-        # Add button that allows the user to select the folder of the images
-        self.selectFolderButton = ctk.CTkButton(master=self.mainFrame, text='Select Folder', command=self.selectFolder,
+        self.selectFolderButton = ctk.CTkButton(master=f, text='Select Folder', command=self.selectFolder,
                                                 fg_color="navy")
         self.selectFolderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky="ew")
 
-        # On same line, add a button that allows the user to interact with the images in the folder
-        self.openImagesButton = ctk.CTkButton(master=self.mainFrame, text='Not Selected', fg_color="black",
-                                              command=self.openImageWindow)
-        self.openImagesButton.grid(row=rowID, column=1, padx=5, pady=5, sticky="ew")
-        rowID += 1
+        self.availImagesLabel = ctk.CTkLabel(master=f, text='Not Selected', fg_color="black")
+        self.availImagesLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky="ew")
 
-        # Allow user to select type of calibration
+        rowID += 1
+        self.selectModeLabel = ctk.CTkLabel(master=f, text='Calibration Type')
+        self.selectModeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         modes = [type.value for type in CalibrationType]
-        self.selectModeLabel = ctk.CTkLabel(master=self.mainFrame, text='Calibration Type')
-        self.selectModeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
-        self.selectModeCombo = ctk.CTkComboBox(master=self.mainFrame, values=modes, command=self.updateMode)
+        self.selectModeCombo = ctk.CTkComboBox(master=f, values=modes, command=self.updateMode)
         self.selectModeCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
-        rowID += 1
 
-        # Allow user to select type of image
+        rowID += 1
         imgTypes = ['png', 'bmp', 'img', 'jpg']
-        self.selectImgTypeLabel = ctk.CTkLabel(master=self.mainFrame, text='File Type')
-        self.selectImgTypeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
-        self.selectImgTypeCombo = ctk.CTkComboBox(master=self.mainFrame, values=imgTypes, command=self.updateImgType)
+        self.selectImgTypeLabel = ctk.CTkLabel(master=f, text='File Type')
+        self.selectImgTypeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.selectImgTypeCombo = ctk.CTkComboBox(master=f, values=imgTypes, command=self.updateImgType)
         self.selectImgTypeCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
-        rowID += 1
 
-        # Add text label that shows what folder is selected by the user
-        self.folderLabel = ctk.CTkLabel(master=self.mainFrame,
+        rowID += 1
+        folderPathLabel = ctk.CTkLabel(master=f,
+                                        text="Filepath:")
+        folderPathLabel.grid(row=rowID, column=0, sticky='nsw')
+        self.folderLabel = ctk.CTkLabel(master=f,
                                         text="../" + os.path.basename(os.path.normpath(self.filepath)))
-        self.folderLabel.grid(row=rowID, column=0, columnspan=2, sticky='ew')
-        rowID += 1
+        self.folderLabel.grid(row=rowID, column=1, columnspan=2, sticky='nsw')
 
-        # Add option for the user to invert the images (useful for White-hot images, like from LWIR)
-        self.invertImagesCheckbox = ctk.CTkCheckBox(master=self.mainFrame, text='Invert Image? (LWIR)',
+        rowID += 1
+        self.invertImagesCheckbox = ctk.CTkCheckBox(master=f, text='Invert Image? (LWIR)',
                                                     command=self.invertImageToggle)
         if self.imageConfig.invert_image:
             self.invertImagesCheckbox.select()
-        self.invertImagesCheckbox.grid(row=rowID, columnspan=2, column=0, padx=5, pady=5, sticky='ew')
-        rowID += 1
+        self.invertImagesCheckbox.grid(row=rowID, columnspan=1, column=0, padx=5, pady=5, sticky='nsw')
 
-        self.fisheyeLensCheckbox = ctk.CTkCheckBox(master=self.mainFrame, text='Fisheye Lens?',
+
+        self.fisheyeLensCheckbox = ctk.CTkCheckBox(master=f, text='Fisheye Lens?',
                                                    command=self.toggleFisheye)
         if self.imageConfig.fisheye:
             self.fisheyeLensCheckbox.select()
-        self.fisheyeLensCheckbox.grid(row=rowID, columnspan=2, column=0, padx=5, pady=5, sticky='ew')
+        self.fisheyeLensCheckbox.grid(row=rowID, columnspan=1, column=1, padx=5, pady=5, sticky='nsw')
         rowID += 1
 
-        # Create options for the user to select the number of inner chessboard corners
         values = [str(num) for num in range(5, 21)]
-        self.cornerInputLabel = ctk.CTkLabel(self.mainFrame, text='# of Inner CB Corners')
+        self.cornerInputLabel = ctk.CTkLabel(f, text='# of Inner CB Corners')
         self.cornerInputLabel.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
 
-        self.widthLabel = ctk.CTkLabel(self.mainFrame, text='Width')
+        self.widthLabel = ctk.CTkLabel(f, text='Width')
         self.widthLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.heightLabel = ctk.CTkLabel(self.mainFrame, text='Height')
+        self.heightLabel = ctk.CTkLabel(f, text='Height')
         self.heightLabel.grid(row=rowID, column=1, padx=5, pady=5)
-        self.widthComboEntry = ctk.CTkComboBox(master=self.mainFrame,
+        self.widthComboEntry = ctk.CTkComboBox(master=f,
                                                values=values,
                                                command=self.widthInput)
         self.widthComboEntry.grid(row=rowID, column=0, padx=5, pady=5)
-        self.heightComboEntry = ctk.CTkComboBox(master=self.mainFrame,
+        self.heightComboEntry = ctk.CTkComboBox(master=f,
                                                 values=values,
                                                 command=self.heightInput)
         self.heightComboEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
-        # Do the same thing for the sub-pixel search
-        self.SUBcornerInputLabel = ctk.CTkLabel(self.mainFrame, text='# for sub-Pixel Search')
+        self.SUBcornerInputLabel = ctk.CTkLabel(f, text='# for sub-Pixel Search')
         self.SUBcornerInputLabel.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         rowID += 1
 
-        self.SUBwidthLabel = ctk.CTkLabel(self.mainFrame, text='Width')
+        self.SUBwidthLabel = ctk.CTkLabel(f, text='Width')
         self.SUBwidthLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.SUBheightLabel = ctk.CTkLabel(self.mainFrame, text='Height')
+        self.SUBheightLabel = ctk.CTkLabel(f, text='Height')
         self.SUBheightLabel.grid(row=rowID, column=1, padx=5, pady=5)
 
-        self.SUBwidthComboEntry = ctk.CTkComboBox(master=self.mainFrame,
+        self.SUBwidthComboEntry = ctk.CTkComboBox(master=f,
                                                   values=values,
                                                   command=self.SUBwidthInput)
         self.SUBwidthComboEntry.grid(row=rowID, column=0, padx=5, pady=5)
 
-        self.SUBheightComboEntry = ctk.CTkComboBox(master=self.mainFrame,
+        self.SUBheightComboEntry = ctk.CTkComboBox(master=f,
                                                    values=values,
                                                    command=self.SUBheightInput)
         self.SUBheightComboEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
-        # Initiate the calibration procedure in a separate thread so that the GUI still functions
-        self.calibrateButton = ctk.CTkButton(self.mainFrame, text="Calibrate!", state="disabled",
-                                             command=self.calibrate)
-        self.calibrateButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        rowID += 1
+        self.calibrateButton = ctk.CTkButton(f, text="Calibrate!", state="disabled",
+                                             command=lambda f=master_frame: self.calibrate(f))
+        self.calibrateButton.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5)
+
+        self.protectClearCache(f, rowID)
 
         self.loadFromCache()
 
-        # Once a calibration is active, allow user to display a window that manages the calibration
-        self.displayCal = None
-        self.createCalibrationDisplay(rowID)
         rowID += 1
 
-        # Once a calibration is active, allow user to display a window that manages the calibration
-        self.configWindowButton = None
-        self.createConfigWindowButton(rowID)
-        rowID += 1
-
-        # Create a button that allows a user to clear the cache, but they must select it twice
-        self.clearCacheRow = rowID
-        self.protectClearCache()
-
-        # Now that necessary starting variables are created, load states from cache
-
-        self.restoreFromImageConfig()
-        self.updateConfigWindow()
-        self.updateCalWindow()
-
-    def createCalibrationDisplay(self, rowID):
-        self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
-                                        command=self.openCalWindow)
-        self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        if self.imageConfig.camCal.validCal:
-            self.displayCal.configure(state='normal')
+        return f
 
     def createCalibrationWindowButton(self, rowID):
         self.displayCal = ctk.CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
@@ -368,27 +341,6 @@ class FrontEndGui(ctk.CTk):
         self.configWindowButton = ctk.CTkButton(self.mainFrame, text='Criteria Configuration',
                                                 command=self.openConfigWindow)
         self.configWindowButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-
-    def on_closing(self):
-        '''
-        Closes camera streaming down, if it's still active, ensuring all destructors called in sequence
-        '''
-        if self.camera is not None:
-            self.camera.shutdown()
-        self.after(1000, self.destroy())
-
-    def openCamera(self):
-        '''
-        Opens Camera class and camera class GUI overrides main GUI while active
-        :return:
-        '''
-        if self.camera is None:
-            self.camera = cam.CameraGui(self)
-
-        self.camera.showWindow = True
-        self.unpackAllFrames()
-        self.geometry(self.camera.camFrameGeometry)
-        self.camera.setupFrame()
 
     def isFramePacked(self, frame):
         return frame.winfo_ismapped()
@@ -415,18 +367,17 @@ class FrontEndGui(ctk.CTk):
         '''
         return join(self.filepath, self.imageConfig.img_collection[idx].imageName)
 
-    def displayImagePointsThread(self):
+    def displayImagePointsThread(self, master_frame):
         '''
         This button spawns a thread that looks at all the existing chessboard corners (see displayImagePoints()).
         While the thread is spawned, the image menu is unavailable (as it is being consistently updated).
         '''
         self.displayImagePointsButton.configure(text='Calculating', fg_color='gray', state='disabled')
-        self.returnToMain()
-        self.openImagesButton.configure(command=None, fg_color='gray', state='disabled')
-        self.t3 = Thread(target=self.displayImagePoints, daemon=True)
+        self.availImagesLabel.configure(fg_color='gray', state='disabled')
+        self.t3 = Thread(target=lambda f=master_frame: self.displayImagePoints(f), daemon=True)
         self.t3.start()
 
-    def displayImagePoints(self):
+    def displayImagePoints(self, master_frame):
         '''
         This function examines all of the active image chessboard results and plots them to a graph.
         This is useful if the user wants to see what regions have already been included in the image. If a
@@ -441,7 +392,7 @@ class FrontEndGui(ctk.CTk):
 
         for imgClass in self.imageConfig.img_collection:
             if imgClass.include:
-                self.findChessboardCorners(imgClass, showImage=False)
+                self.findChessboardCorners(master_frame, imgClass, showImage=False)
 
         self.sortBySharpness()
         # Create a blank, black image with 3 color channels (BGR)
@@ -472,7 +423,7 @@ class FrontEndGui(ctk.CTk):
                     cv2.circle(blank_image, (round(imgPt[0][0]), round(imgPt[0][1])), 2,
                                (int(255 * b), int(255 * g), int(255 * r)), 2)
 
-        self.updateImageFrame()
+        self.updateImageFrame(master_frame)
 
         # If we succeeded at at least one image, then display the image of all of the found corners
         if gotAtLeastOneImage:
@@ -499,7 +450,7 @@ class FrontEndGui(ctk.CTk):
 
         self.displayImagePointsButton.configure(text='Display Image Points', fg_color=GREEN, state='normal')
         self.saveToCache()
-        self.openImagesButton.configure(command=self.openImageWindow, fg_color=GREEN, state='normal')
+        self.availImagesLabel.configure(fg_color=GREEN, state='normal')
 
     def saveCal(self, button):
         if self.imageConfig.camCal.validCal:
@@ -509,49 +460,40 @@ class FrontEndGui(ctk.CTk):
             return
         button.configure(fg_color='red')
 
-    def openImageWindow(self):
-        self.unpackAllFrames()
-        self.geometry(self.imageWinGeometry)
-        self.updateImageFrame()
-        self.after(100, self.imageFrame.pack(fill='both', expand=True))
-
     def openCalWindow(self):
-        self.unpackAllFrames()
-        self.geometry(self.calGeometry)
+        # self.unpackAllFrames()
+        # self.geometry(self.calGeometry)
         self.updateCalWindow()
-        self.calFrame.pack(fill='both', expand=True)
+        # self.calFrame.pack(fill='both', expand=True)
 
     def openConfigWindow(self):
         self.unpackAllFrames()
-        self.geometry(self.configGeometry)
-        self.configFrame.pack()
+        # self.geometry(self.configGeometry)
+        # self.configFrame.pack()
 
-    def returnToMain(self):
-        self.unpackAllFrames()
-        self.geometry(self.mainGeometry)
-        self.mainFrame.pack()
+    def setup_CalFrame(self, master_frame):
 
-    def updateCalWindow(self):
+        f = ctk.CTkFrame(master_frame)
         # If we have a previous calibration
         if self.imageConfig.camCal.validCal:
-
             # Then display the calibration
-            saveCalButton = ctk.CTkButton(master=self.calFrame, text='Save Calibration')
+            saveCalButton = ctk.CTkButton(master=f, text='Save Calibration')
             saveCalButton.configure(command=lambda btn=saveCalButton: self.saveCal(btn))
-            saveCalButton.grid(row=0, column=0, padx=0, pady=0)
+            saveCalButton.grid(row=0, column=0, padx=5, pady=5)
 
-            cal = ctk.CTkLabel(master=self.calFrame, text=self.imageConfig.camCal.calStr, justify='left', anchor='w')
-            cal.grid(row=1, column=0, padx=0, pady=0)
+            self.calLabel = ctk.CTkLabel(master=f, text=self.imageConfig.camCal.calStr, justify='center', anchor='w')
+            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
 
-            scale864Button = ctk.CTkButton(master=self.calFrame, text='Scale to 864x864', command=self.scaleTo864)
+            scale864Button = ctk.CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
             scale864Button.grid(row=3, column=0, padx=5, pady=5)
-            scale2848Button = ctk.CTkButton(master=self.calFrame, text='Scale to 2848x2848', command=self.scaleTo2848)
+            scale2848Button = ctk.CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
             scale2848Button.grid(row=4, column=0, padx=5, pady=5)
-            scaleAnyButton = ctk.CTkButton(master=self.calFrame, text='Scale to Input Size', command=self.scaleToInput)
+            scaleAnyButton = ctk.CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
             scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
-
-        backToMainButton = ctk.CTkButton(master=self.calFrame, text='Go back', command=self.returnToMain)
-        backToMainButton.grid(row=6, column=0, padx=5, pady=5)
+        else:
+            self.calLabel = ctk.CTkLabel(f, text="No calibration calculated yet.", justify='center')
+            self.calLabel.grid(row=0, column=0, padx=5, pady=5)
+        return f
 
     def scaleTo864(self):
         self.imageConfig.camCal.scaleCalibration(864)
@@ -573,7 +515,6 @@ class FrontEndGui(ctk.CTk):
             self.updateCalWindow()
         except ValueError:
             print('Invalid input. Please input only an integer.')
-
 
     def updateConfigWindow(self):
         rowID = 0
@@ -601,7 +542,7 @@ class FrontEndGui(ctk.CTk):
         else:
             fixPrincipalPointCB.deselect()
         fixPrincipalPointCB.configure(command=self.toggleFixPrincipalPoint)
-        fixPrincipalPointCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='ew')
+        fixPrincipalPointCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
         rowID += 1
 
         fixAspectRatioCB = ctk.CTkCheckBox(master=self.configFrame, text='Fix Aspect Ratio', checkbox_height=20)
@@ -610,7 +551,7 @@ class FrontEndGui(ctk.CTk):
         else:
             fixAspectRatioCB.deselect()
         fixAspectRatioCB.configure(command=self.toggleFixAspectRatio)
-        fixAspectRatioCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='ew')
+        fixAspectRatioCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
         rowID += 1
 
         zeroTangentDistCB = ctk.CTkCheckBox(master=self.configFrame, text='Zero Tangent Distance', checkbox_height=20)
@@ -619,7 +560,7 @@ class FrontEndGui(ctk.CTk):
         else:
             zeroTangentDistCB.deselect()
         zeroTangentDistCB.configure(command=self.toggleZeroTangentDist)
-        zeroTangentDistCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='ew')
+        zeroTangentDistCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
         rowID += 1
 
         backToMainButton = ctk.CTkButton(master=self.configFrame, text='Go back', command=self.returnToMain)
@@ -670,83 +611,91 @@ class FrontEndGui(ctk.CTk):
     def toggleFixAspectRatio(self):
         self.imageConfig.fixAspectRatio = not self.imageConfig.fixAspectRatio
 
-    def unpackAllFrames(self, exception=''):
-        if not exception == 'mainFrame' and self.isFramePacked(self.mainFrame):
-            self.mainFrame.pack_forget()
-        if not exception == 'imageFrame' and self.isFramePacked(self.imageFrame):
-            self.imageFrame.pack_forget()
-        if not exception == 'configFrame' and self.isFramePacked(self.configFrame):
-            self.configFrame.pack_forget()
-        if not exception == 'calFrame' and self.isFramePacked(self.calFrame):
-            self.calFrame.pack_forget()
-        if not exception == 'camFrame' and self.camera is not None and self.isFramePacked(self.camera.cam_frame):
-            self.camera.cam_frame.pack_forget()
+    def setup_imageFrame(self, master_frame):
+        f = ctk.CTkScrollableFrame(master_frame, height=600)
 
-    def setupImageFrame(self):
+        # try:
+        #     f._scrollable_frame.grid_columnconfigure(list(range(9)), weight=1)  # columns 0..11 used by your rows
+        # except AttributeError:
+        #     pass  # older customtkinter; safe to ignore
 
-        rowID = 0
-        selectAllButton = ctk.CTkButton(master=self.imageFrame, text='Include All Images',
+        rowID = 1
+        selectAllButton = ctk.CTkButton(master=f, text='Include All',
                                         command=self.includeAll)
         selectAllButton.grid(row=rowID, column=0, padx=5, pady=5)
 
-        removeUnselected = ctk.CTkButton(master=self.imageFrame, text='Remove Unselected', command=self.removeUnused)
-        removeUnselected.grid(row=rowID, column=3, padx=5, pady=5, columnspan=2)
+        removeUnselected = ctk.CTkButton(master=f, text='Remove Unselected', command=self.removeUnused)
+        removeUnselected.grid(row=rowID, column=1, padx=5, pady=5, columnspan=2)
 
-        self.displayImagePointsButton = ctk.CTkButton(master=self.imageFrame, text='Display All Chessboard Points',
-                                                      command=self.displayImagePointsThread)
-        self.displayImagePointsButton.grid(row=rowID, column=5, columnspan=2, padx=5, pady=5)
+        self.displayImagePointsButton = ctk.CTkButton(master=f, text='Display All Chessboard Points',
+                                                      command=lambda f=master_frame: self.displayImagePointsThread(f))
+        self.displayImagePointsButton.grid(row=rowID, column=3, columnspan=2, padx=5, pady=5)
 
-        backToMainButton = ctk.CTkButton(master=self.imageFrame, text='Go back', command=self.returnToMain)
-        backToMainButton.grid(row=rowID, column=7, padx=5, pady=5)
+        self.imgInvertProtectedButton = ctk.CTkButton(master=f, text='Invert All', hover_color='navy',
+                                                      fg_color='blue', width=100, command=self.unprotectInvert)
 
+        self.imgRotateCCWProtectedButton = ctk.CTkButton(master=f, image=self.leftArrow, text='All',
+                                                         hover_color='navy',
+                                                         fg_color='blue', width=100, command=self.unprotectRotateCCW)
+
+        self.imgRotateCWProtectedButton = ctk.CTkButton(master=f, image=self.rightArrow, text='All',
+                                                        hover_color='navy',
+                                                        fg_color='blue', width=100, command=self.unprotectRotateCW)
+
+        self.imgGrayProtectedButton = ctk.CTkButton(master=f, text='Grayscale All', hover_color='navy',
+                                                    fg_color='blue', width=100, command=self.unprotectAllGrayscale)
         self.protectInvert()
         self.protectAllGrayscale()
         self.protectRotateCCW()
         self.protectRotateCW()
 
         self.imageConfigWindowObjects = []
-        rowID = 0
 
+        rowID += 1
         while len(self.imageConfigWindowObjects) < self.imageConfig.num_valid_imgs:
-            self.createNewRow(rowID)
+            self.createNewRow(f, rowID)
             rowID += 1
 
-    def createNewRow(self, rowID):
-        imgIncludeCheckbox = ctk.CTkCheckBox(master=self.subImageFrame, text='')
+        self.updateImageFrame(f)
+
+        return f
+
+    def createNewRow(self, f, rowID):
+        imgIncludeCheckbox = ctk.CTkCheckBox(master=f, text='')
         imgIncludeCheckbox.grid(row=rowID, column=0)
 
-        imgNameButton = ctk.CTkButton(master=self.subImageFrame, text='')
+        imgNameButton = ctk.CTkButton(master=f, text='')
         imgNameButton.grid(row=rowID, column=1, padx=5, pady=5)
 
-        imgRes = ctk.CTkLabel(master=self.subImageFrame, text='')
+        imgRes = ctk.CTkLabel(master=f, text='')
         imgRes.grid(row=rowID, column=2, padx=5, pady=5)
 
-        imgShp = ctk.CTkLabel(master=self.subImageFrame, text='')
+        imgShp = ctk.CTkLabel(master=f, text='')
         imgShp.grid(row=rowID, column=3, padx=5, pady=5)
 
-        imgRestoreButton = ctk.CTkButton(master=self.subImageFrame, text='Restore')
+        imgRestoreButton = ctk.CTkButton(master=f, text='Restore')
         imgRestoreButton.grid(row=rowID, column=4, padx=5, pady=5)
 
-        imgFindCornersButton = ctk.CTkButton(master=self.subImageFrame, text='Find Corners')
+        imgFindCornersButton = ctk.CTkButton(master=f, text='Find Corners')
         imgFindCornersButton.grid(row=rowID, column=5, padx=5, pady=5)
 
-        imgInvertButton = ctk.CTkButton(master=self.subImageFrame, text='Invert Image')
+        imgInvertButton = ctk.CTkButton(master=f, text='Invert Image')
         imgInvertButton.grid(row=rowID, column=6, padx=5, pady=5)
 
-        imgGrayButton = ctk.CTkButton(master=self.subImageFrame, text='Grayscale Image')
+        imgGrayButton = ctk.CTkButton(master=f, text='Grayscale Image')
         imgGrayButton.grid(row=rowID, column=7, padx=5, pady=5)
 
-        imgCCWRotateButton = ctk.CTkButton(master=self.subImageFrame, text='', image=self.leftArrow)
+        imgCCWRotateButton = ctk.CTkButton(master=f, text='', image=self.leftArrow)
         imgCCWRotateButton.grid(row=rowID, column=8, padx=5, pady=5)
 
-        imgCWRotateButton = ctk.CTkButton(master=self.subImageFrame, text='', image=self.rightArrow)
+        imgCWRotateButton = ctk.CTkButton(master=f, text='', image=self.rightArrow)
         imgCWRotateButton.grid(row=rowID, column=9, padx=5, pady=5)
 
         self.imageConfigWindowObjects.append([imgIncludeCheckbox, imgNameButton, imgRes, imgShp, imgRestoreButton,
                                               imgFindCornersButton, imgInvertButton, imgGrayButton,
                                               imgCCWRotateButton, imgCWRotateButton])
 
-    def updateImageFrame(self):
+    def updateImageFrame(self, f):
 
         while len(self.imageConfigWindowObjects) > len(self.imageConfig.img_collection):
             for item in self.imageConfigWindowObjects[-1]:
@@ -754,11 +703,11 @@ class FrontEndGui(ctk.CTk):
                 item.destroy()
             self.imageConfigWindowObjects.pop(-1)
         while len(self.imageConfigWindowObjects) < len(self.imageConfig.img_collection):
-            self.createNewRow(len(self.imageConfigWindowObjects))
+            self.createNewRow(f, len(self.imageConfigWindowObjects))
 
         self.sortByResidual()
 
-        rowID = 0
+        rowID = 2
         for idx, imgClass in enumerate(self.imageConfig.img_collection):
             (imgIncludeCheckbox,
              imgNameButton,
@@ -797,7 +746,7 @@ class FrontEndGui(ctk.CTk):
 
             imgRestoreButton.configure(command=lambda imgC=imgClass: self.restore(imgC))
 
-            imgFindCornersButton.configure(command=lambda imgC=imgClass: self.findChessboardCorners(imgC, True, True))
+            imgFindCornersButton.configure(command=lambda imgC=imgClass: self.findChessboardCorners(f, imgC, True, True))
 
             imgInvertButton.configure(command=lambda imgC=imgClass: self.invertIndividualImage(imgC))
 
@@ -827,10 +776,10 @@ class FrontEndGui(ctk.CTk):
         self.updateImageFrame()
 
         if len(self.imageConfig.img_collection) > 5:
-            self.openImagesButton.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
+            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
             self.calibrateButton.configure(state="normal")
         else:
-            self.openImagesButton.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
+            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
 
     def copyToRemovedFolder(self, imgClass):
         if not os.path.exists(join(self.filepath, 'Removed')):
@@ -898,24 +847,24 @@ class FrontEndGui(ctk.CTk):
     def protectInvert(self, row=1):
         self.imgInvertProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectInvert)
         if not self.imgInvertProtectedButton.winfo_ismapped():
-            self.imgInvertProtectedButton.grid(row=row, column=5, padx=5, pady=5, sticky='ew')
+            self.imgInvertProtectedButton.grid(row=row, column=6, padx=5, pady=5, sticky='nsew')
 
     def protectAllGrayscale(self, row=1):
         self.imgGrayProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectAllGrayscale)
         if not self.imgGrayProtectedButton.winfo_ismapped():
-            self.imgGrayProtectedButton.grid(row=row, column=6, padx=5, pady=5, sticky='ew')
+            self.imgGrayProtectedButton.grid(row=row, column=7, padx=5, pady=5, sticky='nsew')
 
     def protectRotateCCW(self, row=1):
         self.imgRotateCCWProtectedButton.configure(fg_color='blue', hover_color='cyan4',
                                                    command=self.unprotectRotateCCW)
         if not self.imgRotateCCWProtectedButton.winfo_ismapped():
-            self.imgRotateCCWProtectedButton.grid(row=row, column=7, padx=5, pady=5, sticky='ew')
+            self.imgRotateCCWProtectedButton.grid(row=row, column=8, padx=5, pady=5, sticky='nsew')
 
     def protectRotateCW(self, row=1):
         self.imgRotateCWProtectedButton.configure(fg_color='blue', hover_color='cyan4',
                                                   command=self.unprotectRotateCW)
         if not self.imgRotateCWProtectedButton.winfo_ismapped():
-            self.imgRotateCWProtectedButton.grid(row=row, column=8, padx=5, pady=5, sticky='ew')
+            self.imgRotateCWProtectedButton.grid(row=row, column=9, padx=5, pady=5, sticky='nsew')
 
     def invertAll(self):
         self.imgInvertProtectedButton.configure(fg_color='black')
@@ -976,37 +925,38 @@ class FrontEndGui(ctk.CTk):
         self.saveToCache()
         self.updateIncludeCheckboxes()
 
-    def unprotectClearCache(self, button: ctk.CTkButton):
+    def unprotectClearCache(self, master_frame, button: ctk.CTkButton, rowID):
         button.grid_forget()
-        clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='Really Clear Cache', fg_color='green',
-                                         command=self.clearCache)
-        clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
-        self.after(2000, self.protectClearCache)
+        clearCacheButton = ctk.CTkButton(master=master_frame, text='Really Clear Cache', fg_color='green',
+                                         command=lambda f=master_frame: self.clearCache(f, rowID))
+        clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        self.after(2000, lambda f=master_frame, rid=rowID: self.protectClearCache(f, rid))
         self.after(2000, clearCacheButton.grid_forget)
 
-    def protectClearCache(self):
-        clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='Clear Cache', fg_color='blue', hover_color='navy')
-        clearCacheButton.configure(command=lambda button=clearCacheButton: self.unprotectClearCache(button))
-        clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
+    def protectClearCache(self, master_frame, rowID):
+        clearCacheButton = ctk.CTkButton(master=master_frame, text='Clear Cache', fg_color='blue', hover_color='navy')
+        clearCacheButton.configure(command=lambda button=clearCacheButton, f=master_frame, rid = rowID: self.unprotectClearCache(f, button, rid))
+        clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
 
-    def clearCache(self):
+    def clearCache(self, master_frame, rowID):
         if os.path.exists(join(self.filepath, IMAGE_CACHE)):
             filepath = copy.copy(self.filepath)
             os.remove(join(self.filepath, IMAGE_CACHE))
 
-            clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='Clearing', fg_color='yellow',
+            clearCacheButton = ctk.CTkButton(master=master_frame, text='Clearing', fg_color='yellow',
                                              text_color='black', hover_color='yellow')
-            clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
-
+            clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+            self.imageConfig.camCal = Calibration()
             self.imageConfig = ImageryCalibrationConfig()
             self.filepath = filepath
             self.restoreFromWindowState()
             self.loadImages()
-            self.updateImageFrame()
+            self.updateImageFrame(master_frame)
+            self.calLabel.configure(text=self.imageConfig.camCal.calStr)
         else:
-            clearCacheButton = ctk.CTkButton(master=self.mainFrame, text='No cache!', fg_color='red', hover_color='red')
-            clearCacheButton.grid(row=self.clearCacheRow, column=0, columnspan=2, padx=5, pady=5)
-        self.after(2000, self.protectClearCache)
+            clearCacheButton = ctk.CTkButton(master=master_frame, text='No cache!', fg_color='red', hover_color='red')
+            clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        self.after(2000, lambda f=master_frame, rid=rowID : self.protectClearCache(f, rid))
 
     def updateInclusion(self, idx):
         self.imageConfig.img_collection[idx].include = not self.imageConfig.img_collection[idx].include
@@ -1068,19 +1018,19 @@ class FrontEndGui(ctk.CTk):
         self.restoreFromImageConfig()
         self.loadImages()
 
-    def calibrate(self):
+    def calibrate(self, master_frame):
         self.calculating = True
         self.calibrateButton.configure(state='disabled', text='Calculating...', fg_color='gray')
-        self.t1 = Thread(target=self.threadedCal)
+        self.t1 = Thread(target=lambda f=master_frame: self.threadedCal(f))
         self.t1.start()
 
-    def threadedCal(self):
+    def threadedCal(self, master_frame):
         for imgClass in self.imageConfig.img_collection:
             if imgClass.include is True:
-                self.findChessboardCorners(imgClass, False)
+                self.findChessboardCorners(master_frame, imgClass, False)
         self.calibrateCamera()
         self.saveToCache()
-        self.updateImageFrame()
+        self.updateImageFrame(master_frame)
         self.calibrateButton.configure(state='normal', text='Calibrate', fg_color='green')
         self.calculating = False
 
@@ -1112,16 +1062,18 @@ class FrontEndGui(ctk.CTk):
         self.filepath = os.path.dirname(poss_filepath)
         self.folderLabel.configure(text=os.path.basename(self.filepath))
         self.imageConfig.img_collection = []
+
         self.loadFromCache(False)
+
         self.saveToCache()
 
     def sortBySharpness(self):
         self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,
-                                                key=lambda img: self.sharpnessTest(img.sharpness))
+                                                 key=lambda img: self.sharpnessTest(img.sharpness))
 
     def sortByResidual(self):
         self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,
-                                                key=lambda img: self.sharpnessTest(img.residual))
+                                                 key=lambda img: self.sharpnessTest(img.residual))
 
     def sharpnessTest(self, sharpValue):
         if sharpValue is None:
@@ -1142,17 +1094,17 @@ class FrontEndGui(ctk.CTk):
                 self.imageConfig.img_collection.append(ImageData(os.path.basename(img)))
 
         if len(self.imageConfig.img_collection) > 5:
-            self.openImagesButton.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
+            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
             self.calibrateButton.configure(state="normal")
         else:
-            self.openImagesButton.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
+            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
             self.calibrateButton.configure(state="disabled")
 
         self.saveToCache()
         if not self.initImageFrame:
-            self.setupImageFrame()
+            # self.setupImageFrame()
             self.initImageFrame = True
-        self.updateImageFrame()
+        # self.updateImageFrame()
 
     def invertImageToggle(self):
         self.imageConfig.invert_image = not self.imageConfig.invert_image
@@ -1174,30 +1126,7 @@ class FrontEndGui(ctk.CTk):
 
         cv2.namedWindow(imgClass.imageName)
 
-        # kernel = np.array([[0, -1, 0],[-1, 5, -1], [0, -1, 0]])
-        # sharpened_image = cv2.filter2D(dispImg, -1, kernel)
-        #
-        # gray = cv2.cvtColor(dispImg, cv2.COLOR_BGR2GRAY)
-        # _laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        # _sharpness = _laplacian.var()
-        #
-        # _contrast = gray.std()
-        #
-        # _clarity = _sharpness * _contrast
-        #
-        # _sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=5)
-        # _sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-        # _sobel = np.sqrt(_sobel_x ** 2 + _sobel_y ** 2)
-        # _resolution = np.mean(_sobel)
-
-        # print(f'Laplacian: {_laplacian}')
-        # print(f'Sharpness: {_sharpness}')
-        # print(f'Contrast: {_contrast}')
-        # print(f'Clarity: {_clarity}')
-        # print(f'Resolution: {_resolution}')
-
         cv2.imshow(imgClass.imageName, dispImg)
-        # cv2.imshow('Sharper? ', sharpened_image)
 
         self.currImgClass = imgClass
         self.currImg = copy.copy(dispImg)
@@ -1249,7 +1178,7 @@ class FrontEndGui(ctk.CTk):
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-    def findChessboardCorners(self, imgClass, showImage=True, updateImageFrame=False):
+    def findChessboardCorners(self, master_frame, imgClass, showImage=True, updateImageFrame=False):
 
         if imgClass.imgPts is not None and not showImage:
             return  # Already have points for this image
@@ -1278,8 +1207,9 @@ class FrontEndGui(ctk.CTk):
         # cv2.waitKey(0)
 
         objp = np.zeros((self.imageConfig.num_inner_corners_W * self.imageConfig.num_inner_corners_H, 3), np.float32)
-        objp[:, :2] = np.mgrid[0:self.imageConfig.num_inner_corners_W, 0:self.imageConfig.num_inner_corners_H].T.reshape(-1,
-                                                                                                                   2) * self.imageConfig.spacing
+        objp[:, :2] = np.mgrid[0:self.imageConfig.num_inner_corners_W,
+                      0:self.imageConfig.num_inner_corners_H].T.reshape(-1,
+                                                                        2) * self.imageConfig.spacing
 
         if self.imageConfig.invert_image:
             temp = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1312,34 +1242,36 @@ class FrontEndGui(ctk.CTk):
             imgClass.objPts = objp
 
             criteria = (
-            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, self.imageConfig.maxIter, self.imageConfig.minStepSize)
+                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, self.imageConfig.maxIter,
+                self.imageConfig.minStepSize)
             corners2 = cv2.cornerSubPix(gray, np.float32(corners),
-                                        (self.imageConfig.SUB_num_inner_corners_H, self.imageConfig.SUB_num_inner_corners_W),
+                                        (self.imageConfig.SUB_num_inner_corners_H,
+                                         self.imageConfig.SUB_num_inner_corners_W),
                                         (-1, -1), criteria)
             imgClass.imgPts = corners2
 
             sharpness = cv2.estimateChessboardSharpness(gray, (
-            self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H), np.float32(corners2))
+                self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H), np.float32(corners2))
             imgClass.sharpness = sharpness[0][0]
         else:
             imgClass.include = False
-            self.openImagesButton.configure(text=str(len(self.imageConfig.img_collection)) + ' valid images')
+            self.availImagesLabel.configure(text=str(len(self.imageConfig.img_collection)) + ' valid images')
 
         if updateImageFrame:
-            self.updateImageFrame()
+            self.updateImageFrame(master_frame)
 
         self.saveToCache()
 
         if showImage:
             self.drawImagePoints(imgClass, img, gray)
 
-
     def drawImagePoints(self, imgClass, img, gray):
         if imgClass.imgPts is not None:
             # Draw and display the corners
             img = cv2.drawChessboardCorners(img,
                                             (
-                                            self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H),
+                                                self.imageConfig.num_inner_corners_W,
+                                                self.imageConfig.num_inner_corners_H),
                                             imgClass.imgPts, True)
 
             min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
@@ -1397,7 +1329,7 @@ class FrontEndGui(ctk.CTk):
         res - list of residuals for each input image
         '''
 
-        self.startTime = time.time()
+        startTime = time.time()
 
         images = []
         objPoints = []
@@ -1408,13 +1340,10 @@ class FrontEndGui(ctk.CTk):
                 objPoints.append(imgClass.objPts)
                 imgPoints.append(imgClass.imgPts)
 
-        initialVector = np.eye(3, 3)
-        initialVector[2, 2] = 0
-
         gray = cv2.cvtColor(cv2.imread(self.fileName(0)), cv2.COLOR_BGR2GRAY)
 
         if self.imageConfig.fisheye:
-            K = np.array([[400.0, 0.0, 400.0],[0.0, 400.0, 400.0],[0.0, 0.0, 1.0]])
+            K = np.array([[400.0, 0.0, 400.0], [0.0, 400.0, 400.0], [0.0, 0.0, 1.0]])
             D = np.zeros((4, 1))
             rvecs = [np.zeros((1, 1, 3), dtype=np.float64) for i in range(len(objPoints))]
             tvecs = [np.zeros((1, 1, 3), dtype=np.float64) for i in range(len(objPoints))]
@@ -1433,14 +1362,23 @@ class FrontEndGui(ctk.CTk):
             mtx = calValues[1]
             dist = np.squeeze(calValues[2])
         else:
+            K0 = cv2.initCameraMatrix2D(objPoints, imgPoints, gray.shape[::-1], 0)
+
+            flags = (self.imageConfig.flags or 0) | cv2.CALIB_USE_INTRINSIC_GUESS
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                        self.imageConfig.maxIter,  # e.g. 30–50 is usually enough
+                        self.imageConfig.minStepSize)  # e.g. 1e-6..1e-5
+
             calValues = cv2.calibrateCameraROExtended(
-                objPoints,
-                imgPoints,
-                gray.shape[::-1],
-                1,
-                initialVector,
-                None,
-                flags=(self.imageConfig.flags))
+                objectPoints=objPoints,
+                imagePoints=imgPoints,
+                imageSize=gray.shape[::-1],
+                iFixedPoint=1,  # keep if you really want RO; otherwise use calibrateCamera(...)
+                cameraMatrix=K0,
+                distCoeffs=None,
+                flags=flags,
+                criteria=criteria
+            )
             ret = calValues[0]
             mtx = calValues[1]
             dist = calValues[2]
@@ -1454,12 +1392,12 @@ class FrontEndGui(ctk.CTk):
 
             for img_idx, img in enumerate(images):
                 self.imageConfig.img_collection[self.findIndexGivenImageName(os.path.basename(img))].residual = \
-                residuals[img_idx][0]
+                    residuals[img_idx][0]
 
             # Sort the images by their residual Values
             self.sortByResidual()
 
-        self.endTime = time.time()
+        endTime = time.time()
 
         fovx, fovy, focalLength, principalPoint, aspectRatio = cv2.calibrationMatrixValues(mtx, gray.shape[::-1], 25.,
                                                                                            25.)
@@ -1467,14 +1405,8 @@ class FrontEndGui(ctk.CTk):
         self.imageConfig.camCal.fisheye = self.imageConfig.fisheye
         self.imageConfig.camCal.setCameraMatrix(mtx=mtx)
         self.imageConfig.camCal.setDistortion(dist=dist.T)
-        self.imageConfig.camCal.setAccessories(calTime=self.endTime - self.startTime, numCBUsed=len(images),
+        self.imageConfig.camCal.setAccessories(calTime=endTime - startTime, numCBUsed=len(images),
                                                width=gray.shape[::-1][0], height=gray.shape[::-1][1], hfov=fovx,
                                                rms=ret, timeOfCompute=datetime.datetime.now())
 
-
-        self.updateCalWindow()
-        self.displayCal.configure(state='normal')
-
-
-if __name__ == '__main__':
-    (gui := FrontEndGui()).mainloop()
+        self.calLabel.configure(text=self.imageConfig.camCal.calStr)

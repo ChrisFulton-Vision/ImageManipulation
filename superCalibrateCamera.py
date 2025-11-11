@@ -196,6 +196,7 @@ class CameraGui(ctk.CTkFrame):
         self.cam_frame = ctk.CTkFrame(master=master)
         self.config_frame = ctk.CTkFrame(master=master)
         self.export_frame = ctk.CTkFrame(master=master)
+        self.hotkey_frame = ctk.CTkFrame(master=master)
         self.showWindow = False
         self.GaborGUI = None
         self.radius = 800
@@ -973,7 +974,45 @@ class CameraGui(ctk.CTkFrame):
         self.exportStartFrame.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.exportEndFrame.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
 
-        self.cam_frame.pack()
+        # self.cam_frame.pack()
+
+        title = 'Folder Replay Hotkeys'
+        items = [
+            ("Space",      "Pause / resume"),
+            ("f",          "Toggle Fixed-FPS ↔ Real-time"),
+            ("c / z",      "Step forward / backward one frame"),
+            ("d / a",      "Speed up / slow down playback"),
+            ("r",          "Reverse direction"),
+            ("w",          "Toggle overlays"),
+            ("s / e",      "Mark export start / end"),
+            ("[ / ] , { / }", "Adjust time offset (small / large)"),
+            ("; / ' , : / \"", "Adjust time offset (fine)"),
+            ("p",          "Persist time offset"),
+            ("Esc",        "Exit player"),
+        ]
+
+        ctk.CTkLabel(self.hotkey_frame, text=title, font=("Segoe UI", 16, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8)
+        )
+
+        # headings
+        ctk.CTkLabel(self.hotkey_frame, text="Key", font=("Segoe UI", 13, "bold")).grid(
+            row=1, column=0, sticky="w", padx=12, pady=(6, 2)
+        )
+        ctk.CTkLabel(self.hotkey_frame, text="Action", font=("Segoe UI", 13, "bold")).grid(
+            row=1, column=1, sticky="w", padx=12, pady=(6, 2)
+        )
+
+        # rows
+        for i, (key, desc) in enumerate(items, start=2):
+            ctk.CTkLabel(self.hotkey_frame, text=key).grid(row=i, column=0, sticky="w", padx=12, pady=2)
+            ctk.CTkLabel(self.hotkey_frame, text=desc, justify="left", wraplength=520).grid(
+                row=i, column=1, sticky="w", padx=12, pady=2
+            )
+
+        # let text column expand
+        self.hotkey_frame.grid_columnconfigure(0, weight=0)
+        self.hotkey_frame.grid_columnconfigure(1, weight=1)
 
     def shutdown(self):
         self.shutting_down = True
@@ -1086,6 +1125,14 @@ class CameraGui(ctk.CTkFrame):
         self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=CTK_GREEN)
         self.making_gifOrVid = False
 
+    def startStreamToggle(self):
+        if self._thread is None or not self._thread.is_alive():  # thread not running
+            self.startStreamOn()
+            return True
+
+        self.startStreamOffBool()
+        return False
+
     def startStreamOn(self):
         self.showWindow = True
         self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying',
@@ -1137,6 +1184,7 @@ class CameraGui(ctk.CTkFrame):
             self.showWindow = False
 
         cv2.destroyAllWindows()
+
 
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
@@ -1646,6 +1694,11 @@ class CameraGui(ctk.CTkFrame):
                     while self.making_gifOrVid:
                         time.sleep(0.1)
                 pressed.clear()
+
+                pending_keys.extend(self._poll_keys(1))
+                if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
+                    self.threadStopper.set()
+                    break
 
         finally:
             cv2.destroyAllWindows()

@@ -98,7 +98,7 @@ class HUD_Marker:
 
         self.draw_controlMode(image, mode)
 
-        cv2.putText(image, f'{self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+        # cv2.putText(image, f'BnkOffset: {self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
 
         if box_around:
             cv2.rectangle(image, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)

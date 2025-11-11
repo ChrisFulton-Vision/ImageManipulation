@@ -776,10 +776,10 @@ class CalibrateGui(ctk.CTkFrame):
         self.updateImageFrame()
 
         if len(self.imageConfig.img_collection) > 5:
-            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
+            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color='blue')
             self.calibrateButton.configure(state="normal")
         else:
-            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
+            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color="red")
 
     def copyToRemovedFolder(self, imgClass):
         if not os.path.exists(join(self.filepath, 'Removed')):
@@ -1094,10 +1094,10 @@ class CalibrateGui(ctk.CTkFrame):
                 self.imageConfig.img_collection.append(ImageData(os.path.basename(img)))
 
         if len(self.imageConfig.img_collection) > 5:
-            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color=GREEN)
+            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color='blue')
             self.calibrateButton.configure(state="normal")
         else:
-            self.availImagesLabel.configure(text=str(self.imageConfig.num_valid_imgs) + ' valid images', fg_color="red")
+            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color="red")
             self.calibrateButton.configure(state="disabled")
 
         self.saveToCache()

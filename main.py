@@ -6,6 +6,7 @@ from tkinter import TclError
 import customtkinter as ctk
 import superCalibrateCamera as cam
 import superCalibrate as calibrate
+from copy import deepcopy
 
 GREEN = '#2FA572'
 DEFAULT_HOVER = ('#0C955A', '#106A43')
@@ -71,14 +72,28 @@ class CalibratePage(ctk.CTkFrame):
         show_section(self, "Configuration")
 
     # ----- section UIs -----
-    def _make_ImagePage(self):
-        return self.calPage.setup_imageFrame(self)
 
     def _make_setupPage(self):
         return self.calPage.setup_configFrame(self)
 
+    def _make_ImagePage(self):
+        return self.calPage.setup_imageFrame(self)
+
     def _make_calibrationPage(self):
         return self.calPage.setup_CalFrame(self)
+
+    def submenu_footer(self):
+        def on_toggle(btn: ctk.CTkButton):
+            # call your existing toggle
+            running = self.calPage.calibrate_buttonCallback(self, btn)
+
+            btn.configure(text="Calibrating", fg_color="royalblue4", hover_color="blue", state='disabled')
+            # update UI to reflect state
+            # if running:
+            # else:
+            #     btn.configure(text="Start Calibrate", fg_color=GREEN, hover_color=DEFAULT_HOVER)
+
+        return ("Start Calibrate", on_toggle)
 
 
 class CameraPage(ctk.CTkFrame):
@@ -95,6 +110,8 @@ class CameraPage(ctk.CTkFrame):
             "Configuration": self._make_setupPage(),
             "Image Processing": self._make_ImgProcPage(),
             "Export": self._make_exportPage(),
+            "Playback": self._make_playbackPage(),
+            "Data Processing": self._make_dataPage(),
             "Hotkeys": self._make_hotkeyPage(),
         }
         show_section(self, "Configuration")
@@ -105,6 +122,10 @@ class CameraPage(ctk.CTkFrame):
         return self.camGui.config_frame
     def _make_exportPage(self):
         return self.camGui.export_frame
+    def _make_playbackPage(self):
+        return self.camGui.playback_frame
+    def _make_dataPage(self):
+        return self.camGui.hotkey_frame
     def _make_hotkeyPage(self):
         return self.camGui.hotkey_frame
 
@@ -299,48 +320,62 @@ class App(ctk.CTk):
 
         return handler
 
-    def _fit_to_content(self, page, show_subnav: bool):
-        self.update_idletasks()
-
-        if not self.mainnav.winfo_exists():
+    def _fit_to_content(self, page, show_subnav: bool,
+                        smooth_transition_tuple: tuple[list, tuple[int, int]] = (None, (None, None))):
+        # prevent overlapping animations
+        if getattr(self, "_resize_inflight", False):
             return
+        self._resize_inflight = True
 
-        # Sidebars
-        main_w = self.mainnav.winfo_reqwidth()
+        try:
+            self.update_idletasks()
+            if not self.mainnav.winfo_exists():
+                return
 
-        if show_subnav:
-            mapped = [w for w in self.subnav.winfo_children() if w.winfo_ismapped()]
-            sub_w = max((w.winfo_reqwidth() for w in mapped), default=0)
-        else:
-            sub_w = 0
+            # Sidebars
+            main_w = self.mainnav.winfo_reqwidth()
+            if show_subnav:
+                mapped = [w for w in self.subnav.winfo_children() if w.winfo_ismapped()]
+                sub_w = max((w.winfo_reqwidth() for w in mapped), default=0)
+            else:
+                sub_w = 0
 
-        # Page: use only active section width (unchanged)
-        page_w = self._section_reqwidth(page)
+            # Page width/height
+            page_w = self._section_reqwidth(page)
+            main_h = self.mainnav.winfo_reqheight()
+            sub_h = self.subnav.winfo_reqheight() if show_subnav else 0
+            page_h = page.winfo_reqheight()
 
-        # Heights: take max of columns to keep things simple
-        main_h = self.mainnav.winfo_reqheight()
-        sub_h = self.subnav.winfo_reqheight() if show_subnav else 0
-        page_h = page.winfo_reqheight()
+            BORDER_W, BORDER_H = 12, 12
+            target_w = main_w + sub_w + page_w + BORDER_W
+            target_h = max(main_h, sub_h, page_h) + BORDER_H
 
-        # Modest window chrome allowance (keep small to avoid bloat)
-        BORDER_W, BORDER_H = 12, 12
+            # current geom
+            curr_w, curr_h = self.winfo_width(), self.winfo_height()
+            dw, dh = target_w - curr_w, target_h - curr_h
 
-        total_w = main_w + sub_w + page_w + BORDER_W
-        total_h = max(main_h, sub_h, page_h) + BORDER_H
+            # If already close, snap once and bail
+            if abs(dw) + abs(dh) <= 12:
+                self.geometry(f"{target_w}x{target_h}")
+                return
 
-        # Ensure parents propagate sizes
-        self.content.grid_propagate(True)
-        page.grid_propagate(True)
+            # Build a tiny easing list based on distance (2–3 steps max)
+            steps = 2 if (abs(dw) + abs(dh) < 600) else 3
+            alphas = [i / float(steps) for i in range(1, steps + 1)]  # e.g., [0.5, 1.0] or [0.33, 0.66, 1.0]
 
-        curr_w, curr_h = self.winfo_width(), self.winfo_height()
+            def tick(i: int):
+                a = alphas[i]
+                w = int(curr_w + a * dw)
+                h = int(curr_h + a * dh)
+                self.geometry(f"{w}x{h}")
+                self.update_idletasks()  # cheaper than full update
+                if i + 1 < len(alphas):
+                    self.after(12, tick, i + 1)
 
-        alpha = 0.5
-
-        new_geom = f"{int(alpha*total_w + (1.0-alpha) * curr_w)}x{int(alpha * total_h + (1.0-alpha) * curr_h)}"
-        self.geometry(new_geom)
-        self.update()
-        if abs(total_w - curr_w) > 10 or abs(total_h - curr_h) > 10:
-            self.after(5, lambda: self._fit_to_content(page, show_subnav))
+            tick(0)
+        finally:
+            # let the last scheduled after run before clearing; small delay prevents re-entrancy thrash
+            self.after(50, lambda: setattr(self, "_resize_inflight", False))
 
     def _active_section(self, page):
         # Prefer explicitly recorded active section (see show_section)

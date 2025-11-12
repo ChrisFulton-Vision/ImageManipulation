@@ -7,6 +7,7 @@ from tkinter import filedialog
 from threading import Thread
 from PIL import Image
 from enum import Enum
+from functools import partial
 
 from SupportModules.Calibration import Calibration
 import superCalibrateCamera as cam
@@ -165,6 +166,7 @@ class CalibrateGui(ctk.CTkFrame):
         ##########################################################################
         # Image Management Frame Setup
 
+        self.imageFrame = None
         self.leftArrow = ctk.CTkImage(light_image=Image.open('leftArrow.png'), size=(20, 20))
         self.rightArrow = ctk.CTkImage(light_image=Image.open('rightArrow.png'), size=(20, 20))
 
@@ -172,6 +174,17 @@ class CalibrateGui(ctk.CTkFrame):
         self.imgRotateCCWProtectedButton = None
         self.imgRotateCWProtectedButton = None
         self.imgGrayProtectedButton = None
+
+        self.imageFrame = None
+        self._rows_holder = None
+        self._page_start = 0
+        self._page_size = 10
+        self._page_label = None
+
+        self.firstPageBtn = None
+        self.prevPageBtn = None
+        self.nextPageBtn = None
+        self.lastPageBtn = None
 
         ##########################################################################
         # Calibration Frame Setup
@@ -611,53 +624,148 @@ class CalibrateGui(ctk.CTkFrame):
     def toggleFixAspectRatio(self):
         self.imageConfig.fixAspectRatio = not self.imageConfig.fixAspectRatio
 
+    def _render_row(self, idx, widgets, f):
+        """Retitle + rebind one row from item idx (no new widgets)."""
+        (imgIncludeCheckbox,
+         imgNameButton,
+         imgRes,
+         imgShp,
+         imgRestoreButton,
+         imgFindCornersButton,
+         imgInvertButton,
+         imgGrayButton,
+         imgCCWRotateButton,
+         imgCWRotateButton) = widgets
+
+        imgClass = self.imageConfig.img_collection[idx]
+
+        # checkbox state
+        (imgIncludeCheckbox.select() if imgClass.include else imgIncludeCheckbox.deselect())
+        imgIncludeCheckbox.configure(command=partial(self.updateInclusion, idx),
+                                     state="normal")
+
+        # labels
+        if imgClass.residual is None:
+            currRes = ''
+        elif imgClass.residual == 10000.0:
+            currRes = 'Disabled'
+        else:
+            currRes = f'Res: {round(imgClass.residual, 3)}'
+        imgRes.configure(text=currRes)
+
+        currShrp = '' if imgClass.sharpness is None else f'Shrp: {round(imgClass.sharpness, 3)}'
+        imgShp.configure(text=currShrp)
+
+        # commands
+        imgNameButton.configure(text=imgClass.imageName, command=partial(self.showBasicImage, imgClass), state="normal")
+        imgRestoreButton.configure(command=partial(self.restore, imgClass), state="normal")
+        imgFindCornersButton.configure(command=partial(self.findChessboardCorners, f, imgClass, True, True),
+                                       state="normal")
+        imgInvertButton.configure(command=partial(self.invertIndividualImage, imgClass), state="normal")
+        imgGrayButton.configure(command=partial(self.grayscaleIndividualImage, imgClass), state="normal")
+        imgCCWRotateButton.configure(command=partial(self.rotateCCWIndividualImage, imgClass), state="normal")
+        imgCWRotateButton.configure(command=partial(self.rotateCWIndividualImage, imgClass), state="normal")
+
+    def _page_bounds(self):
+        total = len(self.imageConfig.img_collection)
+        start = max(0, min(self._page_start, max(0, total - 1)))
+        end = min(total, start + self._page_size)
+        return start, end, total
+
+    def _refresh_all_rows(self, f):
+        start, end, total = self._page_bounds()
+        needed = end - start
+        while len(self.imageConfigWindowObjects) < needed:
+            self.createNewRow(self._rows_holder, len(self.imageConfigWindowObjects))
+
+        for i in range(needed):
+            idx = start + i
+            widgets = self.imageConfigWindowObjects[i]
+            self._render_row(idx, widgets, f)
+            for w in widgets:
+                try:
+                    w.grid()
+                except:
+                    pass
+
+        for i in range(needed, len(self.imageConfigWindowObjects)):
+            for w in self.imageConfigWindowObjects[i]:
+                try:
+                    w.grid_remove()
+                except:
+                    pass
+
+        self._update_page_label_and_buttons()  # ← keep UI in sync
+
     def setup_imageFrame(self, master_frame):
-        f = ctk.CTkScrollableFrame(master_frame, height=600)
 
-        # try:
-        #     f._scrollable_frame.grid_columnconfigure(list(range(9)), weight=1)  # columns 0..11 used by your rows
-        # except AttributeError:
-        #     pass  # older customtkinter; safe to ignore
+        f = ctk.CTkFrame(master_frame)  # <— plain frame
+        f.grid_rowconfigure(0, weight=0)  # header
+        f.grid_rowconfigure(1, weight=1)  # rows
+        f.grid_columnconfigure(0, weight=1)
 
-        rowID = 1
-        selectAllButton = ctk.CTkButton(master=f, text='Include All',
-                                        command=self.includeAll)
+        # Header container (row 0)
+        header = ctk.CTkFrame(f, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(list(range(12)), weight=0)  # plenty of columns
+
+        # Rows container (row 1)
+        self._rows_holder = ctk.CTkFrame(f, fg_color="transparent")
+        self._rows_holder.grid(row=1, column=0, sticky="nsew")
+        self._rows_holder.grid_columnconfigure(list(range(10)), weight=1)
+
+        # --- put all header buttons in `header` (NOT in f) ---
+        rowID = 0
+        selectAllButton = ctk.CTkButton(master=header, text='Include All', command=self.includeAll)
         selectAllButton.grid(row=rowID, column=0, padx=5, pady=5)
 
-        removeUnselected = ctk.CTkButton(master=f, text='Remove Unselected', command=self.removeUnused)
+        removeUnselected = ctk.CTkButton(master=header, text='Remove Unselected',
+                                         command=lambda f=master_frame: self.removeUnused(f))
         removeUnselected.grid(row=rowID, column=1, padx=5, pady=5, columnspan=2)
 
-        self.displayImagePointsButton = ctk.CTkButton(master=f, text='Display All Chessboard Points',
+        self.displayImagePointsButton = ctk.CTkButton(master=header, text='Display All Chessboard Points',
                                                       command=lambda f=master_frame: self.displayImagePointsThread(f))
         self.displayImagePointsButton.grid(row=rowID, column=3, columnspan=2, padx=5, pady=5)
 
-        self.imgInvertProtectedButton = ctk.CTkButton(master=f, text='Invert All', hover_color='navy',
+        self.imgInvertProtectedButton = ctk.CTkButton(master=header, text='Invert All', hover_color='navy',
                                                       fg_color='blue', width=100, command=self.unprotectInvert)
-
-        self.imgRotateCCWProtectedButton = ctk.CTkButton(master=f, image=self.leftArrow, text='All',
-                                                         hover_color='navy',
-                                                         fg_color='blue', width=100, command=self.unprotectRotateCCW)
-
-        self.imgRotateCWProtectedButton = ctk.CTkButton(master=f, image=self.rightArrow, text='All',
-                                                        hover_color='navy',
-                                                        fg_color='blue', width=100, command=self.unprotectRotateCW)
-
-        self.imgGrayProtectedButton = ctk.CTkButton(master=f, text='Grayscale All', hover_color='navy',
+        self.imgRotateCCWProtectedButton = ctk.CTkButton(master=header, image=self.leftArrow, text='All',
+                                                         hover_color='navy', fg_color='blue', width=100,
+                                                         command=self.unprotectRotateCCW)
+        self.imgRotateCWProtectedButton = ctk.CTkButton(master=header, image=self.rightArrow, text='All',
+                                                        hover_color='navy', fg_color='blue', width=100,
+                                                        command=self.unprotectRotateCW)
+        self.imgGrayProtectedButton = ctk.CTkButton(master=header, text='Grayscale All', hover_color='navy',
                                                     fg_color='blue', width=100, command=self.unprotectAllGrayscale)
-        self.protectInvert()
-        self.protectAllGrayscale()
-        self.protectRotateCCW()
-        self.protectRotateCW()
 
+        self.protectInvert(row=0);
+        self.protectRotateCCW(row=0);
+        self.protectRotateCW(row=0);
+        self.protectAllGrayscale(row=0)
+
+        # Pager controls in the header
+        self._page_label = ctk.CTkLabel(header, text="1/1")
+        self._page_label.grid(row=rowID, column=12, padx=6, pady=6, sticky="e")
+
+
+        self.firstPageBtn = ctk.CTkButton(header, text="◀◀", command=self._first_page, width=70)
+        self.prevPageBtn = ctk.CTkButton(header, text="◀ Prev", command=self._page_prev, width=70)
+        self.nextPageBtn = ctk.CTkButton(header, text="Next ▶", command=self._page_next, width=70)
+        self.lastPageBtn = ctk.CTkButton(header, text="▶▶", command=self._last_page, width=70)
+        self.firstPageBtn.grid(row=rowID, column=10, padx=6, pady=6, sticky='w')
+        self.prevPageBtn.grid(row=rowID, column=11, padx=6, pady=6, sticky="w")
+        self.nextPageBtn.grid(row=rowID, column=13, padx=6, pady=6, sticky="w")
+        self.lastPageBtn.grid(row=rowID, column=14, padx=6, pady=6, sticky='w')
+
+        # fresh paging state
+        self._page_start = 0
         self.imageConfigWindowObjects = []
+        for child in list(self._rows_holder.winfo_children()):
+            child.destroy()
 
-        rowID += 1
-        while len(self.imageConfigWindowObjects) < self.imageConfig.num_valid_imgs:
-            self.createNewRow(f, rowID)
-            rowID += 1
-
+        self.imageFrame = f
+        self._refresh_all_rows(f)  # render only current page
         self.updateImageFrame(f)
-
         return f
 
     def createNewRow(self, f, rowID):
@@ -695,70 +803,44 @@ class CalibrateGui(ctk.CTkFrame):
                                               imgFindCornersButton, imgInvertButton, imgGrayButton,
                                               imgCCWRotateButton, imgCWRotateButton])
 
-    def updateImageFrame(self, f):
+    def _update_page_label_and_buttons(self):
+        total = len(self.imageConfig.img_collection)
+        pages = max(1, (total + self._page_size - 1) // self._page_size)
+        curr = min(pages, (self._page_start // self._page_size) + 1)
+        if self._page_label:
+            self._page_label.configure(text=f"{curr}/{pages}")
 
-        while len(self.imageConfigWindowObjects) > len(self.imageConfig.img_collection):
-            for item in self.imageConfigWindowObjects[-1]:
-                item.grid_forget()
-                item.destroy()
-            self.imageConfigWindowObjects.pop(-1)
-        while len(self.imageConfigWindowObjects) < len(self.imageConfig.img_collection):
-            self.createNewRow(f, len(self.imageConfigWindowObjects))
+        # enable/disable pager buttons safely
+        self.firstPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
+        self.prevPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
+        self.nextPageBtn.configure(state=("normal" if curr < pages else "disabled"))
+        self.lastPageBtn.configure(state=("normal" if curr < pages else "disabled"))
 
-        self.sortByResidual()
+    def _first_page(self):
+        self._page_start = 0
+        self.updateImageFrame()
 
-        rowID = 2
-        for idx, imgClass in enumerate(self.imageConfig.img_collection):
-            (imgIncludeCheckbox,
-             imgNameButton,
-             imgRes,
-             imgShp,
-             imgRestoreButton,
-             imgFindCornersButton,
-             imgInvertButton,
-             imgGrayButton,
-             imgCCWRotateButton,
-             imgCWRotateButton) = self.imageConfigWindowObjects[idx]
+    def _page_prev(self):
+        self._page_start = max(0, self._page_start - self._page_size)
+        self.updateImageFrame()
 
-            if imgClass.include:
-                imgIncludeCheckbox.select()
-            else:
-                imgIncludeCheckbox.deselect()
-            imgIncludeCheckbox.configure(command=lambda ident=idx: self.updateInclusion(ident))
+    def _page_next(self):
+        _, end, total = self._page_bounds()
+        if end < total:
+            self._page_start += self._page_size
+            self.updateImageFrame()
+    def _last_page(self):
+        _, _, total = self._page_bounds()
+        self._page_start = total
+        self.updateImageFrame()
 
-            imgNameButton.configure(text=imgClass.imageName, command=lambda iC=imgClass: self.showBasicImage(iC))
+    def updateImageFrame(self, f=None):
+        f = f or self.imageFrame
+        if not f:
+            return
+        self._refresh_all_rows(f)
 
-            if imgClass.residual is None:
-                currRes = ''
-            elif imgClass.residual == 10000.0:
-                currRes = 'Disabled'
-            else:
-                currRes = 'Res: ' + str(round(imgClass.residual, 3))
-
-            imgRes.configure(text=currRes)
-
-            if imgClass.sharpness is None:
-                currShrp = ''
-            else:
-                currShrp = 'Shrp: ' + str(round(imgClass.sharpness, 3))
-
-            imgShp.configure(text=currShrp)
-
-            imgRestoreButton.configure(command=lambda imgC=imgClass: self.restore(imgC))
-
-            imgFindCornersButton.configure(command=lambda imgC=imgClass: self.findChessboardCorners(f, imgC, True, True))
-
-            imgInvertButton.configure(command=lambda imgC=imgClass: self.invertIndividualImage(imgC))
-
-            imgGrayButton.configure(command=lambda imgC=imgClass: self.grayscaleIndividualImage(imgC))
-
-            imgCCWRotateButton.configure(command=lambda imgC=imgClass: self.rotateCCWIndividualImage(imgC))
-
-            imgCWRotateButton.configure(command=lambda imgC=imgClass: self.rotateCWIndividualImage(imgC))
-
-            rowID += 1
-
-    def removeUnused(self):
+    def removeUnused(self, master_frame):
         if not os.path.exists(join(self.filepath, 'Removed')):
             os.makedirs(join(self.filepath, 'Removed'))
         removeIds = []
@@ -773,7 +855,7 @@ class CalibrateGui(ctk.CTkFrame):
         for id in reversed(removeIds):
             self.imageConfig.img_collection.pop(id)
         self.saveToCache()
-        self.updateImageFrame()
+        self.updateImageFrame(master_frame)
 
         if len(self.imageConfig.img_collection) > 5:
             self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color='blue')
@@ -1018,9 +1100,26 @@ class CalibrateGui(ctk.CTkFrame):
         self.restoreFromImageConfig()
         self.loadImages()
 
+    def calibrate_buttonCallback(self, master_frame, btn: ctk.CTkButton):
+        self.calculating = True
+        self.calibrateButton.configure(state='disabled', text='Calibrating...', fg_color='gray')
+        self.t1 = Thread(target=lambda f=master_frame: self.threadedCalWithButtonCallback(f, btn))
+        self.t1.start()
+
+    def threadedCalWithButtonCallback(self, master_frame, btn: ctk.CTkButton):
+        for imgClass in self.imageConfig.img_collection:
+            if imgClass.include is True:
+                self.findChessboardCorners(master_frame, imgClass, False)
+        self.calibrateCamera()
+        self.saveToCache()
+        self.updateImageFrame(master_frame)
+        self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
+        self.calculating = False
+        btn.configure(text='Start Calibration', state='normal')
+
     def calibrate(self, master_frame):
         self.calculating = True
-        self.calibrateButton.configure(state='disabled', text='Calculating...', fg_color='gray')
+        self.calibrateButton.configure(state='disabled', text='Calibrating...', fg_color='gray')
         self.t1 = Thread(target=lambda f=master_frame: self.threadedCal(f))
         self.t1.start()
 
@@ -1031,7 +1130,7 @@ class CalibrateGui(ctk.CTkFrame):
         self.calibrateCamera()
         self.saveToCache()
         self.updateImageFrame(master_frame)
-        self.calibrateButton.configure(state='normal', text='Calibrate', fg_color='green')
+        self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
         self.calculating = False
 
     def widthInput(self, newVal):
@@ -1064,8 +1163,8 @@ class CalibrateGui(ctk.CTkFrame):
         self.imageConfig.img_collection = []
 
         self.loadFromCache(False)
-
         self.saveToCache()
+        self.updateImageFrame(self.imageFrame)
 
     def sortBySharpness(self):
         self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,

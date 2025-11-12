@@ -17,6 +17,7 @@ from enum import Enum
 from itertools import cycle
 from tkinter import filedialog
 
+from tkinter import StringVar
 import customtkinter as ctk
 import pandas as pd
 from PIL import Image
@@ -57,6 +58,25 @@ if not LOG.handlers:
 #  pip install cv2_enumerate_cameras
 #  or
 #  pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
+
+# Keys that should be treated as edge-triggered (one per distinct press)
+_EDGE_KEYS = {ord(' '), ord('f'), ord('w'), ord('s'), ord('e'), ord('p'),
+              ord('r'), ord('['), ord(']'), ord('{'), ord('}'),
+              ord(';'), ord("'"), ord(':'), ord('"'), ord('b'), ord('n'), 27}
+
+# Keys that should fire on every event (allow repeats within a burst)
+_REPEAT_KEYS = {ord('a'), ord('d'), ord('c'), ord('z')}
+
+# Cooldown for edge keys (optional, prevents accidental double-hits)
+_EDGE_COOLDOWN_MS = 120
+
+def _is_edge_allowed(key: int, last_ts: dict[int, float]) -> bool:
+    now = time.monotonic()
+    prev = last_ts.get(key, 0.0)
+    if (now - prev) * 1000.0 >= _EDGE_COOLDOWN_MS:
+        last_ts[key] = now
+        return True
+    return False
 
 CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
@@ -180,10 +200,22 @@ class CameraGui(ctk.CTkFrame):
     def __init__(self, master, *args, **kwargs):
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
-        # self.GifMaker = GifMaker()
+        self._flag_vars: dict[str, ctk.BooleanVar] = {}
+        self._checkboxes: dict[str, ctk.CTkCheckBox] = {}
+        self._flags = [
+            "detectTags", "undistort", "pnpLidarPoints", "qnpLidarPoints",
+            "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
+            "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
+            "cubemap", "hud"
+        ]
         self.recording = False
         self.yoloSession = yolo.YOLO()
         self.camConfig = CameraConfig()
+        self.detector = None
+        self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+        self.arucoParams = cv2.aruco.DetectorParameters()
+        self._init_flag_vars()
+
         self.calibration = Calibration()
         self.detectIDS = None
         self.projectProbe = None
@@ -196,6 +228,8 @@ class CameraGui(ctk.CTkFrame):
         self.cam_frame = ctk.CTkFrame(master=master)
         self.config_frame = ctk.CTkFrame(master=master)
         self.export_frame = ctk.CTkFrame(master=master)
+        self.playback_frame = ctk.CTkFrame(master=master)
+        self.data_frame = ctk.CTkFrame(master=master)
         self.hotkey_frame = ctk.CTkFrame(master=master)
         self.showWindow = False
         self.GaborGUI = None
@@ -241,6 +275,8 @@ class CameraGui(ctk.CTkFrame):
 
         self.fps_time_log = time.time()
         self.curr_fps = 20.0
+        self.pause = False
+        self.last_nonzero_sign = 1
 
         self.imageProcessingKernelCombobox = None
 
@@ -254,6 +290,14 @@ class CameraGui(ctk.CTkFrame):
                                                 command=self.sourceUpdate)
         self.startStreamButton = ctk.CTkButton(master=self.cam_frame, text='Start Stream', fg_color=BUTTON_RED,
                                                hover_color='blue')
+
+        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img',
+                                                     command=self.selectImagesFilepath)
+        self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
+        self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder',
+                                                    command=self.selectImagesFilepath)
+        self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
+
         self.recordButton = ctk.CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
                                           hover_color='navy', command=self.recordOff)
         self.printButton = ctk.CTkButton(master=self.export_frame, text='Print LiDAR', fg_color='green',
@@ -266,6 +310,9 @@ class CameraGui(ctk.CTkFrame):
                                                      hover_color='blue', command=self.selectLidarFile)
         self.selectFlightLogButton = ctk.CTkButton(master=self.cam_frame, text='Select Flight Log File',
                                                    hover_color='blue', command=self.selectLogFile)
+
+        self.playbackModeText = StringVar(value='Playback Mode: FPS')
+        self.update_playbackMenu()
 
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = ctk.CTkLabel(self.cam_frame,
@@ -288,26 +335,32 @@ class CameraGui(ctk.CTkFrame):
                                                        self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
                                                    )
         self.selectCalibLabel = None
-        self.undistortCheckbox = ctk.CTkCheckBox(self.config_frame, text='Undistort')
-        self.detectAprilTagsCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect April Tags')
-        self.detectHorizonCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Horizon')
-        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO on image',
-                                                     command=self.toggleYoloInference)
-        self.yoloBiasCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
-                                                command=self.toggleYoloBiasTracking)
-        self.factorgraphCheckbox = ctk.CTkCheckBox(self.config_frame, text='Factor Graph')
-        self.hyperfocusCheckbox = ctk.CTkCheckBox(self.config_frame, text='Hyper Focus')
-        self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.config_frame, text='PhaseCorrelation')
-        self.crosshairsCheckbox = ctk.CTkCheckBox(self.config_frame, text='Crosshairs')
-        self.cubemapCheckbox = ctk.CTkCheckBox(self.config_frame, text='Cubemap')
-        self.hudCheckbox = ctk.CTkCheckBox(self.config_frame, text='HUD')
+        self.undistortCheckbox = ctk.CTkCheckBox(self.config_frame, text='Undistort',
+                                                 variable=self._flag_vars['undistort'])
+        self.detectAprilTagsCheckbox = ctk.CTkCheckBox(
+            self.config_frame, text="Detect April Tags",
+            variable=self._flag_vars["detectTags"]
+        )
+        self.detectHorizonCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Horizon',
+                                                     variable=self._flag_vars['detect_horizon'])
 
-        self.singleImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img',
-                                                     command=self.selectImagesFilepath)
-        self.singleImageTextButton = ctk.CTkButton(self.cam_frame, text='No Image Selected')
-        self.multiImageFolderSelect = ctk.CTkButton(self.cam_frame, text='Select Img Folder',
-                                                    command=self.selectImagesFilepath)
-        self.multiImageTextButton = ctk.CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
+        self.yoloInferenceCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO on image',
+                                                     variable=self._flag_vars['yoloInference'])
+
+        self.yoloBiasCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
+                                                variable=self._flag_vars['yoloBiasTracking'])
+        self.factorgraphCheckbox = ctk.CTkCheckBox(self.config_frame, text='Factor Graph',
+                                                variable=self._flag_vars['factor_graph'])
+        self.hyperfocusCheckbox = ctk.CTkCheckBox(self.config_frame, text='Hyper Focus',
+                                                  variable=self._flag_vars['hyper_focus'])
+        self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.config_frame, text='PhaseCorrelation',
+                                                        variable=self._flag_vars['phase_correlation'])
+        self.crosshairsCheckbox = ctk.CTkCheckBox(self.config_frame, text='Crosshairs',
+                                                  variable=self._flag_vars['crosshairs'])
+        self.cubemapCheckbox = ctk.CTkCheckBox(self.config_frame, text='Cubemap',
+                                               variable=self._flag_vars['cubemap'])
+        self.hudCheckbox = ctk.CTkCheckBox(self.config_frame, text='HUD',
+                                           variable=self._flag_vars['hud'])
         self.confSliderLabel = ctk.CTkLabel(self.config_frame, text='Conf: 0.75')
         self.confSliderBar = ctk.CTkSlider(self.config_frame, command=self.confSlider,
                                            from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
@@ -322,6 +375,8 @@ class CameraGui(ctk.CTkFrame):
 
         self.loadFromCache()
 
+        self._sync_flags_from_model()
+
         self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
 
@@ -331,14 +386,10 @@ class CameraGui(ctk.CTkFrame):
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
         self.vc = None
 
-        self.detector = None
-        self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
-        self.arucoParams = cv2.aruco.DetectorParameters()
 
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.camFrameGeometry = '445x915'
         self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.lastWidth = 1
@@ -346,6 +397,35 @@ class CameraGui(ctk.CTkFrame):
         self.saveToCache()
 
         self.setupFrame()
+
+    def _init_flag_vars(self):
+        for name in self._flags:
+            v = ctk.BooleanVar(value=bool(getattr(self.camConfig, name)))
+            # when UI flips, write to model
+            v.trace_add("write", lambda *_, n=name: self._on_flag_changed(n))
+            self._flag_vars[name] = v
+
+    def _on_flag_changed(self, name: str):
+        val = bool(self._flag_vars[name].get())
+        # guard rails / side-effects
+        if name == "undistort" and not self.calibration.validCal:
+            # can't enable; snap back off
+            self._flag_vars[name].set(False)
+            return
+
+        if name == "detectTags":
+            if val and self.detector is None:
+                self.createDetector()
+            if not val:
+                self.detector = None
+
+        setattr(self.camConfig, name, val)
+        self.saveToCache()
+
+    # keep model -> UI sync helper (if you ever load cache, etc.)
+    def _sync_flags_from_model(self):
+        for n in self._flags:
+            self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
 
     def loadFromCache(self):
         """
@@ -751,6 +831,13 @@ class CameraGui(ctk.CTkFrame):
             self.saveToCache()
 
     def setupFrame(self):
+        self.setup_camFrame()
+        self.setup_configFrame()
+        self.setup_exportFrame()
+        self.setup_dataFrame()
+        self.setup_playbackFrame()
+
+    def setup_camFrame(self):
         rowID = 0
 
         self.streamOrImgCombo = ctk.CTkComboBox(self.cam_frame,
@@ -800,6 +887,16 @@ class CameraGui(ctk.CTkFrame):
         self.selectFlightLogLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
+        aprilTagSizeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
+                                                command=self.setAprilTagSize)
+        aprilTagSizeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+
+        self.aprilTagSizeEntry = ctk.CTkEntry(self.cam_frame, placeholder_text=str(self.camConfig.aprilTagSize))
+        self.aprilTagSizeEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
+
+    def setup_configFrame(self):
+        rowID = 0
+
         self.confSliderLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         self.confSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
@@ -808,123 +905,50 @@ class CameraGui(ctk.CTkFrame):
         self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        # detectAprilTagsCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect April Tags')
-        if self.camConfig.detectTags is False:
-            self.detectAprilTagsCheckbox.deselect()
-        else:
-            self.detectAprilTagsCheckbox.select()
-            self.createDetector()
-        self.detectAprilTagsCheckbox.configure(command=self.toggleDetectTags)
+        self.createDetector()
         self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
-        # self.undistortCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Undistort')
         if not self.calibration.validCal:
             self.undistortCheckbox.configure(state='disabled')
 
-        if self.camConfig.undistort is False:
-            self.undistortCheckbox.deselect()
-        else:
-            self.undistortCheckbox.select()
-
-        self.undistortCheckbox.configure(command=self.toggleUndistort)
         self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        pnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image')
-        if self.camConfig.pnpLidarPoints is False:
-            pnpLidarPoints.deselect()
-        else:
-            pnpLidarPoints.select()
-        pnpLidarPoints.configure(command=self.togglePnpLidarPoints)
+        pnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image',
+                                         variable=self._flag_vars['pnpLidarPoints'])
         pnpLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        qnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolveQnP LiDAR Into Image')
-        if self.camConfig.qnpLidarPoints is False:
-            qnpLidarPoints.deselect()
-        else:
-            qnpLidarPoints.select()
-        qnpLidarPoints.configure(command=self.toggleQnpLidarPoints)
+        qnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolveQnP LiDAR Into Image',
+                                         variable=self._flag_vars['qnpLidarPoints'])
         qnpLidarPoints.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
-
         rowID += 1
 
-        # yoloInferenceCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Run YOLO on image')
-        if self.camConfig.yoloInference is False:
-            self.yoloInferenceCheckbox.deselect()
-        else:
-            self.yoloInferenceCheckbox.select()
         self.yoloInferenceCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        if self.camConfig.yoloBiasTracking is False:
-            self.yoloBiasCheckbox.deselect()
-        else:
-            self.yoloBiasCheckbox.select()
         self.yoloBiasCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
-        detectCornersCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Corners')
-        if self.camConfig.detect_corners is False:
-            detectCornersCheckbox.deselect()
-        else:
-            detectCornersCheckbox.select()
-        detectCornersCheckbox.configure(command=self.toggleDetectCorners)
+        detectCornersCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Corners',
+                                                variable=self._flag_vars['detect_corners'])
         detectCornersCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        # detectHorizonCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Detect Horizon')
-        if self.camConfig.detect_horizon is False:
-            self.detectHorizonCheckbox.deselect()
-        else:
-            self.detectHorizonCheckbox.select()
-        self.detectHorizonCheckbox.configure(command=self.toggleDetectHorizon)
         self.detectHorizonCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        # factorgraphCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Factor Graph')
-        if self.camConfig.factor_graph is False:
-            self.factorgraphCheckbox.deselect()
-        else:
-            self.factorgraphCheckbox.select()
-        self.factorgraphCheckbox.configure(command=self.toggleFactorgraph)
         self.factorgraphCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        # hyperfocusCheckbox = ctk.CTkCheckBox(self.cam_frame, text='Hyper Focus')
-        if self.camConfig.hyper_focus is False:
-            self.hyperfocusCheckbox.deselect()
-        else:
-            self.hyperfocusCheckbox.select()
-        self.hyperfocusCheckbox.configure(command=self.toggleHyperFocus)
         self.hyperfocusCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
 
-        if self.camConfig.phase_correlation is False:
-            self.phaseCorrelationCheckbox.deselect()
-        else:
-            self.phaseCorrelationCheckbox.select()
-        self.phaseCorrelationCheckbox.configure(command=self.togglePhaseCorrelation)
         self.phaseCorrelationCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        if self.camConfig.crosshairs is False:
-            self.crosshairsCheckbox.deselect()
-        else:
-            self.crosshairsCheckbox.select()
-        self.crosshairsCheckbox.configure(command=self.toggleCrosshairs)
         self.crosshairsCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
 
-        if not self.camConfig.cubemap:
-            self.cubemapCheckbox.deselect()
-        else:
-            self.cubemapCheckbox.select()
-        self.cubemapCheckbox.configure(command=self.toggleCubemap, state='disabled')
         self.cubemapCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        if not self.camConfig.hud:
-            self.hudCheckbox.deselect()
-        else:
-            self.hudCheckbox.select()
-        self.hudCheckbox.configure(command=self.toggleHud)
         self.hudCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
@@ -937,16 +961,11 @@ class CameraGui(ctk.CTkFrame):
         self.imageProcessingKernelCombobox.configure(command=self.updateImageProcessingKernel)
         self.updateImageProcessingKernel(self.camConfig.processingKernel.name)
         self.imageProcessingKernelCombobox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+
         rowID += 1
 
-        aprilTagSizeEntryButton = ctk.CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
-                                                command=self.setAprilTagSize)
-        aprilTagSizeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-
-        self.aprilTagSizeEntry = ctk.CTkEntry(self.cam_frame, placeholder_text=str(self.camConfig.aprilTagSize))
-        self.aprilTagSizeEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
+    def setup_exportFrame(self):
+        rowID = 0
         self.recordOff()
         self.recordButton.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
         self.printButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
@@ -973,8 +992,6 @@ class CameraGui(ctk.CTkFrame):
 
         self.exportStartFrame.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.exportEndFrame.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
-
-        # self.cam_frame.pack()
 
         title = 'Folder Replay Hotkeys'
         items = [
@@ -1013,6 +1030,14 @@ class CameraGui(ctk.CTkFrame):
         # let text column expand
         self.hotkey_frame.grid_columnconfigure(0, weight=0)
         self.hotkey_frame.grid_columnconfigure(1, weight=1)
+
+    def setup_dataFrame(self):
+        pass
+    def setup_playbackFrame(self):
+        rowID = 0
+        self.update_playbackMenu()
+        playbackLabel = ctk.CTkLabel(self.playback_frame, textvariable=self.playbackModeText)
+        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=5, pady=5)
 
     def shutdown(self):
         self.shutting_down = True
@@ -1198,52 +1223,6 @@ class CameraGui(ctk.CTkFrame):
     def printLidarOnce(self):
         self.printLidar = True
 
-    def _toggle(self, attr: str, checkbox: ctk.CTkCheckBox | None = None):
-        val = not getattr(self.camConfig, attr)
-        setattr(self.camConfig, attr, val)
-        if checkbox is not None:
-            (checkbox.select() if val else checkbox.deselect())
-        self.saveToCache()
-
-    def togglePnpLidarPoints(self):
-        self.camConfig.pnpLidarPoints = not self.camConfig.pnpLidarPoints
-        self.saveToCache()
-
-    def toggleQnpLidarPoints(self):
-        self.camConfig.qnpLidarPoints = not self.camConfig.qnpLidarPoints
-        self.saveToCache()
-
-    def toggleDetectCorners(self):
-        self.camConfig.detect_corners = not self.camConfig.detect_corners
-        self.saveToCache()
-
-    def toggleYoloInference(self):
-        self._toggle('yoloInference', self.yoloInferenceCheckbox)
-
-    def toggleYoloBiasTracking(self):
-        self._toggle('yoloBiasTracking', self.yoloBiasCheckbox)
-
-    def toggleDetectHorizon(self):
-        self._toggle('detect_horizon', self.detectHorizonCheckbox)
-
-    def togglePhaseCorrelation(self):
-        self._toggle('phase_correlation', self.phaseCorrelationCheckbox)
-
-    def toggleCrosshairs(self):
-        self._toggle('crosshairs', self.crosshairsCheckbox)
-
-    def toggleCubemap(self):
-        self._toggle('cubemap', self.cubemapCheckbox)
-
-    def toggleHud(self):
-        self._toggle('hud', self.hudCheckbox)
-
-    def toggleFactorgraph(self):
-        self._toggle('factor_graph', self.factorgraphCheckbox)
-
-    def toggleHyperFocus(self):
-        self._toggle('hyper_focus', self.hyperfocusCheckbox)
-
     def updateImageProcessingKernel(self, newValue):
         if self.camConfig.processingKernel == ImageKernel.Gabor and self.GaborGUI is not None:
             self.GaborGUI.close()
@@ -1257,29 +1236,6 @@ class CameraGui(ctk.CTkFrame):
 
     def createDetector(self):
         self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
-
-    def toggleDetectTags(self):
-        if self.detector is None:
-            # self.detector = Detector(quad_decimate=1.5, quad_sigma =1.0, decode_sharpening=0.75)
-            self.createDetector()
-            self.camConfig.detectTags = True
-        else:
-            self.detector = None
-            self.camConfig.detectTags = False
-        self.saveToCache()
-
-    def toggleUndistort(self):
-        if not self.calibration.validCal:
-            self.camConfig.undistort = False
-            return
-
-        self.camConfig.undistort = not self.camConfig.undistort
-        if self.camConfig.undistort:
-            self.undistortCheckbox.select()
-        else:
-            self.undistortCheckbox.deselect()
-
-        self.saveToCache()
 
     def run_detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
@@ -1364,16 +1320,15 @@ class CameraGui(ctk.CTkFrame):
                 self.ImageTimeReader.idsTimes.append([image, None])
 
     @staticmethod
-    def _poll_keys(max_ms: int = 1) -> list[int]:
+    def _poll_keys(max_ms: int = 8) -> list[int]:
         keys = []
-        k = cv2.waitKey(max_ms) & 0xFF
-        if k not in (0, 0xFF, 255, -1):
-            keys.append(k)
-            for _ in range(8):  # drain a short burst
-                k2 = cv2.waitKey(1) & 0xFF
-                if k2 in (0, 0xFF, 255, -1):
-                    break
-                keys.append(k2)
+        # Use small slices to keep latency low and drain bursts
+        deadline = time.monotonic() + (max_ms / 1000.0)
+        while time.monotonic() < deadline:
+            k = cv2.waitKey(1) & 0xFF
+            if k not in (0, 0xFF, 255, -1):
+                keys.append(k)
+            # tiny spin; 1ms waitKey already yields to GUI
         return keys
 
     @staticmethod
@@ -1411,8 +1366,8 @@ class CameraGui(ctk.CTkFrame):
         num_images = len(paths)
 
         self.playback.speed = 1  # negative=rewind, 0=freeze, positive=forward
-        pause = False
-        last_nonzero_sign = 1
+        self.pause = False
+        self.last_nonzero_sign = 1
         last_speed = self.playback.speed
         curr_idx = 0
 
@@ -1433,19 +1388,19 @@ class CameraGui(ctk.CTkFrame):
         ).start()
 
         # one-shot key handling
-        pressed = set()
         pending_keys = []
+        last_edge_time: dict[int, float] = {}
 
         wall_start = time.monotonic()
 
         def sleep_until(deadline) -> list[int]:
-            # Keep GUI responsive and capture bursts
             keys = []
             while True:
                 remain = deadline - time.monotonic()
                 if remain <= 0:
                     break
-                keys.extend(self._poll_keys(int(max(1, remain * 100))))
+                slice_ms = int(min(8, max(1, remain * 1000)))
+                keys.extend(self._poll_keys(slice_ms))
             return keys
 
         try:
@@ -1466,13 +1421,13 @@ class CameraGui(ctk.CTkFrame):
                     s_abs = self._stride_for_speed(abs(self.playback.speed))
 
                     if self.playback.speed != 0:
-                        last_nonzero_sign = (1 if self.playback.speed > 0 else -1)
+                        self.last_nonzero_sign = (1 if self.playback.speed > 0 else -1)
 
                     if s_abs == 0:
-                        pause = True
+                        self.pause = True
                     else:
-                        pause = False
-                        signed_stride = last_nonzero_sign * s_abs
+                        self.pause = False
+                        signed_stride = self.last_nonzero_sign * s_abs
                         if signed_stride != self.playback.stride:
                             loader.set_stride(signed_stride)
                             self.playback.stride = signed_stride
@@ -1484,7 +1439,7 @@ class CameraGui(ctk.CTkFrame):
                     last_speed = self.playback.speed
 
                 # ===== fetch a frame =====
-                if not pause:
+                if not self.pause:
                     # streaming mode: loader drives index
                     got = loader.get_next(timeout=0.02)
 
@@ -1531,27 +1486,27 @@ class CameraGui(ctk.CTkFrame):
                 # ===== display / HUD =====
                 if frame is not None and Path(paths[curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
 
-                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not pause:
+                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not self.pause:
                         period = 1.0 / self.camConfig.target_fps
                         target_time = wall_start + period * (
-                            curr_idx if not last_nonzero_sign < 0 else num_images - curr_idx)
+                            curr_idx if not self.last_nonzero_sign < 0 else num_images - curr_idx)
                         if target_time < time.monotonic():
                             wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not last_nonzero_sign < 0 else num_images - curr_idx)
-                        pending_keys = sleep_until(target_time)
+                                curr_idx if not self.last_nonzero_sign < 0 else num_images - curr_idx)
+                        pending_keys.extend(sleep_until(target_time))
 
-                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not pause:
+                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not self.pause:
                         rs = float(self.camConfig.rt_speed) or 1e-6
                         elapsed = (time.monotonic() - wall_start) * rs
-                        elapsed_ref = (t[-1] - elapsed) if last_nonzero_sign < 0 else elapsed
+                        elapsed_ref = (t[-1] - elapsed) if self.last_nonzero_sign < 0 else elapsed
 
                         if elapsed_ref < t[0]:
                             idx_target = num_images - 1
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not last_nonzero_sign < 0
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
                                                              else ((t[-1] - t[idx_target]) / rs))
                         elif elapsed_ref > t[-1]:
                             idx_target = 0
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not last_nonzero_sign < 0
+                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
                                                              else ((t[-1] - t[idx_target]) / rs))
                         else:
                             idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
@@ -1579,121 +1534,107 @@ class CameraGui(ctk.CTkFrame):
                     # Nothing to draw this iteration; just keep window responsive
                     pass
 
-                pending_keys.extend(self._poll_keys(1))
+
+                pending_keys.extend(self._poll_keys(4))
 
                 # --- Key handling: edge-triggered dispatcher ---
                 while pending_keys:
                     key = pending_keys.pop(0)
 
-                    # edge-detect helper (same semantics as your current on_key)
-                    def on_key(kcode: int) -> bool:
-                        if kcode == 255:
-                            return False
-                        if kcode in pressed:
-                            return False
-                        pressed.add(kcode)
-                        return True
-
-                    # reset edge-state on "no key"
-                    if key in (255, 0xFF, 0):
-                        pressed.clear()
+                    if key in (255, 0xFF, 0, -1):
                         continue
 
-                    elif key == ord('f') and on_key(ord('f')):
-                        # Switch between Fixed_fps and Real_time
-                        self._on_toggle_fps_mode()
+                    # Decide edge vs repeat behavior:
+                    if key in _EDGE_KEYS:
+                        if not _is_edge_allowed(key, last_edge_time):
+                            continue  # skip if within cooldown
+                    # if key in _REPEAT_KEYS: let every event through (no gating)
 
-                        # --- Re-anchor to keep the current frame fixed ---
-                        self.camConfig.playback_mode = self.camConfig.playback_mode  # ensure updated
+                    # --- dispatch ---
+                    if key == ord('f'):
+                        self.pause = False
+                        self._on_toggle_fps_mode()
                         wall_start = self._reanchor_on_mode_change(
                             new_mode=self.camConfig.playback_mode,
                             curr_idx=curr_idx,
-                            t=t,
-                            last_nonzero_sign=last_nonzero_sign
+                            t=t
                         )
+                        self.update_playbackMenu()
                         self.saveToCache()
 
-                    # AFTER
-                    elif key == ord('c') and on_key(ord('c')):
+                    elif key == ord('c'):
                         curr_idx = self._on_step_forward(curr_idx, num_images)
-                        pause = True
+                        self.pause = True
                         self.pauseCache.clear()
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                         loader.seek(curr_idx, clear_buffer=True)
+                        self.update_playbackMenu()
 
-                    elif key == ord('z') and on_key(ord('z')):
+                    elif key == ord('z'):
                         curr_idx = self._on_step_back(curr_idx)
-                        pause = True
+                        self.pause = True
                         self.pauseCache.clear()
                         self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
                         loader.seek(curr_idx, clear_buffer=True)
+                        self.update_playbackMenu()
 
-                    elif key == ord(' ') and on_key(ord(' ')):
-                        wall_start = self._on_toggle_pause(curr_idx, t, wall_start, last_nonzero_sign)
+                    elif key == ord(' '):
+                        wall_start = self._on_toggle_pause(curr_idx, t, wall_start)
+                        self.update_playbackMenu()
 
-                    elif key == ord('d') and on_key(ord('d')):
-                        wall_start = self._on_speed_up(
-                            curr_idx=curr_idx,
-                            t=t,
-                            last_nonzero_sign=last_nonzero_sign,
-                        )
+                    elif key == ord('d'):
+                        wall_start = self._on_speed_up(curr_idx=curr_idx, t=t)
+                        self.update_playbackMenu()
 
-                    elif key == ord('a') and on_key(ord('a')):
-                        wall_start = self._on_speed_down(
-                            curr_idx=curr_idx,
-                            t=t,
-                            last_nonzero_sign=last_nonzero_sign,
-                        )
+                    elif key == ord('a'):
+                        wall_start = self._on_speed_down(curr_idx=curr_idx, t=t)
+                        self.update_playbackMenu()
 
-                    elif key == ord('w') and on_key(ord('w')):
+                    elif key == ord('w'):
                         self._on_toggle_overlays()
 
-                    elif key == ord('s') and on_key(ord('s')):
+                    elif key == ord('s'):
                         self._on_mark_start(curr_idx)
 
-                    elif key == ord('e') and on_key(ord('e')):
+                    elif key == ord('e'):
                         self._on_mark_end(curr_idx)
 
-                    elif key == ord('r') and on_key(ord('r')):
-                        last_nonzero_sign, wall_start = self._on_reverse(
-                            loader=loader,
-                            last_nonzero_sign=last_nonzero_sign,
-                            curr_idx=curr_idx,
-                            t=t,
+                    elif key == ord('r'):
+                        wall_start = self._on_reverse(
+                            loader=loader, curr_idx=curr_idx, t=t
                         )
+                        self.update_playbackMenu()
 
-                    elif key == ord('b') and on_key(ord('b')):
+                    elif key == ord('b'):
                         self.hud_marker.cam_bank_offset -= 0.1
-                    elif key == ord('n') and on_key(ord('n')):
+                    elif key == ord('n'):
                         self.hud_marker.cam_bank_offset += 0.1
 
-                    # time offset nudges (small/medium/large)
-                    elif key == ord(";") and on_key(ord(";")):
+                    elif key == ord(";"):
                         self._on_adjust_offset(-0.01)
-                    elif key == ord("'") and on_key(ord("'")):
+                    elif key == ord("'"):
                         self._on_adjust_offset(+0.01)
-                    elif key == ord(':') and on_key(ord(':')):
+                    elif key == ord(':'):
                         self._on_adjust_offset(-0.10)
-                    elif key == ord('"') and on_key(ord('"')):
+                    elif key == ord('"'):
                         self._on_adjust_offset(+0.10)
-                    elif key == ord('[') and on_key(ord('[')):
+                    elif key == ord('['):
                         self._on_adjust_offset(-1.00)
-                    elif key == ord(']') and on_key(ord(']')):
+                    elif key == ord(']'):
                         self._on_adjust_offset(+1.00)
-                    elif key == ord('{') and on_key(ord('{')):
+                    elif key == ord('{'):
                         self._on_adjust_offset(-10.00)
-                    elif key == ord('}') and on_key(ord('}')):
+                    elif key == ord('}'):
                         self._on_adjust_offset(+10.00)
-                    elif key == ord('p') and on_key(ord('p')):
+                    elif key == ord('p'):
                         self._on_persist_offset()
 
-                    elif key == 27 and on_key(27):  # ESC
+                    elif key == 27:  # ESC
                         self.threadStopper.set()
                         break
 
                     while self.making_gifOrVid:
                         time.sleep(0.1)
-                pressed.clear()
 
                 pending_keys.extend(self._poll_keys(1))
                 if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
@@ -1705,7 +1646,13 @@ class CameraGui(ctk.CTkFrame):
             self.after(0, self._on_worker_exit)
             loader.stop()
 
-    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t, last_nonzero_sign: int) -> float:
+    def update_playbackMenu(self):
+        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+            self.playbackModeText.set(value=f'Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}')
+        else:
+            self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
+
+    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t) -> float:
         """
         Re-anchor wall_start so the current frame stays fixed when switching modes,
         including while reversing. Uses time.monotonic() to match the main loop.
@@ -1716,7 +1663,7 @@ class CameraGui(ctk.CTkFrame):
             # Map wall clock to log time (direction-aware)
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
-            if last_nonzero_sign < 0:
+            if self.last_nonzero_sign < 0:
                 # reverse: tN - (now - wall_start)*rs == t[curr_idx]
                 return now - (tN - t[curr_idx]) / rs
             else:
@@ -1727,7 +1674,7 @@ class CameraGui(ctk.CTkFrame):
             # Fixed-FPS: anchor to the correct phase for direction
             fps = max(0.001, float(self.camConfig.target_fps))
             num_images = len(t)
-            phase = (num_images - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
             return now - (phase / fps)
 
     @staticmethod
@@ -1742,20 +1689,20 @@ class CameraGui(ctk.CTkFrame):
             # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
             return now - (t[curr_idx] - t0) / rt_rate
 
-    def _on_reverse(self, loader, last_nonzero_sign: int, curr_idx: int, t):
+    def _on_reverse(self, loader, curr_idx: int, t):
         """
         Toggle playback direction without jumping the current frame.
-        Returns: (new_last_nonzero_sign, new_wall_start)
+        Returns: (new_wall_start)
         """
         # New direction (+1 forward, -1 reverse)
-        new_sign = -1 if last_nonzero_sign > 0 else 1
+        self.last_nonzero_sign = -1 if self.last_nonzero_sign > 0 else 1
 
         # If actively playing, flip speed sign and update stride, then realign buffer at current index.
         if self.playback.speed != 0:
             self.playback.speed = -self.playback.speed
             s_abs = self._stride_for_speed(abs(self.playback.speed))
             if s_abs > 0:
-                loader.set_stride(new_sign * s_abs)
+                loader.set_stride(self.last_nonzero_sign * s_abs)
                 loader.seek(curr_idx, clear_buffer=True)
 
         now = time.monotonic()
@@ -1764,7 +1711,7 @@ class CameraGui(ctk.CTkFrame):
             # --- Real-time: direction-aware re-anchor on the log timeline ---
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
-            if new_sign < 0:
+            if self.last_nonzero_sign < 0:
                 # reverse:  tN - (now - wall_start)*rs == t[curr_idx]
                 wall_start = now - (tN - t[curr_idx]) / rs
             else:
@@ -1776,10 +1723,10 @@ class CameraGui(ctk.CTkFrame):
             fps = max(0.001, float(self.camConfig.target_fps))
             period = 1.0 / fps
             num_images = len(t)  # or use your existing num_images variable if already in scope
-            phase = (num_images - curr_idx) if new_sign < 0 else curr_idx
+            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
             wall_start = now - period * phase
 
-        return new_sign, wall_start
+        return wall_start
 
     @staticmethod
     def _make_timebase(ts_raw, fallback_fps, n):
@@ -1848,7 +1795,8 @@ class CameraGui(ctk.CTkFrame):
         self.playback.speed = 0.0
         return curr_idx
 
-    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float, last_nonzero_sign: int) -> float:
+    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float) -> float:
+        self.pause = not self.pause
         playing = (self.playback.speed != 0)
         if playing:
             self._resume_speed_mag = max(1.0, abs(self.playback.speed))
@@ -1856,23 +1804,23 @@ class CameraGui(ctk.CTkFrame):
             return wall_start
 
         prev_mag = getattr(self, "_resume_speed_mag", 1.0)
-        self.playback.speed = float(last_nonzero_sign or 1) * prev_mag
+        self.playback.speed = float(self.last_nonzero_sign or 1) * prev_mag
 
         now = time.monotonic()
         if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
-            if last_nonzero_sign < 0:
+            if self.last_nonzero_sign < 0:
                 wall_start = now - (tN - t[curr_idx]) / rs
             else:
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
             fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    def _on_speed_up(self, curr_idx: int, t, last_nonzero_sign: int) -> float:
+    def _on_speed_up(self, curr_idx: int, t) -> float:
         """
         Increase playback speed.
         - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
@@ -1889,7 +1837,7 @@ class CameraGui(ctk.CTkFrame):
             now = time.monotonic()
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
-            if last_nonzero_sign < 0:
+            if self.last_nonzero_sign < 0:
                 # reverse: tN - (now - wall_start)*rs == t[curr_idx]
                 wall_start = now - (tN - t[curr_idx]) / rs
             else:
@@ -1902,11 +1850,11 @@ class CameraGui(ctk.CTkFrame):
             if prev_tgt < 19.9 and self.camConfig.target_fps > 20.0:
                 self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
             fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    def _on_speed_down(self, curr_idx: int, t, last_nonzero_sign: int) -> float:
+    def _on_speed_down(self, curr_idx: int, t) -> float:
         """
         Decrease playback speed.
         - RT mode: divide rt_speed, then re-anchor so current frame stays put.
@@ -1921,7 +1869,7 @@ class CameraGui(ctk.CTkFrame):
             now = time.monotonic()
             rs = max(1e-6, float(self.camConfig.rt_speed))
             t0, tN = t[0], t[-1]
-            if last_nonzero_sign < 0:
+            if self.last_nonzero_sign < 0:
                 wall_start = now - (tN - t[curr_idx]) / rs
             else:
                 wall_start = now - (t[curr_idx] - t0) / rs
@@ -1931,16 +1879,21 @@ class CameraGui(ctk.CTkFrame):
             if prev_tgt > 20.1 and self.camConfig.target_fps < 20.0:
                 self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
             fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if last_nonzero_sign < 0 else curr_idx
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
     def _on_toggle_overlays(self):
-        self.toggleUndistort()
-        self.toggleYoloInference()
-        self.toggleDetectHorizon()
-        self.toggleHyperFocus()
-        self.toggleFactorgraph()
+        self._toggle('undistort')
+        self._toggle('yoloInference')
+        self._toggle('yoloInference')
+        self._toggle('detect_horizon')
+        self._toggle('hyper_focus')
+        self._toggle('factor_graph')
+
+    def _toggle(self, attribute: str):
+        self._flag_vars[attribute].set(not self._flag_vars[attribute].get())
+        self.saveToCache()
 
     def _on_mark_start(self, curr_idx: int):
         self.camConfig.start_export_idx = curr_idx

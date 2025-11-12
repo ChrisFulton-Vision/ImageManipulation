@@ -125,7 +125,7 @@ class CameraPage(ctk.CTkFrame):
     def _make_playbackPage(self):
         return self.camGui.playback_frame
     def _make_dataPage(self):
-        return self.camGui.hotkey_frame
+        return self.camGui.data_frame
     def _make_hotkeyPage(self):
         return self.camGui.hotkey_frame
 

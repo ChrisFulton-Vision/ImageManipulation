@@ -6,6 +6,7 @@ import re
 import threading
 import time
 import sys
+import queue
 
 import vmbpy.c_binding
 from vmbpy import *
@@ -17,6 +18,7 @@ from enum import Enum
 from itertools import cycle
 from tkinter import filedialog
 
+from concurrent.futures import wait
 from tkinter import StringVar
 import customtkinter as ctk
 import pandas as pd
@@ -50,9 +52,9 @@ if not LOG.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
     handler.setFormatter(fmt)
     LOG.addHandler(handler)
-    LOG.setLevel(logging.INFO)
+    # LOG.setLevel(logging.INFO)
     # LOG.setLevel(logging.DEBUG)
-    # LOG.setLevel(logging.WARNING)
+    LOG.setLevel(logging.WARNING)
 
 #  import superCalibrate as superCal
 #  pip install cv2_enumerate_cameras
@@ -437,9 +439,6 @@ class CameraGui(ctk.CTkFrame):
           - All path-like fields are normalized to *strings* ('' when unset)
           - UI labels are updated if widgets already exist
         """
-        from pathlib import Path
-        import pickle
-        import os
 
         def _to_str(p):
             if p is None:
@@ -1031,8 +1030,385 @@ class CameraGui(ctk.CTkFrame):
         self.hotkey_frame.grid_columnconfigure(0, weight=0)
         self.hotkey_frame.grid_columnconfigure(1, weight=1)
 
+    def _is_completed_row(self, row: dict, n_cls: int) -> bool:
+        """Row is 'complete' if it has image_name, image_time and all feat_<cid>_x/y present (even if -1)."""
+        if "image_name" not in row or "image_time" not in row:
+            return False
+        for cid in range(n_cls):
+            if f"feat_{cid}_x" not in row or f"feat_{cid}_y" not in row:
+                return False
+        return True
+
     def setup_dataFrame(self):
-        pass
+        """Build the 'Data Processing' page: folder pick, CSV pick, params, run."""
+        f = self.data_frame
+        for w in f.winfo_children():
+            w.destroy()
+
+        f.grid_rowconfigure(99, weight=1)
+        f.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
+            row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
+        )
+
+        # --- Select image folder ---
+        self._dp_img_dir_var = ctk.StringVar(value=str(self.camConfig.imageFilepath or ""))
+
+        def _choose_dir():
+            from tkinter import filedialog
+            d = filedialog.askdirectory(title="Select image folder")
+            if d:
+                self._dp_img_dir_var.set(d)
+
+        ctk.CTkLabel(f, text="Folder:").grid(row=1, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
+        ctk.CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
+
+        # --- Select output CSV ---
+        self._dp_csv_var = ctk.StringVar(value="")
+
+        def _choose_csv():
+            from tkinter import filedialog
+            p = filedialog.asksaveasfilename(
+                title="Select output CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv")]
+            )
+            if p:
+                self._dp_csv_var.set(p)
+
+        ctk.CTkLabel(f, text="Output CSV:").grid(row=2, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_csv_var).grid(row=2, column=1, padx=12, pady=6, sticky="ew")
+        ctk.CTkButton(f, text="Browse…", command=_choose_csv).grid(row=2, column=2, padx=12, pady=6)
+
+        # --- YOLO knobs (optional, use current session otherwise) ---
+        self._dp_conf = ctk.DoubleVar(value=self.yoloSession.conf)
+        self._dp_iou = ctk.DoubleVar(value=self.yoloSession.iou)
+        ctk.CTkLabel(f, text="Conf:").grid(row=3, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkSlider(f, from_=0.05, to=0.99, number_of_steps=94,
+                      variable=self._dp_conf).grid(row=3, column=1, padx=12, pady=6, sticky="ew")
+        ctk.CTkLabel(f, textvariable=self._dp_conf).grid(row=3, column=2, padx=12, pady=6, sticky="e")
+
+        ctk.CTkLabel(f, text="IoU:").grid(row=4, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkSlider(f, from_=0.10, to=0.99, number_of_steps=90,
+                      variable=self._dp_iou).grid(row=4, column=1, padx=12, pady=6, sticky="ew")
+        ctk.CTkLabel(f, textvariable=self._dp_iou).grid(row=4, column=2, padx=12, pady=6, sticky="e")
+
+        # --- Checkpoint controls ---
+        self._dp_ckptN = ctk.StringVar(value="200")  # default every 200 images
+        ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
+
+        # --- Run button ---
+        # ctk.CTkButton(f, text="Run YOLO Batch", fg_color="#2FA572",
+        #               command=self.run_yolo_batch_to_csv).grid(row=10, column=0, columnspan=3,
+        #                                                        padx=12, pady=(16, 12), sticky="ew")
+        # --- Progress UI ---
+        self._dp_progress_label = ctk.CTkLabel(f, text="Idle")
+        self._dp_progress_label.grid(row=20, column=0, columnspan=3, padx=12, pady=(8, 4), sticky="w")
+
+        self._dp_progress = ctk.CTkProgressBar(f)  # determinate
+        self._dp_progress.grid(row=21, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
+        self._dp_progress.set(0.0)
+
+        self._dp_cancel_flag = False
+
+        def _cancel():
+            self._dp_cancel_flag = True
+            if hasattr(self, "_dp_progress_label"):
+                self._dp_progress_label.configure(text="Canceling…")
+            if hasattr(self, "_dp_cancel_btn"):
+                self._dp_cancel_btn.configure(state="disabled")
+
+        self._dp_run_btn = ctk.CTkButton(f, text="Run YOLO Batch", fg_color="#2FA572",
+                                         command=self.run_yolo_batch_to_csv)
+        self._dp_run_btn.grid(row=10, column=0, columnspan=2, padx=12, pady=(16, 12), sticky="ew")
+
+        self._dp_cancel_btn = ctk.CTkButton(f, text="Cancel", fg_color="#A52F2F",
+                                            command=_cancel)
+        self._dp_cancel_btn.grid(row=10, column=2, padx=12, pady=(16, 12), sticky="ew")
+
+    def _write_csv_atomic(self, out_csv: str, columns: list[str], completed_map: dict[str, dict]):
+        """Write CSV atomically and sort by numeric portion of image_name."""
+        import os, re, pandas as pd
+
+        rows = list(completed_map.values())
+        df = pd.DataFrame(rows, columns=columns)
+
+        # --- Sort numerically by filename stem (e.g. 1.png, 2.png, 10.png) ---
+        def _numeric_key(name: str) -> int:
+            try:
+                # extract first integer from filename; fall back to 0 if none
+                return int(re.search(r"\d+", str(name)).group())
+            except Exception:
+                return 0
+
+        df = df.sort_values(
+            by="image_name",
+            key=lambda col: col.map(_numeric_key),
+            ignore_index=True,
+        )
+
+        tmp = out_csv + ".tmp"
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, out_csv)  # atomic replace
+
+    def run_yolo_batch_to_csv(self):
+        """
+        Resumable, pipelined YOLO batch:
+          - CPU workers: read + preprocess images in parallel
+          - Single GPU consumer: onnxruntime session.run
+          - Writes only complete rows; resumes from existing CSV
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # --- Prep paths & thresholds ---
+        img_dir = Path((self._dp_img_dir_var.get() or "").strip() or self.camConfig.imageFilepath or "")
+        if not img_dir or not img_dir.exists():
+            LOG.warning("No valid image directory selected.")
+            if hasattr(self, "_dp_progress_label"):
+                self._dp_progress_label.configure(text="No valid image directory selected.")
+            return
+
+
+
+        out_csv = (self._dp_csv_var.get() or "").strip() or str(img_dir / "yolo_detections.csv")
+
+        # freeze thresholds once for this run
+        self.yoloSession.conf = float(self._dp_conf.get())
+        self.yoloSession.iou = float(self._dp_iou.get())
+
+        # --- Build list of files/times like playback does ---
+        self.populate_idsTimes(str(img_dir))
+        pairs = list(getattr(self.ImageTimeReader, "idsTimes", []))
+        if not pairs:
+            if hasattr(self, "_dp_progress_label"):
+                self._dp_progress_label.configure(text="No images found in the selected folder.")
+            return
+
+        # --- Columns ---
+        n_cls = self.yoloSession.num_classes
+
+        def _feat_cols(cid: int):
+            return [f"feat_{cid}_x", f"feat_{cid}_y"]
+
+        columns = ["image_name", "image_time"]
+        for cid in range(n_cls):
+            columns.extend(_feat_cols(cid))
+
+        # --- Resume: load completed rows (only rows with all required cols count) ---
+        completed_map = {}
+        if os.path.exists(out_csv):
+            try:
+                prev = pd.read_csv(out_csv)
+                # normalize columns (older CSVs may miss new feat cols)
+                for col in columns:
+                    if col not in prev.columns:
+                        prev[col] = -1.0 if col.startswith("feat_") else None
+                need_keys = set(columns)
+                for _, r in prev.iterrows():
+                    rowd = r.to_dict()
+                    if need_keys.issubset(rowd.keys()):
+                        completed_map[str(rowd["image_name"])] = rowd
+            except Exception as e:
+                LOG.warning("Could not parse existing CSV (%s); starting fresh.", e)
+
+        # --- Checkpoint config ---
+        try:
+            checkpoint_every = max(0, int(str(self._dp_ckptN.get()).strip()))
+        except Exception:
+            checkpoint_every = 0  # 0 means: no mid-run checkpoints
+
+        last_written_count = len(completed_map)  # how many rows are already on disk
+        last_checkpoint_made = 0  # how many "new rows" were added since last checkpoint
+
+        # --- Time map (apply camera->log offset) ---
+        time_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0))
+        time_map = {}
+        for path_str, t in pairs:
+            name = Path(path_str).name
+            time_map[name] = (None if t is None else float(t) + time_offset)
+
+        # --- Work set (skip already completed) ---
+        work_items = [(p, Path(p).name) for (p, _t) in pairs if Path(p).name not in completed_map]
+        total_all = len(pairs)
+        total_todo = len(work_items)
+
+        # --- UI init ---
+        self._dp_cancel_flag = False
+        if hasattr(self, "_dp_run_btn"):
+            self._dp_run_btn.configure(state="disabled")
+        if hasattr(self, "_dp_progress"):
+            self._dp_progress.set(0.0)
+        if hasattr(self, "_dp_progress_label"):
+            self._dp_progress_label.configure(
+                text=f"Starting… (resuming with {total_all - total_todo} already done)"
+            )
+
+        # --- Pipeline settings ---
+        # CPU producer threads (disk read + preprocess); single GPU consumer
+
+        cpu_workers = max(2, min(8, (os.cpu_count() or 4)))
+        q: "queue.Queue[tuple[str, object, tuple[int,int]]]" = queue.Queue(maxsize=2 * cpu_workers)
+        producers_done = threading.Event()
+        yW, yH = self.yoloSession.yoloSize
+
+        def _producer_job(path_str: str, name: str):
+            if self._dp_cancel_flag:
+                return
+            p = Path(path_str)
+            if not p.exists():
+                rp = img_dir / p.name
+                if rp.exists():
+                    p = rp
+            img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+            if img is None:
+                # still notify consumer so progress advances
+                item = (name, None, (0, 0))
+            else:
+                H, W = img.shape[:2]
+                try:
+                    tensor = self.yoloSession.preprocessImage(img)  # CPU preproc
+                    item = (name, tensor, (W, H))
+                except Exception:
+                    item = (name, None, (H and W or 0, H or 0))
+            # never block forever on put
+            while not self._dp_cancel_flag:
+                try:
+                    q.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
+
+        # launch producers
+        start = time.monotonic()
+        made = 0
+        new_rows = []
+        n_cls = self.yoloSession.num_classes
+
+        def _feat_cols(cid: int):
+            return [f"feat_{cid}_x", f"feat_{cid}_y"]
+
+        if hasattr(self, "_dp_run_btn"):
+            self._dp_run_btn.configure(state="disabled")
+        if hasattr(self, "_dp_cancel_btn"):
+            self._dp_cancel_btn.configure(state="normal")
+
+        ex = ThreadPoolExecutor(max_workers=cpu_workers)
+        try:
+            futures = [ex.submit(_producer_job, p, name) for (p, name) in work_items]
+
+            # watcher to set done when all producer futures complete
+            def _watch():
+                wait(futures)
+                producers_done.set()
+
+            threading.Thread(target=_watch, daemon=True).start()
+
+            # single consumer on main/UI thread
+            while True:
+                if self._dp_cancel_flag:
+                    # Clear whatever is in the queue quickly and stop
+                    try:
+                        while True:
+                            q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    break
+
+                try:
+                    name, tensor, (W, H) = q.get(timeout=0.1)
+                except queue.Empty:
+                    # allow UI to breathe
+                    self.data_frame.update_idletasks();
+                    self.data_frame.update()
+                    # also exit if producers are done and queue is empty
+                    if producers_done.is_set():
+                        break
+                    continue
+
+                if tensor is not None:
+                    centers, boxes, scores, classes, _dt = self.yoloSession.runOneSession(tensor)
+
+                    rec = {c: -1.0 for cid in range(n_cls) for c in _feat_cols(cid)}
+                    sx, sy = (W / float(yW)), (H / float(yH))
+                    for (cx, cy), cid in zip(centers, classes):
+                        cidi = int(cid)
+                        rec[f"feat_{cidi}_x"] = float(cx) * sx
+                        rec[f"feat_{cidi}_y"] = float(cy) * sy
+
+                    row = {"image_name": name, "image_time": time_map.get(name, None)}
+                    row.update(rec)
+                    new_rows.append(row)
+                    completed_map[name] = row
+
+                made += 1
+                frac = made / float(max(1, total_todo))
+                if hasattr(self, "_dp_progress"):
+                    self._dp_progress.set(frac)
+
+                elapsed = time.monotonic() - start
+                eta = (elapsed / max(frac, 1e-9)) * (1.0 - frac)
+                mm, ss = int(eta // 60), int(round(eta % 60))
+                pct = int(frac * 100.0 + 0.5)
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(
+                        text=f"Processed {made}/{total_todo} new  •  {pct}%  •  ETA {mm:02d}:{ss:02d}  •  (total done: {len(completed_map)}/{total_all})"
+                    )
+                try:
+                    self.data_frame.update_idletasks();
+                    self.data_frame.update()
+                except Exception:
+                    pass
+
+                for r in new_rows:
+                    completed_map[r["image_name"]] = r
+
+                last_checkpoint_made += 1
+
+                # Mid-run checkpoint: only if threshold reached, not canceled, and there IS new work
+                if (checkpoint_every > 0 and not self._dp_cancel_flag
+                        and last_checkpoint_made >= checkpoint_every):
+                    try:
+                        self._write_csv_atomic(out_csv, columns, completed_map)
+                        last_written_count = len(completed_map)
+                        last_checkpoint_made = 0
+                        if hasattr(self, "_dp_progress_label"):
+                            self._dp_progress_label.configure(
+                                text=f"Checkpoint saved ({last_written_count} rows)…"
+                            )
+                    except Exception as e:
+                        LOG.warning("Checkpoint save failed: %s", e)
+        finally:
+            if hasattr(self, "_dp_run_btn"):
+                self._dp_run_btn.configure(state="normal")
+            if hasattr(self, "_dp_cancel_btn"):
+                self._dp_cancel_btn.configure(state="normal")
+            self._dp_cancel_flag = False
+            if hasattr(self, "_dp_progress_label"):
+                if getattr(self, "_dp_progress", None) and not self._dp_cancel_flag:
+                    self._dp_progress_label.configure(text="Ready.")
+
+            try:
+                self._write_csv_atomic(out_csv, columns, completed_map)
+                msg = (f"Partial CSV written (resume later): {out_csv}"
+                       if self._dp_cancel_flag else
+                       f"Done. CSV written: {out_csv}")
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(text=msg)
+                LOG.info("Wrote YOLO CSV: %s", out_csv)
+            except Exception as e:
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(text=f"Failed to write CSV: {e}")
+                LOG.exception("Failed to write CSV %s: %s", out_csv, e)
+
+            if self._dp_cancel_flag:
+                ex.shutdown(wait=False, cancel_futures=True)  # <- do not block on cancel
+            else:
+                ex.shutdown(wait=True)
+
+
     def setup_playbackFrame(self):
         rowID = 0
         self.update_playbackMenu()

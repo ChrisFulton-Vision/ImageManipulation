@@ -13,6 +13,7 @@ for key in ("CUDA_PATH", "CUDNN_PATH"):
 # Ensure CUDA_PATH is in environment: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin
 # Ensure CUDNN_PATH is in environment: C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6
 import onnxruntime as ort
+import onnx
 print(f'OnnxVersion: {ort.__version__}')
 print(f'Onnx Providers: {ort.get_available_providers()}')
 
@@ -79,6 +80,34 @@ class YOLO:
                 self.yoloSize = (self.reader.imageSize, self.reader.imageSize)
             else:
                 self.yoloSize = self.reader.imageSize
+
+            import ast, onnx
+
+            self.class_names = range(self.reader.numClasses)
+
+            model_proto = onnx.load(self.modelPath)
+            meta = {p.key.lower(): p.value for p in model_proto.metadata_props}
+
+            if "names" in meta:
+                raw = meta["names"]
+                try:
+                    # Try JSON first
+                    import json
+                    names = json.loads(raw)
+                except Exception:
+                    # Fall back to literal_eval for Python-style dicts
+                    names = ast.literal_eval(raw)
+
+                # If it's a dict, convert to ordered list
+                if isinstance(names, dict):
+                    names = [names[k] for k in sorted(names.keys(), key=int)]
+
+                if len(self.class_names) != len(names):
+                    raise ImportError(
+                        f"Onnx file and CSV disagree about number of classes! "
+                        f"Onnx: {len(names)} vs CSV: {len(self.class_names)}. Aborting."
+                    )
+
             self.reinitSession()
 
     def reinitSession(self) -> None:

@@ -18,7 +18,7 @@ from enum import Enum
 from itertools import cycle
 from tkinter import filedialog
 
-from concurrent.futures import wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from tkinter import StringVar
 import customtkinter as ctk
 import pandas as pd
@@ -216,6 +216,8 @@ class CameraGui(ctk.CTkFrame):
         self.detector = None
         self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
         self.arucoParams = cv2.aruco.DetectorParameters()
+        self.arucoParams.cornerRefinementMinAccuracy = 0.15
+        self.arucoParams.adaptiveThreshConstant = 1.0
         self._init_flag_vars()
 
         self.calibration = Calibration()
@@ -398,6 +400,10 @@ class CameraGui(ctk.CTkFrame):
         self.lastHeight = 1
         self.saveToCache()
 
+        self._ui_active = True
+        self._last_ui_tick = 0.0
+        self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
+
         self.setupFrame()
 
     def _init_flag_vars(self):
@@ -428,6 +434,43 @@ class CameraGui(ctk.CTkFrame):
     def _sync_flags_from_model(self):
         for n in self._flags:
             self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
+
+    def set_ui_active(self, active: bool):
+        self._ui_active = bool(active)
+        # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
+        if not self._ui_active:
+            try: self.startStreamOff()
+            except Exception: pass
+        else:
+            # Optionally auto-resume prior state; or keep manual
+            pass
+
+    def _ui_should_paint(self, widget=None) -> bool:
+        # Throttle + only if page/target is visible
+        if not self._ui_active:
+            return False
+        if widget is not None:
+            try:
+                if not widget.winfo_viewable():
+                    return False
+            except Exception:
+                return False
+        now = time.monotonic()
+        if (now - self._last_ui_tick) >= self._ui_throttle_sec:
+            self._last_ui_tick = now
+            return True
+        return False
+
+    # Optional: react to section changes if you want different behavior
+    def on_section_show(self, name: str):
+        # Example: only allow OpenCV windows / key polling while in Playback
+        self._playback_allowed = (name == "Playback")
+
+    def on_section_hide(self, name: str):
+        if name == "Playback":
+            # Close imshow windows / pause playback, etc.
+            try: cv2.destroyWindow(self.windowName)
+            except Exception: pass
 
     def loadFromCache(self):
         """
@@ -571,7 +614,6 @@ class CameraGui(ctk.CTkFrame):
                         pass
 
         except Exception as e:
-            import logging
             logging.warning("Failed to load cache %s: %s", cache_path, e)
             # Fall back to defaults
             try:
@@ -580,6 +622,38 @@ class CameraGui(ctk.CTkFrame):
                 pass
             self.filepath = str(Path.cwd())
             self.calibFile = ''
+
+        self.ingestCalibration()
+        try:
+            yolo_dir = getattr(self.camConfig, "yoloFilepath", "")
+            if yolo_dir and Path(yolo_dir).exists():
+                # Actually load the model/meta now (this was missing)
+                self.yoloSession.setNewFolder(yolo_dir)
+        except Exception as e:
+            LOG.warning("Failed to restore YOLO folder from cache: %s", e)
+
+        try:
+            self.yoloSession.conf = float(getattr(self.camConfig, "yolo_conf", 0.75))
+            self.yoloSession.iou = float(getattr(self.camConfig, "yolo_iou", 1.00))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "confSliderBar"):
+                self.confSliderBar.set(self.yoloSession.conf)
+            if hasattr(self, "confSliderLabel"):
+                self.confSliderLabel.configure(text=f"Conf: {self.yoloSession.conf:.2f}")
+            if hasattr(self, "iouSliderBar"):
+                self.iouSliderBar.set(self.yoloSession.iou)
+            if hasattr(self, "iouSliderLabel"):
+                self.iouSliderLabel.configure(text=f"IOU: {self.yoloSession.iou:.2f}")
+        except Exception:
+            pass
+        # --- Restore LiDAR truth points if path cached ---
+        try:
+            if getattr(self.camConfig, 'lidarFilepath', ''):
+                self.loadTruthPoints()
+        except Exception:
+            pass
 
     def saveToCache(self):
         cache_path = Path(CAM_CONFIG_CACHE)
@@ -687,7 +761,7 @@ class CameraGui(ctk.CTkFrame):
         if not self.calibration.fromBinFile(self.calibFile) and not self.calibration.fromFile(self.calibFile):
             if self.selectCalibLabel is not None:
                 self.selectCalibLabel.configure(text='No Calibration Found')
-                self.after(10, self.update())
+                self.after(10, self.update_idletasks())
             return
 
         if not self.calibration.validCal:
@@ -701,11 +775,11 @@ class CameraGui(ctk.CTkFrame):
         if self.selectCalibLabel is not None:
             self.selectCalibLabel.configure(text="../" + Path(self.calibFile).name if self.calibFile else "../",
                                             bg_color=self.selectCalibLabel.cget("bg_color"))
-            self.cam_frame.update()
-            self.update()
-            self.selectCalibLabel.update()
-            self.cam_frame.update()
-            self.update()
+            self.cam_frame.update_idletasks()
+            self.update_idletasks()
+            self.selectCalibLabel.update_idletasks()
+            self.cam_frame.update_idletasks()
+            self.update_idletasks()
 
         self.undistortCheckbox.configure(state='normal')
         if self.calibration.fisheye:
@@ -1056,7 +1130,6 @@ class CameraGui(ctk.CTkFrame):
         self._dp_img_dir_var = ctk.StringVar(value=str(self.camConfig.imageFilepath or ""))
 
         def _choose_dir():
-            from tkinter import filedialog
             d = filedialog.askdirectory(title="Select image folder")
             if d:
                 self._dp_img_dir_var.set(d)
@@ -1069,7 +1142,6 @@ class CameraGui(ctk.CTkFrame):
         self._dp_csv_var = ctk.StringVar(value="")
 
         def _choose_csv():
-            from tkinter import filedialog
             p = filedialog.asksaveasfilename(
                 title="Select output CSV",
                 defaultextension=".csv",
@@ -1082,28 +1154,16 @@ class CameraGui(ctk.CTkFrame):
         ctk.CTkEntry(f, textvariable=self._dp_csv_var).grid(row=2, column=1, padx=12, pady=6, sticky="ew")
         ctk.CTkButton(f, text="Browse…", command=_choose_csv).grid(row=2, column=2, padx=12, pady=6)
 
-        # --- YOLO knobs (optional, use current session otherwise) ---
-        self._dp_conf = ctk.DoubleVar(value=self.yoloSession.conf)
-        self._dp_iou = ctk.DoubleVar(value=self.yoloSession.iou)
-        ctk.CTkLabel(f, text="Conf:").grid(row=3, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkSlider(f, from_=0.05, to=0.99, number_of_steps=94,
-                      variable=self._dp_conf).grid(row=3, column=1, padx=12, pady=6, sticky="ew")
-        ctk.CTkLabel(f, textvariable=self._dp_conf).grid(row=3, column=2, padx=12, pady=6, sticky="e")
-
-        ctk.CTkLabel(f, text="IoU:").grid(row=4, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkSlider(f, from_=0.10, to=0.99, number_of_steps=90,
-                      variable=self._dp_iou).grid(row=4, column=1, padx=12, pady=6, sticky="ew")
-        ctk.CTkLabel(f, textvariable=self._dp_iou).grid(row=4, column=2, padx=12, pady=6, sticky="e")
-
         # --- Checkpoint controls ---
         self._dp_ckptN = ctk.StringVar(value="200")  # default every 200 images
         ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
         ctk.CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
 
-        # --- Run button ---
-        # ctk.CTkButton(f, text="Run YOLO Batch", fg_color="#2FA572",
-        #               command=self.run_yolo_batch_to_csv).grid(row=10, column=0, columnspan=3,
-        #                                                        padx=12, pady=(16, 12), sticky="ew")
+        # --- Prefetch controls ---
+        self._dp_prefetch = ctk.StringVar(value="32")  # how many decoded/preprocessed items to buffer
+        ctk.CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
+
         # --- Progress UI ---
         self._dp_progress_label = ctk.CTkLabel(f, text="Idle")
         self._dp_progress_label.grid(row=20, column=0, columnspan=3, padx=12, pady=(8, 4), sticky="w")
@@ -1121,8 +1181,10 @@ class CameraGui(ctk.CTkFrame):
             if hasattr(self, "_dp_cancel_btn"):
                 self._dp_cancel_btn.configure(state="disabled")
 
-        self._dp_run_btn = ctk.CTkButton(f, text="Run YOLO Batch", fg_color="#2FA572",
-                                         command=self.run_yolo_batch_to_csv)
+        self._dp_run_btn = ctk.CTkButton(
+            f, text="Run YOLO Batch", fg_color="#2FA572",
+            command=self._run_yolo_batch_start
+        )
         self._dp_run_btn.grid(row=10, column=0, columnspan=2, padx=12, pady=(16, 12), sticky="ew")
 
         self._dp_cancel_btn = ctk.CTkButton(f, text="Cancel", fg_color="#A52F2F",
@@ -1131,7 +1193,6 @@ class CameraGui(ctk.CTkFrame):
 
     def _write_csv_atomic(self, out_csv: str, columns: list[str], completed_map: dict[str, dict]):
         """Write CSV atomically and sort by numeric portion of image_name."""
-        import os, re, pandas as pd
 
         rows = list(completed_map.values())
         df = pd.DataFrame(rows, columns=columns)
@@ -1154,106 +1215,188 @@ class CameraGui(ctk.CTkFrame):
         df.to_csv(tmp, index=False)
         os.replace(tmp, out_csv)  # atomic replace
 
-    def run_yolo_batch_to_csv(self):
-        """
-        Resumable, pipelined YOLO batch:
-          - CPU workers: read + preprocess images in parallel
-          - Single GPU consumer: onnxruntime session.run
-          - Writes only complete rows; resumes from existing CSV
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    def _run_yolo_batch_start(self):
+        if getattr(self, "_dp_worker", None) and self._dp_worker.is_alive():
+            return  # already running
+        self._dp_cancel_flag = False
+        if hasattr(self, "_dp_progress_label"):
+            self._dp_progress_label.configure(text="Starting…")
+        if hasattr(self, "_dp_progress"):
+            self._dp_progress.set(0.0)
+        if hasattr(self, "_dp_run_btn"):
+            self._dp_run_btn.configure(state="disabled")
+        if hasattr(self, "_dp_cancel_btn"):
+            self._dp_cancel_btn.configure(state="normal")
+        # launch worker
+        self._dp_worker = threading.Thread(target=self._run_yolo_batch_worker, daemon=True)
+        self._dp_worker.start()
 
-        # --- Prep paths & thresholds ---
-        img_dir = Path((self._dp_img_dir_var.get() or "").strip() or self.camConfig.imageFilepath or "")
+    def _run_yolo_batch_worker(self):
+        """
+        Worker thread:
+          - Resumable, checkpointed, pipelined batch YOLO
+          - Producers: disk read + preprocess (CPU), with bounded prefetch
+          - Consumer: single GPU session.run
+          - UI updates posted via `after(...)`
+        """
+        # -------------------- helpers (UI-thread posts) --------------------
+        def _post_progress(made, total_todo, completed_map, total_all, start, frac_override=None, note=None):
+            frac = float(frac_override) if frac_override is not None else (made / float(max(1, total_todo)))
+            elapsed = time.monotonic() - start
+            eta = (elapsed / max(frac, 1e-9)) * (1.0 - frac)
+            pct = int(frac * 100.0 + 0.5)
+            mm, ss = int(eta // 60), int(round(eta % 60))
+            txt = note or f"Processed {made}/{total_todo} new  •  {pct}%  •  ETA {mm:02d}:{ss:02d}  •  (total done: {len(completed_map)}/{total_all})"
+
+            def _ui():
+                if hasattr(self, "_dp_progress"):
+                    self._dp_progress.set(frac)
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(text=txt)
+
+            self.after(0, _ui)
+
+        def _post_status(msg):
+            def _ui():
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(text=msg)
+
+            self.after(0, _ui)
+
+        def _post_finish(msg):
+            def _ui():
+                if hasattr(self, "_dp_progress_label"):
+                    self._dp_progress_label.configure(text=msg)
+                if hasattr(self, "_dp_run_btn"):
+                    self._dp_run_btn.configure(state="normal")
+                if hasattr(self, "_dp_cancel_btn"):
+                    self._dp_cancel_btn.configure(state="normal")
+
+            self.after(0, _ui)
+
+        # -------------------- config & resume --------------------
+        # Paths
+        img_dir = Path((getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
+                       or (getattr(self.camConfig, "imageFilepath", "") or ""))
+        out_csv = (getattr(self, "_dp_csv_var", None) and self._dp_csv_var.get().strip()) or str(
+            img_dir / "yolo_detections.csv")
+
         if not img_dir or not img_dir.exists():
-            LOG.warning("No valid image directory selected.")
-            if hasattr(self, "_dp_progress_label"):
-                self._dp_progress_label.configure(text="No valid image directory selected.")
+            _post_status("No valid image directory selected.")
+            _post_finish("Ready.")
+            self._dp_cancel_flag = False
             return
 
+        # Freeze current session thresholds (carry over from main config)
+        conf = float(self.yoloSession.conf)
+        iou = float(self.yoloSession.iou)
+        # Show what we're using
+        _post_status(f"Using YOLO conf={conf:.2f}, iou={iou:.2f}…")
 
-
-        out_csv = (self._dp_csv_var.get() or "").strip() or str(img_dir / "yolo_detections.csv")
-
-        # freeze thresholds once for this run
-        self.yoloSession.conf = float(self._dp_conf.get())
-        self.yoloSession.iou = float(self._dp_iou.get())
-
-        # --- Build list of files/times like playback does ---
+        # Build list of files/times (same as playback)
         self.populate_idsTimes(str(img_dir))
-        pairs = list(getattr(self.ImageTimeReader, "idsTimes", []))
+        pairs = list(getattr(self.ImageTimeReader, "idsTimes", []))  # [(path, time), ...]
+
         if not pairs:
-            if hasattr(self, "_dp_progress_label"):
-                self._dp_progress_label.configure(text="No images found in the selected folder.")
+            _post_status("No images found in the selected folder.")
+            _post_finish("Ready.")
+            self._dp_cancel_flag = False
             return
 
-        # --- Columns ---
+        # Columns (always complete rows)
         n_cls = self.yoloSession.num_classes
 
         def _feat_cols(cid: int):
-            return [f"feat_{cid}_x", f"feat_{cid}_y"]
+            # If the model has only one class, replace (x,y) with full box (x1,y1,x2,y2)
+            if n_cls == 1:
+                return [f"feat_{cid}_x1", f"feat_{cid}_y1", f"feat_{cid}_x2", f"feat_{cid}_y2"]
+            else:
+                return [f"feat_{cid}_x", f"feat_{cid}_y"]
+
+        # Optional undistorted columns — only meaningful for centers, so skip when n_cls==1
+        save_ud = bool(getattr(self, "_dp_save_ud", None) and self._dp_save_ud.get()) and (n_cls > 1)
 
         columns = ["image_name", "image_time"]
         for cid in range(n_cls):
             columns.extend(_feat_cols(cid))
+            if save_ud:
+                columns.extend([f"feat_{cid}_ud_x", f"feat_{cid}_ud_y"])
 
-        # --- Resume: load completed rows (only rows with all required cols count) ---
+        # Resume from existing CSV
         completed_map = {}
         if os.path.exists(out_csv):
             try:
                 prev = pd.read_csv(out_csv)
-                # normalize columns (older CSVs may miss new feat cols)
+                # Normalize any missing columns
                 for col in columns:
                     if col not in prev.columns:
-                        prev[col] = -1.0 if col.startswith("feat_") else None
-                need_keys = set(columns)
+                        prev[col] = (-1.0 if col.startswith("feat_") else None)
+                # Only keep fully-formed rows (all required columns present)
+                need = set(columns)
                 for _, r in prev.iterrows():
-                    rowd = r.to_dict()
-                    if need_keys.issubset(rowd.keys()):
-                        completed_map[str(rowd["image_name"])] = rowd
+                    rd = r.to_dict()
+                    if need.issubset(rd.keys()):
+                        completed_map[str(rd["image_name"])] = rd
             except Exception as e:
-                LOG.warning("Could not parse existing CSV (%s); starting fresh.", e)
+                _post_status(f"Existing CSV unreadable, starting fresh: {e}")
 
-        # --- Checkpoint config ---
+        # Time map (apply camera->log offset)
+        time_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0))
+        time_map = {Path(p).name: (None if t is None else float(t) + time_offset) for (p, t) in pairs}
+
+        # Work list (skip already completed)
+        all_total = len(pairs)
+        work_items = []
+        for p, _t in pairs:
+            name = Path(p).name
+            if name in completed_map:
+                continue
+            work_items.append((p, name))
+
+        total_todo = len(work_items)
+        if total_todo == 0:
+            # Still rewrite CSV to ensure new columns (e.g., UD) get materialized
+            try:
+                self._write_csv_atomic(out_csv, columns, completed_map)
+                _post_finish(f"Already complete. CSV written: {out_csv}")
+            except Exception as e:
+                _post_finish(f"Failed to write CSV: {e}")
+            self._dp_cancel_flag = False
+            return
+
+        # Checkpoint config (images per checkpoint)
         try:
             checkpoint_every = max(0, int(str(self._dp_ckptN.get()).strip()))
         except Exception:
-            checkpoint_every = 0  # 0 means: no mid-run checkpoints
+            checkpoint_every = 0  # no mid-run checkpoints if not set
+        processed_since_ckpt = 0
 
-        last_written_count = len(completed_map)  # how many rows are already on disk
-        last_checkpoint_made = 0  # how many "new rows" were added since last checkpoint
+        # Prefetch / pipeline config
+        try:
+            prefetch = max(2, int(str(self._dp_prefetch.get()).strip()))
+        except Exception:
+            prefetch = 32
 
-        # --- Time map (apply camera->log offset) ---
-        time_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0))
-        time_map = {}
-        for path_str, t in pairs:
-            name = Path(path_str).name
-            time_map[name] = (None if t is None else float(t) + time_offset)
-
-        # --- Work set (skip already completed) ---
-        work_items = [(p, Path(p).name) for (p, _t) in pairs if Path(p).name not in completed_map]
-        total_all = len(pairs)
-        total_todo = len(work_items)
-
-        # --- UI init ---
-        self._dp_cancel_flag = False
-        if hasattr(self, "_dp_run_btn"):
-            self._dp_run_btn.configure(state="disabled")
-        if hasattr(self, "_dp_progress"):
-            self._dp_progress.set(0.0)
-        if hasattr(self, "_dp_progress_label"):
-            self._dp_progress_label.configure(
-                text=f"Starting… (resuming with {total_all - total_todo} already done)"
-            )
-
-        # --- Pipeline settings ---
-        # CPU producer threads (disk read + preprocess); single GPU consumer
-
-        cpu_workers = max(2, min(8, (os.cpu_count() or 4)))
-        q: "queue.Queue[tuple[str, object, tuple[int,int]]]" = queue.Queue(maxsize=2 * cpu_workers)
+        import os as _os
+        cpu_workers = max(2, min(prefetch, (_os.cpu_count() or 4)))
+        q = queue.Queue(maxsize=prefetch)
         producers_done = threading.Event()
+
+        # YOLO dims
         yW, yH = self.yoloSession.yoloSize
 
+        # Optional: matrices for UD points
+        if save_ud and hasattr(self, "calibration") and self.calibration is not None:
+            import numpy as _np, cv2 as _cv2
+            K = self.calibration.getCameraMatrix()
+            D = self.calibration.getDistortion()
+        else:
+            _np = None
+            _cv2 = None
+            K = D = None
+
+        # -------------------- producer / consumer --------------------
+        import cv2
         def _producer_job(path_str: str, name: str):
             if self._dp_cancel_flag:
                 return
@@ -1262,152 +1405,128 @@ class CameraGui(ctk.CTkFrame):
                 rp = img_dir / p.name
                 if rp.exists():
                     p = rp
+
             img = cv2.imread(str(p), cv2.IMREAD_COLOR)
             if img is None:
-                # still notify consumer so progress advances
                 item = (name, None, (0, 0))
             else:
                 H, W = img.shape[:2]
                 try:
-                    tensor = self.yoloSession.preprocessImage(img)  # CPU preproc
+                    tensor = self.yoloSession.preprocessImage(img)  # [1,3,h,w] float32
                     item = (name, tensor, (W, H))
                 except Exception:
-                    item = (name, None, (H and W or 0, H or 0))
-            # never block forever on put
+                    item = (name, None, (W, H))
+
+            # bounded, cancel-aware put
             while not self._dp_cancel_flag:
                 try:
                     q.put(item, timeout=0.05)
-                    return
+                    break
                 except queue.Full:
                     continue
 
-        # launch producers
         start = time.monotonic()
         made = 0
-        new_rows = []
-        n_cls = self.yoloSession.num_classes
 
-        def _feat_cols(cid: int):
-            return [f"feat_{cid}_x", f"feat_{cid}_y"]
-
-        if hasattr(self, "_dp_run_btn"):
-            self._dp_run_btn.configure(state="disabled")
-        if hasattr(self, "_dp_cancel_btn"):
-            self._dp_cancel_btn.configure(state="normal")
-
+        # Start producers
+        from concurrent.futures import ThreadPoolExecutor, wait, as_completed
         ex = ThreadPoolExecutor(max_workers=cpu_workers)
         try:
             futures = [ex.submit(_producer_job, p, name) for (p, name) in work_items]
 
-            # watcher to set done when all producer futures complete
+            # watcher that flips when producers finish
             def _watch():
                 wait(futures)
                 producers_done.set()
 
             threading.Thread(target=_watch, daemon=True).start()
 
-            # single consumer on main/UI thread
+            # single GPU consumer on worker thread
             while True:
-                if self._dp_cancel_flag:
-                    # Clear whatever is in the queue quickly and stop
-                    try:
-                        while True:
-                            q.get_nowait()
-                    except queue.Empty:
-                        pass
+                # stop condition: canceled or producers finished AND queue empty
+                if (self._dp_cancel_flag or producers_done.is_set()) and q.empty():
                     break
 
                 try:
                     name, tensor, (W, H) = q.get(timeout=0.1)
                 except queue.Empty:
-                    # allow UI to breathe
-                    self.data_frame.update_idletasks();
-                    self.data_frame.update()
-                    # also exit if producers are done and queue is empty
-                    if producers_done.is_set():
-                        break
+                    # light UI heartbeat
+                    _post_progress(made, total_todo, completed_map, all_total, start, note="Working…")
                     continue
 
                 if tensor is not None:
+                    # GPU infer
                     centers, boxes, scores, classes, _dt = self.yoloSession.runOneSession(tensor)
 
+                    # build complete row (raw distorted pixels)
                     rec = {c: -1.0 for cid in range(n_cls) for c in _feat_cols(cid)}
                     sx, sy = (W / float(yW)), (H / float(yH))
-                    for (cx, cy), cid in zip(centers, classes):
-                        cidi = int(cid)
-                        rec[f"feat_{cidi}_x"] = float(cx) * sx
-                        rec[f"feat_{cidi}_y"] = float(cy) * sy
+
+                    if n_cls == 1:
+                        # For single-class models, store full box geometry (if any)
+                        if boxes:
+                            x1, y1, x2, y2 = boxes[0]
+                            rec["feat_0_x1"] = float(x1) * sx
+                            rec["feat_0_y1"] = float(y1) * sy
+                            rec["feat_0_x2"] = float(x2) * sx
+                            rec["feat_0_y2"] = float(y2) * sy
+                        # No UD columns in 1-class mode
+                    else:
+                        # Multi-class: keep existing center behavior (+ optional UD)
+                        found_pts, found_cids = [], []
+                        for (cx, cy), cid in zip(centers, classes):
+                            cidi = int(cid)
+                            x = float(cx) * sx
+                            y = float(cy) * sy
+                            rec[f"feat_{cidi}_x"] = x
+                            rec[f"feat_{cidi}_y"] = y
+                            if save_ud:
+                                found_pts.append([x, y])
+                                found_cids.append(cidi)
+
+                        if save_ud and found_pts and _np is not None and _cv2 is not None:
+                            pts_np = _np.array(found_pts, dtype=_np.float32).reshape(-1, 1, 2)
+                            ud = _cv2.undistortPoints(pts_np, K, D, P=K).reshape(-1, 2)
+                            for (ux, uy), cidi in zip(ud, found_cids):
+                                rec[f"feat_{cidi}_ud_x"] = float(ux)
+                                rec[f"feat_{cidi}_ud_y"] = float(uy)
 
                     row = {"image_name": name, "image_time": time_map.get(name, None)}
                     row.update(rec)
-                    new_rows.append(row)
-                    completed_map[name] = row
+                    completed_map[name] = row  # overwrite/insert complete row
 
+                # progress
                 made += 1
-                frac = made / float(max(1, total_todo))
-                if hasattr(self, "_dp_progress"):
-                    self._dp_progress.set(frac)
+                processed_since_ckpt += 1
+                _post_progress(made, total_todo, completed_map, all_total, start)
 
-                elapsed = time.monotonic() - start
-                eta = (elapsed / max(frac, 1e-9)) * (1.0 - frac)
-                mm, ss = int(eta // 60), int(round(eta % 60))
-                pct = int(frac * 100.0 + 0.5)
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(
-                        text=f"Processed {made}/{total_todo} new  •  {pct}%  •  ETA {mm:02d}:{ss:02d}  •  (total done: {len(completed_map)}/{total_all})"
-                    )
-                try:
-                    self.data_frame.update_idletasks();
-                    self.data_frame.update()
-                except Exception:
-                    pass
-
-                for r in new_rows:
-                    completed_map[r["image_name"]] = r
-
-                last_checkpoint_made += 1
-
-                # Mid-run checkpoint: only if threshold reached, not canceled, and there IS new work
-                if (checkpoint_every > 0 and not self._dp_cancel_flag
-                        and last_checkpoint_made >= checkpoint_every):
+                # checkpoint (atomic + numeric sort) on UI-friendly cadence
+                if checkpoint_every > 0 and not self._dp_cancel_flag and processed_since_ckpt >= checkpoint_every:
                     try:
                         self._write_csv_atomic(out_csv, columns, completed_map)
-                        last_written_count = len(completed_map)
-                        last_checkpoint_made = 0
-                        if hasattr(self, "_dp_progress_label"):
-                            self._dp_progress_label.configure(
-                                text=f"Checkpoint saved ({last_written_count} rows)…"
-                            )
+                        processed_since_ckpt = 0
+                        _post_status(f"Checkpoint saved ({len(completed_map)} rows)…")
                     except Exception as e:
-                        LOG.warning("Checkpoint save failed: %s", e)
+                        _post_status(f"Checkpoint save failed: {e}")
+
         finally:
-            if hasattr(self, "_dp_run_btn"):
-                self._dp_run_btn.configure(state="normal")
-            if hasattr(self, "_dp_cancel_btn"):
-                self._dp_cancel_btn.configure(state="normal")
-            self._dp_cancel_flag = False
-            if hasattr(self, "_dp_progress_label"):
-                if getattr(self, "_dp_progress", None) and not self._dp_cancel_flag:
-                    self._dp_progress_label.configure(text="Ready.")
-
-            try:
-                self._write_csv_atomic(out_csv, columns, completed_map)
-                msg = (f"Partial CSV written (resume later): {out_csv}"
-                       if self._dp_cancel_flag else
-                       f"Done. CSV written: {out_csv}")
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=msg)
-                LOG.info("Wrote YOLO CSV: %s", out_csv)
-            except Exception as e:
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=f"Failed to write CSV: {e}")
-                LOG.exception("Failed to write CSV %s: %s", out_csv, e)
-
+            # shutdown producers; don't block on cancel
             if self._dp_cancel_flag:
-                ex.shutdown(wait=False, cancel_futures=True)  # <- do not block on cancel
+                ex.shutdown(wait=False, cancel_futures=True)
             else:
                 ex.shutdown(wait=True)
 
+            # final write (always)
+            try:
+                self._write_csv_atomic(out_csv, columns, completed_map)
+                msg = ("Partial CSV written (resume later): " + out_csv) if self._dp_cancel_flag else (
+                            "Done. CSV written: " + out_csv)
+            except Exception as e:
+                msg = f"Failed to write CSV: {e}"
+
+            _post_finish(msg)
+            # reset for next run
+            self._dp_cancel_flag = False
 
     def setup_playbackFrame(self):
         rowID = 0
@@ -1701,7 +1820,7 @@ class CameraGui(ctk.CTkFrame):
         # Use small slices to keep latency low and drain bursts
         deadline = time.monotonic() + (max_ms / 1000.0)
         while time.monotonic() < deadline:
-            k = cv2.waitKey(1) & 0xFF
+            k = cv2.waitKey(10) & 0xFF
             if k not in (0, 0xFF, 255, -1):
                 keys.append(k)
             # tiny spin; 1ms waitKey already yields to GUI

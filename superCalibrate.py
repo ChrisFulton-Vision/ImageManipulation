@@ -223,23 +223,33 @@ class CalibrateGui(ctk.CTkFrame):
 
         # # Once a calibration is active, allow user to display a window that manages the calibration
         self.displayCal = None
-        # self.createCalibrationDisplay(rowID)
-        # rowID += 1
-        #
+
         # # Once a calibration is active, allow user to display a window that manages the calibration
         self.configWindowButton = None
-        # self.createConfigWindowButton(rowID)
-        # rowID += 1
-        #
-        # # Create a button that allows a user to clear the cache, but they must select it twice
-        # self.clearCacheRow = rowID
-        # self.protectClearCache()
-        #
-        # # Now that necessary starting variables are created, load states from cache
-        #
-        # self.restoreFromImageConfig()
-        # self.updateConfigWindow()
-        # self.updateCalWindow()
+
+        self._ui_active = True
+        self._last_ui_tick = 0.0
+        self._ui_throttle_sec = 0.10  # repaint at most every 100ms
+
+    def set_ui_active(self, active: bool):
+        self._ui_active = bool(active)
+        # Stop/avoid background refreshers when hidden (threads/after loops).
+        # If you have repeating after() callbacks, guard their reschedule on this flag.
+
+    def _ui_should_paint(self, widget=None) -> bool:
+        if not self._ui_active:
+            return False
+        if widget is not None:
+            try:
+                if not widget.winfo_viewable():
+                    return False
+            except Exception:
+                return False
+        now = time.monotonic()
+        if (now - self._last_ui_tick) >= self._ui_throttle_sec:
+            self._last_ui_tick = now
+            return True
+        return False
 
     def setup_configFrame(self, master_frame):
         f = ctk.CTkFrame(master_frame)
@@ -591,7 +601,7 @@ class CalibrateGui(ctk.CTkFrame):
             self.stoppingMinStepSizeEntry.insert(0, str(self.imageConfig.minStepSize))
         self.saveToCache()
         self.stoppingMinStepSizeButton.configure(fg_color='yellow')
-        self.stoppingMinStepSizeButton.after(1, self.update())
+        self.stoppingMinStepSizeButton.after(1, self.update_idletasks())
         self.stoppingMinStepSizeButton.after(500, self.restoreMinSizeButton())
 
     def restoreMinSizeButton(self):
@@ -612,7 +622,7 @@ class CalibrateGui(ctk.CTkFrame):
             self.stoppingIterationEntry.insert(0, str(self.imageConfig.maxIter))
         self.saveToCache()
         self.stoppingIterationButton.configure(fg_color='yellow')
-        self.stoppingIterationButton.after(1, self.update())
+        self.stoppingIterationButton.after(1, self.update_idletasks())
         self.stoppingIterationButton.after(500, self.restoreIterationButton())
 
     def toggleZeroTangentDist(self):
@@ -908,22 +918,22 @@ class CalibrateGui(ctk.CTkFrame):
 
     def unprotectInvert(self):
         self.imgInvertProtectedButton.configure(command=self.invertAll, fg_color=GREEN, hover_color='dark green')
-        self.imgInvertProtectedButton.update()
+        self.imgInvertProtectedButton.update_idletasks()
         self.after(2000, self.protectInvert)
 
     def unprotectAllGrayscale(self):
         self.imgGrayProtectedButton.configure(command=self.grayscaleAll, fg_color=GREEN, hover_color='dark green')
-        self.imgGrayProtectedButton.update()
+        self.imgGrayProtectedButton.update_idletasks()
         self.after(2000, self.protectAllGrayscale)
 
     def unprotectRotateCCW(self):
         self.imgRotateCCWProtectedButton.configure(command=self.rotateAllCCW, fg_color=GREEN, hover_color='dark green')
-        self.imgRotateCCWProtectedButton.update()
+        self.imgRotateCCWProtectedButton.update_idletasks()
         self.after(2000, self.protectRotateCCW)
 
     def unprotectRotateCW(self):
         self.imgRotateCWProtectedButton.configure(command=self.rotateAllCW, fg_color=GREEN, hover_color='dark green')
-        self.imgRotateCWProtectedButton.update()
+        self.imgRotateCWProtectedButton.update_idletasks()
         self.after(2000, self.protectRotateCW)
 
     def protectInvert(self, row=1):
@@ -950,28 +960,28 @@ class CalibrateGui(ctk.CTkFrame):
 
     def invertAll(self):
         self.imgInvertProtectedButton.configure(fg_color='black')
-        self.imgInvertProtectedButton.update()
+        self.imgInvertProtectedButton.update_idletasks()
         for imgClass in self.imageConfig.img_collection:
             self.invertIndividualImage(imgClass)
         self.protectInvert()
 
     def grayscaleAll(self):
         self.imgGrayProtectedButton.configure(fg_color='black')
-        self.imgGrayProtectedButton.update()
+        self.imgGrayProtectedButton.update_idletasks()
         for imgClass in self.imageConfig.img_collection:
             self.grayscaleIndividualImage(imgClass)
         self.protectAllGrayscale()
 
     def rotateAllCW(self):
         self.imgRotateCWProtectedButton.configure(fg_color='black')
-        self.imgRotateCWProtectedButton.update()
+        self.imgRotateCWProtectedButton.update_idletasks()
         for imgClass in self.imageConfig.img_collection:
             self.rotateCWIndividualImage(imgClass)
         self.protectRotateCW()
 
     def rotateAllCCW(self):
         self.imgRotateCCWProtectedButton.configure(fg_color='black')
-        self.imgRotateCCWProtectedButton.update()
+        self.imgRotateCCWProtectedButton.update_idletasks()
         for imgClass in self.imageConfig.img_collection:
             self.rotateCCWIndividualImage(imgClass)
         self.protectRotateCCW()
@@ -1116,6 +1126,7 @@ class CalibrateGui(ctk.CTkFrame):
         self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
         self.calculating = False
         btn.configure(text='Start Calibration', state='normal')
+        self.update()
 
     def calibrate(self, master_frame):
         self.calculating = True
@@ -1164,7 +1175,7 @@ class CalibrateGui(ctk.CTkFrame):
 
         self.loadFromCache(False)
         self.saveToCache()
-        self.updateImageFrame(self.imageFrame)
+        self.updateImageFrame()
 
     def sortBySharpness(self):
         self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,

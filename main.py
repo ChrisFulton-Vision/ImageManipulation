@@ -33,6 +33,12 @@ def _is_alive(widget) -> bool:
 
 # ----- section swapping -----
 def show_section(master_frame, name):
+    if hasattr(master_frame, "_active_section_name"):
+        prev = master_frame._active_section_name
+        if hasattr(master_frame, "on_section_hide"):
+            try: master_frame.on_section_hide(prev)
+            except Exception: pass
+
     if hasattr(master_frame, "_ensure_section"):
         master_frame._ensure_section(name)
 
@@ -46,6 +52,11 @@ def show_section(master_frame, name):
 
     master_frame._active_section_name = name
     master_frame._active_section = frame
+
+    if hasattr(master_frame, "on_section_show"):
+        try: master_frame.on_section_show(name)
+        except Exception: pass
+
 
 
 
@@ -95,6 +106,24 @@ class CalibratePage(ctk.CTkFrame):
 
         return ("Start Calibrate", on_toggle)
 
+    def on_show(self):
+        if hasattr(self.calPage, "set_ui_active"):
+            self.calPage.set_ui_active(True)
+
+    def on_hide(self):
+        if hasattr(self.calPage, "set_ui_active"):
+            self.calPage.set_ui_active(False)
+
+    def on_section_show(self, name: str):
+        if name == "Images":
+            self.calPage.updateImageFrame()
+        if hasattr(self.calPage, "on_section_show"):
+            self.calPage.on_section_show(name)
+
+    def on_section_hide(self, name: str):
+        if hasattr(self.calPage, "on_section_hide"):
+            self.calPage.on_section_hide(name)
+
 
 class CameraPage(ctk.CTkFrame):
     def __init__(self, master):
@@ -128,6 +157,22 @@ class CameraPage(ctk.CTkFrame):
         return self.camGui.data_frame
     def _make_hotkeyPage(self):
         return self.camGui.hotkey_frame
+
+    def on_show(self):
+        if hasattr(self.camGui, "set_ui_active"):
+            self.camGui.set_ui_active(True)
+
+    def on_hide(self):
+        if hasattr(self.camGui, "set_ui_active"):
+            self.camGui.set_ui_active(False)
+
+    def on_section_show(self, name: str):
+        if hasattr(self.camGui, "on_section_show"):
+            self.camGui.on_section_show(name)
+
+    def on_section_hide(self, name: str):
+        if hasattr(self.camGui, "on_section_hide"):
+            self.camGui.on_section_hide(name)
 
     def submenu_footer(self):
         def on_toggle(btn: ctk.CTkButton):
@@ -204,10 +249,31 @@ class App(ctk.CTk):
             p.grid(row=0, column=0, sticky="nsew")
             p.grid_remove()
 
-        self._build_mainnav()
 
+        self._build_mainnav()
         self.current_page = None
         self.show_page("Camera")
+
+        self.after_idle(self._initial_fit_once)
+
+    def _initial_fit_once(self, tries: int = 0):
+        # Let geometry settle
+        self.update()
+        page = self.pages.get(self.current_page)
+        if not page:
+            # first call happens right after show_page("Camera")
+            self.after(16, self._initial_fit_once, tries + 1)
+            return
+
+        # Wait until widgets report non-trivial requested size
+        if page.winfo_reqwidth() <= 1 or page.winfo_reqheight() <= 1:
+            if tries < 30:  # ~0.5s max (30 * 16ms)
+                self.after(16, self._initial_fit_once, tries + 1)
+            return
+
+        # Fit including subnav if present
+        show_sub = bool(getattr(page, "sections", None))
+        self._fit_to_content(page, show_subnav=show_sub)
 
     def _build_mainnav(self):
         ctk.CTkLabel(self.mainnav, text="Main Menu", font=("Segoe UI", 18, "bold")).pack(
@@ -256,19 +322,29 @@ class App(ctk.CTk):
         else:
             self.active_sub_button = None
 
+    # --- in App.show_page ---
     def show_page(self, name):
-        # swap content page
+        self.update_idletasks()
+        if self.current_page and hasattr(self.pages[self.current_page], "on_hide"):
+            try:
+                self.pages[self.current_page].on_hide()
+            except Exception:
+                pass
+
         if self.current_page:
             self.pages[self.current_page].grid_remove()
+
         page = self.pages[name]
         page.grid()
         self.current_page = name
-
-        # highlight first so it paints immediately
         self._highlight_main_button(name)
-
-        # then rebuild submenu (which triggers sizing)
         self._rebuild_subnav(page)
+
+        if hasattr(page, "on_show"):
+            try:
+                page.on_show()
+            except Exception:
+                pass
 
     # in App
     def _rebuild_subnav(self, page):

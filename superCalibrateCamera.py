@@ -8,6 +8,9 @@ import time
 import sys
 import queue
 
+import cProfile
+import pstats
+
 import vmbpy.c_binding
 from vmbpy import *
 
@@ -55,6 +58,10 @@ if not LOG.handlers:
     # LOG.setLevel(logging.INFO)
     # LOG.setLevel(logging.DEBUG)
     LOG.setLevel(logging.WARNING)
+
+
+cv2.setNumThreads(0)
+cv2.setUseOptimized(True)
 
 #  import superCalibrate as superCal
 #  pip install cv2_enumerate_cameras
@@ -200,6 +207,9 @@ class CameraConfig:
 
 class CameraGui(ctk.CTkFrame):
     def __init__(self, master, *args, **kwargs):
+
+        self.profile_run_folder = False
+
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
         self._flag_vars: dict[str, ctk.BooleanVar] = {}
@@ -1758,7 +1768,8 @@ class CameraGui(ctk.CTkFrame):
         if self.camConfig.imageSource == ImageSource.Camera_Stream:
             self.run_video_stream()
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.run_folder_reader()
+            self.profile_run_folder = True
+            self.run_folder_reader_profiled()
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
@@ -1816,15 +1827,11 @@ class CameraGui(ctk.CTkFrame):
 
     @staticmethod
     def _poll_keys(max_ms: int = 8) -> list[int]:
-        keys = []
-        # Use small slices to keep latency low and drain bursts
-        deadline = time.monotonic() + (max_ms / 1000.0)
-        while time.monotonic() < deadline:
-            k = cv2.waitKey(10) & 0xFF
-            if k not in (0, 0xFF, 255, -1):
-                keys.append(k)
-            # tiny spin; 1ms waitKey already yields to GUI
-        return keys
+        # One-shot poll: wait up to max_ms for a key
+        k = cv2.waitKey(max_ms) & 0xFF
+        if k not in (0, 0xFF, 255, -1):
+            return [k]
+        return []
 
     @staticmethod
     def load_time_offset(directory):
@@ -1849,6 +1856,43 @@ class CameraGui(ctk.CTkFrame):
         t = self._make_timebase(ts_raw, self.camConfig.target_fps, len(paths))
 
         return paths, t
+
+    def run_folder_reader_profiled(self):
+        if not self.profile_run_folder:
+            # Normal behavior
+            return self.run_folder_reader()
+
+        prof = cProfile.Profile()
+        try:
+            prof.enable()
+            self.run_folder_reader()
+        finally:
+            prof.disable()
+            prof.dump_stats("run_folder_reader.prof")
+
+            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            print("\n=== superCalibrateCamera functions ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== run_folder_reader / analyze_image ===")
+            stats.print_stats("run_folder_reader")
+            stats.print_stats("analyze_image")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            # Narrow view: only functions from your GUI modules
+            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== CustomTkinter / Tk wrappers ===")
+            stats.print_stats("customtkinter")
+            stats.print_stats("ctk")
+            stats.print_stats("tkinter")
 
     def run_folder_reader(self):
         cv2.destroyAllWindows()
@@ -2013,7 +2057,7 @@ class CameraGui(ctk.CTkFrame):
                             if got is not None:
                                 curr_idx, frame = got
 
-                        pending_keys.extend(self._poll_keys(10))
+                        pending_keys.extend(self._poll_keys(1))
 
                     ts = self.ImageTimeReader.idsTimes[curr_idx][1]
                     boxAround = False
@@ -2030,7 +2074,7 @@ class CameraGui(ctk.CTkFrame):
                     pass
 
 
-                pending_keys.extend(self._poll_keys(4))
+                pending_keys.extend(self._poll_keys(1))
 
                 # --- Key handling: edge-triggered dispatcher ---
                 while pending_keys:
@@ -2441,7 +2485,7 @@ class CameraGui(ctk.CTkFrame):
         if self.camConfig.detect_corners:
             self.corner_detection()
 
-        if self.detector is not None:
+        if self.camConfig.detectTags and self.detector is not None:
             self.detectAprilTags()
 
         if self.camConfig.pnpLidarPoints and self.detector is not None:

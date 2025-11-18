@@ -199,7 +199,7 @@ class App(ctk.CTk):
         self.active_sub_button = None
         self.sub_buttons = {}
 
-        self.title("Two-level Sidebar Demo")
+        self.title("Camera Utilities by Jarvis")
         # self.geometry("1200x750")
 
         # Grid: [MainNav | SubNav | Content]

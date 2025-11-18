@@ -324,12 +324,17 @@ def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_sq
     :return:
     """
 
-    sigma_squared = np.ones(2 * len(object_pts))
-    sigma_squared[0] = 100.0
-    sigma_squared[1] = 100.0
+    # sigma_squared = np.ones(2 * len(object_pts))
+    # sigma_squared[0] = 100.0
+    # sigma_squared[1] = 100.0
 
     # q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
     est_q, est_t = opt(img_pts, object_pts, cal, sigma_squared=sigma_squared)
+    if est_t[0] < 0.5:
+        est_t *= -1.0
+
+        est_q, est_t = opt(img_pts, object_pts, cal, seed_q=q(), seed_t=est_t, sigma_squared=sigma_squared)
+
     # est_q, est_t = q_init, t_init
 
     est_q.force_s_pos()

@@ -8,20 +8,17 @@ import time
 import sys
 import queue
 
-import cProfile
-import pstats
-
 import vmbpy.c_binding
 from vmbpy import *
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 from enum import Enum
 from itertools import cycle
 from tkinter import filedialog
 
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, wait
 from tkinter import StringVar
 import customtkinter as ctk
 import pandas as pd
@@ -59,7 +56,6 @@ if not LOG.handlers:
     # LOG.setLevel(logging.DEBUG)
     LOG.setLevel(logging.WARNING)
 
-
 cv2.setNumThreads(0)
 cv2.setUseOptimized(True)
 
@@ -79,6 +75,7 @@ _REPEAT_KEYS = {ord('a'), ord('d'), ord('c'), ord('z')}
 # Cooldown for edge keys (optional, prevents accidental double-hits)
 _EDGE_COOLDOWN_MS = 120
 
+
 def _is_edge_allowed(key: int, last_ts: dict[int, float]) -> bool:
     now = time.monotonic()
     prev = last_ts.get(key, 0.0)
@@ -87,24 +84,31 @@ def _is_edge_allowed(key: int, last_ts: dict[int, float]) -> bool:
         return True
     return False
 
+
 CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
 HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
 CAM_CONFIG_CACHE = str(Path.home() / ".superCalibrateCamera" / "cam_config.pkl")
 
+
 class PausedCache:
     def __init__(self): self.idx = None; self.frame = None
+
     def set(self, i, f): self.idx, self.frame = i, f
+
     def get(self, i): return self.frame if self.idx == i else None
+
     def clear(self): self.idx = self.frame = None
+
 
 @dataclass
 class PlaybackState:
     """Single source of truth for playback state."""
-    speed: float = 1.0          # signed: <0 reverse, 0 paused, >0 forward
+    speed: float = 1.0  # signed: <0 reverse, 0 paused, >0 forward
     last_nonzero_sign: int = 1  # +1 or -1, used when resuming from pause
-    stride: int = 1             # cached stride we last told the loader
+    stride: int = 1  # cached stride we last told the loader
+
 
 def numerical_sort(file_name):
     try:
@@ -186,6 +190,13 @@ class CameraConfig:
     playback_mode: 'PlaybackSpeed' = None
     processingKernel: 'ImageKernel' = None
 
+    # Data Processing tab defaults
+    dp_img_dir: str = ''
+    dp_output_csv: str = ''
+    dp_conf_list: str = "0.80"
+    dp_ckptN: int = 200
+    dp_prefetch: int = 32
+
     def __post_init__(self):
         # Keep existing defaults if not provided
         if self.imageSource is None:
@@ -226,8 +237,8 @@ class CameraGui(ctk.CTkFrame):
         self.detector = None
         self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
         self.arucoParams = cv2.aruco.DetectorParameters()
-        self.arucoParams.cornerRefinementMinAccuracy = 0.15
-        self.arucoParams.adaptiveThreshConstant = 1.0
+        # self.arucoParams.cornerRefinementMinAccuracy = 0.15
+        # self.arucoParams.adaptiveThreshConstant = 1.0
         self._init_flag_vars()
 
         self.calibration = Calibration()
@@ -237,7 +248,7 @@ class CameraGui(ctk.CTkFrame):
         self.calibFile = ''
         self.indexDict = {}
         self.scanForCameras()
-        self.windowName = 'webcam'
+        self.windowName = 'Processed Image'
         self.filepath = ''
         self.cam_frame = ctk.CTkFrame(master=master)
         self.config_frame = ctk.CTkFrame(master=master)
@@ -364,7 +375,7 @@ class CameraGui(ctk.CTkFrame):
         self.yoloBiasCheckbox = ctk.CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
                                                 variable=self._flag_vars['yoloBiasTracking'])
         self.factorgraphCheckbox = ctk.CTkCheckBox(self.config_frame, text='Factor Graph',
-                                                variable=self._flag_vars['factor_graph'])
+                                                   variable=self._flag_vars['factor_graph'])
         self.hyperfocusCheckbox = ctk.CTkCheckBox(self.config_frame, text='Hyper Focus',
                                                   variable=self._flag_vars['hyper_focus'])
         self.phaseCorrelationCheckbox = ctk.CTkCheckBox(self.config_frame, text='PhaseCorrelation',
@@ -399,7 +410,6 @@ class CameraGui(ctk.CTkFrame):
 
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
         self.vc = None
-
 
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
@@ -449,8 +459,10 @@ class CameraGui(ctk.CTkFrame):
         self._ui_active = bool(active)
         # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
         if not self._ui_active:
-            try: self.startStreamOff()
-            except Exception: pass
+            try:
+                self.startStreamOff()
+            except Exception:
+                pass
         else:
             # Optionally auto-resume prior state; or keep manual
             pass
@@ -476,11 +488,11 @@ class CameraGui(ctk.CTkFrame):
         # Example: only allow OpenCV windows / key polling while in Playback
         self._playback_allowed = (name == "Playback")
 
-    def on_section_hide(self, name: str):
-        if name == "Playback":
-            # Close imshow windows / pause playback, etc.
-            try: cv2.destroyWindow(self.windowName)
-            except Exception: pass
+    # def on_section_hide(self, name: str):
+    # if name == "Playback":
+    # Close imshow windows / pause playback, etc.
+    # try: cv2.destroyWindow(self.windowName)
+    # except Exception: pass
 
     def loadFromCache(self):
         """
@@ -691,7 +703,6 @@ class CameraGui(ctk.CTkFrame):
             self.camConfig.hud_data_filepath = fp
             self.saveToCache()
             self.loadFromCache()
-
 
     def loadCalibration(self):
         init_dir = Path(self.calibFile or self.filepath or Path.cwd()).parent
@@ -1078,17 +1089,17 @@ class CameraGui(ctk.CTkFrame):
 
         title = 'Folder Replay Hotkeys'
         items = [
-            ("Space",      "Pause / resume"),
-            ("f",          "Toggle Fixed-FPS ↔ Real-time"),
-            ("c / z",      "Step forward / backward one frame"),
-            ("d / a",      "Speed up / slow down playback"),
-            ("r",          "Reverse direction"),
-            ("w",          "Toggle overlays"),
-            ("s / e",      "Mark export start / end"),
+            ("Space", "Pause / resume"),
+            ("f", "Toggle Fixed-FPS ↔ Real-time"),
+            ("c / z", "Step forward / backward one frame"),
+            ("d / a", "Speed up / slow down playback"),
+            ("r", "Reverse direction"),
+            ("w", "Toggle overlays"),
+            ("s / e", "Mark export start / end"),
             ("[ / ] , { / }", "Adjust time offset (small / large)"),
             ("; / ' , : / \"", "Adjust time offset (fine)"),
-            ("p",          "Persist time offset"),
-            ("Esc",        "Exit player"),
+            ("p", "Persist time offset"),
+            ("Esc", "Exit player"),
         ]
 
         ctk.CTkLabel(self.hotkey_frame, text=title, font=("Segoe UI", 16, "bold")).grid(
@@ -1158,7 +1169,6 @@ class CameraGui(ctk.CTkFrame):
         except Exception:
             return default
 
-
     def setup_dataFrame(self):
         """Build the 'Data Processing' page: folder pick, CSV pick, params, run."""
         f = self.data_frame
@@ -1177,7 +1187,13 @@ class CameraGui(ctk.CTkFrame):
         )
 
         # --- Select image folder ---
-        self._dp_img_dir_var = ctk.StringVar(value=str(self.camConfig.imageFilepath or ""))
+        # --- Select image folder ---
+        img_dir_default = (
+                getattr(self.camConfig, "dp_img_dir", None)
+                or self.camConfig.imageFilepath
+                or ""
+        )
+        self._dp_img_dir_var = ctk.StringVar(value=str(img_dir_default))
 
         def _choose_dir():
             d = filedialog.askdirectory(title="Select image folder")
@@ -1189,7 +1205,8 @@ class CameraGui(ctk.CTkFrame):
         ctk.CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
 
         # --- Select output CSV ---
-        self._dp_csv_var = ctk.StringVar(value="")
+        csv_default = getattr(self.camConfig, "dp_output_csv", "")
+        self._dp_csv_var = ctk.StringVar(value=str(csv_default or ""))
 
         def _choose_csv():
             p = filedialog.asksaveasfilename(
@@ -1205,8 +1222,8 @@ class CameraGui(ctk.CTkFrame):
         ctk.CTkButton(f, text="Browse…", command=_choose_csv).grid(row=2, column=2, padx=12, pady=6)
 
         # --- Confidence sweep controls ---
-        # User can enter: "0.50, 0.65, 0.80"
-        self._dp_conf_list = ctk.StringVar(value="0.80")
+        conf_default = getattr(self.camConfig, "dp_conf_list", "0.80")
+        self._dp_conf_list = ctk.StringVar(value=str(conf_default))
 
         ctk.CTkLabel(f, text="YOLO conf values (comma-separated):").grid(
             row=3, column=0, padx=12, pady=6, sticky="w"
@@ -1225,12 +1242,14 @@ class CameraGui(ctk.CTkFrame):
         )
 
         # --- Checkpoint controls ---
-        self._dp_ckptN = ctk.StringVar(value="200")  # default every 200 images
+        ckpt_default = getattr(self.camConfig, "dp_ckptN", 200)
+        self._dp_ckptN = ctk.StringVar(value=str(ckpt_default))
         ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
         ctk.CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
 
         # --- Prefetch controls ---
-        self._dp_prefetch = ctk.StringVar(value="32")  # how many decoded/preprocessed items to buffer
+        prefetch_default = getattr(self.camConfig, "dp_prefetch", 32)
+        self._dp_prefetch = ctk.StringVar(value=str(prefetch_default))
         ctk.CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
         ctk.CTkEntry(f, textvariable=self._dp_prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
 
@@ -1243,6 +1262,155 @@ class CameraGui(ctk.CTkFrame):
         self._dp_progress.set(0.0)
 
         self._dp_cancel_flag = False
+
+        def _bind_dp_str(var, attr_name):
+            if var is None:
+                return
+
+            def _on_change(*_):
+                try:
+                    if attr_name == 'dp_conf_list':
+                        rounded_list = [round(num, 2) for num in self._get_dp_conf_values()]
+                        var.set(str(rounded_list)[1:-1])
+                    setattr(self.camConfig, attr_name, var.get())
+                    self.saveToCache()
+                except Exception:
+                    pass
+
+            var.trace_add("write", _on_change)
+
+        _bind_dp_str(self._dp_img_dir_var, "dp_img_dir")
+        _bind_dp_str(self._dp_csv_var, "dp_output_csv")
+        _bind_dp_str(self._dp_conf_list, "dp_conf_list")
+        _bind_dp_str(self._dp_ckptN, "dp_ckptN")
+        _bind_dp_str(self._dp_prefetch, "dp_prefetch")
+
+        def runPnP_QnP_on_folders_threaded():
+            """
+            Kick off SolvePnP/QnP processing in a background thread so the GUI
+            stays responsive. Adds progress updates to the status label.
+            """
+
+            # --- Read all Tk fields BEFORE launching worker ---
+            img_dir_str = (
+                    (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
+                    or (getattr(self.camConfig, "imageFilepath", "") or "")
+            )
+            img_dir = Path(img_dir_str)
+
+            out_csv = (
+                    (getattr(self, "_dp_csv_var", None) and self._dp_csv_var.get().strip())
+                    or str(img_dir / "yolo_detections.csv")
+            )
+
+            conf_list = self._get_dp_conf_values()
+            total = len(conf_list)
+
+            # Update UI immediately
+            if hasattr(self, "_dp_progress_label"):
+                self._dp_progress_label.configure(text=f"Starting SolvePnP/QnP… ({total} files)")
+
+            def update_status(text):
+                """Thread-safe UI updater."""
+                if hasattr(self, "after") and hasattr(self, "_dp_progress_label"):
+                    try:
+                        self.after(0, lambda: self._dp_progress_label.configure(text=text))
+                    except Exception:
+                        pass
+
+            # --- WORKER THREAD ---
+            def _worker(out_csv_base, conf_values):
+                total = len(conf_values)
+
+                for i, conf in enumerate(conf_values, start=1):
+                    if getattr(self, "_dp_cancel_flag", False):
+                        update_status("SolvePnP/QnP canceled.")
+                        break
+
+                    target = out_csv_base.replace(".csv", f"_conf{conf:.2f}.csv")
+
+                    update_status(f"[{i}/{total}] Checking conf={conf:.2f}…")
+
+                    if not os.path.exists(target):
+                        update_status(f"[{i}/{total}] Skipped (missing file)")
+                        continue
+
+                    # ------------ NEW: throttled per-row callback ------------
+                    last_report = {"t": 0.0, "row": 0}  # small mutable for closure
+
+                    def row_progress(done_rows: int, total_rows: int, img_name: str):
+                        now = time.monotonic()
+
+                        # Only update if:
+                        #   - first row, or last row, or
+                        #   - at least 0.1s has passed, or
+                        #   - we've advanced by >= 1% of the file since the last UI update
+                        if done_rows == 1 or done_rows == total_rows:
+                            do_update = True
+                        else:
+                            dt = now - last_report["t"]
+                            dr = done_rows - last_report["row"]
+                            # 1% of file or 0.1s, whichever hits first
+                            step_rows = max(1, total_rows // 100)
+                            do_update = (dt >= 0.1) or (dr >= step_rows)
+
+                        if not do_update:
+                            return
+
+                        # Record the last report
+                        last_report["t"] = now
+                        last_report["row"] = done_rows
+
+                        def _ui():
+                            if hasattr(self, "_dp_progress_label"):
+                                self._dp_progress_label.configure(
+                                    text=(
+                                        f"[{i}/{total}] {os.path.basename(target)} – "
+                                        f"{done_rows}/{total_rows} images (last: {img_name})"
+                                    )
+                                )
+                            if hasattr(self, "_dp_progress"):
+                                # keep the per-conf progress but smooth within each file
+                                base_frac = (i - 1) / max(total, 1)
+                                inner_frac = done_rows / max(total_rows, 1)
+                                overall = base_frac + inner_frac / max(total, 1)
+                                self._dp_progress.set(overall)
+
+                        if hasattr(self, "after"):
+                            self.after(0, _ui)
+
+                    # ------------ END throttled callback ------------
+
+                    update_status(f"[{i}/{total}] Running SolvePnP/QnP on {os.path.basename(target)}")
+                    try:
+                        # your run call, now with a throttled callback
+                        self.run_pnp_qnp_from_detection_csv(target, progress_cb=row_progress)
+                    except Exception as e:
+                        update_status(f"Error on {target}: {e}")
+                        continue
+
+                update_status(f"Done! Processed {total} SolvePnP/QnP files.")
+                self._dp_cancel_flag = False
+
+            # --- Launch worker ---
+            threading.Thread(
+                target=_worker,
+                args=(out_csv, conf_list),
+                daemon=True,
+            ).start()
+
+        ctk.CTkButton(
+            f,
+            text="SolvePnP_QnP",
+            font=("Segoe UI", 16, "bold"),
+            command=runPnP_QnP_on_folders_threaded,
+        ).grid(
+            row=22, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
+        )
+
+        ctk.CTkButton(f, text='SolvePnP_QnP', font=("Segoe UI", 16, "bold"),
+                      command=lambda: runPnP_QnP_on_folders_threaded()).grid(
+            row=22, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w")
 
         def _cancel():
             self._dp_cancel_flag = True
@@ -1309,6 +1477,7 @@ class CameraGui(ctk.CTkFrame):
           - Consumer: single GPU session.run
           - UI updates posted via `after(...)`
         """
+
         # -------------------- helpers (UI-thread posts) --------------------
         def _post_progress(made, total_todo, completed_map, total_all, start, frac_override=None, note=None):
             frac = float(frac_override) if frac_override is not None else (made / float(max(1, total_todo)))
@@ -1322,6 +1491,7 @@ class CameraGui(ctk.CTkFrame):
                 f"ETA {mm:02d}:{ss:02d}  •  "
                 f"(total done: {len(completed_map)}/{all_total})"
             )
+
             def _ui():
                 if hasattr(self, "_dp_progress"):
                     self._dp_progress.set(frac)
@@ -1529,7 +1699,6 @@ class CameraGui(ctk.CTkFrame):
             made = 0
 
             # Start producers
-            from concurrent.futures import ThreadPoolExecutor, wait, as_completed
             ex = ThreadPoolExecutor(max_workers=cpu_workers)
             try:
                 futures = [ex.submit(_producer_job, p, name) for (p, name) in work_items]
@@ -1620,7 +1789,7 @@ class CameraGui(ctk.CTkFrame):
                 try:
                     self._write_csv_atomic(out_csv_conf, columns, completed_map)
                     msg = ("Partial CSV written (resume later): " + out_csv_conf) if self._dp_cancel_flag else (
-                                "Done. CSV written: " + out_csv_conf)
+                            "Done. CSV written: " + out_csv_conf)
                 except Exception as e:
                     msg = f"Failed to write CSV: {e}"
 
@@ -1631,6 +1800,239 @@ class CameraGui(ctk.CTkFrame):
         _post_finish("All confidence sweeps completed.")
         self._dp_cancel_flag = False
         return
+
+    def run_pnp_qnp_from_detection_csv(
+            self,
+            csv_path: str,
+            out_pnp: str | None = None,
+            out_qnp: str | None = None,
+            progress_cb: Callable[[int, int, str], None] | None = None
+    ) -> None:
+
+        if not getattr(self.calibration, "validCal", False):
+            LOG.error("run_pnp_qnp_from_detection_csv: calibration is not valid.")
+            return
+        if not getattr(self.lidarTruthPoints, "truthPoints", None):
+            LOG.error("run_pnp_qnp_from_detection_csv: no LiDAR truth points loaded.")
+            return
+
+        csv_path = str(csv_path)
+        df = pd.read_csv(csv_path)
+
+        total_rows = int(len(df))
+        if total_rows <= 0:
+            LOG.warning("run_pnp_qnp_from_detection_csv: %s is empty", csv_path)
+            return
+
+        base = Path(csv_path)
+        if out_pnp is None:
+            out_pnp = str(base.with_name(base.stem + "__pnp.csv"))
+        if out_qnp is None:
+            out_qnp = str(base.with_name(base.stem + "__qnp.csv"))
+
+        cols = set(df.columns)
+
+        # Discover feature IDs from any feat_* columns
+        feat_ids: set[int] = set()
+        for col in cols:
+            if col.startswith("feat_"):
+                parts = col.split("_")
+                if len(parts) >= 3:
+                    try:
+                        feat_ids.add(int(parts[1]))
+                    except ValueError:
+                        pass
+        feat_ids = sorted(feat_ids)
+
+        if not feat_ids:
+            LOG.error("run_pnp_qnp_from_detection_csv: no feat_* columns found in %s", csv_path)
+            return
+
+        def _valid(v):
+            # -1.0 is our "no detection" sentinel
+            return (v is not None) and (not pd.isna(v)) and (float(v) > -0.5)
+
+        K = self.calibration.getCameraMatrix()
+        D_full = self.calibration.getDistortion()
+        truth_dict = self.yoloSession.reader.idsNamesLocs
+
+        pnp_rows = []
+        qnp_rows = []
+
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
+
+            image_name = row.get("image_name", "")
+            image_time = row.get("image_time", np.nan)
+
+            # Optional incremental progress callback
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx, total_rows, str(image_name))
+                except Exception:
+                    # Don't let UI issues kill the batch
+                    pass
+
+            # Collect 2D points: prefer undistorted if present
+            ud_centers = []
+            ud_ids = []
+            plain_centers = []
+            plain_ids = []
+
+            for fid in feat_ids:
+                # 1) Undistorted points (multi-class with save_ud enabled)
+                ux = row.get(f"feat_{fid}_ud_x", None)
+                uy = row.get(f"feat_{fid}_ud_y", None)
+                if _valid(ux) and _valid(uy):
+                    ud_centers.append([float(ux), float(uy)])
+                    ud_ids.append(fid)
+                    continue
+
+                # 2) Raw centers (multi-class normal case)
+                x = row.get(f"feat_{fid}_x", None)
+                y = row.get(f"feat_{fid}_y", None)
+                if _valid(x) and _valid(y):
+                    plain_centers.append([float(x), float(y)])
+                    plain_ids.append(fid)
+                    continue
+
+                # 3) Box geometry -> center (single-class mode)
+                x1 = row.get(f"feat_{fid}_x1", None)
+                y1 = row.get(f"feat_{fid}_y1", None)
+                x2 = row.get(f"feat_{fid}_x2", None)
+                y2 = row.get(f"feat_{fid}_y2", None)
+                if _valid(x1) and _valid(y1) and _valid(x2) and _valid(y2):
+                    cx = 0.5 * (float(x1) + float(x2))
+                    cy = 0.5 * (float(y1) + float(y2))
+                    plain_centers.append([cx, cy])
+                    plain_ids.append(fid)
+
+            # Decide which set to use
+            if len(ud_centers) >= 6:
+                centers_use = np.asarray(ud_centers, dtype=np.float32)
+                ids_use = ud_ids
+                use_ud = True
+            elif len(plain_centers) >= 6:
+                centers_use = np.asarray(plain_centers, dtype=np.float32)
+                ids_use = plain_ids
+                use_ud = False
+            else:
+                # Not enough features -> still emit NaNs
+                pnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                })
+                qnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                })
+                continue
+
+            # Map IDs -> 3D truth points and drop any unknown IDs
+            obj_pts = []
+            keep_centers = []
+            for key, (u, v) in zip(ids_use, centers_use):
+                obj_pts.append(truth_dict[key][2:])
+                keep_centers.append([u, v])
+
+            if len(obj_pts) < 6:
+                pnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                })
+                qnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                })
+                continue
+
+            obj_pts = np.asarray(obj_pts, dtype=np.float32)
+            img_pts = np.asarray(keep_centers, dtype=np.float32)
+
+            # ----------------- PnP (OpenCV, RANSAC) -----------------
+            # If we used undistorted points (via undistortPoints P=K),
+            # we should pass zero distortion here.
+            distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
+
+            try:
+                ret, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    objectPoints=obj_pts,
+                    imagePoints=img_pts,
+                    cameraMatrix=K,
+                    distCoeffs=distCoeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+            except cv2.error as e:
+                LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
+                ret = False
+
+            if ret:
+                # Same convention as your existing pnpLidarPoints:
+                quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
+                pnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_qw": float(quatPnP.s),
+                    "pnp_qx": float(quatPnP.vec[0]),
+                    "pnp_qy": float(quatPnP.vec[1]),
+                    "pnp_qz": float(quatPnP.vec[2]),
+                    "pnp_x": float(vectPnP[0]),
+                    "pnp_y": float(vectPnP[1]),
+                    "pnp_z": float(vectPnP[2]),
+                })
+            else:
+                pnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                })
+
+            # ----------------- QnP (your solveQnP path) -----------------
+            try:
+                quatQ, vectQ = solveQnP(obj_pts, img_pts, self.calibration, None)
+
+                # Same aircraft-from-CV transform as qnpLidarPoints
+                q_aftr_from_cv = mat2quat(np.array([
+                    [0., 0., 1.],
+                    [-1., 0., 0.],
+                    [0., -1., 0.],
+                ], float))
+
+                vectQ = q_aftr_from_cv * vectQ
+                quatQ = q_aftr_from_cv * quatQ
+
+                qnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "qnp_qw": float(quatQ.s),
+                    "qnp_qx": float(quatQ.vec[0]),
+                    "qnp_qy": float(quatQ.vec[1]),
+                    "qnp_qz": float(quatQ.vec[2]),
+                    "qnp_x": float(vectQ[0]),
+                    "qnp_y": float(vectQ[1]),
+                    "qnp_z": float(vectQ[2]),
+                })
+            except Exception as e:
+                LOG.error("solveQnP failed for %s: %s", image_name, e)
+                qnp_rows.append({
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                })
+
+        pd.DataFrame(pnp_rows).to_csv(out_pnp, index=False)
+        pd.DataFrame(qnp_rows).to_csv(out_qnp, index=False)
+        LOG.info("Offline PnP results written to %s", out_pnp)
+        LOG.info("Offline QnP results written to %s", out_qnp)
 
     def setup_playbackFrame(self):
         rowID = 0
@@ -1809,7 +2211,6 @@ class CameraGui(ctk.CTkFrame):
 
         cv2.destroyAllWindows()
 
-
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
         self.recording = True
@@ -1834,6 +2235,7 @@ class CameraGui(ctk.CTkFrame):
         self.saveToCache()
 
     def createDetector(self):
+        print("Creating april tag")
         self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
     def run_detectSingleImage(self):
@@ -1864,6 +2266,7 @@ class CameraGui(ctk.CTkFrame):
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             self.profile_run_folder = True
             self.run_folder_reader_profiled()
+            # self.run_folder_reader()
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
@@ -1952,6 +2355,9 @@ class CameraGui(ctk.CTkFrame):
         return paths, t
 
     def run_folder_reader_profiled(self):
+        import cProfile
+        import pstats
+
         if not self.profile_run_folder:
             # Normal behavior
             return self.run_folder_reader()
@@ -2135,12 +2541,14 @@ class CameraGui(ctk.CTkFrame):
 
                         if elapsed_ref < t[0]:
                             idx_target = num_images - 1
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
-                                                             else ((t[-1] - t[idx_target]) / rs))
+                            wall_start = time.monotonic() - (
+                                (t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
+                                else ((t[-1] - t[idx_target]) / rs))
                         elif elapsed_ref > t[-1]:
                             idx_target = 0
-                            wall_start = time.monotonic() - ((t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
-                                                             else ((t[-1] - t[idx_target]) / rs))
+                            wall_start = time.monotonic() - (
+                                (t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
+                                else ((t[-1] - t[idx_target]) / rs))
                         else:
                             idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
 
@@ -2166,7 +2574,6 @@ class CameraGui(ctk.CTkFrame):
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
-
 
                 pending_keys.extend(self._poll_keys(1))
 
@@ -2281,7 +2688,8 @@ class CameraGui(ctk.CTkFrame):
 
     def update_playbackMenu(self):
         if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-            self.playbackModeText.set(value=f'Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}')
+            self.playbackModeText.set(
+                value=f'Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}')
         else:
             self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
 
@@ -2559,7 +2967,7 @@ class CameraGui(ctk.CTkFrame):
 
         self.camConfig.cam_to_log_time_offset = 0.0
 
-    def analyze_image(self, frame, img_time=None, name=None, display=True, box_around=False):
+    def analyze_image(self, frame, img_time=None, name=None, display_in_realtime=True, box_around=False):
 
         if frame is None:
             return
@@ -2628,20 +3036,21 @@ class CameraGui(ctk.CTkFrame):
             cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
-        if display:
-            (h, w) = self.markup_frame.shape[:2]
-            self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
-            cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                        (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
-            cv2.putText(self.markup_frame,
-                        f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                        (int(0.015 * w), int(0.060 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+        if display_in_realtime:
+            if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+                (h, w) = self.markup_frame.shape[:2]
+                self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
+                cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                            (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+                cv2.putText(self.markup_frame,
+                            f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                            (int(0.015 * w), int(0.060 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
             self.cleanup()
 
         if self.printLidar:
             self.print_pnp_results()
 
-        if not display:
+        if not display_in_realtime:
             return self.markup_frame
 
     def print_pnp_results(self):

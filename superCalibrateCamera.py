@@ -24,6 +24,7 @@ import customtkinter as ctk
 import pandas as pd
 from PIL import Image
 from cv2_enumerate_cameras import enumerate_cameras
+import numpy as np
 
 from SupportModules import yolo
 from SupportModules.Calibration import Calibration
@@ -2689,7 +2690,7 @@ class CameraGui(ctk.CTkFrame):
     def update_playbackMenu(self):
         if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
             self.playbackModeText.set(
-                value=f'Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}')
+                value=f"Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}")
         else:
             self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
 
@@ -3064,7 +3065,7 @@ class CameraGui(ctk.CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3267,28 +3268,24 @@ class CameraGui(ctk.CTkFrame):
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
         corners, ids, rejected = self.detector.detectMarkers(self.curr_frame_gray)
-        self.centers = None
-        self.detectIDS = []
 
         if corners is None or ids is None:
+            self.detectIDS = []
+            self.centers = None
             return
 
-        for corners, idx in zip(corners, ids):
-            corners = np.squeeze(np.array(corners))
-            polyline = [np.array(corners, np.int32).reshape((-1, 1, 2))]
-            pixCenter = np.mean(corners, axis=0).astype(np.int32)
+        corners_array = np.array(corners, dtype=np.int32).squeeze(axis=1)
+        polylines = corners_array.reshape((-1, 4, 1, 2))
+        pixCenters = np.mean(corners_array, axis=1).astype(np.int32)
+        for polyline, pixCenter, idx in zip(polylines, pixCenters, ids, strict=True):
             cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
             cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
                         cv2.FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
             cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
                         cv2.FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
 
-            self.detectIDS.append(idx)
-
-            if self.centers is None:
-                self.centers = np.array(pixCenter).astype('float32')
-            else:
-                self.centers = np.vstack((self.centers, np.array(pixCenter).astype('float32')))
+        self.detectIDS = ids.flatten().astype(np.float32).tolist()
+        self.centers = pixCenters.astype(np.float32)
 
     def pnpLidarPoints(self):
 
@@ -3300,7 +3297,7 @@ class CameraGui(ctk.CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3312,8 +3309,8 @@ class CameraGui(ctk.CTkFrame):
             if len(points) < 6:
                 return
 
-            ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
-                                           imagePoints=centers,
+            ret, rvec, tvec = cv2.solvePnP(objectPoints=points.astype(np.float32),
+                                           imagePoints=centers.astype(np.float32),
                                            cameraMatrix=self.calibration.getCameraMatrix(),
                                            distCoeffs=distParams,
                                            flags=cv2.SOLVEPNP_ITERATIVE)
@@ -3352,7 +3349,7 @@ class CameraGui(ctk.CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 

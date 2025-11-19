@@ -193,7 +193,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
+        ctk.set_default_color_theme("green")
 
         self.active_main_button = None
         self.active_sub_button = None

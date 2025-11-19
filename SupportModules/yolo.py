@@ -1,8 +1,13 @@
+import copy
+import datetime
+import glob
+import os
+import re
+
 import cv2
-import os, glob, re, datetime
+
 from SupportModules.Calibration import Calibration
 from SupportModules.metaYoloReader import MetaYoloReader
-import copy
 from SupportModules.quaternions import *
 
 for key in ("CUDA_PATH", "CUDNN_PATH"):
@@ -13,7 +18,7 @@ for key in ("CUDA_PATH", "CUDNN_PATH"):
 # Ensure CUDA_PATH is in environment: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin
 # Ensure CUDNN_PATH is in environment: C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6
 import onnxruntime as ort
-import onnx
+
 print(f'OnnxVersion: {ort.__version__}')
 print(f'Onnx Providers: {ort.get_available_providers()}')
 

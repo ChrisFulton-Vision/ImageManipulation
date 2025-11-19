@@ -6,7 +6,8 @@ from tkinter import TclError
 import customtkinter as ctk
 import superCalibrateCamera as cam
 import superCalibrate as calibrate
-from copy import deepcopy
+from functools import partial
+from SupportModules.LidarTruth import TruthPoints
 
 GREEN = '#2FA572'
 DEFAULT_HOVER = ('#0C955A', '#106A43')
@@ -248,6 +249,8 @@ class App(ctk.CTk):
         for p in self.pages.values():
             p.grid(row=0, column=0, sticky="nsew")
             p.grid_remove()
+            if hasattr(p, 'camGui'):
+                p.camGui.func_to_refit(self.passToChild_fit_to_content(p))
 
 
         self._build_mainnav()
@@ -395,6 +398,9 @@ class App(ctk.CTk):
             self._fit_to_content(page, show_subnav=True)
 
         return handler
+
+    def passToChild_fit_to_content(self, page):
+        return partial(self._fit_to_content, page, True)
 
     def _fit_to_content(self, page, show_subnav: bool,
                         smooth_transition_tuple: tuple[list, tuple[int, int]] = (None, (None, None))):

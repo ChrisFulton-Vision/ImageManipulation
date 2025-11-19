@@ -1,8 +1,12 @@
 # AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
+import logging
+
 import pandas as pd
 import numpy as np
 from os.path import join
 from enum import Enum
+
+LOG = logging.getLogger("superCalibrate")
 
 class ControlMode(Enum):
     auto       = 'auto'
@@ -40,7 +44,7 @@ class AttitudeReader:
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
             self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
         except FileNotFoundError:
-            print("Error... file not found")
+            LOG.info("Error. Aircraft Log datafile not found")
             return False
 
         # validate columns (same checks you had)

@@ -157,6 +157,7 @@ class PlaybackSpeed(Enum):
 @dataclass
 class CameraConfig:
     configFilepath: str = 'Configs/Default.yaml'
+    calibFilepath: str = 'Calibrations/GenericAlvium864.txt'
     imageFilepath: Optional[str] = None
     cam_index: int = 0
 
@@ -188,7 +189,7 @@ class CameraConfig:
 
     # sources
     imageSource: ImageSource = None  # set default below in __post_init__
-    lidarFilepath: Optional[str] = None
+    lidarFilepath: str = None
     yoloFilepath: str = ''
     hud_data_filepath: str = ''
 
@@ -259,6 +260,8 @@ class CameraGui(CTkFrame):
 
         self.profile_run_folder = False
 
+        self.func_that_refits = None
+
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
         self._flag_vars: dict[str, BooleanVar] = {}
@@ -290,7 +293,6 @@ class CameraGui(CTkFrame):
         self.detectIDS = None
         self.projectProbe = None
         self.centers = None
-        self.calibFile = ''
         self.indexDict = {}
         self.scanForCameras()
         self.windowName = 'Processed Image'
@@ -479,6 +481,9 @@ class CameraGui(CTkFrame):
 
         self.setupFrame()
 
+    def func_to_refit(self, func):
+        self.func_that_refits = func
+
     def _init_flag_vars(self):
         for name in self._flags:
             v = BooleanVar(value=bool(getattr(self.camConfig, name)))
@@ -548,16 +553,6 @@ class CameraGui(CTkFrame):
     # except Exception: pass
 
     def loadFromCache(self):
-        """
-        Load UI/config cache from CAM_CACHE_FILEPATH, supporting:
-          1) Legacy 3-pickle format:   [camConfig][filepath][calibFile]
-          2) Dict format:               {"version": int, "config": dict|CameraConfig, "filepath": str, "calibFile": str}
-
-        After load:
-          - All path-like fields are normalized to *strings* ('' when unset)
-          - UI labels are updated if widgets already exist
-        """
-
         def _to_str(p):
             if p is None:
                 return ''
@@ -566,7 +561,8 @@ class CameraGui(CTkFrame):
         def _normalize_cached_paths():
             # Top-level
             self.filepath = _to_str(getattr(self, 'filepath', ''))
-            self.calibFile = _to_str(getattr(self, 'calibFile', ''))
+
+            self.camConfig.calibFilepath = _to_str(getattr(self.camConfig, 'calibFilepath', ''))
 
             # Config paths
             cfg = self.camConfig
@@ -582,6 +578,7 @@ class CameraGui(CTkFrame):
             with open(self.camConfig.configFilepath, 'r') as f:
                 data = safe_load(f)
                 self.camConfig.fromDict(data)
+                self.update_post_newCamConfig()
 
         # Sensible defaults if cache missing
         if not cache_path.exists():
@@ -593,7 +590,7 @@ class CameraGui(CTkFrame):
                     LOG.exception("Failed to initialize CameraConfig()")
                     raise
             self.filepath = _to_str(getattr(self, 'filepath', Path.cwd()))
-            self.calibFile = _to_str(getattr(self, 'calibFile', ''))
+            self.camConfig.calibFilepath = _to_str(getattr(self.camConfig, 'calibFilepath', ''))
 
             # Update labels if UI is ready
             if hasattr(self, 'selectFolderLabel'):
@@ -626,7 +623,7 @@ class CameraGui(CTkFrame):
                         self.camConfig = cfg_obj
 
                     self.filepath = _to_str(data.get('filepath', Path.cwd()))
-                    self.calibFile = _to_str(data.get('calibFile', ''))
+                    self.camConfig.calibFile = _to_str(data.get('calibFilepath', ''))
 
                 else:
                     # Case 1: legacy 3-pickle stream
@@ -654,9 +651,9 @@ class CameraGui(CTkFrame):
                     except Exception:
                         self.filepath = str(Path.cwd())
                     try:
-                        self.calibFile = pickle.load(f)
+                        self.camConfig.calibFilepath = pickle.load(f)
                     except Exception:
-                        self.calibFile = ''
+                        self.camConfig.calibFilepath = ''
 
             # Normalize path-like fields to strings for UI code that expects str/''.
             _normalize_cached_paths()
@@ -672,7 +669,7 @@ class CameraGui(CTkFrame):
 
             # Calibration ingest + label (if you have helper)
             try:
-                if hasattr(self, 'ingestCalibration') and self.calibFile:
+                if hasattr(self, 'ingestCalibration') and self.camConfig.calibFilepath:
                     self.ingestCalibration()
             except Exception:
                 pass
@@ -701,7 +698,7 @@ class CameraGui(CTkFrame):
             except Exception:
                 pass
             self.filepath = str(Path.cwd())
-            self.calibFile = ''
+            self.camConfig.calibFile = ''
 
         self.ingestCalibration()
         try:
@@ -730,10 +727,22 @@ class CameraGui(CTkFrame):
             pass
         # --- Restore LiDAR truth points if path cached ---
         try:
-            if getattr(self.camConfig, 'lidarFilepath', ''):
+            if getattr(self.camConfig, 'lidarFilepath', None):
                 self.loadTruthPoints()
         except Exception:
             pass
+
+    def update_post_newCamConfig(self):
+        self.updateSingleOrStream(rowID=1)
+        self.updateLogFile()
+        self.ingestCalibration()
+        self.updateYOLOLabel()
+        self.updateLidarLabel()
+        self.loadTruthPoints()
+
+        if self.func_that_refits is not None:
+            self.func_that_refits()
+
 
     def saveToCache(self):
         cache_path = Path(CAM_CACHE_FILEPATH)
@@ -746,12 +755,12 @@ class CameraGui(CTkFrame):
                 if val is not None and not isinstance(val, str):
                     setattr(cam_cfg, attr, str(val))
         if not isinstance(self.filepath, str):  self.filepath = str(self.filepath)
-        if not isinstance(self.calibFile, str): self.calibFile = str(self.calibFile)
+        if not isinstance(self.camConfig.calibFilepath, str): self.camConfig.calibFilepath = str(self.camConfig.calibFilepath)
 
         with cache_path.open('wb') as f:
             pickle.dump(self.camConfig, f)
             pickle.dump(self.filepath, f)
-            pickle.dump(self.calibFile, f)
+            pickle.dump(self.camConfig.calibFilepath, f)
 
         os.makedirs('Configs', exist_ok=True)
         with open(self.camConfig.configFilepath, 'w') as f:
@@ -762,15 +771,14 @@ class CameraGui(CTkFrame):
         fp = self.askFilepath(str(init_dir), "Select Imagery Folder")
         if fp:
             self.filepath = fp
-            self.camConfig.hud_data_filepath = fp
             self.saveToCache()
             self.loadFromCache()
 
     def loadCalibration(self):
-        init_dir = Path(self.calibFile or self.filepath or Path.cwd()).parent
+        init_dir = Path(self.camConfig.calibFilepath or self.filepath or Path.cwd()).parent
         poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select Calibration File')
         if poss_filepath:
-            self.calibFile = poss_filepath
+            self.camConfig.calibFilepath = poss_filepath
             self.ingestCalibration()
 
     def selectLidarFile(self):
@@ -787,9 +795,12 @@ class CameraGui(CTkFrame):
         poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select Flight Log Data')
         if poss_dir:
             self.camConfig.hud_data_filepath = poss_dir
-            self.hud_marker.read_attitude_files(poss_dir)
-            self.updateFlightLogLabel()
-            self.saveToCache()
+            self.updateLogFile()
+
+    def updateLogFile(self):
+        self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
+        self.updateFlightLogLabel()
+        self.saveToCache()
 
     def selectYoloFolder(self):
         init_dir = Path(self.camConfig.yoloFilepath or Path.cwd())
@@ -797,7 +808,6 @@ class CameraGui(CTkFrame):
         if poss_dir:
             self.camConfig.yoloFilepath = poss_dir
             self.updateYOLOLabel()
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
             self.saveToCache()
 
     def updateLidarLabel(self):
@@ -811,17 +821,41 @@ class CameraGui(CTkFrame):
     def updateYOLOLabel(self):
         if self.camConfig.yoloFilepath:
             self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
     def loadTruthPoints(self):
-        if self.camConfig.lidarFilepath is not None:
-            lidar_path = Path(self.camConfig.lidarFilepath)
-            if lidar_path.exists():
-                with lidar_path.open('rb') as f:
-                    test = pickle.load(f)
-                    self.lidarTruthPoints.copy(test)
-            else:
-                LOG.error(
-                    f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}')
+        if not self.camConfig.lidarFilepath:
+            return
+
+        lidar_path = Path(self.camConfig.lidarFilepath)
+        if not lidar_path.exists():
+            LOG.error(
+                f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}'
+            )
+            return
+
+        from SupportModules.LidarTruth import TruthPoints
+
+        try:
+            with lidar_path.open('rb') as f:
+                obj = pickle.load(f)
+        except AttributeError as e:
+            # Old pickle referring to __main__.TruthPoints or otherwise broken:
+            LOG.warning("Failed to unpickle LiDAR truth points (%s). Using defaults instead.", e)
+            obj = TruthPoints()  # fall back to code-defined truth points
+        except Exception as e:
+            LOG.error("Error loading LiDAR truth points: %s", e)
+            return
+
+        # Accept either a TruthPoints instance or a raw dict
+        if isinstance(obj, TruthPoints):
+            self.lidarTruthPoints.copy(obj)
+        elif isinstance(obj, dict):
+            # Existing self.lidarTruthPoints is a TruthPoints()
+            import copy as _copy
+            self.lidarTruthPoints.truthPoints = _copy.deepcopy(obj)
+        else:
+            LOG.error("Unexpected LiDAR truth data type: %r", type(obj))
 
     def updateQuality(self, qualityValue: str):
         self.camConfig.export_quality = ExportQuality(qualityValue)
@@ -841,7 +875,7 @@ class CameraGui(CTkFrame):
 
     def ingestCalibration(self):
 
-        if not self.calibration.fromBinFile(self.calibFile) and not self.calibration.fromFile(self.calibFile):
+        if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(self.camConfig.calibFilepath):
             if self.selectCalibLabel is not None:
                 self.selectCalibLabel.configure(text='No Calibration Found')
                 self.after(10, self.update_idletasks())
@@ -852,11 +886,11 @@ class CameraGui(CTkFrame):
 
         # Note: this line exists because our aprilTag image was taken at 2848x2848, while calibration images
         # were 1424x1424. Thus, the camera calibration matrix is incorrect for this specific file.
-        if self.calibFile == 'C:/repos/aburn/usr/24WintCalspanFltTest/Alvium_LJ_Calib_2DecSIFTED/calibration.pkl':
+        if self.camConfig.calibFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/Alvium_LJ_Calib_2DecSIFTED/calibration.pkl':
             self.calibration.scaleCalibration(2848)
 
         if self.selectCalibLabel is not None:
-            self.selectCalibLabel.configure(text="../" + Path(self.calibFile).name if self.calibFile else "../",
+            self.selectCalibLabel.configure(text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
                                             bg_color=self.selectCalibLabel.cget("bg_color"))
             self.cam_frame.update_idletasks()
             self.update_idletasks()
@@ -948,6 +982,7 @@ class CameraGui(CTkFrame):
             if self.multiImageFolderSelect.grid_info():
                 self.multiImageFolderSelect.grid_forget()
 
+
         if self.camConfig.imageSource == ImageSource.Camera_Stream:
 
             self.startStreamOff()
@@ -958,17 +993,22 @@ class CameraGui(CTkFrame):
 
         elif self.camConfig.imageSource == ImageSource.Static_Image:
 
+            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
             if not self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.singleImageTextButton.grid_info():
+
                 self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
 
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
 
+            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
             if not self.multiImageFolderSelect.grid_info():
                 self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.multiImageTextButton.grid_info():
                 self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
+
+
 
         else:
             raise ValueError(f'Unknown Image selection mode: {self.camConfig.imageSource}')
@@ -992,6 +1032,7 @@ class CameraGui(CTkFrame):
         if os.path.exists(self.camConfig.configFilepath):
             with open(self.camConfig.configFilepath, 'r') as f:
                 self.camConfig.fromDict(safe_load(f))
+                self.update_post_newCamConfig()
         else:
             with open(self.camConfig.configFilepath, 'w') as f:
                 dump(self.camConfig.toDict, f)
@@ -1059,7 +1100,7 @@ class CameraGui(CTkFrame):
         selectCalibButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.selectCalibLabel = CTkLabel(self.cam_frame,
-                                             text="../" + os.path.basename(os.path.normpath(self.calibFile)))
+                                             text="../" + os.path.basename(os.path.normpath(self.camConfig.calibFilepath)))
         self.selectCalibLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 

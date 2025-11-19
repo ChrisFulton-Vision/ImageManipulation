@@ -59,8 +59,9 @@ class TruthPoints:
         return truthPointsArray
 
     def saveToCache(self):
+        # Store only the data dict, not the whole class instance
         with open('../LIDAR_Truth_Points.pkl', 'wb') as f:
-            pickle.dump(self, f)
+            pickle.dump(self.truthPoints, f)
 
     def copy(self, classToCopy):
         self.__dict__.update(copy.deepcopy(classToCopy.__dict__))

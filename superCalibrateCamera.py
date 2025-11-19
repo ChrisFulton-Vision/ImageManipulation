@@ -3126,26 +3126,26 @@ class CameraGui(CTkFrame):
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = getTextSize(os.path.basename(name), FONT_HERSHEY_SIMPLEX, med_text(), 4)
+            (width, height), base = getTextSize(os.path.basename(name), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                        FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
         if img_time is not None:
             time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-            (time_width, time_height), base = getTextSize(time_str, FONT_HERSHEY_SIMPLEX, med_text(), 4)
+            (time_width, time_height), base = getTextSize(time_str, FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
-                        FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                        FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
 
         if display_in_realtime:
             if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
                 (h, w) = self.markup_frame.shape[:2]
                 self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
                 putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                            (int(0.015 * w), int(0.030 * h)), FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+                            (int(0.015 * w), int(0.030 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_YELLOW, 2)
                 putText(self.markup_frame,
                             f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                            (int(0.015 * w), int(0.060 * h)), FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+                            (int(0.015 * w), int(0.060 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_YELLOW, 2)
             self.cleanup()
 
         if self.printLidar:
@@ -3517,9 +3517,9 @@ class CameraGui(CTkFrame):
             if not self.camConfig.hideAprilTags:
                 polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=FILLED)
                 putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
+                            FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
                 putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
+                            FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 

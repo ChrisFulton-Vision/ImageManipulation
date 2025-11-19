@@ -976,10 +976,8 @@ class CameraGui(CTkFrame):
         self.saveToCache()
 
     def selectConfigFile(self):
-        initDir = self.camConfig.configFilepath
+        initDir = str(Path.cwd() / 'Configs')
 
-        # poss_file = filedialog.asksaveasfilename(initialdir=initDir, title='TestTestTest',
-        #                                          filetypes=[('YAML', '*.yaml')])
         poss_file = filedialog.asksaveasfilename(
             initialdir=initDir,
             title="Select or create YAML config",

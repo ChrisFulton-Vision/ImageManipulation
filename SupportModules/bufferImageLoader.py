@@ -1,7 +1,7 @@
 # buffered_image_loader.py
-import threading, queue, time, os
+import threading, queue, time
 from typing import Callable, Iterable, Optional, Tuple, List
-import cv2
+from cv2 import IMREAD_UNCHANGED, imread
 import numpy as np
 
 class BufferedImageLoader:
@@ -18,7 +18,7 @@ class BufferedImageLoader:
         preprocess: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         start_index: int = 0,
         loop: bool = True,
-        read_flags: int = cv2.IMREAD_UNCHANGED,
+        read_flags: int = IMREAD_UNCHANGED,
     ):
         assert len(filepaths) > 0, "No images to load"
         self.paths = filepaths
@@ -117,7 +117,7 @@ class BufferedImageLoader:
 
             # decode
             path = self.paths[idx]
-            img = cv2.imread(path, self.read_flags)
+            img = imread(path, self.read_flags)
             if img is None:
                 # broken image: emit blank to keep timeline consistent
                 img = np.zeros((480, 640, 3), np.uint8)

@@ -1,6 +1,6 @@
-from PIL import Image, ImageDraw
+from PIL import Image
 from dataclasses import dataclass
-import cv2
+from cv2 import cvtColor, COLOR_BGR2RGB
 from enum import Enum
 
 
@@ -78,7 +78,7 @@ def make_gif(images, fps=10, name='output', infinite: bool = False,
             compress = CompressionSettings.low_res()
 
     for idx, cv_img in enumerate(images):
-        pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+        pil_img = Image.fromarray(cvtColor(cv_img, COLOR_BGR2RGB))
         pil_img = pil_img.convert(mode=compress.mode,
                                   palette=compress.palette,
                                   colors=compress.colors,

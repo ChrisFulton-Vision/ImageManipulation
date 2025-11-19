@@ -36,7 +36,8 @@ import numpy as np
 from numpy import square as sq
 from numpy.linalg import norm
 from copy import deepcopy, copy
-import cv2
+from cv2 import (solvePnP, Rodrigues, solvePnPGeneric, solvePnPRansac,
+                 SOLVEPNP_AP3P, SOLVEPNP_ITERATIVE, SOLVEPNP_EPNP)
 import datetime
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
@@ -134,17 +135,17 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
         return float(np.mean(Z > 0.0))
 
     # --- 1) Plain ITERATIVE (no seed) ---
-    ok, rvec, tvec = cv2.solvePnP(
+    ok, rvec, tvec = solvePnP(
         objectPoints=obj_cv,
         imagePoints=img,
         cameraMatrix=K_CV,
         distCoeffs=DIST_COEFFS,
-        flags=cv2.SOLVEPNP_ITERATIVE,
+        flags=SOLVEPNP_ITERATIVE,
     )
     if not ok:
         raise RuntimeError("OpenCV SOLVEPNP_ITERATIVE failed (no seed).")
 
-    R_cv, _ = cv2.Rodrigues(rvec);
+    R_cv, _ = Rodrigues(rvec)
     t_cv = tvec.reshape(3)
     pf = pos_depth_frac(R_cv, t_cv)
 
@@ -154,12 +155,12 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
 
     # --- 3) Recover via multi-hypothesis AP3P, pick front-most, then polish ---
     # solvePnPGeneric returns multiple (rvecs, tvecs); we choose by positive-depth fraction
-    retval, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+    retval, rvecs, tvecs, reprojErrs = solvePnPGeneric(
         objectPoints=obj_cv,
         imagePoints=img,
         cameraMatrix=K_CV,
         distCoeffs=DIST_COEFFS,
-        flags=cv2.SOLVEPNP_AP3P,  # multi-solution minimal solver
+        flags=SOLVEPNP_AP3P,  # multi-solution minimal solver
     )
     if not retval or len(rvecs) == 0:
         # Fallback to the original even if cheirality is poor
@@ -169,7 +170,7 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
     best = None
     best_key = None
     for i in range(len(rvecs)):
-        R_i, _ = cv2.Rodrigues(rvecs[i]);
+        R_i, _ = Rodrigues(rvecs[i]);
         t_i = tvecs[i].reshape(3)
         pf_i = pos_depth_frac(R_i, t_i)
         err_i = float(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else np.inf
@@ -181,18 +182,18 @@ def opencv_pnp_iterative_baseline(object_points: np.ndarray,
     R_seed, t_seed = best
 
     # Final polish on ALL points with ITERATIVE using the chosen candidate as an initial guess
-    ok_polish, rvec_pol, tvec_pol = cv2.solvePnP(
+    ok_polish, rvec_pol, tvec_pol = solvePnP(
         objectPoints=obj_cv,
         imagePoints=img,
         cameraMatrix=K_CV,
         distCoeffs=DIST_COEFFS,
-        rvec=cv2.Rodrigues(R_seed)[0],
+        rvec=Rodrigues(R_seed)[0],
         tvec=t_seed.reshape(3, 1),
         useExtrinsicGuess=True,
-        flags=cv2.SOLVEPNP_ITERATIVE,
+        flags=SOLVEPNP_ITERATIVE,
     )
     if ok_polish:
-        R_cv, _ = cv2.Rodrigues(rvec_pol);
+        R_cv, _ = Rodrigues(rvec_pol)
         t_cv = tvec_pol.reshape(3)
     else:
         R_cv, t_cv = R_seed, t_seed  # use the AP3P candidate directly
@@ -211,7 +212,7 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
     img = image_points_flat.reshape(-1, 2).astype(np.float64)
     obj_cv = object_points
 
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+    ok, rvec, tvec, inliers = solvePnPRansac(
         objectPoints=obj_cv,
         imagePoints=img,
         cameraMatrix=K_CV,
@@ -219,7 +220,7 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
         reprojectionError=ransac_thresh_px,  # try 8–12 px for ~5 px per-axis noise
         confidence=0.999,
         iterationsCount=3000,
-        flags=cv2.SOLVEPNP_AP3P,
+        flags=SOLVEPNP_AP3P,
     )
     if not ok or inliers is None or len(inliers) < 4:
         raise RuntimeError(f"RANSAC failed or too few inliers ({0 if inliers is None else len(inliers)}).")
@@ -229,13 +230,13 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
     obj_in, img_in = obj_cv[inliers], img[inliers]
 
     if len(inliers) >= 6:
-        ok2, rvec_refit, tvec_refit = cv2.solvePnP(obj_in, img_in, K_CV, DIST_COEFFS, flags=cv2.SOLVEPNP_ITERATIVE)
+        ok2, rvec_refit, tvec_refit = solvePnP(obj_in, img_in, K_CV, DIST_COEFFS, flags=SOLVEPNP_ITERATIVE)
     else:
-        ok2, rvec_refit, tvec_refit = cv2.solvePnP(obj_in, img_in, K_CV, DIST_COEFFS, flags=cv2.SOLVEPNP_EPNP)
+        ok2, rvec_refit, tvec_refit = solvePnP(obj_in, img_in, K_CV, DIST_COEFFS, flags=SOLVEPNP_EPNP)
     if not ok2:
         rvec_refit, tvec_refit = rvec, tvec
 
-    ok3, rvec_final, tvec_final = cv2.solvePnP(
+    ok3, rvec_final, tvec_final = solvePnP(
         objectPoints=obj_in,
         imagePoints=img_in,
         cameraMatrix=K_CV,
@@ -243,12 +244,12 @@ def opencv_pnp_ransac_baseline(object_points: np.ndarray,
         rvec=rvec_refit,
         tvec=tvec_refit,
         useExtrinsicGuess=True,
-        flags=cv2.SOLVEPNP_ITERATIVE,
+        flags=SOLVEPNP_ITERATIVE,
     )
     if not ok3:
         rvec_final, tvec_final = rvec_refit, tvec_refit
 
-    R_cv, _ = cv2.Rodrigues(rvec_final)
+    R_cv, _ = Rodrigues(rvec_final)
     t_cv = tvec_final.reshape(3)
     q_ours, t_ours = _cv_pose_to_ours(R_cv, t_cv)
     return (q_ours, t_ours), inliers
@@ -375,7 +376,7 @@ def init_pose_wahba(Xw, meas_pix, fx, fy, cx, cy):
         t[:2] *= -1.0
 
     # IMPORTANT: h() uses est_q.T * X + t, so est_q.T must equal R
-    return mat2quat_jumbled(R.T), t
+    return mat2quat(R.T), t
 
 
 # --- Camera projection ----------------------------------------------------------

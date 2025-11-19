@@ -3429,34 +3429,83 @@ class CameraGui(ctk.CTkFrame):
 
         self.markup_frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
 
-    def detectAprilTags(self):
-
+    def detectAprilTags(self, scale: float = 0.6):
+        """
+        Faster AprilTag detection:
+          - detect on downscaled image
+          - upscale corners
+          - refine on full-res gray image with cornerSubPix
+        """
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, rejected = self.detector.detectMarkers(self.curr_frame_gray)
+        if self.detector is None:
+            return
+
+        gray_full = self.curr_frame_gray
+        h, w = gray_full.shape[:2]
+
+        # 1) Downscale for detection
+        if not (0.2 <= scale < 1.0):
+            scale = 0.6
+        small = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+
+        # 2) Detect on smaller image
+        corners_small, ids, rejected = self.detector.detectMarkers(small)
+
         self.centers = None
         self.detectIDS = []
 
-        if corners is None or ids is None:
+        if corners_small is None or ids is None or len(corners_small) == 0:
             return
 
-        for corners, idx in zip(corners, ids):
-            corners = np.squeeze(np.array(corners))
-            polyline = [np.array(corners, np.int32).reshape((-1, 1, 2))]
+        # 3) Upscale corners to full-res and pack into a single array
+        all_pts = []
+        marker_lengths = []
+        for c in corners_small:
+            # c: (4,1,2) or (N,1,2)
+            pts = c.reshape(-1, 2).astype(np.float32) / scale
+            marker_lengths.append(len(pts))
+            all_pts.append(pts)
+
+        all_pts = np.concatenate(all_pts, axis=0).reshape(-1, 1, 2)
+
+        # 4) Subpixel refine on full-res gray image
+        #    (this is what gives you precise centers back)
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            20,  # max iterations
+            0.01  # epsilon
+        )
+        cv2.cornerSubPix(gray_full, all_pts, (5, 5), (-1, -1), criteria)
+
+        # 5) Split back per marker and draw / accumulate centers
+        refined_corners_per_marker = []
+        idx0 = 0
+        for length in marker_lengths:
+            refined_corners_per_marker.append(
+                all_pts[idx0:idx0 + length].reshape(-1, 2).copy()
+            )
+            idx0 += length
+
+        for corners, idx in zip(refined_corners_per_marker, ids):
+            # corners: (4,2)
+            polyline = [corners.astype(np.int32).reshape((-1, 1, 2))]
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
+
             if not self.camConfig.hideAprilTags:
                 cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
-                cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
+                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
                             cv2.FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
-                cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
+                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
                             cv2.FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 
             if self.centers is None:
-                self.centers = np.array(pixCenter).astype('float32')
+                self.centers = np.array(pixCenter, dtype=np.float32)
             else:
-                self.centers = np.vstack((self.centers, np.array(pixCenter).astype('float32')))
+                self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
 
     def pnpLidarPoints(self):
 

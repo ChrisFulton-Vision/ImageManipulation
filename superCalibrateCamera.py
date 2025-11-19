@@ -69,7 +69,6 @@ if not LOG.handlers:
 setNumThreads(0)
 setUseOptimized(True)
 
-#  import superCalibrate as superCal
 #  pip install cv2_enumerate_cameras
 #  or
 #  pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
@@ -99,7 +98,7 @@ CTK_GREEN = '#2FA572'
 HUD_GREEN = (0, 255, 0)
 HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
-CAM_CACHE_FILEPATH = str(Path.cwd() / "Caches" / "cam_config.pkl")
+CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 class PausedCache:
     def __init__(self): self.idx = None; self.frame = None
@@ -261,6 +260,9 @@ class CameraGui(CTkFrame):
         self.profile_run_folder = False
 
         self.func_that_refits = None
+
+        # Debounced cache writes
+        self._save_debounce_id = None
 
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
@@ -473,7 +475,7 @@ class CameraGui(CTkFrame):
         self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
         self.lastWidth = 1
         self.lastHeight = 1
-        self.saveToCache()
+        self.saveToCache(immediate=True)
 
         self._ui_active = True
         self._last_ui_tick = 0.0
@@ -553,26 +555,11 @@ class CameraGui(CTkFrame):
     # except Exception: pass
 
     def loadFromCache(self):
-        def _to_str(p):
-            if p is None:
-                return ''
-            return str(p)
 
-        def _normalize_cached_paths():
-            # Top-level
-            self.filepath = _to_str(getattr(self, 'filepath', ''))
-
-            self.camConfig.calibFilepath = _to_str(getattr(self.camConfig, 'calibFilepath', ''))
-
-            # Config paths
-            cfg = self.camConfig
-            # Some configs may not have all attrs (older caches) -> use getattr defaults
-            cfg.imageFilepath = _to_str(getattr(cfg, 'imageFilepath', None))
-            cfg.lidarFilepath = _to_str(getattr(cfg, 'lidarFilepath', None))
-            cfg.hud_data_filepath = _to_str(getattr(cfg, 'hud_data_filepath', ''))
-            cfg.yoloFilepath = _to_str(getattr(cfg, 'yoloFilepath', ''))
-
-        cache_path = Path(CAM_CACHE_FILEPATH)
+        cache_path = Path(CACHE_FILEPATH)
+        with cache_path.open('rb') as f:
+            self.camConfig.configFilepath = pickle.load(f)
+            self.configSelectLabel.configure(text=os.path.basename(self.camConfig.configFilepath))
 
         if os.path.exists(self.camConfig.configFilepath):
             with open(self.camConfig.configFilepath, 'r') as f:
@@ -580,157 +567,6 @@ class CameraGui(CTkFrame):
                 self.camConfig.fromDict(data)
                 self.update_post_newCamConfig()
 
-        # Sensible defaults if cache missing
-        if not cache_path.exists():
-            # Initialize defaults if not already set
-            if not hasattr(self, 'camConfig'):
-                try:
-                    self.camConfig = CameraConfig()  # dataclass path
-                except Exception:
-                    LOG.exception("Failed to initialize CameraConfig()")
-                    raise
-            self.filepath = _to_str(getattr(self, 'filepath', Path.cwd()))
-            self.camConfig.calibFilepath = _to_str(getattr(self.camConfig, 'calibFilepath', ''))
-
-            # Update labels if UI is ready
-            if hasattr(self, 'selectFolderLabel'):
-                try:
-                    folder_text = "./" + os.path.basename(os.path.normpath(self.filepath)) if self.filepath else "./"
-                    self.selectFolderLabel.configure(text=folder_text)
-                except Exception:
-                    LOG.exception("Failed to initialize Folder Label")
-                    raise
-            return
-
-        try:
-            with cache_path.open('rb') as f:
-                first_obj = pickle.load(f)
-
-                # Case 2: dict format (versioned)
-                if isinstance(first_obj, dict) and ('config' in first_obj or 'version' in first_obj):
-                    data = first_obj
-                    cfg_obj = data.get('config', {})
-                    # Accept dict or CameraConfig
-                    if isinstance(cfg_obj, dict):
-                        try:
-                            self.camConfig = CameraConfig(**cfg_obj)
-                        except Exception:
-                            # Be tolerant of extra keys from older caches
-                            self.camConfig = CameraConfig(
-                                **{k: v for k, v in cfg_obj.items() if k in CameraConfig().__dict__})
-                    else:
-                        # Already a CameraConfig (pickled)
-                        self.camConfig = cfg_obj
-
-                    self.filepath = _to_str(data.get('filepath', Path.cwd()))
-                    self.camConfig.calibFile = _to_str(data.get('calibFilepath', ''))
-
-                else:
-                    # Case 1: legacy 3-pickle stream
-                    # first_obj is camConfig (legacy class or dataclass instance)
-                    cam_cfg_loaded = first_obj
-                    # If your old class had .copy, keep using it for migration; otherwise assign directly
-                    try:
-                        # Try dataclass-style construction first
-                        if isinstance(cam_cfg_loaded, dict):
-                            self.camConfig = CameraConfig(**cam_cfg_loaded)
-                        else:
-                            # If CameraConfig (or old class), prefer direct assignment
-                            self.camConfig = cam_cfg_loaded
-                    except Exception:
-                        # Fallback for very old caches with a custom copy()
-                        try:
-                            self.camConfig.copy(cam_cfg_loaded)  # old migration path, if available
-                        except Exception:
-                            # Last resort: new empty config
-                            self.camConfig = CameraConfig()
-
-                    # Next two pickles: filepath, calibFile
-                    try:
-                        self.filepath = pickle.load(f)
-                    except Exception:
-                        self.filepath = str(Path.cwd())
-                    try:
-                        self.camConfig.calibFilepath = pickle.load(f)
-                    except Exception:
-                        self.camConfig.calibFilepath = ''
-
-            # Normalize path-like fields to strings for UI code that expects str/''.
-            _normalize_cached_paths()
-
-            # --- UI refresh (only if widgets exist already) ---
-            # Folder label
-            if hasattr(self, 'selectFolderLabel'):
-                try:
-                    folder_text = "./" + os.path.basename(os.path.normpath(self.filepath)) if self.filepath else "./"
-                    self.selectFolderLabel.configure(text=folder_text)
-                except Exception:
-                    pass
-
-            # Calibration ingest + label (if you have helper)
-            try:
-                if hasattr(self, 'ingestCalibration') and self.camConfig.calibFilepath:
-                    self.ingestCalibration()
-            except Exception:
-                pass
-
-            # Flight log: if set, let the reader ingest
-            try:
-                if getattr(self.camConfig, 'hud_data_filepath', ''):
-                    if hasattr(self, 'hud_marker'):
-                        self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-            except Exception:
-                pass
-
-            # Per-source labels
-            for fn in ('updateLidarLabel', 'updateYOLOLabel', 'updateFlightLogLabel'):
-                if hasattr(self, fn):
-                    try:
-                        getattr(self, fn)()
-                    except Exception:
-                        pass
-
-        except Exception as e:
-            logging.warning("Failed to load cache %s: %s", cache_path, e)
-            # Fall back to defaults
-            try:
-                self.camConfig = CameraConfig()
-            except Exception:
-                pass
-            self.filepath = str(Path.cwd())
-            self.camConfig.calibFile = ''
-
-        self.ingestCalibration()
-        try:
-            yolo_dir = getattr(self.camConfig, "yoloFilepath", "")
-            if yolo_dir and Path(yolo_dir).exists():
-                # Actually load the model/meta now (this was missing)
-                self.yoloSession.setNewFolder(yolo_dir)
-        except Exception as e:
-            LOG.warning("Failed to restore YOLO folder from cache: %s", e)
-
-        try:
-            self.yoloSession.conf = float(getattr(self.camConfig, "yolo_conf", 0.75))
-            self.yoloSession.iou = float(getattr(self.camConfig, "yolo_iou", 1.00))
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "confSliderBar"):
-                self.confSliderBar.set(self.yoloSession.conf)
-            if hasattr(self, "confSliderLabel"):
-                self.confSliderLabel.configure(text=f"Conf: {self.yoloSession.conf:.2f}")
-            if hasattr(self, "iouSliderBar"):
-                self.iouSliderBar.set(self.yoloSession.iou)
-            if hasattr(self, "iouSliderLabel"):
-                self.iouSliderLabel.configure(text=f"IOU: {self.yoloSession.iou:.2f}")
-        except Exception:
-            pass
-        # --- Restore LiDAR truth points if path cached ---
-        try:
-            if getattr(self.camConfig, 'lidarFilepath', None):
-                self.loadTruthPoints()
-        except Exception:
-            pass
 
     def update_post_newCamConfig(self):
         self.updateSingleOrStream(rowID=1)
@@ -744,34 +580,59 @@ class CameraGui(CTkFrame):
             self.func_that_refits()
 
 
-    def saveToCache(self):
-        cache_path = Path(CAM_CACHE_FILEPATH)
+    def _flush_cache_now(self):
+        """Actually write current config to disk. Called by saveToCache()."""
+        cache_path = Path(CACHE_FILEPATH)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        # coerce to strings in case fields were set to Path elsewhere
-        cam_cfg = self.camConfig
-        for attr in ('imageFilepath', 'lidarFilepath', 'hud_data_filepath', 'yoloFilepath'):
-            if hasattr(cam_cfg, attr):
-                val = getattr(cam_cfg, attr)
-                if val is not None and not isinstance(val, str):
-                    setattr(cam_cfg, attr, str(val))
-        if not isinstance(self.filepath, str):  self.filepath = str(self.filepath)
-        if not isinstance(self.camConfig.calibFilepath, str): self.camConfig.calibFilepath = str(self.camConfig.calibFilepath)
 
+        # Pointer to the most recent config YAML
         with cache_path.open('wb') as f:
-            pickle.dump(self.camConfig, f)
-            pickle.dump(self.filepath, f)
-            pickle.dump(self.camConfig.calibFilepath, f)
+            pickle.dump(self.camConfig.configFilepath, f)
 
+        # Full YAML config
         os.makedirs('Configs', exist_ok=True)
         with open(self.camConfig.configFilepath, 'w') as f:
             dump(self.camConfig.toDict, f)
+
+    def saveToCache(self, immediate: bool = False, delay_ms: int = 500):
+        """
+        Debounced cache writer.
+
+        - Normal calls:   saveToCache()
+            Coalesce many rapid updates into a single write after delay_ms.
+        - Immediate save: saveToCache(immediate=True)
+            Write to disk right now (used when we need fresh data before
+            calling loadFromCache(), etc.).
+        """
+        # If GUI isn't fully initialized or caller wants sync write, flush now.
+        if immediate or not hasattr(self, "after"):
+            # cancel any pending debounce
+            if getattr(self, "_save_debounce_id", None) is not None and hasattr(self, "after_cancel"):
+                try:
+                    self.after_cancel(self._save_debounce_id)
+                except Exception:
+                    pass
+                self._save_debounce_id = None
+
+            self._flush_cache_now()
+            return
+
+        # Debounced path: cancel any pending save and schedule a new one
+        if getattr(self, "_save_debounce_id", None) is not None:
+            try:
+                self.after_cancel(self._save_debounce_id)
+            except Exception:
+                pass
+
+        self._save_debounce_id = self.after(delay_ms, self._flush_cache_now)
+
 
     def selectFolder(self):
         init_dir = Path(self.filepath).parent if self.filepath else Path.cwd()
         fp = self.askFilepath(str(init_dir), "Select Imagery Folder")
         if fp:
             self.filepath = fp
-            self.saveToCache()
+            self.saveToCache(immediate=True)
             self.loadFromCache()
 
     def loadCalibration(self):

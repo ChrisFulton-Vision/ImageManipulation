@@ -3138,78 +3138,87 @@ class CameraGui(ctk.CTkFrame):
                           dilate_px: int = 2,
                           method: int = cv2.INPAINT_TELEA,
                           feather: bool = True):
-        """
-        Detect AprilTags / ArUco markers in self.curr_frame_gray and
-        inpaint them out of self.markup_frame.
-
-        - radius_px:  inpainting neighborhood radius (pixels)
-        - dilate_px:  expand mask a bit to include tag borders
-        - method:     cv2.INPAINT_TELEA or cv2.INPAINT_NS
-        - feather:    if True, softly blend inpainted region with original
-        """
-
         if self.curr_frame_gray is None or self.markup_frame is None:
             return
-
-        # 1) Detect markers
         if self.detector is None:
             return
-        corners, ids, rejected = self.detector.detectMarkers(self.curr_frame_gray)
 
+        corners, ids, rejected = self.detector.detectMarkers(self.curr_frame_gray)
         if corners is None or len(corners) == 0:
-            # Nothing to do
             return
 
-        # 2) Prepare mask matching markup_frame size
         mh, mw = self.markup_frame.shape[:2]
-        mask = np.zeros((mh, mw), dtype=np.uint8)
-
-        # If detection image and markup image differ in size, compute scale
         gh, gw = self.curr_frame_gray.shape[:2]
+
+        # scale factors from detection image to markup image
         sx = mw / float(gw)
         sy = mh / float(gh)
 
+        # how much to pad each ROI beyond the exact tag corners
+        pad = dilate_px + radius_px + 3
+
         for c in corners:
-            # c typically has shape (1, 4, 2) -> make it (4, 2)
-            pts = np.asarray(c).squeeze()  # (1,4,2) -> (4,2)
-            pts = pts.reshape(-1, 2)  # safety
+            # c shape ~ (1, 4, 2) -> (4, 2)
+            pts = np.asarray(c).squeeze().reshape(-1, 2).astype(np.float32)
 
-            # Scale to markup_frame coordinates if needed
+            # scale to markup_frame coords
             pts_scaled = np.empty_like(pts, dtype=np.float32)
-            pts_scaled[:, 0] = pts[:, 0] * sx  # x
-            pts_scaled[:, 1] = pts[:, 1] * sy  # y
+            pts_scaled[:, 0] = pts[:, 0] * sx
+            pts_scaled[:, 1] = pts[:, 1] * sy
 
-            # Convert to int and clamp
-            pts_int = pts_scaled.astype(np.int32)
-            pts_int[:, 0] = np.clip(pts_int[:, 0], 0, mw - 1)
-            pts_int[:, 1] = np.clip(pts_int[:, 1], 0, mh - 1)
+            # tight bounding box around the tag
+            x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
+            x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
+            y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
+            y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
 
-            # Fill the quadrilateral for this tag
-            cv2.fillConvexPoly(mask, pts_int, 255)
+            # clamp to image
+            x_min = max(x_min, 0)
+            y_min = max(y_min, 0)
+            x_max = min(x_max, mw - 1)
+            y_max = min(y_max, mh - 1)
+            if x_max <= x_min or y_max <= y_min:
+                continue  # degenerate ROI
 
-        # Optional dilation to cover edges/borders
-        if dilate_px > 0:
-            k = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
-            )
-            mask = cv2.dilate(mask, k)
+            roi_w = x_max - x_min + 1
+            roi_h = y_max - y_min + 1
 
-        # 3) Inpaint
-        inpainted = cv2.inpaint(self.markup_frame, mask, radius_px, method)
+            # build local mask for this tag only
+            mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
 
-        # 4) Optional feathered blend to reduce halos
-        if feather:
-            blur_ks = max(3, 2 * radius_px + 1)
-            soft = cv2.GaussianBlur(mask, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
-            soft = soft[..., None]  # (H,W,1)
+            # shift tag points into ROI coordinates
+            pts_roi = pts_scaled.copy()
+            pts_roi[:, 0] -= x_min
+            pts_roi[:, 1] -= y_min
+            pts_int = pts_roi.astype(np.int32)
 
-            base = self.markup_frame.astype(np.float32)
-            inp = inpainted.astype(np.float32)
+            cv2.fillConvexPoly(mask_roi, pts_int, 255)
 
-            blended = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
-            self.markup_frame = blended
-        else:
-            self.markup_frame = inpainted
+            # optional dilation to cover borders
+            if dilate_px > 0:
+                k = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+                )
+                mask_roi = cv2.dilate(mask_roi, k)
+
+            # slice out the ROI from the big frame
+            frame_roi = self.markup_frame[y_min:y_max + 1, x_min:x_max + 1]
+
+            # inpaint only this small region
+            inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
+
+            if feather:
+                blur_ks = max(3, 2 * radius_px + 1)
+                soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
+                soft = soft[..., None]  # (H,W,1)
+
+                base = frame_roi.astype(np.float32)
+                inp = inpainted_roi.astype(np.float32)
+                blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
+
+                self.markup_frame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
+            else:
+                self.markup_frame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)

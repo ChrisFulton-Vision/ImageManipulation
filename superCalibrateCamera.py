@@ -258,7 +258,7 @@ class CameraGui(ctk.CTkFrame):
             "detectTags", "undistort", "pnpLidarPoints", "qnpLidarPoints",
             "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
-            "cubemap", "hud"
+            "cubemap", "hud", "hideAprilTags"
         ]
         self.recording = False
         self.yoloSession = yolo.YOLO()
@@ -398,6 +398,10 @@ class CameraGui(ctk.CTkFrame):
         self.detectAprilTagsCheckbox = ctk.CTkCheckBox(
             self.config_frame, text="Detect April Tags",
             variable=self._flag_vars["detectTags"]
+        )
+        self.hideAprilTagsCheckbox = ctk.CTkCheckBox(
+            self.config_frame, text="Hide April Tags",
+            variable=self._flag_vars['hideAprilTags']
         )
         self.detectHorizonCheckbox = ctk.CTkCheckBox(self.config_frame, text='Detect Horizon',
                                                      variable=self._flag_vars['detect_horizon'])
@@ -1064,15 +1068,18 @@ class CameraGui(ctk.CTkFrame):
         self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
-        self.createDetector()
-        self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-
         if not self.calibration.validCal:
             self.undistortCheckbox.configure(state='disabled')
 
         self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
-        rowID += 1
 
+        rowID += 1
+        self.createDetector()
+        self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
+        self.hideAprilTagsCheckbox.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
+
+
+        rowID += 1
         pnpLidarPoints = ctk.CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image',
                                          variable=self._flag_vars['pnpLidarPoints'])
         pnpLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
@@ -3428,11 +3435,12 @@ class CameraGui(ctk.CTkFrame):
             corners = np.squeeze(np.array(corners))
             polyline = [np.array(corners, np.int32).reshape((-1, 1, 2))]
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
-            cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
-            cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
-            cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
-                        cv2.FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
+            if not self.camConfig.hideAprilTags:
+                cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
+                cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
+                            cv2.FONT_HERSHEY_SIMPLEX, small_text(), HUD_GREEN, 4)
+                cv2.putText(self.markup_frame, str(idx[0]), pixCenter,
+                            cv2.FONT_HERSHEY_SIMPLEX, small_text(), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 

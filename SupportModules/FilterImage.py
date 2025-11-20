@@ -1,5 +1,5 @@
 from enum import Enum
-import cv2
+from cv2 import getGaborKernel, GaussianBlur, addWeighted, filter2D
 import numpy as np
 from numpy import rad2deg, deg2rad
 from numpy.typing import NDArray
@@ -93,7 +93,7 @@ class GaborGUI:
             self.pop_up.grid_columnconfigure([0, 1], weight=1)
             self.configure_pop_up()
 
-        return cv2.getGaborKernel(self.gaborFilter.ksize,
+        return getGaborKernel(self.gaborFilter.ksize,
                                   self.gaborFilter.sigma,
                                   self.gaborFilter.theta,
                                   self.gaborFilter.lambd,
@@ -129,7 +129,7 @@ class Gabor:
         self.psi = new_psi
 
     def filter_kernel(self):
-        return cv2.getGaborKernel(self.ksize,
+        return getGaborKernel(self.ksize,
                                   self.sigma,
                                   self.theta,
                                   self.lambd,
@@ -186,13 +186,13 @@ class ImageKernel(Enum):
 
 def applyConvolutionFilter(img: NDArray, kernel: ImageKernel, gabor: None | Gabor = None) -> NDArray:
     if kernel == ImageKernel.Unsharp:
-        gaussian_3 = cv2.GaussianBlur(img, (0, 0), 2.0)
-        return cv2.addWeighted(img, 2.0, gaussian_3, -1.0, 0)
+        gaussian_3 = GaussianBlur(img, (0, 0), 2.0)
+        return addWeighted(img, 2.0, gaussian_3, -1.0, 0)
 
     if kernel == ImageKernel.Gabor:
         convolution = gabor.filter_kernel()
-        return cv2.filter2D(img, -1, convolution)
+        return filter2D(img, -1, convolution)
 
     convolution = ImageKernel.get_convolution(kernel)
-    return cv2.filter2D(img, -1, convolution)
+    return filter2D(img, -1, convolution)
 

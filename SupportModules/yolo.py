@@ -1,8 +1,15 @@
-import cv2
-import os, glob, re, datetime
+import copy
+import datetime
+import glob
+import os
+import re
+
+from cv2 import (resize, putText, FONT_HERSHEY_PLAIN, rectangle, putText, FONT_HERSHEY_SIMPLEX,
+                 solvePnPRansac, SOLVEPNP_ITERATIVE, Rodrigues, projectPoints)
+from cv2.dnn import NMSBoxes
+
 from SupportModules.Calibration import Calibration
 from SupportModules.metaYoloReader import MetaYoloReader
-import copy
 from SupportModules.quaternions import *
 
 for key in ("CUDA_PATH", "CUDNN_PATH"):
@@ -13,7 +20,7 @@ for key in ("CUDA_PATH", "CUDNN_PATH"):
 # Ensure CUDA_PATH is in environment: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin
 # Ensure CUDNN_PATH is in environment: C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6
 import onnxruntime as ort
-import onnx
+
 print(f'OnnxVersion: {ort.__version__}')
 print(f'Onnx Providers: {ort.get_available_providers()}')
 
@@ -150,7 +157,7 @@ class YOLO:
         '''
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
-            image = cv2.resize(image, self.yoloSize)
+            image = resize(image, self.yoloSize)
         image = image.transpose((2, 0, 1))
         image = np.expand_dims(image, axis=0)
         image = image.astype(np.float32) / 255.0
@@ -252,10 +259,10 @@ class YOLO:
         centers, boxes, scores, class_ids, time = output
 
         text = f'Inference time: {time:.3f}s'
-        cv2.putText(image, text, (10, 50), cv2.FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 4)
+        putText(image, text, (10, 50), FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 4)
 
         if len(class_ids) > 0:
-            indices = cv2.dnn.NMSBoxes(boxes, scores, self.conf, self.iou)
+            indices = NMSBoxes(boxes, scores, self.conf, self.iou)
             newCenters, newBoxes, newClass_ids, newScores = [], [], [], []
             for i in indices:
                 # for i in range(len(centers)):
@@ -297,12 +304,12 @@ class YOLO:
             y2 = int(h / y_h * y2)
 
             label = f"{class_id}: {score:.2f}"
-            cv2.rectangle(image, (x1, y1), (x2, y2), LIGHTBLUE, 1)
+            rectangle(image, (x1, y1), (x2, y2), LIGHTBLUE, 1)
             # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, LIGHTBLUE, 1)
+            putText(image, f"{class_id}", (x, y), FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            putText(image, f"{class_id}", (x, y), FONT_HERSHEY_SIMPLEX, 0.5, LIGHTBLUE, 1)
 
-        cv2.putText(image, 'Direct Inference', (25, h - 100), cv2.FONT_HERSHEY_SIMPLEX,
+        putText(image, 'Direct Inference', (25, h - 100), FONT_HERSHEY_SIMPLEX,
                     0.75, LIGHTBLUE, 1)
 
         return image
@@ -340,14 +347,14 @@ class YOLO:
         if len(object_points) < 6:
             return
 
-        ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
+        ret, rvec, tvec, inliers = solvePnPRansac(objectPoints=object_points,
                                                       imagePoints=image_points,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)),
                                                       confidence=0.99,
-                                                      flags=cv2.SOLVEPNP_ITERATIVE)
+                                                      flags=SOLVEPNP_ITERATIVE)
 
-        dcm, jacob = cv2.Rodrigues(rvec)
+        dcm, jacob = Rodrigues(rvec)
         np.set_printoptions(suppress=True, precision=10)
 
 
@@ -356,10 +363,10 @@ class YOLO:
 
         self.orig_tvec.append(tvec)
 
-        cv2.putText(image, 'SolvePnP Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
+        putText(image, 'SolvePnP Solution', (25, w - 75), FONT_HERSHEY_SIMPLEX,
                     0.75, YELLOW, 1)
-        cv2.putText(image, f'x:{tvec[0, 0]:.3f}, y:{tvec[1, 0]:.3f}, z:{tvec[2, 0]:.3f}', (25, w - 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
+        putText(image, f'x:{tvec[0, 0]:.3f}, y:{tvec[1, 0]:.3f}, z:{tvec[2, 0]:.3f}', (25, w - 50),
+                    FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
 
         self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec)
 
@@ -378,7 +385,7 @@ class YOLO:
                 id = self.reader.idsNamesLocs[y_class_id][0]
                 xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
 
-                projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
+                projectedPixel, _ = projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)))
 
@@ -401,14 +408,14 @@ class YOLO:
                     else:
                         self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
 
-                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                putText(image, str(id), (int(x), int(y)), FONT_HERSHEY_SIMPLEX,
                             0.5, BLACK, 3)
-                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                putText(image, str(id), (int(x), int(y)), FONT_HERSHEY_SIMPLEX,
                             0.5, YELLOW, 2)
 
                 if self.bias_tracking_active and y_class_id in self.biasTracker:
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
-                    cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
+                    putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), FONT_HERSHEY_SIMPLEX,
                                 0.75, RED, 2)
 
         bias_image_points = []
@@ -422,11 +429,11 @@ class YOLO:
                     bias_image_points.append(y_centers[idx])
         bias_image_points = np.array(bias_image_points)
 
-        ret, bias_rvec, bias_tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
+        ret, bias_rvec, bias_tvec, inliers = solvePnPRansac(objectPoints=object_points,
                                                                 imagePoints=bias_image_points,
                                                                 cameraMatrix=self.calibration.getCameraMatrix(),
                                                                 distCoeffs=np.zeros((5,)),
-                                                                flags=cv2.SOLVEPNP_ITERATIVE)
+                                                                flags=SOLVEPNP_ITERATIVE)
         self.bias_tvec.append(bias_tvec)
         self.plotCount += 1
         # print(np.squeeze(np.array(self.orig_tvec)))
@@ -448,8 +455,8 @@ class YOLO:
         #     plt.show()
         #     self.plotCount = 0
         if self.bias_tracking_active:
-            cv2.putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
+            putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
+                    FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
 
 
 def natural_sort(l):
@@ -459,13 +466,15 @@ def natural_sort(l):
 
 
 if __name__ == '__main__':
+    from cv2 import imshow, imread, waitKey
+
     yolo = YOLO(conf=0.75, iou=0.99, yoloSize=(864, 864),
                 model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
                 numClasses=1)
 
     np.set_printoptions(suppress=True)
 
-    # testImage = cv2.imread('BoundingBoxCandidates/13608.bmp')
+    # testImage = imread('BoundingBoxCandidates/13608.bmp')
     # testImage, sol = yolo.inferOnImage(testImage)
 
     allImages = glob.glob(
@@ -474,10 +483,10 @@ if __name__ == '__main__':
     allImages = natural_sort(allImages)
 
     for imgFP in allImages:
-        (newImg, rvec_tvec), sol = yolo.inferOnImage(cv2.imread(imgFP))
-        cv2.imshow('YOLO', newImg)
+        (newImg, rvec_tvec), sol = yolo.inferOnImage(imread(imgFP))
+        imshow('YOLO', newImg)
         # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
-        key = cv2.waitKey(0)
+        key = waitKey(0)
         if key == 121:
             print('you hit yes')
             with open("test.txt", "w") as f:

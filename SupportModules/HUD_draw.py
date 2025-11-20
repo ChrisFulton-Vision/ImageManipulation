@@ -1,10 +1,11 @@
-import cv2
+
 import numpy as np
 from numpy import sin, cos, deg2rad
 from SupportModules.AttitudeInterpreter import AttitudeReader as AttRdr
 from SupportModules.AttitudeInterpreter import ControlMode
 from SupportModules.CVFontScaling import med_text
 from numpy.typing import NDArray
+from cv2 import putText, FONT_HERSHEY_SIMPLEX, polylines, fillPoly, line, circle, getTextSize
 from math import sin, cos, radians
 
 HUD_GREEN = (0, 255, 0)
@@ -74,7 +75,7 @@ class HUD_Marker:
     def offset(self):
         return self.attRdr.offset
 
-    def draw_HUD(self, image: NDArray, img_time: float, box_around: bool):
+    def draw_HUD(self, image: NDArray, img_time: float):
         x, y, _ = image.shape
 
         # If image size changes
@@ -85,8 +86,8 @@ class HUD_Marker:
             img_time)  # + 173.11338 - 11.658461)
 
         # Speed
-        cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+        putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
+                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
         self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
 
@@ -100,18 +101,13 @@ class HUD_Marker:
 
         # cv2.putText(image, f'BnkOffset: {self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
 
-        if box_around:
-            cv2.rectangle(image, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
-
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy
         green = HUD_GREEN
-        draw_lines = cv2.polylines
-        fill_poly = cv2.fillPoly
 
         # --- Static bank indicator (prebuilt in self.bank_indicator_lines) ---
-        draw_lines(image, self.bank_indicator_lines, False, green, 2)
+        polylines(image, self.bank_indicator_lines, False, green, 2)
 
         # --- Precompute trig once ---
         # Bank for "response"
@@ -148,8 +144,8 @@ class HUD_Marker:
         cmd_lines = np.array([(int(px * x), int(py * y)) for (px, py) in cmd_bank_pts], dtype=np.int32)
 
         # --- Draw bank shapes ---
-        draw_lines(image, [lines], True, green, 2)  # "Bank Cmd" in your comment
-        fill_poly(image, [cmd_lines], green)  # "Bank Response" in your comment
+        polylines(image, [lines], True, green, 2)  # "Bank Cmd" in your comment
+        fillPoly(image, [cmd_lines], green)  # "Bank Response" in your comment
 
         # --- Pitch command triangles ---
         # Use cos(-θ)=cos θ and sin(-θ)=-sin θ
@@ -184,8 +180,8 @@ class HUD_Marker:
             hv(+0.03, -0.01 + delta),
         ], dtype=np.int32)
 
-        draw_lines(image, [left_tri], True, green, 2)
-        draw_lines(image, [right_tri], True, green, 2)
+        polylines(image, [left_tri], True, green, 2)
+        polylines(image, [right_tri], True, green, 2)
 
     def draw_pitchAngle(self, image, pitch_angle, bank_angle):
         x, y = self.last_xy
@@ -198,8 +194,7 @@ class HUD_Marker:
         outer = 0.15 * x
         s_b = sin(radians(bank_angle + self.cam_bank_offset))
         c_b = cos(radians(bank_angle + self.cam_bank_offset))
-        putText = cv2.putText
-        drawLine = cv2.line
+
         to_int = int  # local alias is slightly faster than global lookup
         green = HUD_GREEN
         # Cache the scale once per call (your no-arg cached version)
@@ -229,7 +224,7 @@ class HUD_Marker:
             x2 = cx - inner * c_b - x_off
             y2 = cy + inner * s_b - y_off
 
-            drawLine(image, (to_int(x1), to_int(y1)), (to_int(x2), to_int(y2)), green, 2)
+            line(image, (to_int(x1), to_int(y1)), (to_int(x2), to_int(y2)), green, 2)
 
             # right line: inner -> outer
             x3 = cx + inner * c_b - x_off
@@ -237,28 +232,28 @@ class HUD_Marker:
             x4 = cx + outer * c_b - x_off
             y4 = cy - outer * s_b - y_off
 
-            drawLine(image, (to_int(x3), to_int(y3)), (to_int(x4), to_int(y4)), green, 2)
+            line(image, (to_int(x3), to_int(y3)), (to_int(x4), to_int(y4)), green, 2)
 
             # label; avoid f-string format cost by int()
             putText(
                 image, str(int(i)),
                 (to_int(x4 + x * 0.02), to_int(y4)),
-                cv2.FONT_HERSHEY_SIMPLEX, txt_scale, green, 2
+                FONT_HERSHEY_SIMPLEX, txt_scale, green, 2
             )
 
-        cv2.circle(image, (int(cx), int(cy)), 5, green, 2)
+        circle(image, (int(cx), int(cy)), 5, green, 2)
 
     def draw_altitude(self, image, alt):
         x, y = self.last_xy
 
         alt_text = f'ALT: {alt:.0f}'
 
-        (width, height), baseline = cv2.getTextSize(alt_text, cv2.FONT_HERSHEY_SIMPLEX,
+        (width, height), baseline = getTextSize(alt_text, FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)
 
-        cv2.putText(image, alt_text,
+        putText(image, alt_text,
                     (int(0.775 * x - width / 2.0), int(0.4 * y - height / 2.0)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
         # cv2.rectangle(image,
         #               (int(0.773 * x - width / 2.0 ), int(0.4 * y - height * 2.0 )),
@@ -279,25 +274,26 @@ class HUD_Marker:
                         [self.throttle_loc[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r * 0.8)),
                          self.throttle_loc[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r * 0.6))]], np.int32)
 
-        cv2.polylines(image, self.throttle_circle_points, False, HUD_GREEN, 2)  # Arc
+        polylines(image, self.throttle_circle_points, False, HUD_GREEN, 2)  # Arc
 
-        cv2.fillPoly(image, [tri], HUD_GREEN)  # Triangle Pointer
-        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%', cv2.FONT_HERSHEY_SIMPLEX,
+        fillPoly(image, [tri], HUD_GREEN)  # Triangle Pointer
+        (width, height), baseline = getTextSize(f'{cmd_throttle:.1f}%', FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)
-        cv2.putText(image, f'{cmd_throttle:.1f}%',
+        putText(image, f'{cmd_throttle:.1f}%',
                     (int(self.throttle_loc[0] - width / 2), int(self.throttle_loc[1] - height / 2)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
 
     def draw_controlMode(self, image, mode):
-        if mode == ControlMode.controller:
-            cv2.putText(image, "MODE: CNTL", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
-        if mode == ControlMode.manual:
-            cv2.putText(image, "MODE: MAN", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
-        if mode == ControlMode.auto:
-            cv2.putText(image, "MODE: AUTO", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
-        if mode == ControlMode.error:
-            cv2.putText(image, "MODE: ERR", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)
+        match mode:
+            case ControlMode.controller:
+                putText(image, "MODE: CNTL", self.controlMode_text_loc,
+                        FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
+            case ControlMode.manual:
+                putText(image, "MODE: MAN", self.controlMode_text_loc,
+                        FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
+            case ControlMode.auto:
+                putText(image, "MODE: AUTO", self.controlMode_text_loc,
+                        FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+            case _:
+                putText(image, "MODE: ERR", self.controlMode_text_loc,
+                        FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)

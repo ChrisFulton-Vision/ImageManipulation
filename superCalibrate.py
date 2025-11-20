@@ -1085,6 +1085,9 @@ class CalibrateGui(CTkFrame):
             with open(join(self.filepath, IMAGE_CACHE), 'wb') as f:
                 pickle.dump(self.imageConfig, f)
 
+        if not os.path.exists(os.path.dirname(FILEPATH_CACHE)):
+            os.makedirs(os.path.dirname(FILEPATH_CACHE))
+
         with open(FILEPATH_CACHE, 'wb') as f:
             pickle.dump(self.filepath, f)
 

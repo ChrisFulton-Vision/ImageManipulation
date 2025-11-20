@@ -1,5 +1,9 @@
-import numpy as np
+import os
 import pickle, copy
+
+import numpy as np
+
+from SupportModules.sensor_datum_mat4_bundle import parse_sensor_datum_mat4_bundle
 
 class TruthPoints:
     def __init__(self):
@@ -65,6 +69,14 @@ class TruthPoints:
 
     def copy(self, classToCopy):
         self.__dict__.update(copy.deepcopy(classToCopy.__dict__))
+
+    def fromSensorDatumMat4Bundle(self, sensorDatumMat4Bundle: str | os.PathLike[str]):
+        self.truthPoints = {}
+
+        mat4_bundle = parse_sensor_datum_mat4_bundle(sensorDatumMat4Bundle).query("object_id.str.startswith('tag_')")
+
+        for tag_id, tag_df in mat4_bundle.groupby('object_id'):
+            self.truthPoints[tag_id] = tag_df[["x", "y", "z"]].mean().to_numpy()
 
 if __name__ == '__main__':
     TruthPoints()

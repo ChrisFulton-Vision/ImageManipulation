@@ -34,6 +34,7 @@ from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyAllWindows, wai
                  VideoWriter, INTER_AREA)
 from PIL.Image import fromarray
 from cv2_enumerate_cameras import enumerate_cameras
+import numpy as np
 
 from SupportModules import yolo
 from SupportModules.Calibration import Calibration
@@ -2686,7 +2687,7 @@ class CameraGui(CTkFrame):
     def update_playbackMenu(self):
         if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
             self.playbackModeText.set(
-                value=f'Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}')
+                value=f"Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}")
         else:
             self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
 
@@ -3154,7 +3155,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3440,7 +3441,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3492,7 +3493,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID[0])])
+                    points.append(truthPoints[str(detectID)])
                 except KeyError as e:
                     removeIDs.append(idx)
 

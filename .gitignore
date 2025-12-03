@@ -1,1 +1,6 @@
 /Caches
+/Configs
+!/Configs/Default.yaml
+/Calibrations
+!/Calibrations/GenericAlvium2848.txt
+!/Calibrations/GenericAlvium864.txt

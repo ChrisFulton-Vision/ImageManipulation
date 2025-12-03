@@ -587,7 +587,7 @@ def solveQnP(object_pts, img_pts, fx, fy, cx, cy, sigma_squared=None):
     img_pts = deepcopy(img_pts).flatten()
     init_q, init_t = init_pose_wahba(object_pts, img_pts, fx, fy, cx, cy)
     est_q, est_t = opt(init_q, init_t, img_pts, sigma_squared, object_pts, fx, fy, cx, cy)
-    est_q.force_s_pos
+    est_q.force_s_pos()
     return est_q, est_t
 
 

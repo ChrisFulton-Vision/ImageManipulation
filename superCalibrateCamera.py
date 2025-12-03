@@ -19,7 +19,8 @@ from tkinter import filedialog
 from yaml import safe_load, dump
 
 from concurrent.futures import ThreadPoolExecutor, wait
-from customtkinter import CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar, StringVar, CTkProgressBar, END
+from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
+                           StringVar, CTkProgressBar, END)
 from pandas import isna, read_csv, DataFrame
 
 from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyAllWindows, waitKey, imread, namedWindow,
@@ -31,10 +32,10 @@ from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyAllWindows, wai
                  line, circle, phaseCorrelate, arrowedLine, imshow, imwrite, getWindowImageRect, bitwise_and, aruco,
                  setNumThreads, getOptimalNewCameraMatrix, initUndistortRectifyMap, CV_16SC2, COLOR_GRAY2BGR, error,
                  COLOR_RGB2BGR, resize, setUseOptimized, ellipse, bitwise_not, add, undistortPoints, solvePnPRansac,
-                 VideoWriter, INTER_AREA)
+                 VideoWriter, INTER_AREA, CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE,
+                 CAP_PROP_AUTOFOCUS, CAP_PROP_AUTO_WB, CAP_PROP_GAIN)
 from PIL.Image import fromarray
 from cv2_enumerate_cameras import enumerate_cameras
-import numpy as np
 
 from SupportModules import yolo
 from SupportModules.Calibration import Calibration
@@ -50,10 +51,10 @@ from SupportModules.quaternions import *
 from SupportModules.quaternions import Quaternion as q
 from SupportModules.CVFontScaling import small_text, med_text, lrg_text
 
+from math import pow
 import logging
-import math
 
-SPEED_STEP = math.pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
+SPEED_STEP = pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
 SPEED_STEP_INV = 1.0 / SPEED_STEP
 
 LOG = logging.getLogger("superCalibrate")
@@ -63,6 +64,7 @@ if not LOG.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
     handler.setFormatter(fmt)
     LOG.addHandler(handler)
+    
     # LOG.setLevel(logging.INFO)
     # LOG.setLevel(logging.DEBUG)
     LOG.setLevel(logging.WARNING)
@@ -339,6 +341,8 @@ class CameraGui(CTkFrame):
         self.pnpResult = None
         self.qnpResult = None
 
+        self.vc = None
+
         self.pauseCache = PausedCache()
         self.playback = PlaybackState()
 
@@ -467,7 +471,6 @@ class CameraGui(CTkFrame):
         self.iouSliderBar.set(self.camConfig.yolo_iou)
 
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
-        self.vc = None
 
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
@@ -521,7 +524,7 @@ class CameraGui(CTkFrame):
         # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
         if not self._ui_active:
             try:
-                self.startStreamOff()
+                self.after(100, self.startStreamOff)
             except Exception:
                 pass
         else:
@@ -1830,6 +1833,58 @@ class CameraGui(CTkFrame):
         if out_qnp is None:
             out_qnp = str(base.with_name(base.stem + "__qnp.csv"))
 
+        # --- Resume / checkpoint support ---------------------------------
+        # If we already have PnP/QnP output files, remember which images
+        # have been processed so we can skip them on a re-run.
+        processed_pnp: set[str] = set()
+        processed_qnp: set[str] = set()
+
+        if os.path.exists(out_pnp):
+            try:
+                df_pnp = read_csv(out_pnp)
+                if "image_name" in df_pnp.columns:
+                    processed_pnp = set(df_pnp["image_name"].astype(str).tolist())
+                LOG.info(
+                    "run_pnp_qnp_from_detection_csv: existing PnP file %s with %d rows",
+                    out_pnp, len(processed_pnp)
+                )
+            except Exception as e:
+                LOG.warning(
+                    "run_pnp_qnp_from_detection_csv: could not read existing PnP file %s: %s; "
+                    "recomputing all rows for this file",
+                    out_pnp, e,
+                )
+
+        if os.path.exists(out_qnp):
+            try:
+                df_qnp = read_csv(out_qnp)
+                if "image_name" in df_qnp.columns:
+                    processed_qnp = set(df_qnp["image_name"].astype(str).tolist())
+                LOG.info(
+                    "run_pnp_qnp_from_detection_csv: existing QnP file %s with %d rows",
+                    out_qnp, len(processed_qnp)
+                )
+            except Exception as e:
+                LOG.warning(
+                    "run_pnp_qnp_from_detection_csv: could not read existing QnP file %s: %s; "
+                    "recomputing all rows for this file",
+                    out_qnp, e,
+                )
+
+        # Only consider a row fully processed if it exists in BOTH files
+        already_done = processed_pnp & processed_qnp
+        if already_done:
+            LOG.info(
+                "run_pnp_qnp_from_detection_csv: will skip %d rows already in outputs",
+                len(already_done),
+            )
+
+        # Flags for incremental CSV writing – if the file already exists,
+        # we assume it already has a header.
+        pnp_header_written = os.path.exists(out_pnp)
+        qnp_header_written = os.path.exists(out_qnp)
+
+
         cols = set(df.columns)
 
         # Discover feature IDs from any feat_* columns
@@ -1856,6 +1911,8 @@ class CameraGui(CTkFrame):
         D_full = self.calibration.getDistortion()
         truth_dict = self.yoloSession.reader.idsNamesLocs
 
+        # We keep these lists mostly for logging/debug; the CSVs are written
+        # incrementally as we go.
         pnp_rows = []
         qnp_rows = []
 
@@ -1863,14 +1920,21 @@ class CameraGui(CTkFrame):
 
             image_name = row.get("image_name", "")
             image_time = row.get("image_time", np.nan)
+            image_name_str = str(image_name)
 
             # Optional incremental progress callback
             if progress_cb is not None:
                 try:
-                    progress_cb(idx, total_rows, str(image_name))
+                    progress_cb(idx, total_rows, image_name_str)
                 except Exception:
                     # Don't let UI issues kill the batch
                     pass
+
+            # If this image already has BOTH PnP and QnP rows on disk,
+            # skip the expensive math and move on.
+            if image_name_str in already_done:
+                continue
+
 
             # Collect 2D points: prefer undistorted if present
             ud_centers = []
@@ -1917,18 +1981,38 @@ class CameraGui(CTkFrame):
                 use_ud = False
             else:
                 # Not enough features -> still emit NaNs
-                pnp_rows.append({
+                row_pnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
                     "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
-                })
-                qnp_rows.append({
+                }
+                row_qnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
                     "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
-                })
+                }
+
+                pnp_rows.append(row_pnp)
+                qnp_rows.append(row_qnp)
+
+                DataFrame([row_pnp]).to_csv(
+                    out_pnp,
+                    mode="a" if pnp_header_written else "w",
+                    index=False,
+                    header=not pnp_header_written,
+                )
+                pnp_header_written = True
+
+                DataFrame([row_qnp]).to_csv(
+                    out_qnp,
+                    mode="a" if qnp_header_written else "w",
+                    index=False,
+                    header=not qnp_header_written,
+                )
+                qnp_header_written = True
+
                 continue
 
             # Map IDs -> 3D truth points and drop any unknown IDs
@@ -1939,18 +2023,39 @@ class CameraGui(CTkFrame):
                 keep_centers.append([u, v])
 
             if len(obj_pts) < 6:
-                pnp_rows.append({
+                # Not enough features -> still emit NaNs
+                row_pnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
                     "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
-                })
-                qnp_rows.append({
+                }
+                row_qnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
                     "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
-                })
+                }
+
+                pnp_rows.append(row_pnp)
+                qnp_rows.append(row_qnp)
+
+                DataFrame([row_pnp]).to_csv(
+                    out_pnp,
+                    mode="a" if pnp_header_written else "w",
+                    index=False,
+                    header=not pnp_header_written,
+                )
+                pnp_header_written = True
+
+                DataFrame([row_qnp]).to_csv(
+                    out_qnp,
+                    mode="a" if qnp_header_written else "w",
+                    index=False,
+                    header=not qnp_header_written,
+                )
+                qnp_header_written = True
+
                 continue
 
             obj_pts = np.asarray(obj_pts, dtype=np.float32)
@@ -1976,7 +2081,7 @@ class CameraGui(CTkFrame):
             if ret:
                 # Same convention as your existing pnpLidarPoints:
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
-                pnp_rows.append({
+                row_pnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "pnp_qw": float(quatPnP.s),
@@ -1986,14 +2091,23 @@ class CameraGui(CTkFrame):
                     "pnp_x": float(vectPnP[0]),
                     "pnp_y": float(vectPnP[1]),
                     "pnp_z": float(vectPnP[2]),
-                })
+                }
             else:
-                pnp_rows.append({
+                row_pnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
                     "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
-                })
+                }
+
+            pnp_rows.append(row_pnp)
+            DataFrame([row_pnp]).to_csv(
+                out_pnp,
+                mode="a" if pnp_header_written else "w",
+                index=False,
+                header=not pnp_header_written,
+            )
+            pnp_header_written = True
 
             # ----------------- QnP (your solveQnP path) -----------------
             try:
@@ -2009,7 +2123,7 @@ class CameraGui(CTkFrame):
                 vectQ = q_aftr_from_cv * vectQ
                 quatQ = q_aftr_from_cv * quatQ
 
-                qnp_rows.append({
+                row_qnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "qnp_qw": float(quatQ.s),
@@ -2019,20 +2133,29 @@ class CameraGui(CTkFrame):
                     "qnp_x": float(vectQ[0]),
                     "qnp_y": float(vectQ[1]),
                     "qnp_z": float(vectQ[2]),
-                })
+                }
             except Exception as e:
                 LOG.error("solveQnP failed for %s: %s", image_name, e)
-                qnp_rows.append({
+                row_qnp = {
                     "image_name": image_name,
                     "image_time": image_time,
                     "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
                     "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
-                })
+                }
 
-        DataFrame(pnp_rows).to_csv(out_pnp, index=False)
-        DataFrame(qnp_rows).to_csv(out_qnp, index=False)
-        LOG.info("Offline PnP results written to %s", out_pnp)
-        LOG.info("Offline QnP results written to %s", out_qnp)
+            qnp_rows.append(row_qnp)
+            DataFrame([row_qnp]).to_csv(
+                out_qnp,
+                mode="a" if qnp_header_written else "w",
+                index=False,
+                header=not qnp_header_written,
+            )
+            qnp_header_written = True
+
+        LOG.info(
+            "run_pnp_qnp_from_detection_csv: appended %d PnP rows and %d QnP rows to existing files.",
+            len(pnp_rows), len(qnp_rows)
+        )
 
     def setup_playbackFrame(self):
         rowID = 0
@@ -2040,9 +2163,7 @@ class CameraGui(CTkFrame):
         playbackLabel = CTkLabel(self.playback_frame, textvariable=self.playbackModeText)
         playbackLabel.grid(row=rowID, column=0, sticky='w', padx=5, pady=5)
 
-    def shutdown(self):
-        self.shutting_down = True
-        self.recordOff()
+    def safely_close_playwindow(self):
         self.startStreamOffBool()
         # Safely wait for window to be gone
         while True:
@@ -2053,6 +2174,12 @@ class CameraGui(CTkFrame):
             except Exception:
                 break
             time.sleep(0.1)
+
+    def shutdown(self):
+        self.shutting_down = True
+        self.recordOff()
+        self.safely_close_playwindow()
+
 
     def setAprilTagSize(self):
 
@@ -2272,6 +2399,7 @@ class CameraGui(CTkFrame):
     def run_video_stream(self):
 
         self.vc = VideoCapture(self.camConfig.cam_index, CAP_DSHOW)
+
         self.vc.set(CAP_PROP_FPS, 60)
 
         namedWindow(self.windowName, WINDOW_NORMAL)
@@ -3155,7 +3283,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID)])
+                    points.append(truthPoints[str(detectID[0])])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3163,6 +3291,9 @@ class CameraGui(CTkFrame):
             for id in reversed(removeIDs):
                 centers = np.delete(centers, id, axis=0)
             points = np.array(points)
+
+        probe_pose = np.array([4.89965725, .20014286, -1.55304432])
+
 
         if points is not None and self.detector is not None:
             print(f'Obj Points: \n{points}')
@@ -3174,6 +3305,10 @@ class CameraGui(CTkFrame):
         if self.qnpResult is not None:
             print(f'QnP Result: \ncam_R_tgt:\n{self.qnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.qnpResult[1]}')
         print()
+        print(f'Diff: {self.pnpResult[1]}')
+        print(f'Diff: {probe_pose}')
+        print(f'Diff: {self.pnpResult[1]-probe_pose}')
+
         self.printLidar = False
 
     def update_cube_map_vectors(self):
@@ -3441,7 +3576,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID)])
+                    points.append(truthPoints[str(detectID[0])])
                 except KeyError as e:
                     removeIDs.append(idx)
 
@@ -3493,7 +3628,7 @@ class CameraGui(CTkFrame):
             removeIDs = []
             for idx, detectID in enumerate(self.detectIDS):
                 try:
-                    points.append(truthPoints[str(detectID)])
+                    points.append(truthPoints[str(detectID[0])])
                 except KeyError as e:
                     removeIDs.append(idx)
 

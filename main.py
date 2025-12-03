@@ -7,7 +7,7 @@ import customtkinter as ctk
 import superCalibrateCamera as cam
 import superCalibrate as calibrate
 from functools import partial
-from SupportModules.LidarTruth import TruthPoints
+# from SupportModules.LidarTruth import TruthPoints
 
 GREEN = '#2FA572'
 DEFAULT_HOVER = ('#0C955A', '#106A43')
@@ -164,6 +164,10 @@ class CameraPage(ctk.CTkFrame):
             self.camGui.set_ui_active(True)
 
     def on_hide(self):
+        self.camGui.shutting_down = True
+        self.camGui.recordOff()
+        self.camGui.startStreamOffBool()
+        self.camGui.safely_close_playwindow()
         if hasattr(self.camGui, "set_ui_active"):
             self.camGui.set_ui_active(False)
 

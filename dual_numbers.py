@@ -151,7 +151,7 @@ def f(x: Dual_Number | float, y: Dual_Number | float):
 
 
 def g(x: Dual_Number | float):
-    return dn.sin(x)
+    return dn.sin(x * 2.0)
 
 
 def h(a: Dual_Number | float, b: Dual_Number | float, c: Dual_Number | float):
@@ -209,12 +209,12 @@ def main():
     print(break_str)
 
     z = 0.5
-    print("sin(z):")
+    print("sin(2z):")
     print(f'{z=}')
     print("Function value:")
     print(g(z))
     print("Partial with respect to z:")
-    print(np.cos(z))
+    print(2.0 * np.cos(2.0 * z))
     print("Dual Result:")
     print(deriv(g, z))
     print(break_str)

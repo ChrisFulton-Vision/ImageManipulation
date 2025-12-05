@@ -75,6 +75,47 @@ def build_timer_frames(checker_a, checker_b, flash_freq_hz, period, screen_width
 
     return timer_frame_a, timer_frame_b
 
+def build_squares_frames(checker_a,
+                       checker_b,
+                       screen_width,
+                       screen_height,
+                       now,
+                       squares_x,
+                       squares_y,
+                       hud_duration = 5.0):
+    timer_frame_a = checker_a.copy()
+    timer_frame_b = checker_b.copy()
+
+    org1 = (int(screen_width * 0.1), int(screen_height * 0.05))
+    org2 = (int(screen_width * 0.1), int(screen_height * 0.10))
+
+    instr_text_a = f'{squares_x - 1} inner row corners'
+    instr_text_b = f'{squares_y - 1} inner col corners'
+
+    # Draw on A
+    cv2.putText(timer_frame_a, instr_text_a, org1,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+    cv2.putText(timer_frame_a, instr_text_a, org1,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+    cv2.putText(timer_frame_a, instr_text_b, org2,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+    cv2.putText(timer_frame_a, instr_text_b, org2,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+
+    # Draw on B (same text)
+    cv2.putText(timer_frame_b, instr_text_a, org1,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+    cv2.putText(timer_frame_b, instr_text_a, org1,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+    cv2.putText(timer_frame_b, instr_text_b, org2,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+    cv2.putText(timer_frame_b, instr_text_b, org2,
+                cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+
+    display_until = now + hud_duration
+
+    return display_until, timer_frame_a, timer_frame_b
+
 def build_instr_frames(checker_a,
                        checker_b,
                        screen_width,
@@ -182,6 +223,8 @@ def main():
     frames_a = 0
     frames_b = 0
 
+    pause = False
+
     while True:
         now = time.perf_counter()
         dt = now - last_time
@@ -201,9 +244,9 @@ def main():
         # Choose which frame to display (HUD vs plain)
         show_hud = (display_until is not None and now < display_until)
         if show_hud:
-            frame = timer_frame_a if use_a else timer_frame_b
+            frame = timer_frame_a if (pause or use_a) else timer_frame_b
         else:
-            frame = checker_a if use_a else checker_b
+            frame = checker_a if (pause or use_a) else checker_b
 
         cv2.imshow(win_name, frame)
 
@@ -280,6 +323,9 @@ def main():
                 squares_y -= 1
             rebuild = True
 
+        elif key == 32:
+            pause = not pause
+
         # Any other key (non-255): show instructions overlay for a bit
         elif key != 255:
             display_until, timer_frame_a, timer_frame_b = build_instr_frames(
@@ -294,8 +340,8 @@ def main():
             checker_b = np.ones_like(checker_a) * 255
 
             # Refresh HUD variants too
-            timer_frame_a, timer_frame_b = build_timer_frames(
-                checker_a, checker_b, flash_freq_hz, period, screen_width, screen_height
+            display_until, timer_frame_a, timer_frame_b = build_squares_frames(
+                checker_a, checker_b, screen_width, screen_height, now, squares_x, squares_y
             )
             rebuild = False
 

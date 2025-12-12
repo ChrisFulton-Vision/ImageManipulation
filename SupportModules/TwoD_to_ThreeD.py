@@ -82,59 +82,80 @@ def h(est_q: q, est_t: np.array, feature_points, cal: Calibration):
     return us_vs_s_proj.flatten()
 
 
+def _skew(v: np.ndarray) -> np.ndarray:
+    """Return 3x3 skew-symmetric matrix [v]_x such that [v]_x w = v × w."""
+    vx, vy, vz = v
+    return np.array([
+        [0.0, -vz,  vy],
+        [vz,  0.0, -vx],
+        [-vy, vx,  0.0]
+    ], dtype=float)
+
+
 # --- Analytic Jacobian of h w.r.t. (q, t) -------------------------------------
 
-def deriv(est_q: q, est_t: np.array, feature_points, cal: Calibration):
-    """Return analytic Jacobian L = dh/dx evaluated at (est_q, est_t).
+def deriv(est_q: q, est_t: np.ndarray, feature_points, cal: Calibration):
+    """Analytic Jacobian L = dh/dx at (est_q, est_t) with minimal rotation params.
 
-    State ordering: x = [qs, qx, qy, qz, tx, ty, tz]^T  (7 parameters)
-    Output ordering matches `h()`: [u0, v0, u1, v1, ...] (2N measurements).
+    New state ordering (6 parameters):
+        x = [δr_x, δr_y, δr_z, tx, ty, tz]^T
 
-    This leverages the quaternion helper `est_q.transpose_vect_deriv(p)` which is
-    expected to produce d(X_cam)/dq for a model point `p`, already projected to
-    the tangent space of unit quaternions (right-projected onto the constraint).
+    where δr is a *small* Rodrigues / axis-angle increment in the camera frame
+    applied via: q_new = from_rodrigues(δr) * est_q.
 
     Returns
     -------
-    np.ndarray, shape (2N, 7)
-        Jacobian matrix.
+    L : np.ndarray, shape (2N, 6)
+        Jacobian of stacked [u0, v0, ...] w.r.t. [δr, t].
     """
 
     num_points = len(feature_points)
-    L = np.zeros((2 * num_points, 7))
+    L = np.zeros((2 * num_points, 6), dtype=float)
 
-    # Current camera-frame coordinates of each feature
-    xyz_proj = est_q * feature_points + est_t
+    # Current camera-frame coordinates of each feature:
+    #   X_cam = R(q) X + t
+    xyz_cam = est_q * feature_points + est_t          # shape (N, 3)
 
-    # Unpack for compact per-point derivatives of the projection
-    X_hat, Y_hat, Z_hat = xyz_proj[:, 0], xyz_proj[:, 1], xyz_proj[:, 2]
+    # R(q) X part only (rotation without translation)
+    RX = xyz_cam - est_t                              # shape (N, 3)
 
-    # Loop over features to accumulate per-point analytic derivatives
-    for idx, feature in enumerate(feature_points):
-        # new_deriv is the 3x4 Jacobian d(X_cam)/d[q s qx qy qz] for this point
-        new_deriv = est_q.vect_deriv(feature, False)
+    X_hat, Y_hat, Z_hat = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
 
-        # Translation effect on camera-frame coords is identity
-        # dx_dtx, dy_dty, dz_dtz = 1.0, 1.0, 1.0
+    for idx, (Xw, RXi) in enumerate(zip(feature_points, RX)):
+        # Projection partials for this point:
+        #   u = fx * (x / z) + cx
+        #   v = fy * (y / z) + cy
+        z = Z_hat[idx]
+        x = X_hat[idx]
+        y = Y_hat[idx]
 
-        # Projection partials for u, v with respect to x, y, z at this point
-        #   u = FX * (  x / z ) + CX =>  du/dx =  FX / z, du/dz = -FX * x / z^2
-        #   v = FY * (  y / z ) + CY =>  dv/dy =  FY / z, dv/dz = -FY * y / z^2
-        du_dX = cal.fx / Z_hat[idx]
-        du_dZ = -cal.fx * X_hat[idx] / sq(Z_hat[idx])
+        du_dX = cal.fx / z
+        du_dZ = -cal.fx * x / (z * z)
 
-        dv_dY = cal.fy / Z_hat[idx]
-        dv_dZ = -cal.fy * Y_hat[idx] / sq(Z_hat[idx])
+        dv_dY = cal.fy / z
+        dv_dZ = -cal.fy * y / (z * z)
 
-        dUV_dXYZ = np.array([[du_dX, 0.0, du_dZ],
-                           [0.0, dv_dY, dv_dZ]])
+        dUV_dXYZ = np.array([
+            [du_dX,    0.0,   du_dZ],
+            [0.0,      dv_dY, dv_dZ],
+        ], dtype=float)
 
-        L[2*idx:2*idx+2, 0:4] = dUV_dXYZ @ new_deriv
+        # Rotation Jacobian: δX_cam = -[R X]_x δr
+        J_rot = -_skew(RXi)                           # 3x3
 
-        # Translation columns (∂(X,Y,Z)/∂t = I)
-        L[2*idx:2*idx+2, 4:7] = dUV_dXYZ
+        # Translation Jacobian: δX_cam = δt
+        J_trans = np.eye(3, dtype=float)              # 3x3
+
+        # Project to image:
+        L_block_rot = dUV_dXYZ @ J_rot                # 2x3
+        L_block_trans = dUV_dXYZ @ J_trans            # 2x3
+
+        row = 2 * idx
+        L[row:row + 2, 0:3] = L_block_rot
+        L[row:row + 2, 3:6] = L_block_trans
 
     return L
+
 
 
 def print_rayPts(ray_proj: np.array):
@@ -146,25 +167,22 @@ def print_rayPts(ray_proj: np.array):
 
 
 def opt(img_pts: NDArray, object_pts: NDArray,
-        cal: Calibration, seed_q: q = None, seed_t: NDArray = None, sigma_squared: NDArray = None):
+        cal: Calibration, seed_q: q = None, seed_t: NDArray = None,
+        trust_weighting: NDArray = None):
     """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
 
-    Uses the analytic Jacobian `deriv`, a pseudoinverse step `delta_x`, and a
-    simple backtracking line search on a scalar `scale` to accept/reject the step
-    based on the agreement between linear prediction and actual residual change.
+    Uses a *minimal* 6D state:
+        x = [δr_x, δr_y, δr_z, δt_x, δt_y, δt_z]^T
 
-    Termination conditions:
-      - Small step (norm(scale * delta_x) < 1e-7)
-      - Iteration limit reached (iter > 10)
+    where δr is a small Rodrigues vector in the camera frame, applied via:
+        q_new = Quaternion.from_rodrigues(δr) * q_old
 
-    Returns
-    -------
-    (est_q, est_t)
-        The refined quaternion and translation.
+    Translation is updated additively: t_new = t_old + δt.
     """
 
+    # ----------------- Initialization -----------------
     if seed_q is None or seed_t is None:
-        est_q, est_t = DLT(object_pts, img_pts, cal, sigma_squared)
+        est_q, est_t = DLT(object_pts, img_pts, cal, trust_weighting)
     else:
         est_q = deepcopy(seed_q)
         est_t = deepcopy(seed_t)
@@ -176,31 +194,47 @@ def opt(img_pts: NDArray, object_pts: NDArray,
     while keep_going:
         iter_num += 1
 
+        # Residual and Jacobian at current pose
         y = meas_pix - h(est_q, est_t, object_pts, cal)
         old_y_mag = norm(y)
-        L = deriv(est_q, est_t, object_pts, cal)
+        L = deriv(est_q, est_t, object_pts, cal)      # (2N, 6)
 
-        if sigma_squared is not None:
-            Q = np.diag(1.0 / sigma_squared)
+        if trust_weighting is not None:
+            Q = np.diag(trust_weighting)
             y = Q.dot(y)
             L = Q.dot(L)
         else:
             Q = None
 
-        delta_x = np.linalg.pinv(L).dot(y)
+        # ------------- Damped normal equations -------------
+        lam = 1e-1  # tune; 1e-4 to 1e-1 is a reasonable range
+        LtL = L.T @ L                                  # (6, 6)
+        Lty = L.T @ y                                  # (6,)
 
+        LAMBDA = lam * np.eye(LtL.shape[0])
+
+        LtL_damped = LtL + LAMBDA
+
+        delta_x = np.linalg.solve(LtL, Lty)     # (6,)
+
+        # ------------- Backtracking line search -------------
         scale = 1.0
         scale_is_good = False
         while not scale_is_good:
-            # Trial step
+            delta_r = scale * delta_x[0:3]
+            delta_t = scale * delta_x[3:6]
+
+            trial_q = q.from_rodrigues(delta_r) * est_q
+            trial_t = est_t + delta_t
+
             if Q is not None:
                 new_y_mag = norm(Q.dot(
-                    meas_pix - h(q(s=float(est_q.s + scale * delta_x[0]), vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:], object_pts, cal)))
+                    meas_pix - h(trial_q, trial_t, object_pts, cal)
+                ))
             else:
                 new_y_mag = norm(
-                    meas_pix - h(q(s=float(est_q.s + scale * delta_x[0]), vec=est_q.vec + scale * delta_x[1:4]),
-                                 est_t + scale * delta_x[4:], object_pts, cal))
+                    meas_pix - h(trial_q, trial_t, object_pts, cal)
+                )
 
             # Linear prediction of residual magnitude
             y_pred_mag = norm(y - L.dot(scale * delta_x))
@@ -211,25 +245,48 @@ def opt(img_pts: NDArray, object_pts: NDArray,
                 keep_going = False
             else:
                 # Accept step if the ratio is in a reasonable trust range
-                ratio = (old_y_mag - new_y_mag) / (old_y_mag - y_pred_mag)
+                denom = (old_y_mag - y_pred_mag)
+                if denom == 0:
+                    ratio = 0.0
+                else:
+                    ratio = (old_y_mag - new_y_mag) / denom
+
                 if 0.25 < ratio < 4.0:
                     scale_is_good = True
-                    est_q = q(
-                        s=float(est_q.s + scale * delta_x[0]),
-                        vec=est_q.vec + scale * delta_x[1:4],
-                    )
-                    est_t += scale * delta_x[4:]
+                    # Commit step
+                    est_q = q.from_rodrigues(delta_r) * est_q
+                    est_t = est_t + delta_t
                 else:
                     # Backtrack
                     scale /= 2.0
+                    if scale < 1e-4:
+                        # Don't get stuck forever
+                        scale_is_good = True
 
-        if norm(scale * delta_x) < 1e-7 or iter_num > 10:
+        # ------------- Termination -------------
+        if norm(scale * delta_x) < 1e-7 or iter_num > 20:
             keep_going = False
 
+    # Enforce sign convention once at the end
+    est_q.force_s_pos()
     return est_q, est_t
 
 
-def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, sigma_squared: np.array = None):
+def enforce_chirality(q_est, t_est, object_pts, cal):
+    # Camera-frame points
+    XYZ = q_est * object_pts + t_est
+    Z = XYZ[:, 2]
+
+    front_fraction = np.mean(Z > 0.0)
+
+    # If most points are behind the camera, flip
+    if front_fraction < 0.5:
+        q_est = q(-q_est.s, -q_est.vec)
+        t_est = -t_est
+        return True, q_est, t_est,
+    return False, q_est, t_est
+
+def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, trust_weighting: np.array = None):
 
     num_points = len(img_pts)
 
@@ -242,8 +299,8 @@ def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, sigma_squared: 
         A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
         A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
 
-    if sigma_squared is not None:
-        Q = np.diag(1.0 / sigma_squared)
+    if trust_weighting is not None:
+        Q = np.diag( trust_weighting)
         A = Q @ A
 
     # 2. Solve the linear system Ap = 0 using SVD
@@ -315,41 +372,72 @@ def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
     t, *_ = np.linalg.lstsq(A, b, rcond=None)
     return t
 
-def solveQnP(object_pts: np.array, img_pts: np.array, cal: Calibration, sigma_squared=None):
+
+def solveQnP(object_pts: np.array,
+             img_pts: np.array,
+             cal: Calibration,
+             trust_weighting=None,
+             user_seed_q=None,
+             user_seed_t=None):
     """
-    :param object_pts: Truth Object Points
-    :param img_pts: Detected Feature points in image
-    :param cal: Camera calibration from Calibration.py
-    :param sigma_squared:
-    :return:
+    Quaternion-based PnP solver.
+
+    - If user_seed_q / user_seed_t are provided, they are used as the initial pose.
+    - Otherwise, we initialize with a DLT pose, then refine with Gauss–Newton (opt).
+    - Optional 'trust_weighting' (length 2N) down-weights residuals in pixel space
+      during the nonlinear refinement (but not in DLT).
     """
+    trust_weighting = np.ones(img_pts.size)
+    trust_weighting[0] = trust_weighting[1] = 0.1
 
-    # sigma_squared = np.ones(2 * len(object_pts))
-    # sigma_squared[0] = 100.0
-    # sigma_squared[1] = 100.0
+    # ------------------------------------------------------------------
+    # 1) Choose a good initial seed
+    # ------------------------------------------------------------------
+    if (user_seed_q is not None) and (user_seed_t is not None):
+        # Use caller-provided seed (e.g., previous frame, or PnP pose)
+        seed_q = deepcopy(user_seed_q)
+        seed_t = deepcopy(user_seed_t)
+    else:
+        # Use DLT initializer to mirror PnP-style behavior
+        seed_q, seed_t = DLT(object_pts, img_pts, cal, trust_weighting=trust_weighting)
 
-    q_init, t_init = DLT(object_pts, img_pts, cal, sigma_squared)
-    est_q, est_t = opt(img_pts, object_pts, cal, seed_q=q_init, seed_t=t_init, sigma_squared=sigma_squared)
-    if est_t[0] < 0.5:
-        est_t *= -1.0
 
-        est_q, est_t = opt(img_pts, object_pts, cal, seed_q=q(), seed_t=est_t, sigma_squared=sigma_squared)
+    # ------------------------------------------------------------------
+    # 2) Nonlinear refinement around the seed (Gauss–Newton / LM-like)
+    #    This is where trust_weighting gives us an advantage over PnP.
+    # ------------------------------------------------------------------
+    est_q, est_t = opt(
+        img_pts,
+        object_pts,
+        cal,
+        seed_q=seed_q,
+        seed_t=seed_t,
+        trust_weighting=trust_weighting,
+    )
 
-    # est_q, est_t = q_init, t_init
+    # ------------------------------------------------------------------
+    # 3) Enforce chirality (points in front of camera), then optionally
+    #    re-optimize from the corrected pose.
+    # ------------------------------------------------------------------
+    # flipped, est_q, est_t = enforce_chirality(est_q, est_t, object_pts, cal)
+    # if flipped:
+    #     # Small re-optimization starting from the chirality-corrected pose
+    #     est_q, est_t = opt(
+    #         img_pts,
+    #         object_pts,
+    #         cal,
+    #         seed_q=est_q,
+    #         seed_t=est_t,
+    #         trust_weighting=trust_weighting,
+    #     )
 
+    # ------------------------------------------------------------------
+    # 4) Clean up quaternion sign convention (avoid random sign flips)
+    # ------------------------------------------------------------------
     est_q.force_s_pos()
 
-    # est_q, est_t = _post_refine_flip_biside(est_q, est_t, img_pts, object_pts, cal, min_ch=0.90, margin_px=100.0)
-
-    # print(f'Residual: {norm(img_pts - h(est_q, est_t, object_pts, cal))}')
-    # print(f'Init: {init_q}, {init_t}')
-    # print(f'InitM: \n{quat2mat(init_q)}')
-    # print(f'Est: {est_q}, {est_t}')
-    # print(f'EstM: \n{quat2mat(est_q)}')
-    # print(f'EstT: \n{est_t}')
-    # print(f'Trans: \n{quat2mat(init_q) @ quat2mat(est_q.T)}')
-    # print(f'Ang Between (deg): {est_q.angle_betweenD(init_q)}\n\n')
     return est_q, est_t
+
 
 
 if __name__ == '__main__':

@@ -21,7 +21,7 @@ from cv2 import (CALIB_ZERO_TANGENT_DIST, CALIB_FIX_ASPECT_RATIO, CALIB_FIX_PRIN
                  EVENT_FLAG_LBUTTON, rectangle, EVENT_LBUTTONUP, findChessboardCorners, ADAPTIVE_THRESH_GAUSSIAN_C,
                  findCirclesGrid, estimateChessboardSharpness, TERM_CRITERIA_MAX_ITER, TERM_CRITERIA_EPS, cornerSubPix,
                  drawChessboardCorners, fisheye, initCameraMatrix2D, CALIB_USE_INTRINSIC_GUESS, calibrateCameraROExtended,
-                 calibrationMatrixValues)
+                 calibrationMatrixValues, CALIB_FIX_FOCAL_LENGTH)
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
 
@@ -196,23 +196,11 @@ class CalibrateGui(CTkFrame):
         self.nextPageBtn = None
         self.lastPageBtn = None
 
-        ##########################################################################
-        # Calibration Frame Setup
-        self.calFrame = CTkFrame(master=self)
+        self.saveCalButton = None
+        self.scale864Button = None
+        self.scale2848Button = None
+        self.scaleAnyButton = None
 
-        self.calFrame.grid_rowconfigure([0, 1], weight=1)
-        self.calFrame.grid_columnconfigure([0], weight=1)
-        self.calLabel = None
-
-        ##########################################################################
-        # Custom TKinter Configuration Setup
-        self.configFrame = CTkFrame(master=self)
-        self.stoppingIterationEntry = CTkEntry(master=self.configFrame)
-        self.stoppingIterationButton = CTkButton(master=self.configFrame, text='Update',
-                                                     command=self.stoppingCritIterUpdate)
-        self.stoppingMinStepSizeEntry = CTkEntry(master=self.configFrame)
-        self.stoppingMinStepSizeButton = CTkButton(master=self.configFrame, text='Update',
-                                                       command=self.stoppingCritMinStepSizeUpdate)
         ##########################################################################
         # Now Initialize the buttons on the main frame
         self.selectFolderButton = None
@@ -497,24 +485,30 @@ class CalibrateGui(CTkFrame):
 
         f = CTkFrame(master_frame)
         # If we have a previous calibration
+        self.saveCalButton = CTkButton(master=f, text='Save Calibration')
+        self.saveCalButton.configure(command=lambda btn=self.saveCalButton: self.saveCal(btn))
+        self.saveCalButton.grid(row=0, column=0, padx=5, pady=5)
+
+        scale864Button = CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
+        scale864Button.grid(row=3, column=0, padx=5, pady=5)
+        scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
+        scale2848Button.grid(row=4, column=0, padx=5, pady=5)
+        scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
+        scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
+
         if self.imageConfig.camCal.validCal:
             # Then display the calibration
-            saveCalButton = CTkButton(master=f, text='Save Calibration')
-            saveCalButton.configure(command=lambda btn=saveCalButton: self.saveCal(btn))
-            saveCalButton.grid(row=0, column=0, padx=5, pady=5)
 
             self.calLabel = CTkLabel(master=f, text=self.imageConfig.camCal.calStr, justify='center', anchor='w')
             self.calLabel.grid(row=1, column=0, padx=5, pady=5)
-
-            scale864Button = CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
-            scale864Button.grid(row=3, column=0, padx=5, pady=5)
-            scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
-            scale2848Button.grid(row=4, column=0, padx=5, pady=5)
-            scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
-            scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
         else:
             self.calLabel = CTkLabel(f, text="No calibration calculated yet.", justify='center')
             self.calLabel.grid(row=0, column=0, padx=5, pady=5)
+            self.saveCalButton.configure(state='disabled')
+            self.scale864Button.configure(state='disabled')
+            self.scale2848Button.configure(state='disabled')
+            self.scaleAnyButton.configure(state='disabled')
+
         return f
 
     def scaleTo864(self):
@@ -538,27 +532,31 @@ class CalibrateGui(CTkFrame):
         except ValueError:
             print('Invalid input. Please input only an integer.')
 
-    def updateConfigWindow(self):
+    def updateConfigWindow(self, master_frame):
         rowID = 0
         values = [1, 10, 100, 1000]
-        stoppingIterationLabel = CTkLabel(master=self.configFrame, text='Max Iterations: ')
+        f = CTkFrame(master_frame)
+
+        stoppingIterationLabel = CTkLabel(master=f, text='Max Iterations: ')
         stoppingIterationLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.stoppingIterationEntry.configure(placeholder_text=str(self.imageConfig.maxIter))
-        self.stoppingIterationEntry.bind('<Return>', self.stoppingCritIterUpdate)
+        stoppingIterationEntry = CTkEntry(master=f, placeholder_text=str(self.imageConfig.maxIter))
+        stoppingIterationEntry.bind('<Return>', lambda event, x=stoppingIterationEntry: self.stoppingCritIterUpdate(x))
 
-        self.stoppingIterationEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        self.stoppingIterationButton.grid(row=rowID, column=2, padx=5, pady=5)
+        stoppingIterationEntry.grid(row=rowID, column=1, padx=5, pady=5)
+        # self.stoppingIterationButton.grid(row=rowID, column=2, padx=5, pady=5)
         rowID += 1
 
-        stoppingMinStepSizeLabel = CTkLabel(master=self.configFrame, text='Stopping Min Step Size: ')
+        stoppingMinStepSizeLabel = CTkLabel(master=f, text='Stopping Min Step Size: ')
         stoppingMinStepSizeLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.stoppingMinStepSizeEntry.configure(placeholder_text=str(self.imageConfig.minStepSize))
-        self.stoppingMinStepSizeEntry.bind('<Return>', self.stoppingCritMinStepSizeUpdate)
-        self.stoppingMinStepSizeEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        self.stoppingMinStepSizeButton.grid(row=rowID, column=2, padx=5, pady=5)
+
+        stoppingMinStepSizeEntry = CTkEntry(master=f, placeholder_text=str(self.imageConfig.minStepSize))
+        stoppingMinStepSizeEntry.bind('<Return>',
+                                      lambda event, x=stoppingMinStepSizeEntry:
+                                        self.stoppingCritMinStepSizeUpdate(x))
+        stoppingMinStepSizeEntry.grid(row=rowID, column=1, padx=5, pady=5)
         rowID += 1
 
-        fixPrincipalPointCB = CTkCheckBox(master=self.configFrame, text='Fix Principle Point', checkbox_height=20)
+        fixPrincipalPointCB = CTkCheckBox(master=f, text='Fix Principle Point', checkbox_height=20)
         if self.imageConfig.fixPrincipalPoint:
             fixPrincipalPointCB.select()
         else:
@@ -567,7 +565,7 @@ class CalibrateGui(CTkFrame):
         fixPrincipalPointCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
         rowID += 1
 
-        fixAspectRatioCB = CTkCheckBox(master=self.configFrame, text='Fix Aspect Ratio', checkbox_height=20)
+        fixAspectRatioCB = CTkCheckBox(master=f, text='Fix Aspect Ratio', checkbox_height=20)
         if self.imageConfig.fixAspectRatio:
             fixAspectRatioCB.select()
         else:
@@ -576,32 +574,34 @@ class CalibrateGui(CTkFrame):
         fixAspectRatioCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
         rowID += 1
 
-        zeroTangentDistCB = CTkCheckBox(master=self.configFrame, text='Zero Tangent Distance', checkbox_height=20)
+        zeroTangentDistCB = CTkCheckBox(master=f, text='Zero Tangent Distance', checkbox_height=20)
         if self.imageConfig.zeroTangentDist:
             zeroTangentDistCB.select()
         else:
             zeroTangentDistCB.deselect()
         zeroTangentDistCB.configure(command=self.toggleZeroTangentDist)
         zeroTangentDistCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
-        rowID += 1
 
-        backToMainButton = CTkButton(master=self.configFrame, text='Go back', command=self.returnToMain)
-        backToMainButton.grid(row=rowID, column=1, padx=5, pady=5)
+        return f
 
     def stoppingCritMinStepSizeUpdate(self, entry=None):
         try:
-            newStep = float(self.stoppingMinStepSizeEntry.get())
+            newStep = float(entry.get())
         except ValueError:
             newStep = None
+            entry.delete(0, END)
+            entry.insert(0, str(self.imageConfig.maxIter))
+            return
+
         if isinstance(newStep, float) and newStep > 0:
             self.imageConfig.minStepSize = newStep
         else:
-            self.stoppingMinStepSizeEntry.delete(0, END)
-            self.stoppingMinStepSizeEntry.insert(0, str(self.imageConfig.minStepSize))
+            entry.delete(0, END)
+            entry.insert(0, str(self.imageConfig.minStepSize))
         self.saveToCache()
-        self.stoppingMinStepSizeButton.configure(fg_color='yellow')
-        self.stoppingMinStepSizeButton.after(1, self.update_idletasks())
-        self.stoppingMinStepSizeButton.after(500, self.restoreMinSizeButton())
+        entry.configure(fg_color='yellow')
+        entry.after(1, self.update_idletasks())
+        entry.after(500, entry.configure(fg_color='green'))
 
     def restoreMinSizeButton(self):
         self.stoppingMinStepSizeButton.configure(fg_color=GREEN)
@@ -611,18 +611,16 @@ class CalibrateGui(CTkFrame):
 
     def stoppingCritIterUpdate(self, entry=None):
         try:
-            newIter = int(self.stoppingIterationEntry.get())
+            newIter = int(entry.get())
         except ValueError:
-            newIter = None
-        if isinstance(newIter, int) and newIter > 0:
-            self.imageConfig.maxIter = newIter
-        else:
-            self.stoppingIterationEntry.delete(0, END)
-            self.stoppingIterationEntry.insert(0, str(self.imageConfig.maxIter))
+            entry.delete(0, END)
+            entry.insert(0, str(self.imageConfig.maxIter))
+            return
+        self.imageConfig.maxIter = newIter
         self.saveToCache()
-        self.stoppingIterationButton.configure(fg_color='yellow')
-        self.stoppingIterationButton.after(1, self.update_idletasks())
-        self.stoppingIterationButton.after(500, self.restoreIterationButton())
+        entry.configure(fg_color='yellow')
+        entry.after(1, self.update_idletasks())
+        entry.after(500, entry.configure(fg_color=GREEN))
 
     def toggleZeroTangentDist(self):
         self.imageConfig.zeroTangentDist = not self.imageConfig.zeroTangentDist
@@ -1392,7 +1390,7 @@ class CalibrateGui(CTkFrame):
             max_Y = min(int(np.max(imgClass.imgPts[:, :, 1] + 100)), img.shape[0])
 
             roi = img[min_Y:max_Y, min_X:max_X, :]
-
+            roi = resize(roi, (img.shape[0], img.shape[1]))
             imshow('Chessboard Corners Detected', roi)
             waitKey(0)
         else:
@@ -1477,6 +1475,7 @@ class CalibrateGui(CTkFrame):
             K0 = initCameraMatrix2D(objPoints, imgPoints, gray.shape[::-1], 0)
 
             flags = (self.imageConfig.flags or 0) | CALIB_USE_INTRINSIC_GUESS
+
             criteria = (TERM_CRITERIA_EPS + TERM_CRITERIA_MAX_ITER,
                         self.imageConfig.maxIter,  # e.g. 30–50 is usually enough
                         self.imageConfig.minStepSize)  # e.g. 1e-6..1e-5
@@ -1485,7 +1484,7 @@ class CalibrateGui(CTkFrame):
                 objectPoints=objPoints,
                 imagePoints=imgPoints,
                 imageSize=gray.shape[::-1],
-                iFixedPoint=1,  # keep if you really want RO; otherwise use calibrateCamera(...)
+                iFixedPoint=1,
                 cameraMatrix=K0,
                 distCoeffs=None,
                 flags=flags,
@@ -1522,3 +1521,8 @@ class CalibrateGui(CTkFrame):
                                                rms=ret, timeOfCompute=datetime.datetime.now())
 
         self.calLabel.configure(text=self.imageConfig.camCal.calStr)
+
+        self.saveCalButton.configure(state='normal')
+        self.scale864Button.configure(state='normal')
+        self.scale2848Button.configure(state='normal')
+        self.scaleAnyButton.configure(state='normal')

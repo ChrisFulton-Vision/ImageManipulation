@@ -78,6 +78,7 @@ class CalibratePage(ctk.CTkFrame):
         self.sections = {
             "Configuration": self._make_setupPage(),
             "Images": self._make_ImagePage(),
+            "Config": self._make_configPage(),
             "Cal Result": self._make_calibrationPage(),
         }
         # show default section
@@ -93,6 +94,9 @@ class CalibratePage(ctk.CTkFrame):
 
     def _make_calibrationPage(self):
         return self.calPage.setup_CalFrame(self)
+
+    def _make_configPage(self):
+        return self.calPage.updateConfigWindow(self)
 
     def submenu_footer(self):
         def on_toggle(btn: ctk.CTkButton):

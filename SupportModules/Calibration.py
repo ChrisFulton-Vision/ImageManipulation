@@ -1,3 +1,4 @@
+import copy
 import os
 import pickle as pkl
 import re
@@ -5,13 +6,21 @@ from datetime import datetime
 from os.path import join
 
 import numpy as np
+from PixelHandler import Pixel as pxl
+
+
 
 class Calibration:
     def __init__(self, filepath=None):
+        # cache bits first so __setattr__ can use them safely
+        self._validCal_dirty = True
+        self._validCal_cache = False
+
         self.fx = None
         self.fy = None
         self.cx = None
         self.cy = None
+
         self.k1 = None
         self.k2 = None
         self.p1 = None
@@ -24,13 +33,20 @@ class Calibration:
         self.width = None
         self.height = None
         self.hfov = None
-        self.fisheye = None
+        self.has_tangential = False
+        self.fisheye = False
         self.calDatetime = None
 
         self.scale = 1.0
 
         if filepath is not None:
             self.fromFile(filepath)
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name in getattr(self, "_VALID_FIELDS", ()):
+            # any change to these means validity might have changed
+            object.__setattr__(self, "_validCal_dirty", True)
 
     def __str__(self):
         return self.calStr
@@ -282,40 +298,37 @@ class Calibration:
         else:
             return False
 
-    @property
-    def validCal(self):
-        if self.fisheye and any([self.fx is None,
-                self.fy is None,
-                self.cx is None,
-                self.cy is None,
-                self.k1 is None,
-                self.k2 is None,
-                self.k3 is None,
-                self.k4 is None,
-                self.calTime is None,
-                self.numCBUsed is None,
-                self.rmsError is None,
-                self.width is None,
-                self.height is None,
-                self.hfov is None]):
+    def _compute_validCal(self) -> bool:
+        # (this is your existing logic, just moved into a function)
+        if self.fisheye and any([
+            self.fx is None, self.fy is None, self.cx is None, self.cy is None,
+            self.k1 is None, self.k2 is None, self.k3 is None, self.k4 is None,
+            self.calTime is None, self.numCBUsed is None, self.rmsError is None,
+            self.width is None, self.height is None, self.hfov is None
+        ]):
             return False
-        elif not self.fisheye and any([self.fx is None,
-                self.fy is None,
-                self.cx is None,
-                self.cy is None,
-                self.k1 is None,
-                self.k2 is None,
-                self.p1 is None,
-                self.p2 is None,
-                self.k3 is None,
-                self.calTime is None,
-                self.numCBUsed is None,
-                self.rmsError is None,
-                self.width is None,
-                self.height is None,
-                self.hfov is None]):
+        elif not self.fisheye and any([
+            self.fx is None, self.fy is None, self.cx is None, self.cy is None,
+            self.k1 is None, self.k2 is None, self.p1 is None, self.p2 is None, self.k3 is None,
+            self.calTime is None, self.numCBUsed is None, self.rmsError is None,
+            self.width is None, self.height is None, self.hfov is None
+        ]):
             return False
+        self.has_tangential = self.p1 != 0.0 or self.p2 != 0.0
         return True
+
+    @property
+    def validCal(self) -> bool:
+        '''
+        >>> cal = default_864_cam()
+        >>> assert cal.validCal
+        >>> cal2 = default_2848_cam()
+        >>> assert cal2.validCal
+        '''
+        if self._validCal_dirty:
+            self._validCal_cache = self._compute_validCal()
+            self._validCal_dirty = False
+        return self._validCal_cache
 
     def scaleCalibration(self, newWidth: int):
 
@@ -323,3 +336,527 @@ class Calibration:
             raise ValueError('Invalid Calibration. Missing necessary parameter.')
 
         self.scale = newWidth / self.width
+
+    def havePix_needNorm(self, pixel: pxl):
+        '''
+        >>> cal = default_864_cam()
+        >>> p = pxl(pix_coords=(cal.cx, cal.cy))
+        >>> cal.havePix_needNorm(p)
+        >>> assert round(p.norm_coords[0], 12) == 0.0
+        >>> assert  round(p.norm_coords[1], 12) == 0.0
+
+        >>> cal = default_2848_cam()
+        >>> p = pxl(pix_coords=(cal.cx, cal.cy))
+        >>> cal.havePix_needNorm(p)
+        >>> assert round(p.norm_coords[0], 12) == 0.0
+        >>> assert  round(p.norm_coords[1], 12) == 0.0
+        '''
+        if not self.validCal:
+            raise ValueError("Calibration invalid.")
+        if pixel.pix_coords is not None:
+            pixel.norm_coords = [(pixel.pix_coords[0] - self.cx)/self.fx,
+                                (pixel.pix_coords[1] - self.cy)/self.fy]
+            return
+        raise ValueError("Pix_coords must exist before calling this function.")
+
+    def haveNorm_needPix(self, pixel: pxl):
+        '''
+        >>> cal = default_864_cam()
+        >>> p = pxl(pix_coords=(cal.cx, cal.cy))
+        >>> cal.havePix_needNorm(p)
+        >>> assert round(p.norm_coords[0], 12) == 0.0
+        >>> assert  round(p.norm_coords[1], 12) == 0.0
+        '''
+        if not self.validCal:
+            raise ValueError("Calibration invalid.")
+        if pixel.norm_coords is not None:
+            pixel.pix_coords = [pixel.norm_coords[0] * self.fx + self.cx,
+                                pixel.norm_coords[1] * self.fy + self.cy]
+            return
+        raise ValueError("Norm_coords must exist before calling this function.")
+
+    def distort_point(self, pixel: pxl):
+        '''
+        >>> cal = default_864_cam()
+        >>> p = pxl(pix_coords=(700.0, 250.0))
+        >>> cal.undistort_point(p)
+        >>> cal.distort_point(p)
+        >>> first = p.pix_coords.copy()
+        >>> cal.distort_point(p)
+        >>> assert p.pix_coords == first
+        >>> assert not p.is_undistorted
+
+        >>> cal = default_864_cam()
+        >>> p = pxl(norm_coords=(0.12, -0.08), already_undistorted=True)
+        >>> orig = p.norm_coords.copy()
+        >>> cal.distort_point(p)
+        >>> cal.undistort_point(p)
+        >>> assert abs(p.norm_coords[0]-orig[0]) < 1e-10 and abs(p.norm_coords[1]-orig[1]) < 1e-10
+        '''
+        if not pixel.is_undistorted:
+            return
+        if not self.validCal:
+            raise ValueError("Trying to unproject points, but calibration isn't complete.")
+        if pixel.pix_coords is None and pixel.norm_coords is None:
+            raise ValueError("Pixel doesn't have any coordinates.")
+
+        if pixel.norm_coords is None:
+            self.havePix_needNorm(pixel)
+
+        nx, ny = pixel.norm_coords
+        xy = nx*ny
+        r_sqd = nx*nx + ny*ny
+
+        L = 1 + r_sqd * (self.k1 + r_sqd * (self.k2 + r_sqd * self.k3))
+        del_x = 2.0 * self.p1 * xy + self.p2 * (r_sqd + 2.0 * nx * nx)
+        del_y = self.p1 * (r_sqd + 2.0 * ny * ny) + 2.0 * self.p2 * xy
+
+        pixel.norm_coords = [nx * L + del_x, ny * L + del_y]
+        self.haveNorm_needPix(pixel)
+        pixel.is_undistorted = False
+
+    def undistort_point(self, pixel: pxl):
+        '''
+        >>> cal = default_864_cam()
+        >>> p = pxl(pix_coords=(700.0, 250.0))
+        >>> cal.undistort_point(p)
+        >>> first = p.pix_coords.copy()
+        >>> cal.undistort_point(p)
+        >>> assert p.pix_coords == first
+        >>> assert p.is_undistorted
+
+        >>> cal = default_864_cam()
+        >>> p = pxl(pix_coords=(700.0, 250.0))
+        >>> orig = p.pix_coords.copy()
+        >>> cal.undistort_point(p)
+        >>> cal.distort_point(p)
+        >>> err = ((p.pix_coords[0]-orig[0])**2 + (p.pix_coords[1]-orig[1])**2) ** 0.5
+        >>> assert err < 1e-6
+
+        >>> cal = default_864_cam()
+        >>> p = pxl(norm_coords=(0.2, 0.1), already_undistorted=True)
+        >>> orig = p.norm_coords.copy()
+        >>> cal.distort_point(p)
+        >>> assert (abs(p.norm_coords[0]-orig[0]) + abs(p.norm_coords[1]-orig[1])) > 0.0
+
+        >>> cal = default_864_cam()
+        >>> # start with an undistorted cam point, distort it to get a synthetic measurement
+        >>> pu = pxl(norm_coords=(0.25, -0.15), already_undistorted=True)
+        >>> cal.distort_point(pu)                 # now pu.norm_coords is distorted
+        >>> xd, yd = pu.norm_coords
+        >>> # now undistort back
+        >>> cal.undistort_point(pu)
+        >>> xu, yu = pu.norm_coords
+        >>> # forward-distort xu,yu and compare to xd,yd
+        >>> test = pxl(norm_coords=(xu, yu), already_undistorted=True)
+        >>> cal.distort_point(test)
+        >>> assert abs(test.norm_coords[0]-xd) < 1e-10 and abs(test.norm_coords[1]-yd) < 1e-10
+        '''
+        if pixel.is_undistorted:
+            return
+        if pixel.pix_coords is None and pixel.norm_coords is None:
+            raise ValueError("Pixel doesn't have any coordinates.")
+        if not self.validCal:
+            raise ValueError("Trying to unproject points, but calibration isn't complete.")
+
+        if pixel.norm_coords is None:
+            self.havePix_needNorm(pixel)
+
+        def cleanup(pixel: pxl, Nx: float, Ny: float):
+            pixel.norm_coords = [Nx, Ny]
+            self.haveNorm_needPix(pixel)
+            pixel.is_undistorted = True
+
+        kMinAbsL = 1e-12
+        kMinRes = 1e-14
+        kMinAbsDet = 1e-18
+
+        x_d = pixel.norm_coords[0]
+        y_d = pixel.norm_coords[1]
+
+        new_x = copy.deepcopy(x_d)
+        new_y = copy.deepcopy(y_d)
+
+        # 2 Fixed Point Iterations
+        def compute_L_and_tangential(_x : float, _y : float) -> tuple[float, float, float, float]:
+            x2 = _x * _x
+            y2 = _y * _y
+            r2 = x2 + y2
+
+            L = 1.0 + r2 * (self.k1 + r2 * (self.k2 + r2 * self.k3))
+
+            dL_dr2 = self.k1 + (2.0*self.k2 + 3.0*self.k3*r2)*r2
+
+            if not self.has_tangential:
+                return L, dL_dr2, 0.0, 0.0
+
+            xy = _x * _y
+            dx = 2.0 * self.p1 * xy + self.p2 * (r2 + 2.0 * x2)
+            dy = self.p1 * ( r2 + 2.0 * y2) + 2.0 * self.p2 * xy
+
+            return L, dL_dr2, dx, dy
+
+        for _ in range(2):
+            L, dL_dr2, dx, dy = compute_L_and_tangential(new_x, new_y)
+            if abs(L) < kMinAbsL:
+                cleanup(pixel, new_x, new_y)
+                return
+
+            new_x = (x_d - dx) / L
+            new_y = (y_d - dy) / L
+
+        # 1 Newton Cleanup
+        L, dL_dr2, dx, dy = compute_L_and_tangential(new_x, new_y)
+
+        x2 = new_x * new_x
+        y2 = new_y * new_y
+
+        dL_dx = 2.0 * new_x * dL_dr2
+        dL_dy = 2.0 * new_y * dL_dr2
+
+        ddx_dx = ddx_dy = ddy_dx = ddy_dy = 0.0
+        if self.has_tangential:
+            ddx_dx = 2.0 * self.p1 * new_y + 6.0 * self.p2 * new_x
+            ddx_dy = 2.0 * self.p1 * new_x + 2.0 * self.p2 * new_y
+            ddy_dx = 2.0 * self.p1 * new_x + 2.0 * self.p2 * new_y
+            ddy_dy = 6.0 * self.p1 * new_y + 2.0 * self.p2 * new_x
+
+        gx = (new_x * L + dx) - x_d
+        gy = (new_y * L + dy) - y_d
+
+        if abs(gx) + abs(gy) < kMinRes:
+            cleanup(pixel, new_x, new_y)
+            return
+
+        J11 = L + new_x * dL_dx + ddx_dx
+        J12 = new_x * dL_dy + ddx_dy
+        J21 = new_y * dL_dx + ddy_dx
+        J22 = L + new_y * dL_dy + ddy_dy
+
+        det = J11 * J22 - J12 * J21
+        if abs(det) > kMinAbsDet:
+            inv_det = 1.0 / det
+            del_x = ( gx * J22 - gy * J12) * inv_det
+            del_y = (-gx * J21 + gy * J11) * inv_det
+
+            new_x -= del_x
+            new_y -= del_y
+
+        cleanup(pixel, new_x, new_y)
+
+def distort_points_px(cal, pts_px_und):
+    """
+    Vectorized forward distortion (undistorted pixels -> distorted pixels).
+
+    Parameters
+    ----------
+    cal : Calibration
+        Valid calibration object.
+    pts_px_und : array_like
+        Shape (N,2) or (2,). Undistorted pixel coordinates.
+
+    Returns
+    -------
+    pts_px_dist : np.ndarray
+        Shape (N,2) or (2,). Distorted pixel coordinates.
+
+    Doctests
+    --------
+    Basic equivalence with scalar distort_point:
+
+    >>> cal = default_864_cam()
+    >>> pts = np.array([[700.0, 250.0],
+    ...                 [100.0, 100.0],
+    ...                 [800.0, 400.0]])
+    >>> # scalar reference
+    >>> ref = []
+    >>> for pxy in pts:
+    ...     p = pxl(pix_coords=pxy.tolist(), already_undistorted=True)
+    ...     cal.havePix_needNorm(p)
+    ...     cal.distort_point(p)
+    ...     ref.append(p.pix_coords)
+    >>> ref = np.array(ref)
+    >>> vec = distort_points_px(cal, pts)
+    >>> np.allclose(ref, vec, rtol=0, atol=1e-12)
+    True
+
+    Idempotence: applying vectorized distort twice does nothing new
+    (assuming inputs are already distorted):
+
+    >> # Round-trip: distort then undistort gets back the original (within tolerance)
+    >>> pts = np.array([[700.0, 250.0],
+    ...                 [100.0, 100.0],
+    ...                 [800.0, 400.0]])
+    >>> dist = distort_points_px(cal, pts)
+    >>> back = []
+    >>> for pxy in dist:
+    ...     p = pxl(pix_coords=pxy.tolist(), already_undistorted=False)
+    ...     cal.undistort_point(p)
+    ...     back.append(p.pix_coords)
+    >>> back = np.array(back)
+    >>> np.allclose(back, pts, atol=1e-6)
+    True
+
+    Round-trip consistency with undistort_point:
+
+    >>> pts = np.array([[600.0, 300.0],
+    ...                 [200.0, 700.0]])
+    >>> und = []
+    >>> for pxy in pts:
+    ...     p = pxl(pix_coords=pxy.tolist())
+    ...     cal.undistort_point(p)
+    ...     und.append(p.pix_coords)
+    >>> und = np.array(und)
+    >>> redist = distort_points_px(cal, und)
+    >>> np.allclose(redist, pts, atol=1e-6)
+    True
+    """
+    if not cal.validCal:
+        raise ValueError("Calibration invalid.")
+
+    pts = np.asarray(pts_px_und, dtype=np.float64)
+    scalar_input = False
+    if pts.ndim == 1:
+        pts = pts.reshape(1, 2)
+        scalar_input = True
+    if pts.shape[1] != 2:
+        raise ValueError(f"Expected shape (N,2) or (2,), got {pts.shape}")
+
+    # pixels -> camera-normalized (undistorted)
+    x = (pts[:, 0] - cal.cx) / cal.fx
+    y = (pts[:, 1] - cal.cy) / cal.fy
+
+    x2 = x * x
+    y2 = y * y
+    r2 = x2 + y2
+    xy = x * y
+
+    # Radial factor (Horner form)
+    L = 1.0 + r2 * (cal.k1 + r2 * (cal.k2 + r2 * cal.k3))
+
+    if cal.has_tangential:
+        dx = 2.0 * cal.p1 * xy + cal.p2 * (r2 + 2.0 * x2)
+        dy = cal.p1 * (r2 + 2.0 * y2) + 2.0 * cal.p2 * xy
+    else:
+        dx = 0.0
+        dy = 0.0
+
+    # Apply distortion in normalized space
+    xd = x * L + dx
+    yd = y * L + dy
+
+    # Back to pixels
+    u = xd * cal.fx + cal.cx
+    v = yd * cal.fy + cal.cy
+
+    out = np.column_stack((u, v))
+    return out[0] if scalar_input else out
+
+def undistort_points_px(cal, pts_px_dist, mode: str = "precise"):
+    if not cal.validCal:
+        raise ValueError("Calibration invalid.")
+    if mode not in ("opencv", "precise"):
+        raise ValueError("mode must be 'opencv' or 'precise'")
+
+    pts = np.asarray(pts_px_dist, dtype=np.float64)
+    scalar_input = (pts.ndim == 1)
+    if scalar_input:
+        pts = pts.reshape(1, 2)
+    if pts.shape[1] != 2:
+        raise ValueError(f"Expected shape (N,2) or (2,), got {pts.shape}")
+
+    # ---- cache params locally (fewer attribute lookups) ----
+    fx = float(cal.fx); fy = float(cal.fy); cx = float(cal.cx); cy = float(cal.cy)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    k1 = float(cal.k1); k2 = float(cal.k2); k3 = float(cal.k3)
+    p1 = float(cal.p1); p2 = float(cal.p2)
+    has_t = bool(cal.has_tangential)
+
+    kMinAbsL = 1e-12
+    kMinAbsDet = 1e-18
+    kMinRes = 1e-14
+
+    # distorted pixels -> distorted cam-normalized
+    x_d = (pts[:, 0] - cx) * inv_fx
+    y_d = (pts[:, 1] - cy) * inv_fy
+
+    # initial guess
+    x = x_d.copy()
+    y = y_d.copy()
+
+    iters = 5 if mode == "opencv" else 2
+
+    # ----------------------------
+    # Fixed-point iterations (in-place)
+    # ----------------------------
+    if not has_t:
+        # radial-only fast path (less math, fewer temps)
+        for _ in range(iters):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            good = np.abs(L) >= kMinAbsL
+            if not np.any(good):
+                break
+
+            # in-place masked update (no x_new/y_new copies)
+            x[good] = x_d[good] / L[good]
+            y[good] = y_d[good] / L[good]
+
+        # Newton step (radial-only) if precise
+        if mode == "precise":
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            goodL = np.abs(L) >= kMinAbsL
+            if np.any(goodL):
+                gx = x * L - x_d
+                gy = y * L - y_d
+
+                do = goodL & ((np.abs(gx) + np.abs(gy)) >= kMinRes)
+                if np.any(do):
+                    dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+                    dL_dx = 2.0 * x * dL_dr2
+                    dL_dy = 2.0 * y * dL_dr2
+
+                    J11 = L + x * dL_dx
+                    J12 = x * dL_dy
+                    J21 = y * dL_dx
+                    J22 = L + y * dL_dy
+
+                    det = J11 * J22 - J12 * J21
+                    do &= (np.abs(det) >= kMinAbsDet)
+
+                    if np.any(do):
+                        inv_det = 1.0 / det[do]
+                        del_x = (gx[do] * J22[do] - gy[do] * J12[do]) * inv_det
+                        del_y = (-gx[do] * J21[do] + gy[do] * J11[do]) * inv_det
+                        x[do] -= del_x
+                        y[do] -= del_y
+
+    else:
+        # full model (radial + tangential)
+        for _ in range(iters):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            good = np.abs(L) >= kMinAbsL
+            if not np.any(good):
+                break
+
+            xy = x * y
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+
+            x[good] = (x_d[good] - dx[good]) / L[good]
+            y[good] = (y_d[good] - dy[good]) / L[good]
+
+        # Newton cleanup
+        if mode == "precise":
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            goodL = np.abs(L) >= kMinAbsL
+            if np.any(goodL):
+                xy = x * y
+                dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+                dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+
+                gx = (x * L + dx) - x_d
+                gy = (y * L + dy) - y_d
+
+                do = goodL & ((np.abs(gx) + np.abs(gy)) >= kMinRes)
+                if np.any(do):
+                    dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+                    dL_dx = 2.0 * x * dL_dr2
+                    dL_dy = 2.0 * y * dL_dr2
+
+                    ddx_dx = 2.0 * p1 * y + 6.0 * p2 * x
+                    ddx_dy = 2.0 * p1 * x + 2.0 * p2 * y
+                    ddy_dx = 2.0 * p1 * x + 2.0 * p2 * y
+                    ddy_dy = 6.0 * p1 * y + 2.0 * p2 * x
+
+                    J11 = L + x * dL_dx + ddx_dx
+                    J12 = x * dL_dy + ddx_dy
+                    J21 = y * dL_dx + ddy_dx
+                    J22 = L + y * dL_dy + ddy_dy
+
+                    det = J11 * J22 - J12 * J21
+                    do &= (np.abs(det) >= kMinAbsDet)
+
+                    if np.any(do):
+                        inv_det = 1.0 / det[do]
+                        del_x = (gx[do] * J22[do] - gy[do] * J12[do]) * inv_det
+                        del_y = (-gx[do] * J21[do] + gy[do] * J11[do]) * inv_det
+                        x[do] -= del_x
+                        y[do] -= del_y
+
+    # cam-normalized undistorted -> pixels (avoid column_stack allocation)
+    out = np.empty((pts.shape[0], 2), dtype=np.float64)
+    out[:, 0] = x * fx + cx
+    out[:, 1] = y * fy + cy
+    return out[0] if scalar_input else out
+
+def default_864_cam():
+    cal = Calibration()
+    cal.fx = cal.fy = 941.75
+    cal.cx = cal.cy = 432.0
+    cal.k1 = -0.186
+    cal.k2 =  0.137
+    cal.p1 = -0.000232
+    cal.p2 =  0.000432
+    cal.k3 = -0.0137
+    cal.calTime = 200.0
+    cal.numCBUsed = 50
+    cal.rmsError = 0.10
+    cal.hfov = 49.28
+    cal.width = 864
+    cal.height = 864
+    return cal
+
+def default_2848_cam():
+    cal = Calibration()
+    cal.fx = cal.fy = 3085.026
+    cal.cx = cal.cy = 1423.5
+    cal.k1 = -0.187
+    cal.k2 =  0.137
+    cal.p1 = -0.000232
+    cal.p2 =  0.000432
+    cal.k3 = -0.000269
+    cal.calTime = 200.0
+    cal.numCBUsed = 50
+    cal.rmsError = 0.10
+    cal.hfov = 49.28
+    cal.width = 2848
+    cal.height = 2848
+    return cal
+
+if __name__=="__main__":
+    cal = default_864_cam()
+
+    p0 = pxl(pix_coords = list(864.0 * np.random.rand(2)))
+    start_px = copy.deepcopy(p0.pix_coords)
+    print(p0)
+    cal.undistort_point(p0)
+    print(p0)
+    cal.distort_point(p0)
+    print(p0)
+    print(f'Error: {np.array(p0.pix_coords) - np.array(start_px)}')

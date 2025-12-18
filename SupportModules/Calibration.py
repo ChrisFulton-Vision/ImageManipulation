@@ -15,6 +15,7 @@ class Calibration:
         # cache bits first so __setattr__ can use them safely
         self._validCal_dirty = True
         self._validCal_cache = False
+        self._VALID_FIELDS = ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'width', 'height']
 
         self.fx = None
         self.fy = None

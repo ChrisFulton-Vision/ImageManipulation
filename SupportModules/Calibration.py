@@ -4,11 +4,10 @@ import pickle as pkl
 import re
 from datetime import datetime
 from os.path import join
-
+import sys, types
 import numpy as np
-from PixelHandler import Pixel as pxl
-
-
+from SupportModules.PixelHandler import Pixel as pxl
+from numba import njit, prange
 
 class Calibration:
     def __init__(self, filepath=None):
@@ -52,6 +51,11 @@ class Calibration:
     def __str__(self):
         return self.calStr
 
+    @property
+    def iteratable_params(self):
+        if not self.fisheye:
+            return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2, self.k3
+
     def setCameraMatrix(self, mtx=None, fx=None, fy=None, cx=None, cy=None):
         if mtx is not None:
             self.fx = mtx[0, 0]
@@ -73,10 +77,11 @@ class Calibration:
     @property
     def K(self):
         return self.getCameraMatrix()
+
     @property
     def inv(self):
-        return np.array([[1.0/self.fx, 0.0, -self.cx / self.fx],
-                         [0.0, 1.0/self.fy, -self.cy / self.fy],
+        return np.array([[1.0 / self.fx, 0.0, -self.cx / self.fx],
+                         [0.0, 1.0 / self.fy, -self.cy / self.fy],
                          [0.0, 0.0, 1.0]])
 
     def getCameraMatrix(self):
@@ -183,7 +188,8 @@ class Calibration:
             calStr += 'rmsErr=' + str(self.rmsError) + '\n\n'
 
             calStr += '#Other\n'
-            calStr += 'resolution=' + str(int(self.scale * self.width)) + 'x' + str(int(self.scale*self.height)) + '\n'
+            calStr += 'resolution=' + str(int(self.scale * self.width)) + 'x' + str(
+                int(self.scale * self.height)) + '\n'
             calStr += 'hfov=' + str(self.hfov) + "\n"
         else:
             calStr = 'Bad Cal'
@@ -201,11 +207,10 @@ class Calibration:
                 self.calDatetime = None
 
     def toBinFile(self, fileDirectory):
-        with open(join(fileDirectory,'calibration.pkl'), 'wb') as file:
+        with open(join(fileDirectory, 'calibration.pkl'), 'wb') as file:
             pkl.dump(self, file)
 
     def fromBinFile(self, fileDirectory):
-        import sys, io, types, pickle as _pkl
 
         # Resolve the .pkl path (supports either a directory or direct .pkl file)
         if os.path.isdir(fileDirectory):
@@ -216,7 +221,7 @@ class Calibration:
         if not (os.path.exists(filepath) and filepath.lower().endswith('.pkl')):
             return False
 
-        class _CompatUnpickler(_pkl.Unpickler):
+        class _CompatUnpickler(pkl.Unpickler):
             def find_class(self, module, name):
                 # Old location recorded in the pickle
                 if module in ('Calibration', '__main__') and name == 'Calibration':
@@ -235,7 +240,7 @@ class Calibration:
                 shim.Calibration = Calibration
                 sys.modules.setdefault('Calibration', shim)
                 f.seek(0)
-                obj = _pkl.load(f)
+                obj = pkl.load(f)
 
         self.copy(obj)
         return True
@@ -326,6 +331,11 @@ class Calibration:
         >>> cal2 = default_2848_cam()
         >>> assert cal2.validCal
         '''
+        try:
+            self.__getattribute__('_validCal_dirty')
+        except AttributeError:
+            self._validCal_dirty = True
+
         if self._validCal_dirty:
             self._validCal_cache = self._compute_validCal()
             self._validCal_dirty = False
@@ -355,8 +365,8 @@ class Calibration:
         if not self.validCal:
             raise ValueError("Calibration invalid.")
         if pixel.pix_coords is not None:
-            pixel.norm_coords = [(pixel.pix_coords[0] - self.cx)/self.fx,
-                                (pixel.pix_coords[1] - self.cy)/self.fy]
+            pixel.norm_coords = [(pixel.pix_coords[0] - self.cx) / self.fx,
+                                 (pixel.pix_coords[1] - self.cy) / self.fy]
             return
         raise ValueError("Pix_coords must exist before calling this function.")
 
@@ -405,8 +415,8 @@ class Calibration:
             self.havePix_needNorm(pixel)
 
         nx, ny = pixel.norm_coords
-        xy = nx*ny
-        r_sqd = nx*nx + ny*ny
+        xy = nx * ny
+        r_sqd = nx * nx + ny * ny
 
         L = 1 + r_sqd * (self.k1 + r_sqd * (self.k2 + r_sqd * self.k3))
         del_x = 2.0 * self.p1 * xy + self.p2 * (r_sqd + 2.0 * nx * nx)
@@ -479,21 +489,21 @@ class Calibration:
         new_y = copy.deepcopy(y_d)
 
         # 2 Fixed Point Iterations
-        def compute_L_and_tangential(_x : float, _y : float) -> tuple[float, float, float, float]:
+        def compute_L_and_tangential(_x: float, _y: float) -> tuple[float, float, float, float]:
             x2 = _x * _x
             y2 = _y * _y
             r2 = x2 + y2
 
             L = 1.0 + r2 * (self.k1 + r2 * (self.k2 + r2 * self.k3))
 
-            dL_dr2 = self.k1 + (2.0*self.k2 + 3.0*self.k3*r2)*r2
+            dL_dr2 = self.k1 + (2.0 * self.k2 + 3.0 * self.k3 * r2) * r2
 
             if not self.has_tangential:
                 return L, dL_dr2, 0.0, 0.0
 
             xy = _x * _y
             dx = 2.0 * self.p1 * xy + self.p2 * (r2 + 2.0 * x2)
-            dy = self.p1 * ( r2 + 2.0 * y2) + 2.0 * self.p2 * xy
+            dy = self.p1 * (r2 + 2.0 * y2) + 2.0 * self.p2 * xy
 
             return L, dL_dr2, dx, dy
 
@@ -537,13 +547,14 @@ class Calibration:
         det = J11 * J22 - J12 * J21
         if abs(det) > kMinAbsDet:
             inv_det = 1.0 / det
-            del_x = ( gx * J22 - gy * J12) * inv_det
+            del_x = (gx * J22 - gy * J12) * inv_det
             del_y = (-gx * J21 + gy * J11) * inv_det
 
             new_x -= del_x
             new_y -= del_y
 
         cleanup(pixel, new_x, new_y)
+
 
 def distort_points_px(cal, pts_px_und):
     """
@@ -578,8 +589,7 @@ def distort_points_px(cal, pts_px_und):
     ...     ref.append(p.pix_coords)
     >>> ref = np.array(ref)
     >>> vec = distort_points_px(cal, pts)
-    >>> np.allclose(ref, vec, rtol=0, atol=1e-12)
-    True
+    >>> assert np.allclose(ref, vec, rtol=0, atol=1e-12)
 
     Idempotence: applying vectorized distort twice does nothing new
     (assuming inputs are already distorted):
@@ -595,8 +605,7 @@ def distort_points_px(cal, pts_px_und):
     ...     cal.undistort_point(p)
     ...     back.append(p.pix_coords)
     >>> back = np.array(back)
-    >>> np.allclose(back, pts, atol=1e-6)
-    True
+    >>> assert np.allclose(back, pts, atol=1e-6)
 
     Round-trip consistency with undistort_point:
 
@@ -609,8 +618,7 @@ def distort_points_px(cal, pts_px_und):
     ...     und.append(p.pix_coords)
     >>> und = np.array(und)
     >>> redist = distort_points_px(cal, und)
-    >>> np.allclose(redist, pts, atol=1e-6)
-    True
+    >>> assert np.allclose(redist, pts, atol=1e-6)
     """
     if not cal.validCal:
         raise ValueError("Calibration invalid.")
@@ -653,177 +661,199 @@ def distort_points_px(cal, pts_px_und):
     out = np.column_stack((u, v))
     return out[0] if scalar_input else out
 
-def undistort_points_px(cal, pts_px_dist, mode: str = "precise"):
-    if not cal.validCal:
-        raise ValueError("Calibration invalid.")
-    if mode not in ("opencv", "precise"):
-        raise ValueError("mode must be 'opencv' or 'precise'")
+def _radial_terms(x, y, k1, k2, k3):
+    """Compute r2, r4, L and dL/dr2, plus dL/dx,dL/dy."""
+    x2 = x * x
+    y2 = y * y
+    r2 = x2 + y2
+    r4 = r2 * r2
 
+    # L = 1 + k1*r2 + k2*r4 + k3*r6
+    # r6 = r4*r2
+    L = 1.0 + k1 * r2 + k2 * r4 + k3 * (r4 * r2)
+
+    # dL/dr2 = k1 + 2*k2*r2 + 3*k3*r2^2 = k1 + 2*k2*r2 + 3*k3*r4
+    dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+
+    dL_dx = 2.0 * x * dL_dr2
+    dL_dy = 2.0 * y * dL_dr2
+    return x2, y2, r2, r4, L, dL_dx, dL_dy
+
+
+def _newton_update_in_place(
+    x, y,
+    x_d, y_d,
+    L, dL_dx, dL_dy,
+    gx, gy,
+    do_mask,
+    kMinAbsDet,
+    # tangential jacobian add-ons (can be None for radial-only)
+    ddx_dx=None, ddx_dy=None, ddy_dx=None, ddy_dy=None
+):
+    """
+    Apply one Newton step in-place on x,y for the subset do_mask.
+    Everything is vectorized; expects arrays of the same shape.
+    """
+    if not np.any(do_mask):
+        return
+
+    # Build Jacobian (with optional tangential derivative add-ons)
+    if ddx_dx is None:
+        J11 = L + x * dL_dx
+        J12 = x * dL_dy
+        J21 = y * dL_dx
+        J22 = L + y * dL_dy
+    else:
+        J11 = L + x * dL_dx + ddx_dx
+        J12 = x * dL_dy + ddx_dy
+        J21 = y * dL_dx + ddy_dx
+        J22 = L + y * dL_dy + ddy_dy
+
+    det = J11 * J22 - J12 * J21
+    do = do_mask & (np.abs(det) >= kMinAbsDet)
+    if not np.any(do):
+        return
+
+    inv_det = 1.0 / det[do]
+    del_x = (gx[do] * J22[do] - gy[do] * J12[do]) * inv_det
+    del_y = (-gx[do] * J21[do] + gy[do] * J11[do]) * inv_det
+    x[do] -= del_x
+    y[do] -= del_y
+
+def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-6):
     pts = np.asarray(pts_px_dist, dtype=np.float64)
-    scalar_input = (pts.ndim == 1)
-    if scalar_input:
+    scalar = (pts.ndim == 1)
+    if scalar:
         pts = pts.reshape(1, 2)
-    if pts.shape[1] != 2:
-        raise ValueError(f"Expected shape (N,2) or (2,), got {pts.shape}")
 
-    # ---- cache params locally (fewer attribute lookups) ----
-    fx = float(cal.fx); fy = float(cal.fy); cx = float(cal.cx); cy = float(cal.cy)
+    out = undistort_points_px_numba(
+        pts,
+        float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+        float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
+        bool(cal.has_tangential),
+        mode_opencv_5fp=(mode == "opencv"),
+        eps_px=float(eps_px),
+    )
+    return out[0] if scalar else out
+
+@njit(parallel=True, fastmath=False)
+def undistort_points_px_numba(
+    pts_px_dist,
+    fx, fy, cx, cy,
+    k1, k2, p1, p2, k3,
+    has_tangential,
+    mode_opencv_5fp,         # True => 5 FP, False => 2 FP + gated Newton
+    eps_px=1e-4
+):
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+
     inv_fx = 1.0 / fx
     inv_fy = 1.0 / fy
 
-    k1 = float(cal.k1); k2 = float(cal.k2); k3 = float(cal.k3)
-    p1 = float(cal.p1); p2 = float(cal.p2)
-    has_t = bool(cal.has_tangential)
-
     kMinAbsL = 1e-12
     kMinAbsDet = 1e-18
-    kMinRes = 1e-14
 
-    # distorted pixels -> distorted cam-normalized
-    x_d = (pts[:, 0] - cx) * inv_fx
-    y_d = (pts[:, 1] - cy) * inv_fy
+    iters = 5 if mode_opencv_5fp else 2
 
-    # initial guess
-    x = x_d.copy()
-    y = y_d.copy()
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
 
-    iters = 5 if mode == "opencv" else 2
+        x_d = (u - cx) * inv_fx
+        y_d = (v - cy) * inv_fy
 
-    # ----------------------------
-    # Fixed-point iterations (in-place)
-    # ----------------------------
-    if not has_t:
-        # radial-only fast path (less math, fewer temps)
+        x = x_d
+        y = y_d
+
+        # ----- fixed point -----
         for _ in range(iters):
-            x2 = x * x
-            y2 = y * y
+            x2 = x*x
+            y2 = y*y
             r2 = x2 + y2
-            r4 = r2 * r2
-            r6 = r4 * r2
-
-            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-            good = np.abs(L) >= kMinAbsL
-            if not np.any(good):
+            r4 = r2*r2
+            r6 = r4*r2
+            L = 1.0 + k1*r2 + k2*r4 + k3*r6
+            if abs(L) < kMinAbsL:
                 break
 
-            # in-place masked update (no x_new/y_new copies)
-            x[good] = x_d[good] / L[good]
-            y[good] = y_d[good] / L[good]
+            dx = 0.0
+            dy = 0.0
+            if has_tangential:
+                xy = x*y
+                dx = 2.0*p1*xy + p2*(r2 + 2.0*x2)
+                dy = p1*(r2 + 2.0*y2) + 2.0*p2*xy
 
-        # Newton step (radial-only) if precise
-        if mode == "precise":
-            x2 = x * x
-            y2 = y * y
+            x = (x_d - dx) / L
+            y = (y_d - dy) / L
+
+        # ----- optional Newton cleanup -----
+        if not mode_opencv_5fp:
+            x2 = x*x
+            y2 = y*y
             r2 = x2 + y2
-            r4 = r2 * r2
-            r6 = r4 * r2
+            r4 = r2*r2
+            r6 = r4*r2
+            L = 1.0 + k1*r2 + k2*r4 + k3*r6
+            if abs(L) >= kMinAbsL:
+                dx = 0.0
+                dy = 0.0
+                ddx_dx = ddx_dy = ddy_dx = ddy_dy = 0.0
 
-            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-            goodL = np.abs(L) >= kMinAbsL
-            if np.any(goodL):
-                gx = x * L - x_d
-                gy = y * L - y_d
+                if has_tangential:
+                    xy = x*y
+                    dx = 2.0*p1*xy + p2*(r2 + 2.0*x2)
+                    dy = p1*(r2 + 2.0*y2) + 2.0*p2*xy
 
-                do = goodL & ((np.abs(gx) + np.abs(gy)) >= kMinRes)
-                if np.any(do):
-                    dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
-                    dL_dx = 2.0 * x * dL_dr2
-                    dL_dy = 2.0 * y * dL_dr2
+                    ddx_dx = 2.0*p1*y + 6.0*p2*x
+                    ddx_dy = 2.0*p1*x + 2.0*p2*y
+                    ddy_dx = 2.0*p1*x + 2.0*p2*y
+                    ddy_dy = 6.0*p1*y + 2.0*p2*x
 
-                    J11 = L + x * dL_dx
-                    J12 = x * dL_dy
-                    J21 = y * dL_dx
-                    J22 = L + y * dL_dy
+                gx = (x*L + dx) - x_d
+                gy = (y*L + dy) - y_d
 
-                    det = J11 * J22 - J12 * J21
-                    do &= (np.abs(det) >= kMinAbsDet)
+                # pixel-based gate
+                res_px = (abs(gx) + abs(gy)) * (fx if fx > fy else fy)
+                if res_px >= eps_px:
+                    dL_dr2 = k1 + 2.0*k2*r2 + 3.0*k3*r4
+                    dL_dx = 2.0*x*dL_dr2
+                    dL_dy = 2.0*y*dL_dr2
 
-                    if np.any(do):
-                        inv_det = 1.0 / det[do]
-                        del_x = (gx[do] * J22[do] - gy[do] * J12[do]) * inv_det
-                        del_y = (-gx[do] * J21[do] + gy[do] * J11[do]) * inv_det
-                        x[do] -= del_x
-                        y[do] -= del_y
+                    if has_tangential:
+                        J11 = L + x*dL_dx + ddx_dx
+                        J12 = x*dL_dy + ddx_dy
+                        J21 = y*dL_dx + ddy_dx
+                        J22 = L + y*dL_dy + ddy_dy
+                    else:
+                        J11 = L + x*dL_dx
+                        J12 = x*dL_dy
+                        J21 = y*dL_dx
+                        J22 = L + y*dL_dy
 
-    else:
-        # full model (radial + tangential)
-        for _ in range(iters):
-            x2 = x * x
-            y2 = y * y
-            r2 = x2 + y2
-            r4 = r2 * r2
-            r6 = r4 * r2
+                    det = J11*J22 - J12*J21
+                    if abs(det) >= kMinAbsDet:
+                        inv_det = 1.0 / det
+                        del_x = (gx*J22 - gy*J12) * inv_det
+                        del_y = (-gx*J21 + gy*J11) * inv_det
+                        x -= del_x
+                        y -= del_y
 
-            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-            good = np.abs(L) >= kMinAbsL
-            if not np.any(good):
-                break
+        out[i, 0] = x*fx + cx
+        out[i, 1] = y*fy + cy
 
-            xy = x * y
-            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
-            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+    return out
 
-            x[good] = (x_d[good] - dx[good]) / L[good]
-            y[good] = (y_d[good] - dy[good]) / L[good]
 
-        # Newton cleanup
-        if mode == "precise":
-            x2 = x * x
-            y2 = y * y
-            r2 = x2 + y2
-            r4 = r2 * r2
-            r6 = r4 * r2
-
-            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-            goodL = np.abs(L) >= kMinAbsL
-            if np.any(goodL):
-                xy = x * y
-                dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
-                dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
-
-                gx = (x * L + dx) - x_d
-                gy = (y * L + dy) - y_d
-
-                do = goodL & ((np.abs(gx) + np.abs(gy)) >= kMinRes)
-                if np.any(do):
-                    dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
-                    dL_dx = 2.0 * x * dL_dr2
-                    dL_dy = 2.0 * y * dL_dr2
-
-                    ddx_dx = 2.0 * p1 * y + 6.0 * p2 * x
-                    ddx_dy = 2.0 * p1 * x + 2.0 * p2 * y
-                    ddy_dx = 2.0 * p1 * x + 2.0 * p2 * y
-                    ddy_dy = 6.0 * p1 * y + 2.0 * p2 * x
-
-                    J11 = L + x * dL_dx + ddx_dx
-                    J12 = x * dL_dy + ddx_dy
-                    J21 = y * dL_dx + ddy_dx
-                    J22 = L + y * dL_dy + ddy_dy
-
-                    det = J11 * J22 - J12 * J21
-                    do &= (np.abs(det) >= kMinAbsDet)
-
-                    if np.any(do):
-                        inv_det = 1.0 / det[do]
-                        del_x = (gx[do] * J22[do] - gy[do] * J12[do]) * inv_det
-                        del_y = (-gx[do] * J21[do] + gy[do] * J11[do]) * inv_det
-                        x[do] -= del_x
-                        y[do] -= del_y
-
-    # cam-normalized undistorted -> pixels (avoid column_stack allocation)
-    out = np.empty((pts.shape[0], 2), dtype=np.float64)
-    out[:, 0] = x * fx + cx
-    out[:, 1] = y * fy + cy
-    return out[0] if scalar_input else out
 
 def default_864_cam():
     cal = Calibration()
     cal.fx = cal.fy = 941.75
     cal.cx = cal.cy = 432.0
     cal.k1 = -0.186
-    cal.k2 =  0.137
+    cal.k2 = 0.137
     cal.p1 = -0.000232
-    cal.p2 =  0.000432
+    cal.p2 = 0.000432
     cal.k3 = -0.0137
     cal.calTime = 200.0
     cal.numCBUsed = 50
@@ -833,14 +863,15 @@ def default_864_cam():
     cal.height = 864
     return cal
 
+
 def default_2848_cam():
     cal = Calibration()
     cal.fx = cal.fy = 3085.026
     cal.cx = cal.cy = 1423.5
     cal.k1 = -0.187
-    cal.k2 =  0.137
+    cal.k2 = 0.137
     cal.p1 = -0.000232
-    cal.p2 =  0.000432
+    cal.p2 = 0.000432
     cal.k3 = -0.000269
     cal.calTime = 200.0
     cal.numCBUsed = 50
@@ -850,10 +881,11 @@ def default_2848_cam():
     cal.height = 2848
     return cal
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     cal = default_864_cam()
 
-    p0 = pxl(pix_coords = list(864.0 * np.random.rand(2)))
+    p0 = pxl(pix_coords=list(864.0 * np.random.rand(2)))
     start_px = copy.deepcopy(p0.pix_coords)
     print(p0)
     cal.undistort_point(p0)

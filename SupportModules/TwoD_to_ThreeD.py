@@ -37,7 +37,7 @@ from SupportModules.quaternions import Quaternion as q
 from SupportModules.quaternions import *
 from SupportModules.Calibration import Calibration
 import numpy as np
-from numpy import square as sq
+from numba import njit, prange, config
 from numpy.linalg import norm
 from numpy.typing import NDArray
 from copy import deepcopy
@@ -46,7 +46,65 @@ from copy import deepcopy
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 
 # --- Small helpers --------------------------------------------------------------
+@njit(parallel=True, fastmath=False, cache=True)
+def _deriv_kernel_numba(RX: np.ndarray, xyz_cam: np.ndarray, fx: float, fy: float) -> np.ndarray:
+    """
+    Build L (2N x 6) for state [drx,dry,drz, tx,ty,tz].
+    RX is R(q)X (N x 3), xyz_cam is RX + t (N x 3).
+    """
+    N = RX.shape[0]
+    L = np.empty((2 * N, 6), dtype=np.float64)
 
+    for i in prange(N):
+        x = xyz_cam[i, 0]
+        y = xyz_cam[i, 1]
+        z = xyz_cam[i, 2]
+
+        # projection partials
+        invz = 1.0 / z
+        invz2 = invz * invz
+
+        uX = fx * invz
+        uZ = -fx * x * invz2
+        vY = fy * invz
+        vZ = -fy * y * invz2
+
+        a = RX[i, 0]  # RXx
+        b = RX[i, 1]  # RXy
+        c = RX[i, 2]  # RXz
+
+        # L_rot = dUV_dXYZ @ (-skew(RX))
+        # derived closed-form to avoid per-point matrix alloc:
+        # row u:
+        Lurx = uZ * b
+        Lury = uX * c - uZ * a
+        Lurz = -uX * b
+
+        # row v:
+        Lvrx = -vY * c + vZ * b
+        Lvry = -vZ * a
+        Lvrz = vY * a
+
+        r = 2 * i
+
+        # rotation cols
+        L[r, 0] = Lurx
+        L[r, 1] = Lury
+        L[r, 2] = Lurz
+        L[r + 1, 0] = Lvrx
+        L[r + 1, 1] = Lvry
+        L[r + 1, 2] = Lvrz
+
+        # translation cols: dUV_dXYZ @ I
+        L[r, 3] = uX
+        L[r, 4] = 0.0
+        L[r, 5] = uZ
+
+        L[r + 1, 3] = 0.0
+        L[r + 1, 4] = vY
+        L[r + 1, 5] = vZ
+
+    return L
 def _row_normed(A, eps=1e-12):
     """Row-normalize a 2D array.
 
@@ -94,69 +152,25 @@ def _skew(v: np.ndarray) -> np.ndarray:
 
 # --- Analytic Jacobian of h w.r.t. (q, t) -------------------------------------
 
-def deriv(est_q: q, est_t: np.ndarray, feature_points, cal: Calibration):
-    """Analytic Jacobian L = dh/dx at (est_q, est_t) with minimal rotation params.
-
-    New state ordering (6 parameters):
-        x = [δr_x, δr_y, δr_z, tx, ty, tz]^T
-
-    where δr is a *small* Rodrigues / axis-angle increment in the camera frame
-    applied via: q_new = from_rodrigues(δr) * est_q.
-
-    Returns
-    -------
-    L : np.ndarray, shape (2N, 6)
-        Jacobian of stacked [u0, v0, ...] w.r.t. [δr, t].
+def deriv(est_q: q, est_t: np.ndarray, feature_points: np.ndarray, cal: Calibration):
     """
+    Jacobian for 2D reprojection residuals wrt [drx,dry,drz, tx,ty,tz].
 
-    num_points = len(feature_points)
-    L = np.zeros((2 * num_points, 6), dtype=float)
-
-    # Current camera-frame coordinates of each feature:
-    #   X_cam = R(q) X + t
-    xyz_cam = est_q * feature_points + est_t          # shape (N, 3)
-
-    # R(q) X part only (rotation without translation)
-    RX = xyz_cam - est_t                              # shape (N, 3)
-
-    X_hat, Y_hat, Z_hat = xyz_cam[:, 0], xyz_cam[:, 1], xyz_cam[:, 2]
-
-    for idx, (Xw, RXi) in enumerate(zip(feature_points, RX)):
-        # Projection partials for this point:
-        #   u = fx * (x / z) + cx
-        #   v = fy * (y / z) + cy
-        z = Z_hat[idx]
-        x = X_hat[idx]
-        y = Y_hat[idx]
-
-        du_dX = cal.fx / z
-        du_dZ = -cal.fx * x / (z * z)
-
-        dv_dY = cal.fy / z
-        dv_dZ = -cal.fy * y / (z * z)
-
-        dUV_dXYZ = np.array([
-            [du_dX,    0.0,   du_dZ],
-            [0.0,      dv_dY, dv_dZ],
-        ], dtype=float)
-
-        # Rotation Jacobian: δX_cam = -[R X]_x δr
-        J_rot = -_skew(RXi)                           # 3x3
-
-        # Translation Jacobian: δX_cam = δt
-        J_trans = np.eye(3, dtype=float)              # 3x3
-
-        # Project to image:
-        L_block_rot = dUV_dXYZ @ J_rot                # 2x3
-        L_block_trans = dUV_dXYZ @ J_trans            # 2x3
-
-        row = 2 * idx
-        L[row:row + 2, 0:3] = L_block_rot
-        L[row:row + 2, 3:6] = L_block_trans
-
-    return L
+    Uses Numba kernel when available. Critical: avoid per-call astype() copies.
+    """
+    # Compute camera-frame points using your existing quaternion/vector plumbing.
+    # xyz_cam: (N,3) ; RX: (N,3) == R(q)X
+    xyz_cam = est_q * feature_points + est_t
+    RX = xyz_cam - est_t
 
 
+    # Ensure float64 + C-contiguous only if necessary (avoid unconditional copies)
+    if xyz_cam.dtype != np.float64 or not xyz_cam.flags["C_CONTIGUOUS"]:
+        xyz_cam = np.ascontiguousarray(xyz_cam, dtype=np.float64)
+    if RX.dtype != np.float64 or not RX.flags["C_CONTIGUOUS"]:
+        RX = np.ascontiguousarray(RX, dtype=np.float64)
+
+    return _deriv_kernel_numba(RX, xyz_cam, float(cal.fx), float(cal.fy))
 
 def print_rayPts(ray_proj: np.array):
     """Nicely print a flattened [u0, v0, u1, v1, ...] vector (debug helper)."""

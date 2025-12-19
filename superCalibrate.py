@@ -21,7 +21,7 @@ from cv2 import (CALIB_ZERO_TANGENT_DIST, CALIB_FIX_ASPECT_RATIO, CALIB_FIX_PRIN
                  EVENT_FLAG_LBUTTON, rectangle, EVENT_LBUTTONUP, findChessboardCorners, ADAPTIVE_THRESH_GAUSSIAN_C,
                  findCirclesGrid, estimateChessboardSharpness, TERM_CRITERIA_MAX_ITER, TERM_CRITERIA_EPS, cornerSubPix,
                  drawChessboardCorners, fisheye, initCameraMatrix2D, CALIB_USE_INTRINSIC_GUESS, calibrateCameraROExtended,
-                 calibrationMatrixValues, CALIB_FIX_FOCAL_LENGTH)
+                 calibrationMatrixValues, CALIB_FIX_FOCAL_LENGTH, findChessboardCornersSB)
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
 
@@ -489,12 +489,12 @@ class CalibrateGui(CTkFrame):
         self.saveCalButton.configure(command=lambda btn=self.saveCalButton: self.saveCal(btn))
         self.saveCalButton.grid(row=0, column=0, padx=5, pady=5)
 
-        scale864Button = CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
-        scale864Button.grid(row=3, column=0, padx=5, pady=5)
-        scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
-        scale2848Button.grid(row=4, column=0, padx=5, pady=5)
-        scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
-        scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
+        self.scale864Button = CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
+        self.scale864Button.grid(row=3, column=0, padx=5, pady=5)
+        self.scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
+        self.scale2848Button.grid(row=4, column=0, padx=5, pady=5)
+        self.scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
+        self.scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
 
         if self.imageConfig.camCal.validCal:
             # Then display the calibration
@@ -1333,10 +1333,9 @@ class CalibrateGui(CTkFrame):
             return
 
         if self.imageConfig.calMode == CalibrationType.Chessboard:
-            ret, corners = findChessboardCorners(gray,
+            ret, corners = findChessboardCornersSB(gray,
                                                      (self.imageConfig.num_inner_corners_W,
-                                                      self.imageConfig.num_inner_corners_H),
-                                                     flags=ADAPTIVE_THRESH_GAUSSIAN_C)
+                                                      self.imageConfig.num_inner_corners_H))
 
         elif self.imageConfig.calMode == CalibrationType.Circles:
 

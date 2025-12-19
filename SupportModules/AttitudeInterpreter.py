@@ -40,7 +40,7 @@ class AttitudeReader:
 
         try:
             self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
-            self.alt_dict = pd.read_csv(join(csv_folder_path, 'BARO.csv'))
+            self.alt_dict  = pd.read_csv(join(csv_folder_path, 'BARO.csv'))
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
             self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
         except FileNotFoundError:

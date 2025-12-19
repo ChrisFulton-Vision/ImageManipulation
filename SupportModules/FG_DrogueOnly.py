@@ -436,7 +436,7 @@ class FactorGraph:
         self.solution.ingest_xh(next_states)
         self.optComplete = True
 
-        with open('../Caches/Interim.pkl', 'wb') as f:
+        with open('./Caches/Interim.pkl', 'wb') as f:
             pkl.dump(self, f)
 
     def covariance(self):

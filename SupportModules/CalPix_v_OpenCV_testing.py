@@ -5,7 +5,6 @@ import cv2
 from Calibration import default_864_cam, distort_points_px, undistort_points_px
 from PixelHandler import Pixel
 
-
 def make_opencv_mats(cal):
     K = np.array([[cal.fx, 0.0, cal.cx],
                   [0.0, cal.fy, cal.cy],

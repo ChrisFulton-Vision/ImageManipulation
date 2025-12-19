@@ -8,7 +8,7 @@ from cv2 import (resize, putText, FONT_HERSHEY_PLAIN, rectangle, putText, FONT_H
                  solvePnPRansac, SOLVEPNP_ITERATIVE, Rodrigues, projectPoints)
 from cv2.dnn import NMSBoxes
 
-from SupportModules.Calibration import Calibration
+from SupportModules.Calibration import Calibration, undistort_points_px_numba, distort_points_px
 from SupportModules.metaYoloReader import MetaYoloReader
 from SupportModules.quaternions import *
 
@@ -131,8 +131,11 @@ class YOLO:
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
-    def inferOnImage(self, image: np.array, markup_image: np.array, bias_tracking: bool = False) -> (
-    np.array, np.array):
+    def inferOnImage(self,
+                     image: np.array,
+                     markup_image: np.array,
+                     markup_is_undistorted: bool = False,
+                     bias_tracking: bool = False) -> (np.array, np.array):
         '''
         Runs the sub-methods necessary to process an image with YOLO
         :param image: np.array from OpenCV
@@ -141,7 +144,7 @@ class YOLO:
         self.bias_tracking_active = bias_tracking
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
-        return self.markUpImage(markup_image, output), output
+        return self.markUpImage(markup_image, output, markup_is_undistorted), output
 
     def set_calibration(self, calibration: Calibration) -> None:
         self.calibration = copy.deepcopy(calibration)
@@ -246,7 +249,9 @@ class YOLO:
         classes = [int(k) for k in keep.keys()]
         return centers, boxes, scores, classes
 
-    def markUpImage(self, image: np.array, output: (list, list, list, list)) -> tuple[np.array, tuple[np.array, np.array]]:
+    def markUpImage(self, image: np.array,
+                    output: (list, list, list, list),
+                    markup_is_undistorted: bool) -> tuple[np.array, tuple[np.array, np.array]]:
         '''
         Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
         up the image with a PnP solution as well.
@@ -256,24 +261,53 @@ class YOLO:
         '''
         h, w, _ = image.shape
 
-        centers, boxes, scores, class_ids, time = output
+        centers_dist, boxes, scores, class_ids, time = output
 
         text = f'Inference time: {time:.3f}s'
         putText(image, text, (10, 50), FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 4)
 
+
+
+        centers_und = None
+        if self.calibration is not None and (markup_is_undistorted or len(set(class_ids)) > 5):
+            # Ensure calibration matches YOLO coordinate system (you already do this in drawPnP)
+            # Better: do it here once, before both PnP and draw
+            y_h, y_w = self.yoloSize
+            self.calibration.scaleCalibration(y_w)  # same logic you already use :contentReference[oaicite:2]{index=2}
+
+            # Vectorized: distorted YOLO pixels -> undistorted YOLO pixels
+            # (Function name may be cal.undistort_points_px or module-level undistort_points_px depending on your Calibration.py)
+            centers_und = undistort_points_px_numba(np.array(centers_dist, dtype=np.float64),
+                                                    *self.calibration.iteratable_params,
+                                                    self.calibration.has_tangential,
+                                                    mode_opencv_5fp=False)
+            centers_und = centers_und.tolist()
+
+        centers_for_draw = centers_dist
+        if centers_und is not None:
+            centers_for_pnp = centers_und
+            if markup_is_undistorted:
+                centers_for_draw = centers_und
+        else:
+            centers_for_pnp = centers_dist
+
         if len(class_ids) > 0:
             indices = NMSBoxes(boxes, scores, self.conf, self.iou)
-            newCenters, newBoxes, newClass_ids, newScores = [], [], [], []
+            newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
             for i in indices:
                 # for i in range(len(centers)):
-                newCenters.append(centers[i])
+                newCentersForDraw.append(centers_for_draw[i])
+                newCentersForPnP.append(centers_for_pnp[i])
                 newBoxes.append(boxes[i])
                 newClass_ids.append(class_ids[i])
                 newScores.append(scores[i])
 
-            image = self.drawBoxes(image, newCenters, newBoxes, newClass_ids, newScores)
+            image = self.drawBoxes(image, newCentersForDraw, newBoxes, newClass_ids, newScores)
             if len(set(indices)) > 5:
-                rvec_tvec = self.drawPnP(image, newClass_ids, newCenters)
+                rvec_tvec = self.drawPnP(image,
+                                         newClass_ids,
+                                         newCentersForPnP,
+                                         markup_is_undistorted)
                 return image, rvec_tvec
 
         return image, None
@@ -314,7 +348,11 @@ class YOLO:
 
         return image
 
-    def drawPnP(self, image: np.array, y_class_ids: list, y_centers: list) -> tuple[np.array, np.array]:
+    def drawPnP(self,
+                image: np.array,
+                y_class_ids: list,
+                y_centers: list,
+                markup_is_undistorted: bool) -> tuple[np.array, np.array]:
         '''
         If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
         onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
@@ -368,12 +406,13 @@ class YOLO:
         putText(image, f'x:{tvec[0, 0]:.3f}, y:{tvec[1, 0]:.3f}, z:{tvec[2, 0]:.3f}', (25, w - 50),
                     FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
 
-        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec)
+        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec, markup_is_undistorted)
 
         return (rvec, tvec)
 
     def draw_PnP_proj(self, image: np.array, y_class_ids: list, y_centers: list, object_points: np.array, badList: list,
-                     rvec: np.array, tvec: np.array):
+                      rvec: np.array, tvec: np.array,
+                      markup_is_undistorted: bool):
 
         h, w, _ = image.shape
         y_h, y_w = self.yoloSize
@@ -385,9 +424,15 @@ class YOLO:
                 id = self.reader.idsNamesLocs[y_class_id][0]
                 xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
 
+                if markup_is_undistorted:
+                    dist_coeffs = np.zeros((5,))
+                else:
+                    dist_coeffs = self.calibration.getDistortion()
+
                 projectedPixel, _ = projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
-                                                      distCoeffs=np.zeros((5,)))
+                                                      distCoeffs=dist_coeffs)
+
 
                 x, y = np.squeeze(projectedPixel)
                 if np.isnan(x) or np.isnan(y):

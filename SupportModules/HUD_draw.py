@@ -82,8 +82,7 @@ class HUD_Marker:
         if x != self.last_xy[0] or y != self.last_xy[1]:
             self.update_storage(x, y)
 
-        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
-            img_time)  # + 173.11338 - 11.658461)
+        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(img_time)  # + 173.11338 - 11.658461)
 
         # Speed
         putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
@@ -188,8 +187,9 @@ class HUD_Marker:
         cx = 0.5 * x
         cy = 0.5 * y
 
+        img_height = image.shape[1]
         # Hoist constants & lookups
-        pitch_spacing = 16.0
+        pitch_spacing = 16.0 * img_height / 864.0
         inner = 0.04 * x
         outer = 0.15 * x
         s_b = sin(radians(bank_angle + self.cam_bank_offset))

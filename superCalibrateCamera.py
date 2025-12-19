@@ -17,14 +17,18 @@ from enum import Enum
 from itertools import cycle
 from tkinter import filedialog
 from yaml import safe_load, dump
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from concurrent.futures import ThreadPoolExecutor, wait
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
                            StringVar, CTkProgressBar, END)
 from pandas import isna, read_csv, DataFrame
+from pynvml import (
+    nvmlInit, nvmlShutdown,
+    nvmlDeviceGetHandleByIndex,
+    nvmlDeviceGetUtilizationRates)
 
-from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyAllWindows, waitKey, imread, namedWindow,
+from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyWindow, waitKey, imread, namedWindow,
                  WND_PROP_VISIBLE, rectangle, getWindowProperty, WINDOW_NORMAL, VideoCapture, CAP_DSHOW, CAP_PROP_FPS,
                  resizeWindow, IMREAD_COLOR, getTextSize, FONT_HERSHEY_SIMPLEX, putText, INPAINT_TELEA, fillConvexPoly,
                  getStructuringElement, dilate, MORPH_ELLIPSE, inpaint, GaussianBlur, fisheye, remap, INTER_LINEAR,
@@ -33,8 +37,9 @@ from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyAllWindows, wai
                  line, circle, phaseCorrelate, arrowedLine, imshow, imwrite, getWindowImageRect, bitwise_and, aruco,
                  setNumThreads, getOptimalNewCameraMatrix, initUndistortRectifyMap, CV_16SC2, COLOR_GRAY2BGR, error,
                  COLOR_RGB2BGR, resize, setUseOptimized, ellipse, bitwise_not, add, undistortPoints, solvePnPRansac,
-                 VideoWriter, INTER_AREA, CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE,
-                 CAP_PROP_AUTOFOCUS, CAP_PROP_AUTO_WB, CAP_PROP_GAIN)
+                 VideoWriter, INTER_AREA, CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE, CALIB_CB_EXHAUSTIVE,
+                 CAP_PROP_AUTOFOCUS, CAP_PROP_AUTO_WB, CAP_PROP_GAIN, findChessboardCorners, findChessboardCornersSB,
+                 CALIB_CB_ACCURACY, drawChessboardCorners, error as cv_error, fitLine, DIST_L2)
 from PIL.Image import fromarray
 from cv2_enumerate_cameras import enumerate_cameras
 
@@ -53,8 +58,9 @@ from SupportModules.quaternions import Quaternion as q
 from SupportModules.CVFontScaling import small_text, med_text, lrg_text
 from SupportModules.Pixel_KalmanFilter import KalmanFilter as PixelKalmanFilter
 from SupportModules.Plotting import Plotter
+from SupportModules.CalBoardGenerator import Checkerboard
 
-
+from copy import deepcopy
 from math import pow
 import logging
 
@@ -68,7 +74,7 @@ if not LOG.handlers:
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
     handler.setFormatter(fmt)
     LOG.addHandler(handler)
-    
+
     # LOG.setLevel(logging.INFO)
     # LOG.setLevel(logging.DEBUG)
     LOG.setLevel(logging.WARNING)
@@ -106,6 +112,7 @@ HUD_GREEN = (0, 255, 0)
 HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
+
 
 class PausedCache:
     def __init__(self): self.idx = None; self.frame = None
@@ -168,6 +175,7 @@ class CameraConfig:
     cam_index: int = 0
 
     # feature flags
+    draw_chessboard: bool = False
     detectTags: bool = False
     hideAprilTags: bool = True
     undistort: bool = False
@@ -183,6 +191,7 @@ class CameraConfig:
     crosshairs: bool = False
     cubemap: bool = False
     hud: bool = False
+    dp_gpu: bool = False
 
     # numeric params
     secondsBetweenImages: float = 1.0
@@ -279,7 +288,7 @@ class CameraGui(CTkFrame):
             "detectTags", "undistort", "pnpLidarPoints", "qnpLidarPoints",
             "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
-            "cubemap", "hud", "hideAprilTags"
+            "cubemap", "hud", "hideAprilTags", "draw_chessboard"
         ]
         self.recording = False
         self.yoloSession = yolo.YOLO()
@@ -346,6 +355,18 @@ class CameraGui(CTkFrame):
         self.qnpResult = None
         self.plotter = Plotter()
 
+        # Checkerboard Handlers
+        self.checkerboard = Checkerboard()
+        self.btn_checkerboard = None
+        self._cb_last_ts = 0.0
+        self._cb_last_found = False
+        self._cb_last_corners = None
+        self._cb_pattern = (11, 8)  # inner corners (cols, rows)
+        self._cb_throttle_sec = 0.10  # 10 Hz overlay update
+
+        nvmlInit()
+        self._gpu_handle = nvmlDeviceGetHandleByIndex(0)
+
         self.vc = None
 
         self.pauseCache = PausedCache()
@@ -371,41 +392,41 @@ class CameraGui(CTkFrame):
         self.available_sources = [source.value for source in ImageSource]
 
         self.streamOrImgCombo = CTkComboBox(self.cam_frame, values=self.available_sources,
-                                                command=self.sourceUpdate)
+                                            command=self.sourceUpdate)
         self.startStreamButton = CTkButton(master=self.cam_frame, text='Start Stream', fg_color=BUTTON_RED,
-                                               hover_color='blue')
+                                           hover_color='blue')
 
         self.configSelectButton = CTkButton(self.cam_frame, text='Select Config File',
                                             command=self.selectConfigFile)
         self.configSelectLabel = CTkLabel(self.cam_frame, text=os.path.basename(self.camConfig.configFilepath))
 
         self.singleImageFolderSelect = CTkButton(self.cam_frame, text='Select Img',
-                                                     command=self.selectImagesFilepath)
+                                                 command=self.selectImagesFilepath)
         self.singleImageTextButton = CTkButton(self.cam_frame, text='No Image Selected')
         self.multiImageFolderSelect = CTkButton(self.cam_frame, text='Select Img Folder',
-                                                    command=self.selectImagesFilepath)
+                                                command=self.selectImagesFilepath)
         self.multiImageTextButton = CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
 
         self.recordButton = CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
-                                          hover_color='navy', command=self.recordOff)
+                                      hover_color='navy', command=self.recordOff)
         self.printButton = CTkButton(master=self.export_frame, text='Print LiDAR', fg_color='green',
-                                         hover_color='navy', command=self.printLidarOnce)
+                                     hover_color='navy', command=self.printLidarOnce)
         self.selectCameraCombo = CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
-                                                 command=self.selectCamera)
+                                             command=self.selectCamera)
         self.selectFolderLabel = CTkLabel(self.cam_frame,
-                                              text="../" + Path(self.filepath).name if self.filepath else "../")
+                                          text="../" + Path(self.filepath).name if self.filepath else "../")
         self.selectTruthPointsButton = CTkButton(master=self.cam_frame, text='Select LIDAR Points',
-                                                     hover_color='blue', command=self.selectLidarFile)
+                                                 hover_color='blue', command=self.selectLidarFile)
         self.selectFlightLogButton = CTkButton(master=self.cam_frame, text='Select Flight Log File',
-                                                   hover_color='blue', command=self.selectLogFile)
+                                               hover_color='blue', command=self.selectLogFile)
 
         self.playbackModeText = StringVar(value='Playback Mode: FPS')
         self.update_playbackMenu()
 
         if self.camConfig.lidarFilepath is not None:
             self.selectTruthPointsLabel = CTkLabel(self.cam_frame,
-                                                       text="../" + Path(
-                                                           self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
+                                                   text="../" + Path(
+                                                       self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
         else:
             self.selectTruthPointsLabel = CTkLabel(self.cam_frame, text='No Truth Loaded')
 
@@ -417,14 +438,16 @@ class CameraGui(CTkFrame):
 
         self.lidarTruthPoints = TruthPoints()
         self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=CTK_GREEN,
-                                                     command=self.selectYoloFolder)
+                                                 command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = CTkLabel(self.cam_frame,
-                                                   text="../" + Path(
-                                                       self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
-                                                   )
+                                               text="../" + Path(
+                                                   self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
+                                               )
         self.selectCalibLabel = None
+        self.drawChessboardButton = CTkCheckBox(self.config_frame, text='Draw Chessboard',
+                                              variable=self._flag_vars['draw_chessboard'])
         self.undistortCheckbox = CTkCheckBox(self.config_frame, text='Undistort',
-                                                 variable=self._flag_vars['undistort'])
+                                             variable=self._flag_vars['undistort'])
         self.detectAprilTagsCheckbox = CTkCheckBox(
             self.config_frame, text="Detect April Tags",
             variable=self._flag_vars["detectTags"]
@@ -434,33 +457,33 @@ class CameraGui(CTkFrame):
             variable=self._flag_vars['hideAprilTags']
         )
         self.detectHorizonCheckbox = CTkCheckBox(self.config_frame, text='Detect Horizon',
-                                                     variable=self._flag_vars['detect_horizon'])
+                                                 variable=self._flag_vars['detect_horizon'])
 
         self.yoloInferenceCheckbox = CTkCheckBox(self.config_frame, text='Run YOLO on image',
-                                                     variable=self._flag_vars['yoloInference'])
+                                                 variable=self._flag_vars['yoloInference'])
 
         self.yoloBiasCheckbox = CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
-                                                variable=self._flag_vars['yoloBiasTracking'])
+                                            variable=self._flag_vars['yoloBiasTracking'])
         self.factorgraphCheckbox = CTkCheckBox(self.config_frame, text='Factor Graph',
-                                                   variable=self._flag_vars['factor_graph'])
+                                               variable=self._flag_vars['factor_graph'])
         self.hyperfocusCheckbox = CTkCheckBox(self.config_frame, text='Hyper Focus',
-                                                  variable=self._flag_vars['hyper_focus'])
+                                              variable=self._flag_vars['hyper_focus'])
         self.phaseCorrelationCheckbox = CTkCheckBox(self.config_frame, text='PhaseCorrelation',
-                                                        variable=self._flag_vars['phase_correlation'])
+                                                    variable=self._flag_vars['phase_correlation'])
         self.crosshairsCheckbox = CTkCheckBox(self.config_frame, text='Crosshairs',
-                                                  variable=self._flag_vars['crosshairs'])
+                                              variable=self._flag_vars['crosshairs'])
         self.cubemapCheckbox = CTkCheckBox(self.config_frame, text='Cubemap',
-                                               variable=self._flag_vars['cubemap'])
+                                           variable=self._flag_vars['cubemap'])
         self.hudCheckbox = CTkCheckBox(self.config_frame, text='HUD',
-                                           variable=self._flag_vars['hud'])
+                                       variable=self._flag_vars['hud'])
         self.confSliderLabel = CTkLabel(self.config_frame, text='Conf: 0.75')
         self.confSliderBar = CTkSlider(self.config_frame, command=self.confSlider,
-                                           from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
+                                       from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
         self.iouSliderLabel = CTkLabel(self.config_frame, text='IOU: 1.00')
         self.iouSliderBar = CTkSlider(self.config_frame, command=self.iouSlider)
 
         self.exportQualityCombo = CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
-                                                  command=self.updateQuality)
+                                              command=self.updateQuality)
         self.exportToGifButton = CTkButton(self.export_frame, text="Export to Gif", command=self.exportToGif)
         self.exportToVidButton = CTkButton(self.export_frame, text="Export to Vid", command=self.exportToVid)
         self.making_gifOrVid = False
@@ -471,6 +494,11 @@ class CameraGui(CTkFrame):
 
         self.exportStartFrame = CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
+
+        self.btn_checkerboard = CTkButton(self.export_frame,
+                                          state='normal',
+                                          text='Checkerboard',
+                                          command=self.launch_checkerboard)
 
         self.confSliderBar.set(self.camConfig.yolo_conf)
         self.iouSliderBar.set(self.camConfig.yolo_iou)
@@ -491,6 +519,13 @@ class CameraGui(CTkFrame):
         self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
 
         self.setupFrame()
+
+    def destroy(self):
+        try:
+            nvmlShutdown()
+        except Exception:
+            pass
+        super().destroy()
 
     def func_to_refit(self, func):
         self.func_that_refits = func
@@ -576,7 +611,6 @@ class CameraGui(CTkFrame):
                 self.camConfig.fromDict(data)
                 self.update_post_newCamConfig()
 
-
     def update_post_newCamConfig(self):
         self.updateSingleOrStream(rowID=1)
         self.updateLogFile()
@@ -587,7 +621,6 @@ class CameraGui(CTkFrame):
 
         if self.func_that_refits is not None:
             self.func_that_refits()
-
 
     def _flush_cache_now(self):
         """Actually write current config to disk. Called by saveToCache()."""
@@ -634,7 +667,6 @@ class CameraGui(CTkFrame):
                 pass
 
         self._save_debounce_id = self.after(delay_ms, self._flush_cache_now)
-
 
     def selectFolder(self):
         init_dir = Path(self.filepath).parent if self.filepath else Path.cwd()
@@ -745,7 +777,8 @@ class CameraGui(CTkFrame):
 
     def ingestCalibration(self):
 
-        if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(self.camConfig.calibFilepath):
+        if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(
+                self.camConfig.calibFilepath):
             if self.selectCalibLabel is not None:
                 self.selectCalibLabel.configure(text='No Calibration Found')
                 self.after(10, self.update_idletasks())
@@ -760,8 +793,9 @@ class CameraGui(CTkFrame):
             self.calibration.scaleCalibration(2848)
 
         if self.selectCalibLabel is not None:
-            self.selectCalibLabel.configure(text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
-                                            bg_color=self.selectCalibLabel.cget("bg_color"))
+            self.selectCalibLabel.configure(
+                text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
+                bg_color=self.selectCalibLabel.cget("bg_color"))
             self.cam_frame.update_idletasks()
             self.update_idletasks()
             self.selectCalibLabel.update_idletasks()
@@ -852,7 +886,6 @@ class CameraGui(CTkFrame):
             if self.multiImageFolderSelect.grid_info():
                 self.multiImageFolderSelect.grid_forget()
 
-
         if self.camConfig.imageSource == ImageSource.Camera_Stream:
 
             self.startStreamOff()
@@ -867,7 +900,6 @@ class CameraGui(CTkFrame):
             if not self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.singleImageTextButton.grid_info():
-
                 self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
 
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
@@ -877,9 +909,6 @@ class CameraGui(CTkFrame):
                 self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.multiImageTextButton.grid_info():
                 self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
-
-
-
         else:
             raise ValueError(f'Unknown Image selection mode: {self.camConfig.imageSource}')
 
@@ -935,8 +964,8 @@ class CameraGui(CTkFrame):
         rowID = 0
 
         self.streamOrImgCombo = CTkComboBox(self.cam_frame,
-                                                values=['Camera Stream', 'Static Image', 'Stream from Folder'],
-                                                command=self.sourceUpdate)
+                                            values=['Camera Stream', 'Static Image', 'Stream from Folder'],
+                                            command=self.sourceUpdate)
         self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
@@ -970,7 +999,7 @@ class CameraGui(CTkFrame):
         selectCalibButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.selectCalibLabel = CTkLabel(self.cam_frame,
-                                             text="../" + os.path.basename(os.path.normpath(self.camConfig.calibFilepath)))
+                                         text="../" + os.path.basename(os.path.normpath(self.camConfig.calibFilepath)))
         self.selectCalibLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
@@ -987,7 +1016,7 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         aprilTagSizeEntryButton = CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
-                                                command=self.setAprilTagSize)
+                                            command=self.setAprilTagSize)
         aprilTagSizeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.aprilTagSizeEntry = CTkEntry(self.cam_frame, placeholder_text=str(self.camConfig.aprilTagSize))
@@ -1004,6 +1033,8 @@ class CameraGui(CTkFrame):
         self.iouSliderBar.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
+        self.drawChessboardButton.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='nsew')
+
         if not self.calibration.validCal:
             self.undistortCheckbox.configure(state='disabled')
 
@@ -1014,14 +1045,13 @@ class CameraGui(CTkFrame):
         self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         self.hideAprilTagsCheckbox.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
 
-
         rowID += 1
         pnpLidarPoints = CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image',
-                                         variable=self._flag_vars['pnpLidarPoints'])
+                                     variable=self._flag_vars['pnpLidarPoints'])
         pnpLidarPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
         qnpLidarPoints = CTkCheckBox(self.config_frame, text='SolveQnP LiDAR Into Image',
-                                         variable=self._flag_vars['qnpLidarPoints'])
+                                     variable=self._flag_vars['qnpLidarPoints'])
         qnpLidarPoints.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
         rowID += 1
 
@@ -1031,7 +1061,7 @@ class CameraGui(CTkFrame):
 
         rowID += 1
         detectCornersCheckbox = CTkCheckBox(self.config_frame, text='Detect Corners',
-                                                variable=self._flag_vars['detect_corners'])
+                                            variable=self._flag_vars['detect_corners'])
         detectCornersCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
         self.detectHorizonCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
@@ -1058,7 +1088,7 @@ class CameraGui(CTkFrame):
         imageProcessingKernelLabel = CTkLabel(self.config_frame, text='Image Filter: ')
         imageProcessingKernelLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.imageProcessingKernelCombobox = CTkComboBox(self.config_frame,
-                                                             values=list(ImageKernel.__members__.keys()))
+                                                         values=list(ImageKernel.__members__.keys()))
         self.imageProcessingKernelCombobox.set(self.camConfig.processingKernel.name)
         self.imageProcessingKernelCombobox.configure(command=self.updateImageProcessingKernel)
         self.updateImageProcessingKernel(self.camConfig.processingKernel.name)
@@ -1074,11 +1104,11 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         activeEntryButton = CTkButton(self.export_frame, text="Time Between Saved Frames",
-                                          command=self.getEntryValue)
+                                      command=self.getEntryValue)
         activeEntryButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
 
         self.timeBetweenImgsEntry = CTkEntry(self.export_frame,
-                                                 placeholder_text=str(self.camConfig.secondsBetweenImages))
+                                             placeholder_text=str(self.camConfig.secondsBetweenImages))
         self.timeBetweenImgsEntry.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
         rowID += 1
 
@@ -1094,6 +1124,10 @@ class CameraGui(CTkFrame):
 
         self.exportStartFrame.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.exportEndFrame.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
+
+        self.btn_checkerboard.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
 
         title = 'Folder Replay Hotkeys'
         items = [
@@ -1270,6 +1304,16 @@ class CameraGui(CTkFrame):
         self._dp_progress.set(0.0)
 
         self._dp_cancel_flag = False
+
+        gpu_display = getattr(self.camConfig, "dp_gpu", False)
+        ctk_gpu_bool = BooleanVar(value=gpu_display)
+        gpu_checkbox = CTkCheckBox(f, text='Show GPU Util', variable=ctk_gpu_bool, command=self._on_toggle_show_gpu)
+        gpu_checkbox.grid(row=25, column =0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        self.gpu_slider = CTkSlider(f, from_=0, to=100)
+        self.gpu_slider.grid(row=25, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
+        self.gpu_slider.configure(state='disabled')
+        self.gpu_slider.set(0)
 
         def _bind_dp_str(var, attr_name):
             if var is None:
@@ -1516,7 +1560,6 @@ class CameraGui(CTkFrame):
                 daemon=True,
             ).start()
 
-
         def _cancel():
             self._dp_cancel_flag = True
             if hasattr(self, "_dp_progress_label"):
@@ -1570,7 +1613,6 @@ class CameraGui(CTkFrame):
             text="Close Plots",
             command=self.plotter.close_plot,
         ).grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
-
 
     def _write_csv_atomic(self, out_csv: str, columns: list[str], completed_map: dict[str, dict]):
         """Write CSV atomically and sort by numeric portion of image_name."""
@@ -1705,15 +1747,10 @@ class CameraGui(CTkFrame):
             else:
                 return [f"feat_{cid}_x", f"feat_{cid}_y"]
 
-        # Optional undistorted columns — only meaningful for centers, so skip when n_cls==1
-        save_ud = bool(getattr(self, "_dp_save_ud", None) and self._dp_save_ud.get()) and (n_cls > 1)
-
         columns = ["image_name", "image_time"]
         for cid in range(n_cls):
             columns.extend(_feat_cols(cid))
-            if save_ud:
-                columns.extend([f"feat_{cid}_ud_x", f"feat_{cid}_ud_y"])
-
+            
         current_conf = None
 
         for conf in conf_list:
@@ -1799,15 +1836,15 @@ class CameraGui(CTkFrame):
             # YOLO dims
             yW, yH = self.yoloSession.yoloSize
 
-            # Optional: matrices for UD points
-            if save_ud and hasattr(self, "calibration") and self.calibration is not None:
-                import numpy as _np, cv2 as _cv2
+            if hasattr(self, "calibration") and self.calibration is not None:
                 K = self.calibration.getCameraMatrix()
                 D = self.calibration.getDistortion()
+                width = self.calibration.width
+                height = self.calibration.height
             else:
-                _np = None
-                _cv2 = None
                 K = D = None
+                width = 1.0
+                height = 1.0
 
             # -------------------- producer / consumer --------------------
             def _producer_job(path_str: str, name: str):
@@ -1878,30 +1915,20 @@ class CameraGui(CTkFrame):
                             # For single-class models, store full box geometry (if any)
                             if boxes:
                                 x1, y1, x2, y2 = boxes[0]
-                                rec["feat_0_x1"] = float(x1) * sx
-                                rec["feat_0_y1"] = float(y1) * sy
-                                rec["feat_0_x2"] = float(x2) * sx
-                                rec["feat_0_y2"] = float(y2) * sy
+                                rec["feat_0_x1_dist"] = float(x1) * sx / width
+                                rec["feat_0_y1_dist"] = float(y1) * sy / height
+                                rec["feat_0_x2_dist"] = float(x2) * sx / width
+                                rec["feat_0_y2_dist"] = float(y2) * sy / height
                             # No UD columns in 1-class mode
                         else:
                             # Multi-class: keep existing center behavior (+ optional UD)
                             found_pts, found_cids = [], []
                             for (cx, cy), cid in zip(centers, classes):
                                 cidi = int(cid)
-                                x = float(cx) * sx
-                                y = float(cy) * sy
-                                rec[f"feat_{cidi}_x"] = x
-                                rec[f"feat_{cidi}_y"] = y
-                                if save_ud:
-                                    found_pts.append([x, y])
-                                    found_cids.append(cidi)
-
-                            if save_ud and found_pts and _np is not None and _cv2 is not None:
-                                pts_np = _np.array(found_pts, dtype=_np.float32).reshape(-1, 1, 2)
-                                ud = undistortPoints(pts_np, K, D, P=K).reshape(-1, 2)
-                                for (ux, uy), cidi in zip(ud, found_cids):
-                                    rec[f"feat_{cidi}_ud_x"] = float(ux)
-                                    rec[f"feat_{cidi}_ud_y"] = float(uy)
+                                x = float(cx) * sx / width
+                                y = float(cy) * sy / height
+                                rec[f"feat_{cidi}_x_dist"] = x
+                                rec[f"feat_{cidi}_y_dist"] = y
 
                         row = {"image_name": name, "image_time": time_map.get(name, None)}
                         row.update(rec)
@@ -2101,7 +2128,13 @@ class CameraGui(CTkFrame):
         # ------------------------------------------------------------------
         # Reprojection residual metric
         # ------------------------------------------------------------------
-        def _reproj_norm_pnp(K, distCoeffs, object_pts, img_pts, rvec, tvec, weights=None) -> float:
+        def _reproj_norm_pnp(K_norm,
+                             distCoeffs_norm,
+                             object_pts_norm,
+                             img_pts_norm,
+                             rvec_norm,
+                             tvec_norm,
+                             weights=None) -> float:
             """
             Reprojection residual for PnP, computed in the OpenCV *camera frame*
             using cv2.projectPoints (so it matches what solvePnP uses).
@@ -2110,22 +2143,22 @@ class CameraGui(CTkFrame):
             img_pts    : (N, 2) measured pixel locations (same as passed to solvePnP)
             rvec, tvec : outputs from solvePnP / solvePnPRansac
             """
-            if rvec is None or tvec is None:
+            if rvec_norm is None or tvec_norm is None:
                 return float("nan")
-            if object_pts is None or img_pts is None or len(object_pts) == 0:
+            if object_pts_norm is None or img_pts_norm is None or len(object_pts_norm) == 0:
                 return float("nan")
 
             # OpenCV projection in camera frame
             proj, _ = projectPoints(
-                object_pts.astype(np.float32),
-                rvec.astype(np.float64),
-                tvec.astype(np.float64),
-                K.astype(np.float64),
-                distCoeffs.astype(np.float64) if distCoeffs is not None else None,
+                object_pts_norm.astype(np.float32),
+                rvec_norm.astype(np.float64),
+                tvec_norm.astype(np.float64),
+                K_norm.astype(np.float64),
+                distCoeffs_norm.astype(np.float64) if distCoeffs_norm is not None else None,
             )
             proj = proj.reshape(-1, 2).astype(np.float64)
 
-            meas = img_pts.astype(np.float64)
+            meas = img_pts_norm.astype(np.float64)
             if proj.shape != meas.shape:
                 return float("nan")
 
@@ -2133,7 +2166,7 @@ class CameraGui(CTkFrame):
 
             if weights is not None:
                 w = np.asarray(weights, dtype=np.float64).ravel()
-                if w.size == img_pts.shape[0]:
+                if w.size == img_pts_norm.shape[0]:
                     w = np.repeat(w, 2)
                 if w.size == r.size:
                     r = np.sqrt(w) * r  # weighted L2 norm
@@ -2670,7 +2703,6 @@ class CameraGui(CTkFrame):
             len(pnp_rows), len(qnp_rows)
         )
 
-
     def run_kalman_tracks_from_detection_csv(
             self,
             csv_path: str,
@@ -2733,6 +2765,8 @@ class CameraGui(CTkFrame):
             try:
                 K = self.calibration.getCameraMatrix()
                 fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+                width = self.calibration.width
+                height = self.calibration.height
             except Exception:
                 K = None
 
@@ -2743,8 +2777,7 @@ class CameraGui(CTkFrame):
             """
             if K is None:
                 return float(x), float(y)
-            return (float(x) / (2.0 * cx), float(y) / (2.0 * cy ) )
-
+            return (float(x) / width, float(y) / height)
 
         # --- Output path ---
         base = Path(csv_path)
@@ -2803,10 +2836,10 @@ class CameraGui(CTkFrame):
 
                 # If no measurement, we only propagate if the filter has a state
                 if (
-                    x_val is None or x_val == -1.0
-                    or y_val is None or y_val == -1.0
-                    or isna(x_val)
-                    or isna(y_val)
+                        x_val is None or x_val == -1.0
+                        or y_val is None or y_val == -1.0
+                        or isna(x_val)
+                        or isna(y_val)
                 ):
                     # Predict-only (z=None) if we already have a state
                     if kf.x is not None:
@@ -2861,6 +2894,21 @@ class CameraGui(CTkFrame):
         out_df.to_csv(out_csv, index=False)
         LOG.info("Kalman tracks CSV written: %s", out_csv)
 
+    def launch_checkerboard(self):
+        self.btn_checkerboard.configure(state="disabled", text="Checkerboard (running)")
+
+        def _worker():
+            def _on_close():
+                # hop back to Tk thread
+                self.after(0, lambda: self.btn_checkerboard.configure(
+                    state="normal",
+                    text="Checkerboard"
+                ))
+
+            self.checkerboard.run_checkerboard(on_close=_on_close)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def setup_playbackFrame(self):
         rowID = 0
         self.update_playbackMenu()
@@ -2883,7 +2931,6 @@ class CameraGui(CTkFrame):
         self.shutting_down = True
         self.recordOff()
         self.safely_close_playwindow()
-
 
     def setAprilTagSize(self):
 
@@ -3014,7 +3061,11 @@ class CameraGui(CTkFrame):
         waitKey(1)
 
         self.threadStopper.set()
-        destroyAllWindows()
+        try:
+            destroyWindow(self.windowName)
+        except cv_error as e:
+            pass  # Window not yet open
+
 
         if self.vc is not None and self.vc.isOpened():
             self.vc.release()
@@ -3040,7 +3091,10 @@ class CameraGui(CTkFrame):
 
             self.showWindow = False
 
-        destroyAllWindows()
+        try:
+            destroyWindow(self.windowName)
+        except cv_error:
+            pass # window not yet open
 
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
@@ -3082,7 +3136,7 @@ class CameraGui(CTkFrame):
                 self.threadStopper.set()
                 break
 
-        destroyAllWindows()
+        destroyWindow(self.windowName)
         self.after(0, self._on_worker_exit)
 
     @staticmethod
@@ -3127,7 +3181,12 @@ class CameraGui(CTkFrame):
         if self.vc is not None and self.vc.isOpened():
             self.vc.release()
             self.vc = None
-        destroyAllWindows()
+
+        try:
+            destroyWindow(self.windowName)
+        except cv_error:
+            pass
+
         self.after(0, self._on_worker_exit)
         return
 
@@ -3225,7 +3284,7 @@ class CameraGui(CTkFrame):
             stats.print_stats("tkinter")
 
     def run_folder_reader(self):
-        destroyAllWindows()
+        destroyWindow(self.windowName)
         namedWindow(self.windowName, WINDOW_NORMAL)
 
         directory = Path(self.camConfig.imageFilepath).parent
@@ -3512,7 +3571,7 @@ class CameraGui(CTkFrame):
                     break
 
         finally:
-            destroyAllWindows()
+            destroyWindow(self.windowName)
             self.after(0, self._on_worker_exit)
             loader.stop()
 
@@ -3666,6 +3725,20 @@ class CameraGui(CTkFrame):
         self.playback.speed = 0.0
         return curr_idx
 
+    def _on_toggle_show_gpu(self):
+        self.camConfig.dp_gpu = not self.camConfig.dp_gpu
+        if self.camConfig.dp_gpu:
+            self.after(500, self._poll_gpu)
+
+    def _poll_gpu(self):
+        if self.camConfig.dp_gpu:
+            try:
+                util = nvmlDeviceGetUtilizationRates(self._gpu_handle)
+                self.gpu_slider.set(float(util.gpu))
+            except Exception:
+                pass
+            self.after(500, self._poll_gpu)
+
     def _on_toggle_pause(self, curr_idx: int, t, wall_start: float) -> float:
         self.pause = not self.pause
         playing = (self.playback.speed != 0)
@@ -3806,10 +3879,18 @@ class CameraGui(CTkFrame):
 
         # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
         if self.calibration.validCal and self.camConfig.undistort:
-            self.undistort(frame.copy())
+            self.undistort(frame)
         else:
-            self.curr_frame = frame.copy()
-        self.markup_frame = self.curr_frame.copy()
+            self.curr_frame = frame  # explicit reference passed, saves copy if not undistorting
+
+        # np.copyto is faster (doesn't reallocate), but requires destination to match shape
+        if self.markup_frame is None or self.markup_frame.shape != self.curr_frame.shape:
+            self.markup_frame = self.curr_frame.copy()
+        else:
+            np.copyto(self.markup_frame, self.curr_frame)
+
+        if self.camConfig.draw_chessboard:
+            self.draw_chessboard()
 
         if self.camConfig.processingKernel != ImageKernel.Unfiltered:
             self.applyKernel()
@@ -3838,8 +3919,11 @@ class CameraGui(CTkFrame):
         if self.camConfig.hyper_focus:
             self.hyper_focus()
 
+        if self.camConfig.phase_correlation:
+            self.phase_correlation()
+
         if self.camConfig.yoloInference:
-            self.run_yolo()
+            self.run_yolo(frame)  # Takes original frame, not undistort. YOLO presumes original.
         else:
             self.last_bounding_box_size = None
             self.last_yolo_center = None
@@ -3848,9 +3932,6 @@ class CameraGui(CTkFrame):
             self.factor_graph(img_time)
         else:
             self.last_yolo_3d_estimate = None
-
-        if self.camConfig.phase_correlation:
-            self.phase_correlation()
 
         if self.camConfig.hud and img_time is not None:
             self.hud_marker.draw_HUD(self.markup_frame, img_time)
@@ -3861,26 +3942,30 @@ class CameraGui(CTkFrame):
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = getTextSize(os.path.basename(name), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), 4)
+            (width, height), base = getTextSize(os.path.basename(name), FONT_HERSHEY_SIMPLEX,
+                                                med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+                    FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
         if img_time is not None:
             time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-            (time_width, time_height), base = getTextSize(time_str, FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), 4)
+            (time_width, time_height), base = getTextSize(time_str, FONT_HERSHEY_SIMPLEX,
+                                                          med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
             putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
-                        FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+                    FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
 
         if display_in_realtime:
             if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
                 (h, w) = self.markup_frame.shape[:2]
                 self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
                 putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                            (int(0.015 * w), int(0.030 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_YELLOW, 2)
+                        (int(0.015 * w), int(0.030 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
+                        HUD_YELLOW, 2)
                 putText(self.markup_frame,
-                            f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                            (int(0.015 * w), int(0.060 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_YELLOW, 2)
+                        f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                        (int(0.015 * w), int(0.060 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
+                        HUD_YELLOW, 2)
             self.cleanup()
 
         if self.printLidar:
@@ -3888,6 +3973,90 @@ class CameraGui(CTkFrame):
 
         if not display_in_realtime:
             return self.markup_frame
+
+    @staticmethod
+    def _line_fit_residual_px(pts_xy: np.ndarray) -> float:
+        """
+        pts_xy: (N,2) float array
+        Returns RMS perpendicular distance (pixels) to best-fit line.
+        """
+        if pts_xy.shape[0] < 2:
+            return float("nan")
+
+        # cv2.fitLine returns normalized direction (vx,vy) and a point (x0,y0) on the line
+        vx, vy, x0, y0 = fitLine(pts_xy.astype(np.float32), DIST_L2, 0, 0.01, 0.01).flatten()
+
+        # Perpendicular distance from point p to line through x0 with direction v:
+        # dist = |(p-x0) x v| / ||v||, but ||v||≈1 from fitLine
+        dx = pts_xy[:, 0] - x0
+        dy = pts_xy[:, 1] - y0
+        dist = np.abs(dx * vy - dy * vx)  # since ||v|| ~ 1
+        return float(np.sqrt(np.mean(dist * dist)))
+
+    def _chessboard_straightness_residual(self, corners: np.ndarray, pattern: tuple[int, int]) -> tuple[float, float, float]:
+        """
+        corners: (N,1,2) from OpenCV, pattern=(cols,rows) inner corners.
+        Returns (rms_rows, rms_cols, rms_all) in pixels.
+        """
+        cols, rows = pattern
+        pts = corners.reshape(-1, 2).astype(np.float32)  # (N,2)
+        if pts.shape[0] != cols * rows:
+            return float("nan"), float("nan"), float("nan")
+
+        grid = pts.reshape(rows, cols, 2)  # row-major: [r,c,(x,y)]
+
+        row_rms = []
+        for r in range(rows):
+            row_rms.append(self._line_fit_residual_px(grid[r, :, :]))
+
+        col_rms = []
+        for c in range(cols):
+            col_rms.append(self._line_fit_residual_px(grid[:, c, :]))
+
+        rms_rows = float(np.nanmean(row_rms))
+        rms_cols = float(np.nanmean(col_rms))
+        rms_all = float(np.sqrt((rms_rows * rms_rows + rms_cols * rms_cols) / 2.0))
+        return rms_rows, rms_cols, rms_all
+
+    def draw_chessboard(self):
+        if self.curr_frame_gray is None:
+            self.curr_frame_gray = cvtColor(self.markup_frame, COLOR_BGR2GRAY)
+
+        now = time.monotonic()
+        if (now - self._cb_last_ts) >= self._cb_throttle_sec:
+            self._cb_last_ts = now
+
+            flags = CALIB_CB_EXHAUSTIVE | CALIB_CB_ACCURACY
+            found, corners = findChessboardCornersSB(self.curr_frame_gray, self._cb_pattern, flags)
+
+            self._cb_last_found = bool(found)
+            self._cb_last_corners = corners if found else None
+
+            # NEW: compute residual on update ticks
+            if self._cb_last_found and self._cb_last_corners is not None:
+                rr, cc, allr = self._chessboard_straightness_residual(self._cb_last_corners, self._cb_pattern)
+                self._cb_last_resid = (rr, cc, allr)
+            else:
+                self._cb_last_resid = None
+
+        # Draw from cache (smooth display)
+        if self._cb_last_found and self._cb_last_corners is not None:
+            drawChessboardCorners(self.markup_frame, self._cb_pattern, self._cb_last_corners, True)
+
+            # NEW: overlay residual
+            if getattr(self, "_cb_last_resid", None) is not None:
+                rr, cc, allr = self._cb_last_resid
+                txt = f"CB resid (px): row={rr:.2f} col={cc:.2f} rms={allr:.2f}"
+            else:
+                txt = "CB resid: ---"
+
+        else:
+            txt = "CB: NOT FOUND"
+
+        # Put text on the image (top-left)
+        org = (20, 40)
+        putText(self.markup_frame, txt, org, FONT_HERSHEY_SIMPLEX, lrg_text(self.curr_frame.shape[0]), (0, 0, 0), 4, LINE_AA)
+        putText(self.markup_frame, txt, org, FONT_HERSHEY_SIMPLEX, lrg_text(self.curr_frame.shape[0]), (255, 255, 0), 2, LINE_AA)
 
     def inpaint_apriltags(self,
                           radius_px: int = 3,
@@ -3998,7 +4167,6 @@ class CameraGui(CTkFrame):
 
         probe_pose = np.array([4.89965725, .20014286, -1.55304432])
 
-
         if points is not None and self.detector is not None:
             print(f'Obj Points: \n{points}')
         if self.centers is not None:
@@ -4011,7 +4179,7 @@ class CameraGui(CTkFrame):
         print()
         print(f'Diff: {self.pnpResult[1]}')
         print(f'Diff: {probe_pose}')
-        print(f'Diff: {self.pnpResult[1]-probe_pose}')
+        print(f'Diff: {self.pnpResult[1] - probe_pose}')
 
         self.printLidar = False
 
@@ -4167,7 +4335,7 @@ class CameraGui(CTkFrame):
                 self.curr_frame = self.cubemap_faces['front']
         else:
             self.curr_frame = remap(frame, self.map1, self.map2, interpolation=INTER_LINEAR,
-                                        borderMode=BORDER_CONSTANT)
+                                    borderMode=BORDER_CONSTANT)
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernel.Gabor and self.GaborGUI is not None:
@@ -4211,7 +4379,7 @@ class CameraGui(CTkFrame):
         if not (0.2 <= scale < 1.0):
             scale = 0.6
         small = resize(gray_full, (int(w * scale), int(h * scale)),
-                           interpolation=INTER_AREA)
+                       interpolation=INTER_AREA)
 
         # 2) Detect on smaller image
         corners_small, ids, rejected = self.detector.detectMarkers(small)
@@ -4259,9 +4427,9 @@ class CameraGui(CTkFrame):
             if not self.camConfig.hideAprilTags:
                 polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=FILLED)
                 putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
+                        FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
                 putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
+                        FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 
@@ -4293,17 +4461,17 @@ class CameraGui(CTkFrame):
                 return
 
             ret, rvec, tvec = solvePnP(objectPoints=points,
-                                           imagePoints=centers,
-                                           cameraMatrix=self.calibration.getCameraMatrix(),
-                                           distCoeffs=distParams,
-                                           flags=SOLVEPNP_ITERATIVE)
+                                       imagePoints=centers,
+                                       cameraMatrix=self.calibration.getCameraMatrix(),
+                                       distCoeffs=distParams,
+                                       flags=SOLVEPNP_ITERATIVE)
 
             if ret:
                 projectedPoints_orig, _ = projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
-                                                            rvec=rvec,
-                                                            tvec=tvec,
-                                                            cameraMatrix=self.calibration.getCameraMatrix(),
-                                                            distCoeffs=distParams)
+                                                        rvec=rvec,
+                                                        tvec=tvec,
+                                                        cameraMatrix=self.calibration.getCameraMatrix(),
+                                                        distCoeffs=distParams)
 
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
@@ -4313,13 +4481,13 @@ class CameraGui(CTkFrame):
                 self.pnpResult = (quatPnP, vectPnP)
 
                 putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
-                            FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
-                            (255, 255, 0), 3,
-                            LINE_AA)
+                        FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
+                        (255, 255, 0), 3,
+                        LINE_AA)
                 putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
-                            (50, 150), FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
-                            (255, 255, 0), 3,
-                            LINE_AA)
+                        (50, 150), FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
+                        (255, 255, 0), 3,
+                        LINE_AA)
 
     def qnpLidarPoints(self):
         if self.centers is not None and len(self.centers) >= 6:
@@ -4362,15 +4530,15 @@ class CameraGui(CTkFrame):
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
             self.qnpResult = (quat, vect)
             putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
-                        FONT_HERSHEY_DUPLEX,
-                        small_text(self.markup_frame.shape[0]),
-                        (255, 255, 0), 3,
-                        LINE_AA)
+                    FONT_HERSHEY_DUPLEX,
+                    small_text(self.markup_frame.shape[0]),
+                    (255, 255, 0), 3,
+                    LINE_AA)
             putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
-                        FONT_HERSHEY_DUPLEX,
-                        small_text(self.markup_frame.shape[0]),
-                        (255, 255, 0), 3,
-                        LINE_AA)
+                    FONT_HERSHEY_DUPLEX,
+                    small_text(self.markup_frame.shape[0]),
+                    (255, 255, 0), 3,
+                    LINE_AA)
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
@@ -4392,8 +4560,8 @@ class CameraGui(CTkFrame):
         edges = Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
         lines = HoughLinesP(edges, 1, np.pi / 180.0, 50,
-                                minLineLength=np.sum(self.curr_frame.shape) / 10.0,
-                                maxLineGap=20)
+                            minLineLength=np.sum(self.curr_frame.shape) / 10.0,
+                            maxLineGap=20)
 
         color = (0, 0, 255)
 
@@ -4466,13 +4634,14 @@ class CameraGui(CTkFrame):
             self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
                                                   y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
-    def run_yolo(self):
+    def run_yolo(self, orig_image):
         '''
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
-        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(self.markup_frame, self.markup_frame,
+        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
+                                                                               self.camConfig.undistort,
                                                                                self.camConfig.yoloBiasTracking)
 
         centers, boxes, scores, class_ids, time = output
@@ -4507,11 +4676,11 @@ class CameraGui(CTkFrame):
                 self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                 w, h, _ = self.curr_frame.shape
                 putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), FONT_HERSHEY_SIMPLEX,
-                            med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
+                        med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
                 putText(self.markup_frame,
-                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
-                            (25, w - 50),
-                            FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
+                        f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
+                        (25, w - 50),
+                        FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
                 # circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                 #            3, (255, 0, 255), 3)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
@@ -4547,23 +4716,23 @@ class CameraGui(CTkFrame):
             size = 15
             thickness = 2
             circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
-                       thickness)
+                   thickness)
             line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
-                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
+                 [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
             line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
-                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
+                 [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
             putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), (0, 0, 0), thickness)
+                    med_text(self.markup_frame.shape[0]), (0, 0, 0), thickness)
 
             thickness = 1
             circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
-                       thickness)
+                   thickness)
             line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
-                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
+                 [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
             line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
-                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
+                 [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
             putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), color, thickness)
+                    med_text(self.markup_frame.shape[0]), color, thickness)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
 
@@ -4589,7 +4758,7 @@ class CameraGui(CTkFrame):
 
         if self.last_image is not None and self.last_image.shape == self.curr_frame_gray.shape:
             lft_rt, ret = phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
-                                             self.last_image.astype(np.float64) / 255.0)
+                                         self.last_image.astype(np.float64) / 255.0)
             lft, rt = lft_rt
             arrowedLine(self.markup_frame, (cx, cy), (int(cx + 10 * lft), int(cy + 10 * rt)), (0, 0, 255), 3)
 
@@ -4629,11 +4798,13 @@ class CameraGui(CTkFrame):
         for idx, pxPt in enumerate(points):
             circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (0, 0, 0),
-                        12,
-                        LINE_AA)
-            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), color, 3,
-                        LINE_AA)
+            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX,
+                    med_text(self.markup_frame.shape[0]), (0, 0, 0),
+                    12,
+                    LINE_AA)
+            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX,
+                    med_text(self.markup_frame.shape[0]), color, 3,
+                    LINE_AA)
 
     def potentialResize(self):
         if getWindowProperty(self.windowName, WND_PROP_VISIBLE) <= 0:
@@ -4684,7 +4855,7 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
         # rectangle(mask, (int(center[0]-x_axes),int(center[1]-y_axes)),(int(center[0]+x_axes),int(center[1]+y_axes)),
         #               color=255, thickness=-1)
         ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
-                    angle=0, startAngle=0, endAngle=360, color=(255, 255, 255), thickness=-1)
+                angle=0, startAngle=0, endAngle=360, color=(255, 255, 255), thickness=-1)
 
     # 2. Dim the entire image
     dimmed_img = (frame * dim_factor).astype("uint8")

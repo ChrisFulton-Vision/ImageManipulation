@@ -17,12 +17,74 @@ Terms used in function names:
 import numpy as np
 from numpy import cos, arccos, sin, arcsin, arctan2, rad2deg, deg2rad, sqrt, abs
 from typing_extensions import Self, Union
-from copy import deepcopy
+from numba import njit, prange
 
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 
+@njit(cache=True, fastmath=False)
+def _cross3(a0, a1, a2, b0, b1, b2):
+    return (a1 * b2 - a2 * b1,
+            a2 * b0 - a0 * b2,
+            a0 * b1 - a1 * b0)
+
+@njit(parallel=True, cache=True, fastmath=False)
+def rotate_vecs_quat_numba(w: float, x: float, y: float, z: float, vecs: np.ndarray) -> np.ndarray:
+    """
+    Rotate Nx3 vectors by unit quaternion q = (w, x, y, z).
+    Uses the 't' formulation: t = 2 * (q_vec x v); v' = v + w*t + (q_vec x t)
+    """
+    N = vecs.shape[0]
+    out = np.empty((N, 3), dtype=np.float64)
+
+    for i in prange(N):
+        vx = vecs[i, 0]
+        vy = vecs[i, 1]
+        vz = vecs[i, 2]
+
+        # t = 2 * cross(qvec, v)
+        cx0, cx1, cx2 = _cross3(x, y, z, vx, vy, vz)
+        tx = 2.0 * cx0
+        ty = 2.0 * cx1
+        tz = 2.0 * cx2
+
+        # cross(qvec, t)
+        c2x0, c2x1, c2x2 = _cross3(x, y, z, tx, ty, tz)
+
+        out[i, 0] = vx + w * tx + c2x0
+        out[i, 1] = vy + w * ty + c2x1
+        out[i, 2] = vz + w * tz + c2x2
+
+    return out
+
+@njit(cache=True, fastmath=False)
+def qmul_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    # a,b are shape (4,) = [w,x,y,z]
+    aw, ax, ay, az = a[0], a[1], a[2], a[3]
+    bw, bx, by, bz = b[0], b[1], b[2], b[3]
+    out = np.empty(4, dtype=np.float64)
+    out[0] = aw*bw - ax*bx - ay*by - az*bz
+    out[1] = aw*bx + ax*bw + ay*bz - az*by
+    out[2] = aw*by - ax*bz + ay*bw + az*bx
+    out[3] = aw*bz + ax*by - ay*bx + az*bw
+    return out
+
+@njit(parallel=True, cache=True, fastmath=False)
+def qmul_batch_left_numba(a: np.ndarray, Bs: np.ndarray) -> np.ndarray:
+    # a shape (4,), Bs shape (N,4) => out (N,4) = a ⊗ Bs[i]
+    N = Bs.shape[0]
+    out = np.empty((N, 4), dtype=np.float64)
+    aw, ax, ay, az = a[0], a[1], a[2], a[3]
+    for i in prange(N):
+        bw, bx, by, bz = Bs[i, 0], Bs[i, 1], Bs[i, 2], Bs[i, 3]
+        out[i, 0] = aw*bw - ax*bx - ay*by - az*bz
+        out[i, 1] = aw*bx + ax*bw + ay*bz - az*by
+        out[i, 2] = aw*by - ax*bz + ay*bw + az*bx
+        out[i, 3] = aw*bz + ax*by - ay*bx + az*bw
+    return out
+
 class Quaternion:
+    __slots__ = ("s", "vec", "_cache4")
     __array_priority__ = 10_000  # overrides numpy priority for right mult
 
     def __init__(self, s: float = None, vec: np.array = None, quat: np.array = None, makeUnitQuat: bool = True) -> None:
@@ -33,15 +95,15 @@ class Quaternion:
 
         # Included for redundancy, if a quaternion is passed in, make a copy of its values
         if isinstance(quat, Quaternion):
-            self.s = deepcopy(quat.s)
-            self.vec = deepcopy(quat.vec)
+            self.s = float(quat.s)
+            self.vec = np.array(quat.vec, copy=True)
             # raise ValueError(f'Gave me a quaternion already, with {s = } and {vec = }')
             return
 
         #
         if s is None and vec is None and quat is not None:
-            self.s = deepcopy(quat[0])
-            self.vec = deepcopy(quat[1:4]).flatten()
+            self.s = float(quat[0])
+            self.vec = np.array(quat[1:4]).flatten()
             self.checkUnit(makeUnitQuat)
             return
 
@@ -53,9 +115,9 @@ class Quaternion:
 
         if s is None:
             if np.shape(vec) == (3,):
-                self.vec = deepcopy(vec)
+                self.vec = vec.copy()
             elif np.shape(vec) == (3, 1) or np.shape(vec) == (1, 3):
-                self.vec = vec.flatten()
+                self.vec = vec.flatten().copy()
             else:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
             self.s = sqrt(1.0 - vec.dot(vec))
@@ -65,14 +127,14 @@ class Quaternion:
         if vec is None:
             if not type(s, float):
                 raise ValueError('s should be a single float')
-            self.s = deepcopy(s)
+            self.s = float(s)
             self.vec = np.zeros((3,))
         else:
             self.s = s
             if np.shape(vec) == (3,):
-                self.vec = deepcopy(vec)
+                self.vec = vec.copy()
             elif np.shape(vec) == (3, 1) or np.shape(vec) == (1, 3):
-                self.vec = deepcopy(vec).flatten()
+                self.vec = vec.flatten().copy()
             else:
                 raise ValueError('vec should be a (3,) or (3,1) or (1,3) numpy array')
         self.checkUnit(makeUnitQuat)
@@ -80,7 +142,7 @@ class Quaternion:
     def checkUnit(self, makeUnitQuat: bool):
         if makeUnitQuat:
             norm: float = self.norm
-            if abs(norm) < 0.000001:
+            if abs(norm) < _FLOAT_EPS:
                 raise ValueError('Cannot make zero-quaternion a unit.')
             self.s /= norm
             self.vec /= norm
@@ -239,7 +301,27 @@ class Quaternion:
         return self
 
     def qVECS_mult(self, vecs: np.array):
-        sol: np.array = np.zeros(vecs.shape)
+        """
+        Rotate an Nx3 array of vectors by this quaternion.
+        Uses a Numba JIT kernel when available; otherwise falls back to Python loop.
+        """
+        vecs = np.asarray(vecs)
+
+        # Common case: Nx3
+        if vecs.ndim == 2 and vecs.shape[1] == 3:
+            # Ensure dtype/contiguous once (avoid per-call copies elsewhere)
+            v = vecs
+            if v.dtype != np.float64 or not v.flags["C_CONTIGUOUS"]:
+                v = np.ascontiguousarray(v, dtype=np.float64)
+
+            return rotate_vecs_quat_numba(float(self.s),
+                                          float(self.vec[0]),
+                                          float(self.vec[1]),
+                                          float(self.vec[2]),
+                                          v)
+
+        # Fallback: original behavior
+        sol = np.zeros(vecs.shape, dtype=float)
         for idx, vec in enumerate(vecs):
             sol[idx] = self.qv_mult(vec)
         return sol
@@ -355,16 +437,21 @@ class Quaternion:
         return quat2mat(self.ndarray)
 
     def qq_mult(self, multQuat):
-        return qmult(self.ndarray, multQuat.ndarray)
+        a = self._ndarray_view()
+        b = multQuat._ndarray_view()
+        return qmul_numba(a, b)
 
     def qn_mult(self, multNdarray):
-        return qmult(self.ndarray, multNdarray)
+        a = self._ndarray_view()
+        b = np.asarray(multNdarray, dtype=np.float64).reshape(4, )
+        return qmul_numba(a, b)
 
     def qQs_mult(self, QsNdarray):
-        going_out = np.zeros((QsNdarray.shape))
-        for idx, quat_as_ndarray in enumerate(QsNdarray):
-            going_out[idx] = qmult(self.ndarray, quat_as_ndarray)
-        return going_out
+        a = self._ndarray_view()
+        Bs = np.asarray(QsNdarray, dtype=np.float64)
+        if not Bs.flags["C_CONTIGUOUS"]:
+            Bs = np.ascontiguousarray(Bs)
+        return qmul_batch_left_numba(a, Bs)
 
     def qv_mult(self, multVec):
         return (2 * np.dot(self.vec, multVec) * self.vec +
@@ -383,7 +470,7 @@ class Quaternion:
         return multVec + self.s * t + np.cross(self.vec, t)
 
     def copy(self):
-        return deepcopy(self)
+        return Quaternion(s=float(self.s), vec=self.vec.copy(), makeUnitQuat=False)
 
     def force_s_pos(self):
         if self.s < 0:
@@ -400,8 +487,18 @@ class Quaternion:
         return Quaternion(self.s, -self.vec, makeUnitQuat=False) / self.mag ** 2
 
     @property
-    def ndarray(self):
-        return np.append(self.s, self.vec)
+    def ndarray(self) -> np.ndarray:
+        return np.array([self.s, self.vec[0], self.vec[1], self.vec[2]], dtype=np.float64)
+
+    def _ndarray_view(self):
+        # DO NOT USE OUTSIDE CLASS
+        # MUTABLE SCRATCH BUFFER
+        # RUNS CODE 50-100% FASTER, BUT USER COULD MODIFY QUAT UNINTENTIONALLY
+        if not hasattr(self, "_cache4") or self._cache4 is None:
+            self._cache4 = np.empty(4, dtype=np.float64)
+        self._cache4[0] = self.s
+        self._cache4[1:] = self.vec
+        return self._cache4
 
     @property
     def conj(self):
@@ -585,6 +682,32 @@ pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
 pure_qy = Quaternion(s=0.0, vec=np.array([0.0, 1.0, 0.0]))
 pure_qz = Quaternion(s=0.0, vec=np.array([0.0, 0.0, 1.0]))
 
+def skew(v: np.ndarray) -> np.ndarray:
+    """Return [v]_x such that [v]_x @ a = v x a."""
+    v = np.asarray(v, dtype=float).reshape(3)
+    x, y, z = v
+    return np.array([[0.0, -z,  y],
+                     [z,  0.0, -x],
+                     [-y, x,  0.0]], dtype=float)
+
+def so3_left_jacobian(phi: np.ndarray) -> np.ndarray:
+    """
+    Left Jacobian J_l(phi) for SO(3), phi is 3-vector rotation vector.
+      J = I - (1-cosθ)/θ^2 [φ]_x + (θ - sinθ)/θ^3 [φ]_x^2
+    with stable small-angle series.
+    """
+    phi = np.asarray(phi, dtype=float).reshape(3)
+    theta = float(np.linalg.norm(phi))
+    I = np.eye(3)
+    if theta < 1e-8:
+        # Series: I - 1/2 Φ + 1/6 Φ^2 + O(θ^3)
+        Phi = skew(phi)
+        return I - 0.5 * Phi + (1.0 / 6.0) * (Phi @ Phi)
+
+    Phi = skew(phi)
+    a = (1.0 - np.cos(theta)) / (theta * theta)
+    b = (theta - np.sin(theta)) / (theta * theta * theta)
+    return I - a * Phi + b * (Phi @ Phi)
 
 def interpolate(q1: Quaternion, q2: Quaternion, t: float):
     interp: Quaternion = q1 * (q1.inv * q2).power(t)

@@ -11,6 +11,8 @@ class Checkerboard:
         self.screen_width = 1920
         self.screen_height = 1080
 
+        self.xy_num_squares = [12, 9]
+
         self._refresh_monitors()
 
     def _refresh_monitors(self):
@@ -60,18 +62,18 @@ class Checkerboard:
 
 
     # -------------------- Pattern generation --------------------
-    @staticmethod
-    def make_checkerboard(width, height, squares_x=10, squares_y=8):
+    def make_checkerboard(self, width, height):
         """
         Create a checkerboard image of size (height, width).
         squares_x, squares_y: number of squares horizontally/vertically.
         """
         # Base pattern: 0/1 checkerboard at low resolution
-        pattern = 1 - np.add.outer(np.arange(squares_y), np.arange(squares_x)) % 2
+        pattern = 1 - np.add.outer(np.arange(self.xy_num_squares[1]),
+                                   np.arange(self.xy_num_squares[0])) % 2
 
         # Scale pattern so each square fills equal region in pixels
-        tile_w = max(1, width  // squares_x)
-        tile_h = max(1, height // squares_y)
+        tile_w = max(1, width  // self.xy_num_squares[0])
+        tile_h = max(1, height // self.xy_num_squares[1])
         pattern = pattern.repeat(tile_h, axis=0).repeat(tile_w, axis=1)
 
         # Crop to exact size (in case width/height not divisible)
@@ -119,23 +121,21 @@ class Checkerboard:
 
         return timer_frame_a, timer_frame_b
 
-    @staticmethod
-    def build_squares_frames(checker_a,
-                           checker_b,
-                           screen_width,
-                           screen_height,
-                           now,
-                           squares_x,
-                           squares_y,
-                           hud_duration = 5.0):
+    def build_squares_frames(self,
+                             checker_a,
+                             checker_b,
+                             screen_width,
+                             screen_height,
+                             now,
+                             hud_duration = 5.0):
         timer_frame_a = checker_a.copy()
         timer_frame_b = checker_b.copy()
 
         org1 = (int(screen_width * 0.1), int(screen_height * 0.05))
         org2 = (int(screen_width * 0.1), int(screen_height * 0.10))
 
-        instr_text_a = f'{squares_x - 1} inner row corners'
-        instr_text_b = f'{squares_y - 1} inner col corners'
+        instr_text_a = f'{self.xy_num_squares[0] - 1} inner row corners'
+        instr_text_b = f'{self.xy_num_squares[1] - 1} inner col corners'
 
         # Draw on A
         cv2.putText(timer_frame_a, instr_text_a, org1,
@@ -242,18 +242,13 @@ class Checkerboard:
     # -------------------- Main loop --------------------
 
     def run_checkerboard(self, on_close):
-        # Initial checkerboard resolution
-        squares_x = 12
-        squares_y = 9
 
         flash_freq_hz = 20.0
         period = 1.0 / flash_freq_hz
 
         # Build base patterns
         checker_a = self.make_checkerboard(self.screen_width,
-                                           self.screen_height,
-                                           squares_x,
-                                           squares_y)
+                                           self.screen_height)
         # White frame for B (checkerboard vs full white)
         checker_b = np.ones_like(checker_a) * 255
 
@@ -283,6 +278,7 @@ class Checkerboard:
         frames_b = 0
 
         pause = True
+        last_frame_id = None
 
         while True:
             now = time.perf_counter()
@@ -307,7 +303,15 @@ class Checkerboard:
             else:
                 frame = checker_a if (pause or use_a) else checker_b
 
-            cv2.imshow(win_name, frame)
+
+
+            # when choosing frame:
+            frame_id = ("hud" if show_hud else "plain", "A" if (pause or use_a) else "B",
+                        flash_freq_hz, tuple(self.xy_num_squares), self.monitor_idx)
+
+            if frame_id != last_frame_id:
+                cv2.imshow(win_name, frame)
+                last_frame_id = frame_id
 
             # Frame counters
             if use_a:
@@ -315,7 +319,20 @@ class Checkerboard:
             else:
                 frames_b += 1
 
-            key = cv2.waitKey(1) & 0xFF
+            # How long until we *need* to flip A/B?
+            dt_to_toggle = next_toggle - now
+            # Keep UI responsive; don't block too long even if toggle is far away
+            max_block_ms = 10
+            block_ms = 1
+            if dt_to_toggle > 0:
+                block_ms = max(1, min(max_block_ms, int(dt_to_toggle * 1000)))
+
+            key = cv2.waitKey(block_ms) & 0xFF
+
+            # If we didn't block all the way to the toggle, optionally yield a little more
+            # (waitKey already yields, so this can be tiny or omitted)
+            if dt_to_toggle > (block_ms / 1000.0):
+                time.sleep(0.0005)
 
             if key == ord('a'):  # decrease frequency
                 flash_freq_hz, period, display_until, timer_frame_a, timer_frame_b = self.adjust_frequency_and_build_hud(
@@ -350,28 +367,28 @@ class Checkerboard:
             # --- NUMPAD-BASED CHECKER RESOLUTION CONTROL ---
 
             elif key == ord('4'):  # Numpad 4: fewer columns
-                if squares_x > 2:
-                    squares_x -= 1
+                if self.xy_num_squares[0] > 3:
+                    self.xy_num_squares[0] -= 1
                 rebuild = True
 
             elif key == ord('6'):  # Numpad 6: more columns
-                squares_x += 1
+                self.xy_num_squares[0] += 1
                 rebuild = True
 
             elif key == ord('8'):  # Numpad 8: more rows
-                squares_y += 1
+                self.xy_num_squares[1] += 1
                 rebuild = True
 
             elif key == ord('2'):  # Numpad 2: fewer rows
-                if squares_y > 2:
-                    squares_y -= 1
+                if self.xy_num_squares[1] > 3:
+                    self.xy_num_squares[1] -= 1
                 rebuild = True
 
             elif key == ord('n'):
                 # Hop window to next monitor, then rebuild buffers to match new resolution
                 self._next_monitor(win_name)
 
-                checker_a = self.make_checkerboard(self.screen_width, self.screen_height, squares_x, squares_y)
+                checker_a = self.make_checkerboard(self.screen_width, self.screen_height)
                 checker_b = np.ones_like(checker_a) * 255
 
                 # Rebuild HUD frames too (use updated dims)
@@ -390,17 +407,17 @@ class Checkerboard:
 
             if rebuild:
                 # Clamp to something sane to avoid zero-sized tiles
-                squares_x = max(2, min(squares_x, self.screen_width))
-                squares_y = max(2, min(squares_y, self.screen_height))
+                squares_x = max(2, min(self.xy_num_squares[0], self.screen_width))
+                squares_y = max(2, min(self.xy_num_squares[1], self.screen_height))
 
-                checker_a = self.make_checkerboard(self.screen_width, self.screen_height, squares_x, squares_y)
+                checker_a = self.make_checkerboard(self.screen_width, self.screen_height)
                 checker_b = np.ones_like(checker_a) * 255
 
                 # Refresh HUD variants too
                 display_until, timer_frame_a, timer_frame_b = self.build_squares_frames(
-                    checker_a, checker_b, self.screen_width, self.screen_height, now, squares_x, squares_y
-                )
+                    checker_a, checker_b, self.screen_width, self.screen_height, now)
                 rebuild = False
+                last_frame_id = None
 
         cv2.destroyWindow(win_name)
         on_close()

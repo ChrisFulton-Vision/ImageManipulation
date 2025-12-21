@@ -39,7 +39,7 @@ from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyWindow, waitKey
                  COLOR_RGB2BGR, resize, setUseOptimized, ellipse, bitwise_not, add, undistortPoints, solvePnPRansac,
                  VideoWriter, INTER_AREA, CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE, CALIB_CB_EXHAUSTIVE,
                  CAP_PROP_AUTOFOCUS, CAP_PROP_AUTO_WB, CAP_PROP_GAIN, findChessboardCorners, findChessboardCornersSB,
-                 CALIB_CB_ACCURACY, drawChessboardCorners, error as cv_error, fitLine, DIST_L2)
+                 CALIB_CB_ACCURACY, drawChessboardCorners, error as cv_error, fitLine, DIST_L2, COLOR_HSV2BGR)
 from PIL.Image import fromarray
 from cv2_enumerate_cameras import enumerate_cameras
 
@@ -276,6 +276,7 @@ class CameraGui(CTkFrame):
         self.profile_run_folder = False
 
         self.func_that_refits = None
+        self._checker_proc = None
 
         # Debounced cache writes
         self._save_debounce_id = None
@@ -356,13 +357,12 @@ class CameraGui(CTkFrame):
         self.plotter = Plotter()
 
         # Checkerboard Handlers
-        self.checkerboard = Checkerboard()
         self.btn_checkerboard = None
+        self._cb_pattern = [11, 8]
         self._cb_last_ts = 0.0
         self._cb_last_found = False
         self._cb_last_corners = None
-        self._cb_pattern = (11, 8)  # inner corners (cols, rows)
-        self._cb_throttle_sec = 0.10  # 10 Hz overlay update
+        self._cb_throttle_sec = 0.05  # 10 Hz overlay update
 
         nvmlInit()
         self._gpu_handle = nvmlDeviceGetHandleByIndex(0)
@@ -2895,19 +2895,75 @@ class CameraGui(CTkFrame):
         LOG.info("Kalman tracks CSV written: %s", out_csv)
 
     def launch_checkerboard(self):
-        self.btn_checkerboard.configure(state="disabled", text="Checkerboard (running)")
+        import subprocess
+        import importlib.util
+        """
+        Fix A: Run checkerboard in a separate process so its cv2.imshow/waitKey loop
+        can't stall or contend with the camera GUI's OpenCV usage.
+        """
 
-        def _worker():
-            def _on_close():
-                # hop back to Tk thread
-                self.after(0, lambda: self.btn_checkerboard.configure(
-                    state="normal",
-                    text="Checkerboard"
-                ))
+        # If it's already running, make the button act like "Stop"
+        if getattr(self, "_checker_proc", None) is not None and self._checker_proc.poll() is None:
+            try:
+                self._checker_proc.terminate()
+            except Exception:
+                pass
+            self._checker_proc = None
+            self.btn_checkerboard.configure(state="normal", text="Checkerboard")
+            return
 
-            self.checkerboard.run_checkerboard(on_close=_on_close)
+        self.btn_checkerboard.configure(state="disabled", text="Checkerboard (launching...)")
 
-        threading.Thread(target=_worker, daemon=True).start()
+        # Prefer launching as a module so paths are robust inside your project:
+        #   python -m SupportModules.CalBoardGenerator
+        # This assumes your package layout matches your import:
+        #   from SupportModules.CalBoardGenerator import Checkerboard
+        cmd = [sys.executable, "-m", "SupportModules.CalBoardGenerator"]
+
+        # On Windows, creating a separate process group helps termination behave better
+        creationflags = 0
+        if sys.platform.startswith("win"):
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        try:
+            self._checker_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except Exception:
+            # Fallback: launch via file path (if -m fails in your environment)
+            spec = importlib.util.find_spec("SupportModules.CalBoardGenerator")
+            if spec is None or not spec.origin:
+                self.btn_checkerboard.configure(state="normal", text="Checkerboard")
+                raise RuntimeError("Could not locate SupportModules.CalBoardGenerator to launch checkerboard.")
+
+            self._checker_proc = subprocess.Popen(
+                [sys.executable, spec.origin],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+        # Re-enable UI immediately; we’ll poll to know when it closes
+        self.btn_checkerboard.configure(state="normal", text="Checkerboard (running)")
+        self.after(300, self._poll_checkerboard_proc)
+
+    def _poll_checkerboard_proc(self):
+        p = getattr(self, "_checker_proc", None)
+        if p is None:
+            self.btn_checkerboard.configure(state="normal", text="Checkerboard")
+            return
+
+        if p.poll() is None:
+            # still running
+            self.after(300, self._poll_checkerboard_proc)
+            return
+
+        # exited
+        self._checker_proc = None
+        self.btn_checkerboard.configure(state="normal", text="Checkerboard")
 
     def setup_playbackFrame(self):
         rowID = 0
@@ -2929,6 +2985,14 @@ class CameraGui(CTkFrame):
 
     def shutdown(self):
         self.shutting_down = True
+        # kill checkerboard process if running
+        try:
+            if getattr(self, "_checker_proc", None) is not None and self._checker_proc.poll() is None:
+                self._checker_proc.terminate()
+        except Exception:
+            pass
+        self._checker_proc = None
+
         self.recordOff()
         self.safely_close_playwindow()
 
@@ -3167,15 +3231,33 @@ class CameraGui(CTkFrame):
             self.lastHeight = self.curr_frame.shape[0]
             self.lastWidth = self.curr_frame.shape[1]
 
+        stop_display_time = None
+
         while (rval and not self.threadStopper.is_set() and
                getWindowProperty(self.windowName, WND_PROP_VISIBLE) > 0 and
                self.showWindow and not self.making_gifOrVid):
             rval, frame = self.vc.read()
+
+            if stop_display_time is not None:
+                self._draw_chessboard_state(frame)
+
             self.analyze_image(frame)
             key = waitKey(1)
+
             if key == 27:  # exit on ESC
                 self.threadStopper.set()
                 break
+
+            if self._flag_vars['draw_chessboard'].get():
+                new_time = self._handle_chessboard_hotkeys(key)
+                if new_time is not None:
+                    stop_display_time = new_time
+
+
+
+            if stop_display_time is not None and time.monotonic() > stop_display_time:
+                stop_display_time = None
+                print('Time out')
 
         # Minimal teardown in the worker; the UI thread will handle buttons/state.
         if self.vc is not None and self.vc.isOpened():
@@ -3189,6 +3271,59 @@ class CameraGui(CTkFrame):
 
         self.after(0, self._on_worker_exit)
         return
+
+    def _draw_chessboard_state(self, frame):
+        width, height, _ = frame.shape
+        org1 = (int(width * 0.1), int(height * 0.20))
+        org2 = (int(width * 0.1), int(height * 0.25))
+
+        instr_text_a = f'{self._cb_pattern[0]} inner row corners'
+        instr_text_b = f'{self._cb_pattern[1]} inner col corners'
+
+        # Draw on A
+        putText(frame, instr_text_a, org1,
+                    FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        putText(frame, instr_text_a, org1,
+                    FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+        putText(frame, instr_text_b, org2,
+                    FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        putText(frame, instr_text_b, org2,
+                    FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+    def _handle_chessboard_hotkeys(self, key: int):
+        # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
+        changed = False
+
+        if key == ord('4'):  # fewer columns
+            if self._cb_pattern[0] > 3:
+                self._cb_pattern[0] -= 1
+                changed = True
+
+        elif key == ord('6'):  # more columns
+            self._cb_pattern[0] += 1
+            changed = True
+
+        elif key == ord('8'):  # more rows
+            self._cb_pattern[1] += 1
+            changed = True
+
+        elif key == ord('2'):  # fewer rows
+            if self._cb_pattern[1] > 3:
+                self._cb_pattern[1] -= 1
+                changed = True
+
+        elif key == ord('r'):  # optional: reset to default
+            self._cb_pattern[:] = [11, 8]
+            changed = True
+
+        if changed:
+            # force an immediate re-detect instead of waiting for throttle
+            self._cb_last_ts = 0.0
+            # clear cached result so you don't draw stale corners
+            self._cb_last_found = False
+            self._cb_last_corners = None
+            return time.monotonic() + 2
+
+        return None
 
     @staticmethod
     def _stride_for_speed(speed_abs: int) -> int:
@@ -3993,6 +4128,50 @@ class CameraGui(CTkFrame):
         dist = np.abs(dx * vy - dy * vx)  # since ||v|| ~ 1
         return float(np.sqrt(np.mean(dist * dist)))
 
+    @staticmethod
+    def _line_fit_point_dists_px(pts_xy: np.ndarray) -> np.ndarray:
+        """
+        pts_xy: (N,2) float array
+        Returns per-point perpendicular distance (pixels) to best-fit line.
+        """
+        if pts_xy.shape[0] < 2:
+            return np.full((pts_xy.shape[0],), np.nan, dtype=np.float32)
+
+        vx, vy, x0, y0 = fitLine(pts_xy.astype(np.float32), DIST_L2, 0, 0.01, 0.01).flatten()
+        dx = pts_xy[:, 0] - x0
+        dy = pts_xy[:, 1] - y0
+        dist = np.abs(dx * vy - dy * vx)  # since ||v|| ~ 1
+        return dist.astype(np.float32)
+
+    def _chessboard_point_residuals(self, corners: np.ndarray, pattern: tuple[int, int]) -> np.ndarray:
+        """
+        corners: (N,1,2) from OpenCV, pattern=(cols,rows) inner corners.
+
+        Returns per-point residual (pixels). For each corner we compute:
+            r_i = max( dist_to_its_row_line , dist_to_its_col_line )
+
+        This tends to highlight local warps / glare / bad detections better than a single RMS.
+        """
+        cols, rows = pattern
+        pts = corners.reshape(-1, 2).astype(np.float32)  # (N,2)
+        if pts.shape[0] != cols * rows:
+            return np.full((pts.shape[0],), np.nan, dtype=np.float32)
+
+        grid = pts.reshape(rows, cols, 2)  # [r,c,(x,y)]
+
+        # Accumulate distances from row and col fits
+        row_d = np.zeros((rows, cols), dtype=np.float32)
+        col_d = np.zeros((rows, cols), dtype=np.float32)
+
+        for r in range(rows):
+            row_d[r, :] = self._line_fit_point_dists_px(grid[r, :, :])
+
+        for c in range(cols):
+            col_d[:, c] = self._line_fit_point_dists_px(grid[:, c, :])
+
+        per = np.maximum(row_d, col_d).reshape(-1)
+        return per
+
     def _chessboard_straightness_residual(self, corners: np.ndarray, pattern: tuple[int, int]) -> tuple[float, float, float]:
         """
         corners: (N,1,2) from OpenCV, pattern=(cols,rows) inner corners.
@@ -4027,21 +4206,47 @@ class CameraGui(CTkFrame):
             self._cb_last_ts = now
 
             flags = CALIB_CB_EXHAUSTIVE | CALIB_CB_ACCURACY
-            found, corners = findChessboardCornersSB(self.curr_frame_gray, self._cb_pattern, flags)
+            found, corners = findChessboardCornersSB(self.curr_frame_gray,
+                                                     self._cb_pattern,
+                                                     flags)
 
             self._cb_last_found = bool(found)
             self._cb_last_corners = corners if found else None
 
             # NEW: compute residual on update ticks
             if self._cb_last_found and self._cb_last_corners is not None:
-                rr, cc, allr = self._chessboard_straightness_residual(self._cb_last_corners, self._cb_pattern)
+                rr, cc, allr = self._chessboard_straightness_residual(self._cb_last_corners,
+                                                                      self._cb_pattern)
                 self._cb_last_resid = (rr, cc, allr)
+                self._cb_last_point_resid = self._chessboard_point_residuals(self._cb_last_corners, self._cb_pattern)
             else:
                 self._cb_last_resid = None
+                self._cb_last_point_resid = None
 
         # Draw from cache (smooth display)
         if self._cb_last_found and self._cb_last_corners is not None:
-            drawChessboardCorners(self.markup_frame, self._cb_pattern, self._cb_last_corners, True)
+            # drawChessboardCorners(self.markup_frame,
+            #                       self._cb_pattern,
+            #                       self._cb_last_corners, True)
+
+            # NEW: highlight bad corners (larger residual => warmer color)
+            per = getattr(self, "_cb_last_point_resid", None)
+            if per is not None:
+                pts = self._cb_last_corners.reshape(-1, 2)
+                # Absolute scaling: choose a pixel residual that counts as "hot"
+                HOT_PX = 1.0
+
+                for (x, y), r in zip(pts, per):
+                    if not np.isfinite(r):
+                        continue
+
+                    bgr = self.residual_to_bgr(r)
+
+                    cx, cy = int(round(x)), int(round(y))
+                    circle(self.markup_frame, (cx, cy), 4,
+                           (0, 0, 0), -1, LINE_AA)  # black underlay
+                    circle(self.markup_frame, (cx, cy), 3,
+                           bgr, -1, LINE_AA)
 
             # NEW: overlay residual
             if getattr(self, "_cb_last_resid", None) is not None:
@@ -4055,8 +4260,32 @@ class CameraGui(CTkFrame):
 
         # Put text on the image (top-left)
         org = (20, 40)
-        putText(self.markup_frame, txt, org, FONT_HERSHEY_SIMPLEX, lrg_text(self.curr_frame.shape[0]), (0, 0, 0), 4, LINE_AA)
-        putText(self.markup_frame, txt, org, FONT_HERSHEY_SIMPLEX, lrg_text(self.curr_frame.shape[0]), (255, 255, 0), 2, LINE_AA)
+        putText(self.markup_frame,
+                txt, org, FONT_HERSHEY_SIMPLEX,
+                lrg_text(self.curr_frame.shape[0]), (0, 0, 0),
+                4, LINE_AA)
+        putText(self.markup_frame,
+                txt, org, FONT_HERSHEY_SIMPLEX,
+                lrg_text(self.curr_frame.shape[0]), (255, 255, 0),
+                2, LINE_AA)
+
+    @staticmethod
+    def residual_to_bgr(r_px, hot_px=1.0):
+        """
+        Map absolute residual (pixels) to BGR color using HSV.
+        0 px -> green
+        hot_px -> red
+        """
+        t = np.clip(r_px / hot_px, 0.0, 1.0)
+
+        # Hue: green (60) -> red (0)
+        h = int((1.0 - t) * 60)
+        s = 255
+        v = 255
+
+        hsv = np.uint8([[[h, s, v]]])
+        bgr = cvtColor(hsv, COLOR_HSV2BGR)[0, 0]
+        return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
     def inpaint_apriltags(self,
                           radius_px: int = 3,

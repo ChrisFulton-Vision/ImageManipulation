@@ -146,7 +146,6 @@ class CalibrateGui(CTkFrame):
     '''
 
     def __init__(self, master, *args, **kwargs):
-
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
 
@@ -1525,3 +1524,21 @@ class CalibrateGui(CTkFrame):
         self.scale864Button.configure(state='normal')
         self.scale2848Button.configure(state='normal')
         self.scaleAnyButton.configure(state='normal')
+
+        self.notify()
+
+    @staticmethod
+    def notify():
+
+        # Try winsound
+        try:
+            import winsound
+            def play_beep():
+                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
+                time.sleep(0.2) # allow sound to fully complete before closing thread
+            t1 = Thread(target=play_beep, daemon=True)
+            t1.start()
+            return
+
+        except ImportError:
+            print("\a", end="", flush=True)

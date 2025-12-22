@@ -33,11 +33,11 @@ with noisy measurements, the initializer results, and the final optimized pose.
 """
 
 from sys import maxsize
+import numpy as np
 from SupportModules.quaternions import Quaternion as q
 from SupportModules.quaternions import *
 from SupportModules.Calibration import Calibration
-import numpy as np
-from numba import njit, prange, config
+from SupportModules.include_numba import njit, prange
 from numpy.linalg import norm
 from numpy.typing import NDArray
 from copy import deepcopy
@@ -401,8 +401,8 @@ def solveQnP(object_pts: np.array,
     - Optional 'trust_weighting' (length 2N) down-weights residuals in pixel space
       during the nonlinear refinement (but not in DLT).
     """
-    trust_weighting = np.ones(img_pts.size)
-    trust_weighting[0] = trust_weighting[1] = 0.1
+    # trust_weighting = np.ones(img_pts.size)
+    # trust_weighting[0] = trust_weighting[1] = 0.1
 
     # ------------------------------------------------------------------
     # 1) Choose a good initial seed

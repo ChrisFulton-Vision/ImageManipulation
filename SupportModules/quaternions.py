@@ -17,10 +17,13 @@ Terms used in function names:
 import numpy as np
 from numpy import cos, arccos, sin, arcsin, arctan2, rad2deg, deg2rad, sqrt, abs
 from typing_extensions import Self, Union
-from numba import njit, prange
+
+# Import overwritten Numba decorator
+# if user has Numba, allows for njit decorator and prange
+# if user doesn't have Numba, njit decorator does nothing and prange is aliased of range
+from SupportModules.include_numba import njit, prange
 
 _FLOAT_EPS = np.finfo(np.float64).eps
-
 
 @njit(cache=True, fastmath=False)
 def _cross3(a0, a1, a2, b0, b1, b2):

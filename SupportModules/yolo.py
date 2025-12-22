@@ -12,6 +12,15 @@ from SupportModules.Calibration import Calibration, undistort_points_px_numba, d
 from SupportModules.metaYoloReader import MetaYoloReader
 from SupportModules.quaternions import *
 
+CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6"
+
+if os.path.isdir(CUDA_BIN):
+    os.add_dll_directory(CUDA_BIN)
+
+if os.path.isdir(CUDNN_BIN):
+    os.add_dll_directory(CUDNN_BIN)
+
 for key in ("CUDA_PATH", "CUDNN_PATH"):
     p = os.environ.get(key)
     if p and os.path.isdir(p):
@@ -198,6 +207,7 @@ class YOLO:
         :return: cleaner outputs for interpretation
         '''
         best_detections = {}
+
         if output is None:
             return [], [], [], []
 
@@ -222,17 +232,17 @@ class YOLO:
         x, y, w, h = xywhc[:, 0], xywhc[:, 1], xywhc[:, 2], xywhc[:, 3]
         x1, y1, x2, y2 = x - w / 2, y - h / 2, x + w / 2, y + h / 2
 
-        W, H = self.yoloSize[0], self.yoloSize[1]
+        H, W = self.yoloSize
         buf = 10
         in_bounds = (x1 - buf >= 0) & (y1 - buf >= 0) & (x2 + buf <= W) & (y2 + buf <= H)
 
-        x = x[in_bounds];
+        x = x[in_bounds]
         y = y[in_bounds]
-        x1 = x1[in_bounds];
-        y1 = y1[in_bounds];
-        x2 = x2[in_bounds];
+        x1 = x1[in_bounds]
+        y1 = y1[in_bounds]
+        x2 = x2[in_bounds]
         y2 = y2[in_bounds]
-        class_id = class_id[in_bounds];
+        class_id = class_id[in_bounds]
         combined = combined[in_bounds]
         score_obj = xywhc[in_bounds, 4]  # objectness as your "score"
 
@@ -247,6 +257,7 @@ class YOLO:
         boxes = [v[2] for v in keep.values()]  # still x1,y1,x2,y2 as you expect
         scores = [v[3] for v in keep.values()]
         classes = [int(k) for k in keep.keys()]
+
         return centers, boxes, scores, classes
 
     def markUpImage(self, image: np.array,

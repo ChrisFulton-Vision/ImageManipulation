@@ -1,12 +1,10 @@
 # AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
-import logging
+from SupportModules.Logging import LOG
 
 import pandas as pd
 import numpy as np
 from os.path import join
 from enum import Enum
-
-LOG = logging.getLogger("superCalibrate")
 
 class ControlMode(Enum):
     auto       = 'auto'

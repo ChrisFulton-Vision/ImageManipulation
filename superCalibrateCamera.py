@@ -44,7 +44,7 @@ from PIL.Image import fromarray
 from cv2_enumerate_cameras import enumerate_cameras
 
 from SupportModules import yolo
-from SupportModules.Calibration import Calibration
+from SupportModules.Calibration import Calibration, distort_points_px
 from SupportModules.FG_DrogueOnly import FactorGraph
 from SupportModules.ImageTimeReader import ImageTimeReader
 from SupportModules.LidarTruth import TruthPoints
@@ -59,25 +59,14 @@ from SupportModules.CVFontScaling import small_text, med_text, lrg_text
 from SupportModules.Pixel_KalmanFilter import KalmanFilter as PixelKalmanFilter
 from SupportModules.Plotting import Plotter
 from SupportModules.CalBoardGenerator import Checkerboard
+from SupportModules.Logging import LOG
 
 from copy import deepcopy
 from math import pow
-import logging
+
 
 SPEED_STEP = pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
 SPEED_STEP_INV = 1.0 / SPEED_STEP
-
-LOG = logging.getLogger("superCalibrate")
-
-if not LOG.handlers:
-    handler = logging.StreamHandler()
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S")
-    handler.setFormatter(fmt)
-    LOG.addHandler(handler)
-
-    # LOG.setLevel(logging.INFO)
-    # LOG.setLevel(logging.DEBUG)
-    LOG.setLevel(logging.WARNING)
 
 setNumThreads(0)
 setUseOptimized(True)
@@ -1602,10 +1591,15 @@ class CameraGui(CTkFrame):
         self._dp_cancel_btn.grid(row=11, column=0, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
         # Cancel button in its own full-width row below
+        def plot_sequential():
+            vars = self._get_dp_conf_values()
+            for var in vars:
+                self.plotter.plot(var)
+
         dp_plotter_btn = CTkButton(
             f,
             text="Plot",
-            command=self.plotter.plot,
+            command=plot_sequential,
         ).grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
         dp_close_plot_btn = CTkButton(
@@ -1743,9 +1737,9 @@ class CameraGui(CTkFrame):
         def _feat_cols(cid: int):
             # If the model has only one class, replace (x,y) with full box (x1,y1,x2,y2)
             if n_cls == 1:
-                return [f"feat_{cid}_x1", f"feat_{cid}_y1", f"feat_{cid}_x2", f"feat_{cid}_y2"]
+                return [f"feat_{cid}_x1_dist", f"feat_{cid}_y1_dist", f"feat_{cid}_x2_dist", f"feat_{cid}_y2_dist"]
             else:
-                return [f"feat_{cid}_x", f"feat_{cid}_y"]
+                return [f"feat_{cid}_x_distPX", f"feat_{cid}_y_distPX",f"feat_{cid}_x_undistPX", f"feat_{cid}_y_undistPX"]
 
         columns = ["image_name", "image_time"]
         for cid in range(n_cls):
@@ -1755,6 +1749,9 @@ class CameraGui(CTkFrame):
 
         for conf in conf_list:
             current_conf = conf
+            self.yoloSession.conf = conf
+            self.camConfig.yolo_conf = conf
+
             # each conf gets its own CSV
             out_csv_conf = out_csv.replace(".csv", f"_conf{conf:.2f}.csv")
 
@@ -1925,10 +1922,13 @@ class CameraGui(CTkFrame):
                             found_pts, found_cids = [], []
                             for (cx, cy), cid in zip(centers, classes):
                                 cidi = int(cid)
-                                x = float(cx) * sx / width
-                                y = float(cy) * sy / height
-                                rec[f"feat_{cidi}_x_dist"] = x
-                                rec[f"feat_{cidi}_y_dist"] = y
+                                x = float(cx) * sx
+                                y = float(cy) * sy
+                                xp, yp = distort_points_px(self.calibration, (x,y))
+                                rec[f"feat_{cidi}_x_distPX"] = x
+                                rec[f"feat_{cidi}_y_distPX"] = y
+                                rec[f"feat_{cidi}_x_undistPX"] = xp
+                                rec[f"feat_{cidi}_y_undistPX"] = yp
 
                         row = {"image_name": name, "image_time": time_map.get(name, None)}
                         row.update(rec)
@@ -2165,11 +2165,13 @@ class CameraGui(CTkFrame):
             r = meas - proj  # pixel residuals
 
             if weights is not None:
-                w = np.asarray(weights, dtype=np.float64).ravel()
-                if w.size == img_pts_norm.shape[0]:
-                    w = np.repeat(w, 2)
-                if w.size == r.size:
-                    r = np.sqrt(w) * r  # weighted L2 norm
+                print(f'{r.shape=}, {np.asarray(weights, dtype=np.float64).shape=}, {np.asarray(weights, dtype=np.float64).ravel().shape=}')
+            # if weights is not None:
+            #     w = np.asarray(weights, dtype=np.float64).ravel()
+            #     if w.size == img_pts_norm.shape[0]:
+            #         w = np.repeat(w, 2)
+            #     if w.size == r.size:
+            #         r = np.sqrt(w) * r  # weighted L2 norm
 
             return float(np.linalg.norm(r.ravel()))
 
@@ -2217,6 +2219,7 @@ class CameraGui(CTkFrame):
         # Collect summary stats
         resid_stats = {
             "pnp_unw": [],
+            "pnp_wt": [],
             "qnp_unw": [],
             "qnp_kf": [],
         }
@@ -2265,20 +2268,12 @@ class CameraGui(CTkFrame):
             plain_ids: list[int] = []
 
             for fid in feat_ids:
-                # 1) Undistorted points (multi-class with save_ud enabled)
-                ux = row.get(f"feat_{fid}_ud_x", None)
-                uy = row.get(f"feat_{fid}_ud_y", None)
+                # 1) Undistorted points (multi-class)
+                ux = row.get(f"feat_{fid}_x_undistPX", None)
+                uy = row.get(f"feat_{fid}_y_undistPX", None)
                 if _valid(ux) and _valid(uy):
                     ud_centers.append([float(ux), float(uy)])
                     ud_ids.append(fid)
-                    continue
-
-                # 2) Raw centers (multi-class normal case)
-                x = row.get(f"feat_{fid}_x", None)
-                y = row.get(f"feat_{fid}_y", None)
-                if _valid(x) and _valid(y):
-                    plain_centers.append([float(x), float(y)])
-                    plain_ids.append(fid)
                     continue
 
                 # 3) Box geometry -> center (single-class mode)
@@ -2511,9 +2506,11 @@ class CameraGui(CTkFrame):
                         quatQ_kf = None
                         vectQ_kf = None
 
+                q1 = q(quat=np.array([0.6661109842, -0.5982180740, -0.2795572132, -0.3468127120])).T
                 # Transform to aircraft frame for CSV output
                 quatQ_aftr = q_aftr_from_cv * quatQ
                 vectQ_aftr = q_aftr_from_cv * vectQ
+
 
                 if quatQ_kf is not None and vectQ_kf is not None:
                     quatQ_kf_aftr = q_aftr_from_cv * quatQ_kf
@@ -2573,6 +2570,7 @@ class CameraGui(CTkFrame):
                 )
 
                 resid_stats["pnp_unw"].append(pnp_resid)
+                # resid_stats["pnp_wgt"].append(pnp_resid_w)
                 resid_stats["qnp_unw"].append(qnp_resid)
 
                 # KF-weighted QnP residual (same metric, but with weights)
@@ -2587,6 +2585,19 @@ class CameraGui(CTkFrame):
                         weights=trust_weights,
                     )
                     resid_stats["qnp_kf"].append(qnp_kf_resid)
+
+                    pnp_resid_w = _reproj_norm_pnp(
+                        K,
+                        distCoeffs,
+                        obj_pts,
+                        img_pts,
+                        rvec,
+                        tvec,
+                        weights=trust_weights,
+                    )
+                else:
+                    pnp_resid_w = float("nan")
+                resid_stats["pnp_wt"].append(pnp_resid_w)
 
                 if idx % 200 == 0:
                     LOG.info(
@@ -2682,16 +2693,27 @@ class CameraGui(CTkFrame):
                 f"max={arr.max():.3f}"
             )
 
+
+        print("start")
+
         if resid_stats["pnp_unw"]:
             LOG.info(
                 "Reproj norm summary (unweighted PnP):  %s",
                 _summ(resid_stats["pnp_unw"]),
             )
+        print("2")
+        if resid_stats["pnp_wt"]:
+            LOG.info(
+                "Reproj norm summary (weighted PnP):  %s",
+                _summ(resid_stats["pnp_wt"]),
+            )
+        print("3")
         if resid_stats["qnp_unw"]:
             LOG.info(
                 "Reproj norm summary (unweighted QnP):  %s",
                 _summ(resid_stats["qnp_unw"]),
             )
+        print("4")
         if resid_stats["qnp_kf"]:
             LOG.info(
                 "Reproj norm summary (KF-weighted QnP): %s",
@@ -2747,7 +2769,7 @@ class CameraGui(CTkFrame):
         # --- Discover feature ids from columns (feat_<id>_x) ---
         feat_ids: list[int] = []
         for col in df.columns:
-            m = re.match(r"feat_(\d+)_x$", col)
+            m = re.match(r"feat_(\d+)_x_undistPX$", col)
             if m:
                 fid = int(m.group(1))
                 if fid not in feat_ids:
@@ -2817,8 +2839,8 @@ class CameraGui(CTkFrame):
             rec = dict(row)
 
             for fid in feat_ids:
-                x_key = f"feat_{fid}_x"
-                y_key = f"feat_{fid}_y"
+                x_key = f"feat_{fid}_x_undistPX"
+                y_key = f"feat_{fid}_y_undistPX"
 
                 x_val = row.get(x_key, None)
                 y_val = row.get(y_key, None)
@@ -2850,7 +2872,7 @@ class CameraGui(CTkFrame):
                             rec[f"feat_{fid}_kf_y"] = float(x_state[1])
                             sigma_px = float(sqrt_diag[0])
                             sigma_py = float(sqrt_diag[1])
-                            rec[f"feat_{fid}_kf_trust"] = 0.03 / max(sigma_px + sigma_py, 1e-6)
+                            rec[f"feat_{fid}_kf_trust"] = 1.00 / max(sigma_px * sigma_px, 1e-6)
                             rec[f"feat_{fid}_kf_vx"] = float(x_state[2])
                             rec[f"feat_{fid}_kf_vy"] = float(x_state[3])
                             rec[f"feat_{fid}_kf_sigma_px"] = sigma_px
@@ -2884,8 +2906,8 @@ class CameraGui(CTkFrame):
 
             # Drop raw measurement columns; comment this out if you want to keep them.
             for fid in feat_ids:
-                rec.pop(f"feat_{fid}_x", None)
-                rec.pop(f"feat_{fid}_y", None)
+                rec.pop(f"feat_{fid}_x_distPX", None)
+                rec.pop(f"feat_{fid}_y_distPX", None)
 
             rows_out.append(rec)
 
@@ -3200,7 +3222,10 @@ class CameraGui(CTkFrame):
                 self.threadStopper.set()
                 break
 
-        destroyWindow(self.windowName)
+        try:
+            destroyWindow(self.windowName)
+        except cv_error as e:
+            pass
         self.after(0, self._on_worker_exit)
 
     @staticmethod
@@ -3289,6 +3314,7 @@ class CameraGui(CTkFrame):
                     FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
         putText(frame, instr_text_b, org2,
                     FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+
     def _handle_chessboard_hotkeys(self, key: int):
         # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
         changed = False
@@ -3419,7 +3445,10 @@ class CameraGui(CTkFrame):
             stats.print_stats("tkinter")
 
     def run_folder_reader(self):
-        destroyWindow(self.windowName)
+        try:
+            destroyWindow(self.windowName)
+        except cv_error:
+            pass
         namedWindow(self.windowName, WINDOW_NORMAL)
 
         directory = Path(self.camConfig.imageFilepath).parent
@@ -3706,7 +3735,10 @@ class CameraGui(CTkFrame):
                     break
 
         finally:
-            destroyWindow(self.windowName)
+            try:
+                destroyWindow(self.windowName)
+            except cv_error:
+                pass
             self.after(0, self._on_worker_exit)
             loader.stop()
 

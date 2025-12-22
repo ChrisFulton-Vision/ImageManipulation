@@ -3,10 +3,11 @@ import matplotlib.pyplot as plt
 
 class Plotter:
     @staticmethod
-    def plot():
+    def plot(conf: float):
+
         # Input CSVs
-        pnp = pd.read_csv("./Images/2024_12 Calspan Subset/yolo_detections_conf0.40__pnp.csv")
-        qnp = pd.read_csv("./Images/2024_12 Calspan Subset/yolo_detections_conf0.40__qnp.csv")
+        pnp = pd.read_csv(fr"./Images/2024_12 Calspan Subset/yolo_detections_conf{conf:.2f}__pnp.csv")
+        qnp = pd.read_csv(fr"./Images/2024_12 Calspan Subset/yolo_detections_conf{conf:.2f}__qnp.csv")
 
         # Merge on image name + time
         merged = pd.merge(

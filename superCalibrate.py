@@ -1091,6 +1091,7 @@ class CalibrateGui(CTkFrame):
     def loadFromCache(self, init=False):
         if init:
             if not os.path.exists(FILEPATH_CACHE):
+                os.makedirs(os.path.dirname(FILEPATH_CACHE))
                 self.filepath = os.getcwd()
                 return
 

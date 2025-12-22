@@ -7,7 +7,7 @@ from os.path import join
 import sys, types
 import numpy as np
 from SupportModules.PixelHandler import Pixel as pxl
-from numba import njit, prange
+from SupportModules.include_numba import njit, prange
 
 class Calibration:
     def __init__(self, filepath=None):
@@ -736,7 +736,7 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-6):
     )
     return out[0] if scalar else out
 
-@njit(parallel=True, fastmath=False)
+@njit(parallel=True, fastmath=True)
 def undistort_points_px_numba(
     pts_px_dist,
     fx, fy, cx, cy,

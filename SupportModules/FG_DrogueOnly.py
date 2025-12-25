@@ -1,22 +1,21 @@
 import numpy as np
 import datetime
 import matplotlib.pyplot as plt
-import matplotlib
 from numpy import linalg as la
 import copy
 import pickle as pkl
 
-def move_figure(f, x, y):
-    """Move figure's upper left corner to pixel (x, y)"""
-    backend = matplotlib.get_backend()
-    if backend == 'TkAgg':
-        f.canvas.manager.window.wm_geometry("+%d+%d" % (x, y))
-    elif backend == 'WXAgg':
-        f.canvas.manager.window.SetPosition((x, y))
-    else:
-        # This works for QT and GTK
-        # You can also use window.setGeometry
-        f.canvas.manager.window.move(x, y)
+# def move_figure(f, x, y):
+#     """Move figure's upper left corner to pixel (x, y)"""
+#     backend = matplotlib.get_backend()
+#     if backend == 'TkAgg':
+#         f.canvas.manager.window.wm_geometry("+%d+%d" % (x, y))
+#     elif backend == 'WXAgg':
+#         f.canvas.manager.window.SetPosition((x, y))
+#     else:
+#         # This works for QT and GTK
+#         # You can also use window.setGeometry
+#         f.canvas.manager.window.move(x, y)
 
 class SolutionData:
     def __init__(self, numMeas):

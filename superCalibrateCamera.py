@@ -22,7 +22,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, wait
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
                            StringVar, CTkProgressBar, END)
-from pandas import isna, read_csv, DataFrame
+from pandas import isna, read_csv, DataFrame, to_datetime, concat
 from pynvml import (
     nvmlInit, nvmlShutdown,
     nvmlDeviceGetHandleByIndex,
@@ -58,7 +58,6 @@ from SupportModules.quaternions import Quaternion as q
 from SupportModules.CVFontScaling import small_text, med_text, lrg_text
 from SupportModules.Pixel_KalmanFilter import KalmanFilter as PixelKalmanFilter
 from SupportModules.Plotting import Plotter
-from SupportModules.CalBoardGenerator import Checkerboard
 from SupportModules.Logging import LOG
 
 from copy import deepcopy
@@ -102,6 +101,30 @@ HUD_YELLOW = (0, 255, 255)
 BUTTON_RED = 'red3'
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
+def _fmt_mmss(seconds: float) -> str:
+    if seconds is None or seconds != seconds or seconds < 0:  # NaN/neg guard
+        return "--:--"
+    seconds = int(round(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m:02d}:{s:02d}"
+
+@dataclass
+class SweepTimer:
+    t0: float = None
+
+    def start(self) -> None:
+        if self.t0 is None:
+            self.t0 = time.monotonic()
+
+    def eta_from_fraction(self, frac_done: float) -> float:
+        """ETA seconds given overall progress fraction [0..1]."""
+        self.start()
+        frac_done = max(0.0, min(1.0, float(frac_done)))
+        if frac_done <= 1e-9:
+            return float("nan")
+        elapsed = time.monotonic() - self.t0
+        total_est = elapsed / frac_done
+        return max(0.0, total_est - elapsed)
 
 class PausedCache:
     def __init__(self): self.idx = None; self.frame = None
@@ -208,7 +231,6 @@ class CameraConfig:
 
     # Data Processing tab defaults
     dp_img_dir: str = ''
-    dp_output_csv: str = ''
     dp_conf_list: str = "0.80"
     dp_ckptN: int = 200
     dp_prefetch: int = 32
@@ -548,6 +570,31 @@ class CameraGui(CTkFrame):
         for n in self._flags:
             self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
 
+    def _sync_dp_from_model(self):
+        """Resync batch-processing (DP) UI controls from camConfig.
+
+        This makes DP settings loadable from the YAML config, not just whatever
+        was last typed into the UI.
+        """
+
+        # strings
+        if hasattr(self, "_dp_img_dir_var") and self._dp_img_dir_var is not None:
+            self._dp_img_dir_var.set(str(getattr(self.camConfig, "dp_img_dir", "") or ""))
+
+        # floats / ints
+        if hasattr(self, "_dp_conf_list") and self._dp_conf_list is not None:
+            self._dp_conf_list.set(str(getattr(self.camConfig, "dp_conf_list", "") or ""))
+
+        if hasattr(self, "_dp_ckptN") and self._dp_ckptN is not None:
+            self._dp_ckptN.set(str(getattr(self.camConfig, "dp_ckptN", 200) or 200))
+
+        if hasattr(self, "_dp_prefetch") and self._dp_prefetch is not None:
+            self._dp_prefetch.set(str(getattr(self.camConfig, "dp_prefetch", 4) or 4))
+
+        # gpu checkbox
+        if hasattr(self, "_dp_gpu_var") and self._dp_gpu_var is not None:
+            self._dp_gpu_var.set(bool(getattr(self.camConfig, "dp_gpu", False)))
+
     def set_ui_active(self, active: bool):
         self._ui_active = bool(active)
         # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
@@ -607,6 +654,32 @@ class CameraGui(CTkFrame):
         self.updateYOLOLabel()
         self.updateLidarLabel()
         self.loadTruthPoints()
+
+        # --- model -> UI resync on config load (batch DP + flags) ---
+        try:
+            if hasattr(self, "_sync_flags_from_model"):
+                self._sync_flags_from_model()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "_sync_dp_from_model"):
+                self._sync_dp_from_model()
+        except Exception:
+            pass
+
+        # Ensure GPU UI matches dp_gpu setting (avoid cached desync)
+        try:
+            if hasattr(self, "gpu_slider"):
+                self.gpu_slider.configure(
+                    state = "normal" if bool(
+                        getattr(self.camConfig, "dp_gpu", False)) else "disabled")
+
+            if not bool(getattr(self.camConfig, "dp_gpu", False)):
+                self.gpu_slider.set(0.0)
+
+        except Exception:
+            pass
 
         if self.func_that_refits is not None:
             self.func_that_refits()
@@ -743,8 +816,7 @@ class CameraGui(CTkFrame):
             self.lidarTruthPoints.copy(obj)
         elif isinstance(obj, dict):
             # Existing self.lidarTruthPoints is a TruthPoints()
-            import copy as _copy
-            self.lidarTruthPoints.truthPoints = _copy.deepcopy(obj)
+            self.lidarTruthPoints.truthPoints = deepcopy(obj)
         else:
             LOG.error("Unexpected LiDAR truth data type: %r", type(obj))
 
@@ -1200,6 +1272,50 @@ class CameraGui(CTkFrame):
         except Exception:
             return default
 
+
+    def _on_toggle_show_gpu(self):
+        """Toggle GPU-util display from the UI checkbox.
+
+        IMPORTANT: Use the checkbox value as source of truth (not cached toggles),
+        so we never desync UI state vs. actual polling behavior.
+        """
+
+        # If checkbox exists, read it; otherwise fall back to toggling.
+
+        if hasattr(self, "_dp_gpu_var") and self._dp_gpu_var is not None:
+            new_val = bool(self._dp_gpu_var.get())
+        else:
+            new_val = not bool(getattr(self.camConfig, "dp_gpu", False))
+
+        self.camConfig.dp_gpu = bool(new_val)
+        self.saveToCache()
+
+        # UI state
+
+        try:
+            self.gpu_slider.configure(state="normal" if self.camConfig.dp_gpu else "disabled")
+
+            if not self.camConfig.dp_gpu:
+                self.gpu_slider.set(0.0)
+        except Exception:
+            pass
+
+        # Start/stop polling
+        if self.camConfig.dp_gpu:
+            self.after(250, self._poll_gpu)
+
+    def _poll_gpu(self):
+        if not bool(getattr(self.camConfig, "dp_gpu", False)):
+            return
+
+        try:
+            util = nvmlDeviceGetUtilizationRates(self._gpu_handle)
+            self.gpu_slider.set(float(util.gpu))
+        except Exception:
+            # NVML might not be available; fail silently.
+            pass
+        self.after(500, self._poll_gpu)
+
     def setup_dataFrame(self):
         """Build the 'Data Processing' page: folder pick, CSV pick, params, run."""
         f = self.data_frame
@@ -1235,22 +1351,6 @@ class CameraGui(CTkFrame):
         CTkEntry(f, textvariable=self._dp_img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
         CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
 
-        # --- Select output CSV ---
-        csv_default = getattr(self.camConfig, "dp_output_csv", "")
-        self._dp_csv_var = StringVar(value=str(csv_default or ""))
-
-        def _choose_csv():
-            p = filedialog.asksaveasfilename(
-                title="Select output CSV",
-                defaultextension=".csv",
-                filetypes=[("CSV", "*.csv")]
-            )
-            if p:
-                self._dp_csv_var.set(p)
-
-        CTkLabel(f, text="Output CSV:").grid(row=2, column=0, padx=12, pady=6, sticky="w")
-        CTkEntry(f, textvariable=self._dp_csv_var).grid(row=2, column=1, padx=12, pady=6, sticky="ew")
-        CTkButton(f, text="Browse…", command=_choose_csv).grid(row=2, column=2, padx=12, pady=6)
 
         # --- Confidence sweep controls ---
         conf_default = getattr(self.camConfig, "dp_conf_list", "0.80")
@@ -1294,9 +1394,14 @@ class CameraGui(CTkFrame):
 
         self._dp_cancel_flag = False
 
-        gpu_display = getattr(self.camConfig, "dp_gpu", False)
-        ctk_gpu_bool = BooleanVar(value=gpu_display)
-        gpu_checkbox = CTkCheckBox(f, text='Show GPU Util', variable=ctk_gpu_bool, command=self._on_toggle_show_gpu)
+        gpu_display = bool(getattr(self.camConfig, "dp_gpu", False))
+        # Keep a handle to the Tk var so config-load can resync the checkbox (no desync).
+        self._dp_gpu_var = BooleanVar(value=gpu_display)
+        gpu_checkbox = CTkCheckBox(
+            f,
+            text = 'Show GPU Util',
+            variable = self._dp_gpu_var,
+            command = self._on_toggle_show_gpu)
         gpu_checkbox.grid(row=25, column =0, columnspan=1, padx=5, pady=5, sticky='ew')
 
         self.gpu_slider = CTkSlider(f, from_=0, to=100)
@@ -1326,7 +1431,6 @@ class CameraGui(CTkFrame):
             var.trace_add("write", _on_change)
 
         _bind_dp_str(self._dp_img_dir_var, "dp_img_dir")
-        _bind_dp_str(self._dp_csv_var, "dp_output_csv")
         _bind_dp_str(self._dp_conf_list, "dp_conf_list")
         _bind_dp_str(self._dp_ckptN, "dp_ckptN")
         _bind_dp_str(self._dp_prefetch, "dp_prefetch")
@@ -1340,14 +1444,13 @@ class CameraGui(CTkFrame):
             # --- Read all Tk fields BEFORE launching worker ---
             img_dir_str = (
                     (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
-                    or (getattr(self.camConfig, "imageFilepath", "") or "")
-            )
+                    or (getattr(self.camConfig, "imageFilepath", "") or ""))
             img_dir = Path(img_dir_str)
 
-            out_csv = (
-                    (getattr(self, "_dp_csv_var", None) and self._dp_csv_var.get().strip())
-                    or str(img_dir / "yolo_detections.csv")
-            )
+            if not Path(img_dir / "_ProcessedData").exists():
+                Path.mkdir(img_dir / "_ProcessedData")
+
+            out_csv = str(img_dir / "_ProcessedData" / "3_pnp_qnp.csv")
 
             conf_list = self._get_dp_conf_values()
             total = len(conf_list)
@@ -1368,20 +1471,41 @@ class CameraGui(CTkFrame):
             def _worker(out_csv_base, conf_values):
                 total = len(conf_values)
 
+                # NEW: one timer for the entire sweep
+                sweep_timer = SweepTimer()
+                sweep_timer.start()
+
                 for i, conf in enumerate(conf_values, start=1):
                     if getattr(self, "_dp_cancel_flag", False):
                         update_status("SolvePnP/QnP canceled.")
                         break
 
-                    target = out_csv_base.replace(".csv", f"_conf{conf:.2f}.csv")
+                    target = out_csv_base.replace(".csv", f"_conf{conf:.2f}.csv").replace("3_pnp_qnp",
+                                                                                          "1_yolo_detections")
 
                     update_status(f"[{i}/{total}] Checking conf={conf:.2f}…")
 
                     if not os.path.exists(target):
-                        update_status(f"[{i}/{total}] Skipped (missing file)")
+                        # NEW: advance overall progress even on skip so ETA doesn't stall
+                        overall = i / max(total, 1)
+                        eta_s = sweep_timer.eta_from_fraction(overall)
+                        eta_txt = _fmt_mmss(eta_s)
+
+                        def _ui_skip():
+                            if hasattr(self, "_dp_progress_label"):
+                                self._dp_progress_label.configure(
+                                    text=f"[{i}/{total}] Skipped (missing file) • ETA {eta_txt}"
+                                )
+                            if hasattr(self, "_dp_progress"):
+                                self._dp_progress.set(overall)
+
+                        if hasattr(self, "after"):
+                            self.after(0, _ui_skip)
+                        else:
+                            update_status(f"[{i}/{total}] Skipped (missing file) • ETA {eta_txt}")
                         continue
 
-                    # ------------ NEW: throttled per-row callback ------------
+                    # ------------ throttled per-row callback ------------
                     last_report = {"t": 0.0, "row": 0}  # small mutable for closure
 
                     def row_progress(done_rows: int, total_rows: int, img_name: str):
@@ -1396,30 +1520,32 @@ class CameraGui(CTkFrame):
                         else:
                             dt = now - last_report["t"]
                             dr = done_rows - last_report["row"]
-                            # 1% of file or 0.1s, whichever hits first
                             step_rows = max(1, total_rows // 100)
                             do_update = (dt >= 0.1) or (dr >= step_rows)
 
                         if not do_update:
                             return
 
-                        # Record the last report
                         last_report["t"] = now
                         last_report["row"] = done_rows
+
+                        # NEW: compute overall progress + ETA in the worker thread
+                        base_frac = (i - 1) / max(total, 1)
+                        inner_frac = done_rows / max(total_rows, 1)
+                        overall = base_frac + inner_frac / max(total, 1)
+
+                        eta_s = sweep_timer.eta_from_fraction(overall)
+                        eta_txt = _fmt_mmss(eta_s)
 
                         def _ui():
                             if hasattr(self, "_dp_progress_label"):
                                 self._dp_progress_label.configure(
                                     text=(
                                         f"[{i}/{total}] {os.path.basename(target)} – "
-                                        f"{done_rows}/{total_rows} images (last: {img_name})"
+                                        f"{done_rows}/{total_rows} images (last: {img_name}) • ETA {eta_txt}"
                                     )
                                 )
                             if hasattr(self, "_dp_progress"):
-                                # keep the per-conf progress but smooth within each file
-                                base_frac = (i - 1) / max(total, 1)
-                                inner_frac = done_rows / max(total_rows, 1)
-                                overall = base_frac + inner_frac / max(total, 1)
                                 self._dp_progress.set(overall)
 
                         if hasattr(self, "after"):
@@ -1429,7 +1555,6 @@ class CameraGui(CTkFrame):
 
                     update_status(f"[{i}/{total}] Running SolvePnP/QnP on {os.path.basename(target)}")
                     try:
-                        # your run call, now with a throttled callback
                         self.run_pnp_qnp_from_detection_csv(target, progress_cb=row_progress)
                     except Exception as e:
                         update_status(f"Error on {target}: {e}")
@@ -1456,10 +1581,10 @@ class CameraGui(CTkFrame):
             )
             img_dir = Path(img_dir_str)
 
-            out_csv = (
-                    (getattr(self, "_dp_csv_var", None) and self._dp_csv_var.get().strip())
-                    or str(img_dir / "yolo_detections.csv")
-            )
+            if not Path(img_dir / "_ProcessedData").exists():
+                Path.mkdir(img_dir / "_ProcessedData")
+
+            out_csv = str(img_dir / "_ProcessedData" / "1_yolo_detections.csv")
 
             conf_list = self._get_dp_conf_values()
             total = len(conf_list)
@@ -1479,6 +1604,10 @@ class CameraGui(CTkFrame):
             def _worker(out_csv_base: str, conf_values: list[float]):
                 total_local = len(conf_values)
 
+                # NEW: one timer for the entire sweep
+                sweep_timer = SweepTimer()
+                sweep_timer.start()
+
                 for i, conf in enumerate(conf_values, start=1):
                     if getattr(self, "_dp_cancel_flag", False):
                         update_status("Kalman tracks canceled.")
@@ -1489,7 +1618,23 @@ class CameraGui(CTkFrame):
                     update_status(f"[{i}/{total_local}] Checking conf={conf:.2f}…")
 
                     if not os.path.exists(det_csv):
-                        update_status(f"[{i}/{total_local}] Skipped (missing file)")
+                        # NEW: advance progress even on skip so ETA doesn't stall
+                        overall = i / max(total_local, 1)
+                        eta_s = sweep_timer.eta_from_fraction(overall)
+                        eta_txt = _fmt_mmss(eta_s)
+
+                        def _ui_skip():
+                            if hasattr(self, "_dp_progress_label"):
+                                self._dp_progress_label.configure(
+                                    text=f"[{i}/{total_local}] Skipped (missing file) • ETA {eta_txt}"
+                                )
+                            if hasattr(self, "_dp_progress"):
+                                self._dp_progress.set(overall)
+
+                        if hasattr(self, "after"):
+                            self.after(0, _ui_skip)
+                        else:
+                            update_status(f"[{i}/{total_local}] Skipped (missing file) • ETA {eta_txt}")
                         continue
 
                     # Throttled per-row callback (same pattern as SolvePnP/QnP)
@@ -1511,19 +1656,24 @@ class CameraGui(CTkFrame):
                         last_report["t"] = now
                         last_report["row"] = done_rows
 
+                        # NEW: compute overall + ETA in worker thread (cheap)
+                        base_frac = (i - 1) / max(total_local, 1)
+                        inner_frac = done_rows / max(total_rows, 1)
+                        overall = base_frac + inner_frac / max(total_local, 1)
+
+                        eta_s = sweep_timer.eta_from_fraction(overall)
+                        eta_txt = _fmt_mmss(eta_s)
+
                         def _ui():
                             if hasattr(self, "_dp_progress_label"):
                                 self._dp_progress_label.configure(
                                     text=(
                                         f"[{i}/{total_local}] "
                                         f"{os.path.basename(det_csv)} – "
-                                        f"{done_rows}/{total_rows} images (last: {img_name})"
+                                        f"{done_rows}/{total_rows} images (last: {img_name}) • ETA {eta_txt}"
                                     )
                                 )
                             if hasattr(self, "_dp_progress"):
-                                base_frac = (i - 1) / max(total_local, 1)
-                                inner_frac = done_rows / max(total_rows, 1)
-                                overall = base_frac + inner_frac / max(total_local, 1)
                                 self._dp_progress.set(overall)
 
                         if hasattr(self, "after"):
@@ -1593,8 +1743,9 @@ class CameraGui(CTkFrame):
         # Cancel button in its own full-width row below
         def plot_sequential():
             vars = self._get_dp_conf_values()
+            img_dir = Path(str(os.path.dirname(getattr(self.camConfig, "imageFilepath", "")) or "")) / "_ProcessedData"
             for var in vars:
-                self.plotter.plot(var)
+                self.plotter.plot(var, img_dir)
 
         dp_plotter_btn = CTkButton(
             f,
@@ -1655,25 +1806,40 @@ class CameraGui(CTkFrame):
           - Producers: disk read + preprocess (CPU), with bounded prefetch
           - Consumer: single GPU session.run
           - UI updates posted via `after(...)`
+
+        Updated:
+          - Progress bar + ETA now reflect the *entire* confidence sweep (all conf values),
+            consistent with Kalman / PnP-QnP batches.
+          - ETA formatting uses _fmt_mmss() and SweepTimer (shared helper used elsewhere).
         """
 
         # -------------------- helpers (UI-thread posts) --------------------
-        def _post_progress(made, total_todo, completed_map, total_all, start, frac_override=None, note=None):
-            frac = float(frac_override) if frac_override is not None else (made / float(max(1, total_todo)))
-            elapsed = time.monotonic() - start
-            eta = (elapsed / max(frac, 1e-9)) * (1.0 - frac)
-            pct = int(frac * 100.0 + 0.5)
-            mm, ss = int(eta // 60), int(round(eta % 60))
+        def _post_progress(
+                conf_made, conf_total_todo,
+                completed_map, all_total,
+                sweep_timer, conf_i, conf_n,
+                overall_done, overall_total,
+                frac_override=None, note=None
+        ):
+            overall_frac = float(overall_done) / float(max(1, overall_total))
+            if frac_override is not None:
+                overall_frac = float(frac_override)
+
+            eta_s = sweep_timer.eta_from_fraction(overall_frac)
+            eta_txt = _fmt_mmss(eta_s)
+            pct = int(overall_frac * 100.0 + 0.5)
+
             txt = note or (
-                f"conf={current_conf:.2f}  •  "
-                f"{made}/{total_todo}  •  {pct}%  •  "
-                f"ETA {mm:02d}:{ss:02d}  •  "
+                f"[{conf_i}/{conf_n}] conf={current_conf:.2f}  •  "
+                f"conf: {conf_made}/{max(1, conf_total_todo)}  •  "
+                f"overall: {overall_done}/{overall_total} ({pct}%)  •  "
+                f"ETA {eta_txt}  •  "
                 f"(total done: {len(completed_map)}/{all_total})"
             )
 
             def _ui():
                 if hasattr(self, "_dp_progress"):
-                    self._dp_progress.set(frac)
+                    self._dp_progress.set(overall_frac)
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=txt)
 
@@ -1699,10 +1865,15 @@ class CameraGui(CTkFrame):
 
         # -------------------- config & resume --------------------
         # Paths
-        img_dir = Path((getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
-                       or (getattr(self.camConfig, "imageFilepath", "") or ""))
-        out_csv = (getattr(self, "_dp_csv_var", None) and self._dp_csv_var.get().strip()) or str(
-            img_dir / "yolo_detections.csv")
+        img_dir = Path(
+            (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
+            or (getattr(self.camConfig, "imageFilepath", "") or "")
+        )
+
+        if not Path(img_dir / "_ProcessedData").exists():
+            Path.mkdir(img_dir / "_ProcessedData")
+
+        out_csv = str(img_dir / "_ProcessedData" / "1_yolo_detections.csv")
 
         if not img_dir or not img_dir.exists():
             _post_status("No valid image directory selected.")
@@ -1711,14 +1882,13 @@ class CameraGui(CTkFrame):
             return
 
         # Freeze current session thresholds (carry over from main config)
-
         iou = float(self.yoloSession.iou)
         conf_list = self._get_dp_conf_values()
 
         _post_status(
-            "Running YOLO batch sweep: " +
-            ", ".join(f"{c:.2f}" for c in conf_list) +
-            f"  (iou={iou:.2f})"
+            "Running YOLO batch sweep: "
+            + ", ".join(f"{c:.2f}" for c in conf_list)
+            + f"  (iou={iou:.2f})"
         )
 
         # Build list of files/times (same as playback)
@@ -1737,17 +1907,36 @@ class CameraGui(CTkFrame):
         def _feat_cols(cid: int):
             # If the model has only one class, replace (x,y) with full box (x1,y1,x2,y2)
             if n_cls == 1:
-                return [f"feat_{cid}_x1_dist", f"feat_{cid}_y1_dist", f"feat_{cid}_x2_dist", f"feat_{cid}_y2_dist"]
+                return [
+                    f"feat_{cid}_x1_dist",
+                    f"feat_{cid}_y1_dist",
+                    f"feat_{cid}_x2_dist",
+                    f"feat_{cid}_y2_dist",
+                ]
             else:
-                return [f"feat_{cid}_x_distPX", f"feat_{cid}_y_distPX",f"feat_{cid}_x_undistPX", f"feat_{cid}_y_undistPX"]
+                return [
+                    f"feat_{cid}_x_distPX",
+                    f"feat_{cid}_y_distPX",
+                    f"feat_{cid}_x_undistPX",
+                    f"feat_{cid}_y_undistPX",
+                ]
 
         columns = ["image_name", "image_time"]
         for cid in range(n_cls):
             columns.extend(_feat_cols(cid))
-            
+
+        # -------------------- overall sweep accounting --------------------
+        conf_n = len(conf_list)
+        all_total_imgs = len(pairs)
+        overall_total = max(1, conf_n * all_total_imgs)
+        overall_done = 0
+
+        sweep_timer = SweepTimer()
+        sweep_timer.start()
+
         current_conf = None
 
-        for conf in conf_list:
+        for conf_i, conf in enumerate(conf_list, start=1):
             current_conf = conf
             self.yoloSession.conf = conf
             self.camConfig.yolo_conf = conf
@@ -1755,15 +1944,15 @@ class CameraGui(CTkFrame):
             # each conf gets its own CSV
             out_csv_conf = out_csv.replace(".csv", f"_conf{conf:.2f}.csv")
 
-            # Clear progress for this confidence value
-            self.after(0, lambda c=conf: (
-                hasattr(self, "_dp_progress_label")
-                and self._dp_progress_label.configure(
-                    text=f"Preparing batch (conf={c:.2f})…"
+            # NOTE: don't reset progress bar per conf; it now reflects overall sweep.
+            self.after(
+                0,
+                lambda c=conf: (
+                        hasattr(self, "_dp_progress_label")
+                        and self._dp_progress_label.configure(text=f"Preparing batch (conf={c:.2f})…")
                 ),
-                hasattr(self, "_dp_progress")
-                and self._dp_progress.set(0.0)
-            ))
+            )
+
             # Resume from existing CSV
             completed_map = {}
             if os.path.exists(out_csv_conf):
@@ -1781,6 +1970,9 @@ class CameraGui(CTkFrame):
                             completed_map[str(rd["image_name"])] = rd
                 except Exception as e:
                     _post_status(f"Existing CSV unreadable, starting fresh: {e}")
+
+            # Count already-complete images for this conf into overall progress (once)
+            overall_done += len(completed_map)
 
             # Time map (apply camera->log offset)
             time_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0))
@@ -1800,15 +1992,22 @@ class CameraGui(CTkFrame):
                 # Still rewrite CSV to ensure new columns (e.g., UD) get materialized
                 try:
                     self._write_csv_atomic(out_csv_conf, columns, completed_map)
-                    self.after(0, lambda: (
-                        hasattr(self, "_dp_progress") and self._dp_progress.set(0.0),
-                        hasattr(self, "_dp_progress_label") and self._dp_progress_label.configure(
-                            text=f"Completed conf={conf:.2f}. Preparing next…"
-                        )
-                    ))
-                    _post_finish(f"Already complete. CSV written: {out_csv_conf}")
+
+                    _post_progress(
+                        conf_made=0,
+                        conf_total_todo=0,
+                        completed_map=completed_map,
+                        all_total=all_total,
+                        sweep_timer=sweep_timer,
+                        conf_i=conf_i,
+                        conf_n=conf_n,
+                        overall_done=overall_done,
+                        overall_total=overall_total,
+                        note=f"[{conf_i}/{conf_n}] Completed conf={conf:.2f}. Preparing next… • ETA {_fmt_mmss(sweep_timer.eta_from_fraction(overall_done / max(1, overall_total)))}",
+                    )
                 except Exception as e:
-                    _post_finish(f"Failed to write CSV: {e}")
+                    _post_status(f"Failed to write CSV: {e}")
+
                 self._dp_cancel_flag = False
                 continue
 
@@ -1825,8 +2024,8 @@ class CameraGui(CTkFrame):
             except Exception:
                 prefetch = 32
 
-            import os as _os
-            cpu_workers = max(2, min(prefetch, (_os.cpu_count() or 4)))
+            from os import cpu_count
+            cpu_workers = max(2, min(prefetch, (cpu_count() or 4)))
             q = queue.Queue(maxsize=prefetch)
             producers_done = threading.Event()
 
@@ -1872,7 +2071,6 @@ class CameraGui(CTkFrame):
                     except queue.Full:
                         continue
 
-            start = time.monotonic()
             made = 0
 
             # Start producers
@@ -1897,7 +2095,18 @@ class CameraGui(CTkFrame):
                         name, tensor, (W, H) = q.get(timeout=0.1)
                     except queue.Empty:
                         # light UI heartbeat
-                        _post_progress(made, total_todo, completed_map, all_total, start, note="Working…")
+                        _post_progress(
+                            conf_made=made,
+                            conf_total_todo=total_todo,
+                            completed_map=completed_map,
+                            all_total=all_total,
+                            sweep_timer=sweep_timer,
+                            conf_i=conf_i,
+                            conf_n=conf_n,
+                            overall_done=overall_done,
+                            overall_total=overall_total,
+                            note="Working…",
+                        )
                         continue
 
                     if tensor is not None:
@@ -1919,12 +2128,11 @@ class CameraGui(CTkFrame):
                             # No UD columns in 1-class mode
                         else:
                             # Multi-class: keep existing center behavior (+ optional UD)
-                            found_pts, found_cids = [], []
                             for (cx, cy), cid in zip(centers, classes):
                                 cidi = int(cid)
                                 x = float(cx) * sx
                                 y = float(cy) * sy
-                                xp, yp = distort_points_px(self.calibration, (x,y))
+                                xp, yp = distort_points_px(self.calibration, (x, y))
                                 rec[f"feat_{cidi}_x_distPX"] = x
                                 rec[f"feat_{cidi}_y_distPX"] = y
                                 rec[f"feat_{cidi}_x_undistPX"] = xp
@@ -1937,7 +2145,19 @@ class CameraGui(CTkFrame):
                     # progress
                     made += 1
                     processed_since_ckpt += 1
-                    _post_progress(made, total_todo, completed_map, all_total, start)
+                    overall_done += 1
+
+                    _post_progress(
+                        conf_made=made,
+                        conf_total_todo=total_todo,
+                        completed_map=completed_map,
+                        all_total=all_total,
+                        sweep_timer=sweep_timer,
+                        conf_i=conf_i,
+                        conf_n=conf_n,
+                        overall_done=overall_done,
+                        overall_total=overall_total,
+                    )
 
                     # checkpoint (atomic + numeric sort) on UI-friendly cadence
                     if checkpoint_every > 0 and not self._dp_cancel_flag and processed_since_ckpt >= checkpoint_every:
@@ -1959,11 +2179,13 @@ class CameraGui(CTkFrame):
                 try:
                     self._write_csv_atomic(out_csv_conf, columns, completed_map)
                     msg = ("Partial CSV written (resume later): " + out_csv_conf) if self._dp_cancel_flag else (
-                            "Done. CSV written: " + out_csv_conf)
+                            "Done. CSV written: " + out_csv_conf
+                    )
                 except Exception as e:
                     msg = f"Failed to write CSV: {e}"
 
-                _post_finish(msg)
+                # NOTE: don't re-enable buttons per-conf; only post status.
+                _post_status(msg)
                 # reset for next run
                 self._dp_cancel_flag = False
 
@@ -1996,16 +2218,17 @@ class CameraGui(CTkFrame):
 
         base = Path(csv_path)
         if out_pnp is None:
-            out_pnp = str(base.with_name(base.stem + "__pnp.csv"))
+            out_pnp = str(base.with_name("3_pnp_" + base.stem[18:] + ".csv"))
         if out_qnp is None:
-            out_qnp = str(base.with_name(base.stem + "__qnp.csv"))
+            out_qnp = str(base.with_name("4_qnp_" + base.stem[18:] + ".csv"))
 
         # ------------------------------------------------------------------
         # Optional Kalman-trust CSV (for KF-weighted QnP)
         # ------------------------------------------------------------------
         df_kf = None
         kalman_available = False
-        kalman_csv = base.with_name(base.stem + "__kalman.csv")
+        kalman_csv = base.with_name("2_kalman_" + base.stem[18:] + ".csv")
+
         if kalman_csv.exists():
             try:
                 df_kf = read_csv(kalman_csv)
@@ -2077,9 +2300,7 @@ class CameraGui(CTkFrame):
         pnp_header_written = os.path.exists(out_pnp)
         qnp_header_written = os.path.exists(out_qnp)
 
-        # Determine how often to flush CSVs, using the Data Processing UI
-        # slider (_dp_ckptN) if available, otherwise falling back to the
-        # CameraConfig default dp_ckptN.
+        # Determine how often to flush CSVs
         checkpoint_every = 0
         try:
             if hasattr(self, "_dp_ckptN"):
@@ -2090,18 +2311,62 @@ class CameraGui(CTkFrame):
         except Exception:
             checkpoint_every = 0
 
-        LOG.info(f"Logging every {checkpoint_every} message.")
-
         if checkpoint_every <= 0:
             try:
                 checkpoint_every = int(getattr(self.camConfig, "dp_ckptN", 0) or 0)
             except Exception:
                 checkpoint_every = 0
+        LOG.info("Checkpoint cadence: every %d processed rows.", checkpoint_every)
 
         # In-memory batches that we flush every checkpoint_every images.
         pnp_batch: list[dict] = []
         qnp_batch: list[dict] = []
         rows_since_ckpt = 0
+        ckpt_idx = 0
+
+        def _flush_and_log_checkpoint(image_name_str,
+                                      pnp_resid=float("nan"),
+                                      qnp_resid=float("nan"),
+                                      qnp_kf_resid=float("nan")):
+            """
+            Single source of truth for checkpointing:
+            - writes any staged pnp_batch/qnp_batch
+            - resets rows_since_ckpt
+            - emits the checkpoint LOG line
+            """
+            nonlocal ckpt_idx, rows_since_ckpt, pnp_header_written, qnp_header_written
+            ckpt_idx += 1
+
+            if pnp_batch:
+                DataFrame(pnp_batch).to_csv(
+                    out_pnp,
+                    mode="a" if pnp_header_written else "w",
+                    index=False,
+                    header=not pnp_header_written,
+                )
+                pnp_header_written = True
+                pnp_batch.clear()
+
+            if qnp_batch:
+                DataFrame(qnp_batch).to_csv(
+                    out_qnp,
+                    mode="a" if qnp_header_written else "w",
+                    index=False,
+                    header=not qnp_header_written,
+                )
+                qnp_header_written = True
+                qnp_batch.clear()
+
+            rows_since_ckpt = 0
+
+            LOG.info(
+                "Checkpoint %d: Reproj norms [%s]: PnP=%.3f, QnP=%.3f, QnP-KF=%s",
+                ckpt_idx,
+                image_name_str,
+                float(pnp_resid),
+                float(qnp_resid),
+                f"{qnp_kf_resid:.3f}" if not np.isnan(qnp_kf_resid) else "nan",
+            )
 
         cols = set(df.columns)
 
@@ -2135,20 +2400,11 @@ class CameraGui(CTkFrame):
                              rvec_norm,
                              tvec_norm,
                              weights=None) -> float:
-            """
-            Reprojection residual for PnP, computed in the OpenCV *camera frame*
-            using cv2.projectPoints (so it matches what solvePnP uses).
-
-            object_pts : (N, 3)
-            img_pts    : (N, 2) measured pixel locations (same as passed to solvePnP)
-            rvec, tvec : outputs from solvePnP / solvePnPRansac
-            """
             if rvec_norm is None or tvec_norm is None:
                 return float("nan")
             if object_pts_norm is None or img_pts_norm is None or len(object_pts_norm) == 0:
                 return float("nan")
 
-            # OpenCV projection in camera frame
             proj, _ = projectPoints(
                 object_pts_norm.astype(np.float32),
                 rvec_norm.astype(np.float64),
@@ -2162,30 +2418,23 @@ class CameraGui(CTkFrame):
             if proj.shape != meas.shape:
                 return float("nan")
 
-            r = meas - proj  # pixel residuals
+            r = (meas - proj).ravel()
 
             if weights is not None:
-                print(f'{r.shape=}, {np.asarray(weights, dtype=np.float64).shape=}, {np.asarray(weights, dtype=np.float64).ravel().shape=}')
-            # if weights is not None:
-            #     w = np.asarray(weights, dtype=np.float64).ravel()
-            #     if w.size == img_pts_norm.shape[0]:
-            #         w = np.repeat(w, 2)
-            #     if w.size == r.size:
-            #         r = np.sqrt(w) * r  # weighted L2 norm
+                w = np.asarray(weights, dtype=np.float64).ravel()
+                if w.size == img_pts_norm.shape[0]:
+                    w = np.repeat(w, 2)
+                if w.size == r.size:
+                    r = np.sqrt(w) * r
 
-            return float(np.linalg.norm(r.ravel()))
+            return float(np.linalg.norm(r))
 
         def _reproj_norm(cal, object_pts, img_pts, quat, vect, weights=None) -> float:
-            """
-            Compute ||r||_2 where r is the (optionally weighted) reprojection residual
-            in pixel space for a given pose (quat, vect).
-            """
             if quat is None or vect is None:
                 return float("nan")
             if object_pts is None or img_pts is None or len(object_pts) == 0:
                 return float("nan")
 
-            # Camera-frame projection: X_cam = q * X + t
             X_cam = quat * object_pts
             X_cam = X_cam + vect
             X = X_cam[:, 0]
@@ -2205,18 +2454,17 @@ class CameraGui(CTkFrame):
             if proj_flat.shape != meas_flat.shape:
                 return float("nan")
 
-            r = meas_flat - proj_flat  # residual in pixel space
+            r = meas_flat - proj_flat
 
             if weights is not None:
                 w = np.asarray(weights, dtype=np.float64).ravel()
                 if w.size == img_pts.shape[0]:
                     w = np.repeat(w, 2)
                 if w.size == r.size:
-                    r = np.sqrt(w) * r  # weighted L2 norm
+                    r = np.sqrt(w) * r
 
             return float(np.linalg.norm(r))
 
-        # Collect summary stats
         resid_stats = {
             "pnp_unw": [],
             "pnp_wt": [],
@@ -2228,8 +2476,6 @@ class CameraGui(CTkFrame):
         D_full = self.calibration.getDistortion()
         truth_dict = self.yoloSession.reader.idsNamesLocs
 
-        # We keep these lists mostly for logging/debug; the CSVs are written
-        # incrementally as we go.
         pnp_rows: list[dict] = []
         qnp_rows: list[dict] = []
 
@@ -2237,7 +2483,6 @@ class CameraGui(CTkFrame):
         prev_qnp_q = prev_qnp_t = None
         prev_qnp_kf_q = prev_qnp_kf_t = None
 
-        # Fixed CV->aircraft transform as in qnpLidarPoints
         q_aftr_from_cv = mat2quat(np.array([
             [0., 0., 1.],
             [-1., 0., 0.],
@@ -2250,25 +2495,24 @@ class CameraGui(CTkFrame):
             image_time = row.get("image_time", np.nan)
             image_name_str = str(image_name)
 
-            # Optional incremental progress callback
             if progress_cb is not None:
                 try:
                     progress_cb(idx, total_rows, image_name_str)
                 except Exception:
                     pass
 
-            # If this image already has BOTH PnP and QnP rows on disk, skip.
             if image_name_str in already_done:
                 continue
 
-            # Collect 2D points: prefer undistorted if present
+            # --------------------------
+            # Build point sets
+            # --------------------------
             ud_centers: list[list[float]] = []
             ud_ids: list[int] = []
             plain_centers: list[list[float]] = []
             plain_ids: list[int] = []
 
             for fid in feat_ids:
-                # 1) Undistorted points (multi-class)
                 ux = row.get(f"feat_{fid}_x_undistPX", None)
                 uy = row.get(f"feat_{fid}_y_undistPX", None)
                 if _valid(ux) and _valid(uy):
@@ -2276,7 +2520,6 @@ class CameraGui(CTkFrame):
                     ud_ids.append(fid)
                     continue
 
-                # 3) Box geometry -> center (single-class mode)
                 x1 = row.get(f"feat_{fid}_x1", None)
                 y1 = row.get(f"feat_{fid}_y1", None)
                 x2 = row.get(f"feat_{fid}_x2", None)
@@ -2287,7 +2530,6 @@ class CameraGui(CTkFrame):
                     plain_centers.append([cx, cy])
                     plain_ids.append(fid)
 
-            # Decide which set to use
             if len(ud_centers) >= 6:
                 centers_use = np.asarray(ud_centers, dtype=np.float32)
                 ids_use = ud_ids
@@ -2315,23 +2557,14 @@ class CameraGui(CTkFrame):
 
                 pnp_rows.append(row_pnp)
                 qnp_rows.append(row_qnp)
+                pnp_batch.append(row_pnp)
+                qnp_batch.append(row_qnp)
 
-                DataFrame([row_pnp]).to_csv(
-                    out_pnp,
-                    mode="a" if pnp_header_written else "w",
-                    index=False,
-                    header=not pnp_header_written,
-                )
-                pnp_header_written = True
-
-                DataFrame([row_qnp]).to_csv(
-                    out_qnp,
-                    mode="a" if qnp_header_written else "w",
-                    index=False,
-                    header=not qnp_header_written,
-                )
-                qnp_header_written = True
-
+                # Count exactly ONCE per processed row (including NaN rows)
+                if checkpoint_every > 0:
+                    rows_since_ckpt += 1
+                    if rows_since_ckpt >= checkpoint_every:
+                        _flush_and_log_checkpoint(image_name_str)
                 continue
 
             # Map IDs -> 3D truth points and drop any unknown IDs
@@ -2357,43 +2590,16 @@ class CameraGui(CTkFrame):
                     "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
                 }
 
-                # Track for logging/debug
                 pnp_rows.append(row_pnp)
                 qnp_rows.append(row_qnp)
-
-                # Stage for batched IO
                 pnp_batch.append(row_pnp)
                 qnp_batch.append(row_qnp)
 
-                # Flush only on checkpoint cadence
+                # Count exactly ONCE per processed row
                 if checkpoint_every > 0:
                     rows_since_ckpt += 1
                     if rows_since_ckpt >= checkpoint_every:
-
-                        LOG.info("Updating CSV...")
-                        if pnp_batch:
-                            DataFrame(pnp_batch).to_csv(
-                                out_pnp,
-                                mode="a" if pnp_header_written else "w",
-                                index=False,
-                                header=not pnp_header_written,
-                            )
-                            pnp_header_written = True
-                            pnp_batch.clear()
-
-                        if qnp_batch:
-                            DataFrame(qnp_batch).to_csv(
-                                out_qnp,
-                                mode="a" if qnp_header_written else "w",
-                                index=False,
-                                header=not qnp_header_written,
-                            )
-                            qnp_header_written = True
-                            qnp_batch.clear()
-
-                        rows_since_ckpt = 0
-                        LOG.info("CSV Updated...")
-
+                        _flush_and_log_checkpoint(image_name_str)
                 continue
 
             obj_pts = np.asarray(obj_pts, dtype=np.float32)
@@ -2404,7 +2610,7 @@ class CameraGui(CTkFrame):
             # ------------------------------------------------------------------
             trust_weights = None
             if kalman_available:
-                row_kf = df_kf.iloc[idx - 1]  # same row order
+                row_kf = df_kf.iloc[idx - 1]
                 weights_1d: list[float] = []
                 for fid in ids_use:
                     col_name = f"feat_{fid}_kf_trust"
@@ -2419,16 +2625,19 @@ class CameraGui(CTkFrame):
                     if w < 0.0:
                         w = 0.0
                     weights_1d.append(w)
+
                 if any(w > 0.0 for w in weights_1d):
                     trust_weights = []
                     for w in weights_1d:
-                        trust_weights.extend([w, w])
+                        trust_weights.extend([self.calibration.width * w, self.calibration.height * w])
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
 
             quatPnP = None
             vectPnP = None
+            ret = False
+            rvec = tvec = None
             try:
                 ret, rvec, tvec, inliers = solvePnPRansac(
                     objectPoints=obj_pts,
@@ -2437,7 +2646,6 @@ class CameraGui(CTkFrame):
                     distCoeffs=distCoeffs,
                     flags=SOLVEPNP_ITERATIVE
                 )
-
             except error as e:
                 LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
                 ret = False
@@ -2465,18 +2673,19 @@ class CameraGui(CTkFrame):
                     "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
                 }
 
-            # Track PnP row
             pnp_rows.append(row_pnp)
             pnp_batch.append(row_pnp)
 
             # ----------------- QnP (unweighted + KF-weighted) -----------------
-            quatQ = None
-            vectQ = None
-            quatQ_kf = None
-            vectQ_kf = None
+            quatQ = vectQ = None
+            quatQ_kf = vectQ_kf = None
+
+            # Defaults for checkpoint logging
+            pnp_resid = float("nan")
+            qnp_resid = float("nan")
+            qnp_kf_resid = float("nan")
 
             try:
-                # Unweighted QnP
                 quatQ, vectQ = solveQnP(
                     obj_pts,
                     img_pts,
@@ -2488,7 +2697,6 @@ class CameraGui(CTkFrame):
                 prev_qnp_q = quatQ
                 prev_qnp_t = vectQ
 
-                # KF-weighted QnP (if trust weights available)
                 if trust_weights is not None:
                     try:
                         quatQ_kf, vectQ_kf = solveQnP(
@@ -2506,11 +2714,8 @@ class CameraGui(CTkFrame):
                         quatQ_kf = None
                         vectQ_kf = None
 
-                q1 = q(quat=np.array([0.6661109842, -0.5982180740, -0.2795572132, -0.3468127120])).T
-                # Transform to aircraft frame for CSV output
                 quatQ_aftr = q_aftr_from_cv * quatQ
                 vectQ_aftr = q_aftr_from_cv * vectQ
-
 
                 if quatQ_kf is not None and vectQ_kf is not None:
                     quatQ_kf_aftr = q_aftr_from_cv * quatQ_kf
@@ -2544,78 +2749,29 @@ class CameraGui(CTkFrame):
                 }
 
                 # ---- residuals for this frame ----
-
-                # PnP residual: use rvec/tvec in the *camera frame* via cv2.projectPoints
                 if ret and rvec is not None and tvec is not None:
                     pnp_resid = _reproj_norm_pnp(
-                        K,
-                        distCoeffs,
-                        obj_pts,
-                        img_pts,
-                        rvec,
-                        tvec,
-                        weights=None,
+                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, weights=None
                     )
-                else:
-                    pnp_resid = float("nan")
-
-                # QnP residual: use camera-frame quatQ / vectQ with your projector h()
                 qnp_resid = _reproj_norm(
-                    self.calibration,
-                    obj_pts,
-                    img_pts,
-                    quatQ,
-                    vectQ,
-                    weights=None,
+                    self.calibration, obj_pts, img_pts, quatQ, vectQ, weights=None
                 )
 
                 resid_stats["pnp_unw"].append(pnp_resid)
-                # resid_stats["pnp_wgt"].append(pnp_resid_w)
                 resid_stats["qnp_unw"].append(qnp_resid)
 
-                # KF-weighted QnP residual (same metric, but with weights)
-                qnp_kf_resid = float("nan")
                 if trust_weights is not None and quatQ_kf is not None and vectQ_kf is not None:
                     qnp_kf_resid = _reproj_norm(
-                        self.calibration,
-                        obj_pts,
-                        img_pts,
-                        quatQ_kf,
-                        vectQ_kf,
-                        weights=trust_weights,
+                        self.calibration, obj_pts, img_pts, quatQ_kf, vectQ_kf, weights=trust_weights
                     )
                     resid_stats["qnp_kf"].append(qnp_kf_resid)
 
                     pnp_resid_w = _reproj_norm_pnp(
-                        K,
-                        distCoeffs,
-                        obj_pts,
-                        img_pts,
-                        rvec,
-                        tvec,
-                        weights=trust_weights,
+                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, weights=trust_weights
                     )
                 else:
                     pnp_resid_w = float("nan")
                 resid_stats["pnp_wt"].append(pnp_resid_w)
-
-                if idx % 200 == 0:
-                    LOG.info(
-                        "Reproj norms [%s]: PnP=%.3f, QnP=%.3f, QnP-KF=%s",
-                        image_name,
-                        pnp_resid,
-                        qnp_resid,
-                        f"{qnp_kf_resid:.3f}" if not np.isnan(qnp_kf_resid) else "nan",
-                    )
-
-                if idx % 200 == 0:
-                    LOG.info(
-                        "Reproj norms [%s]: PnP=%.3f, QnP=%.3f, QnP-KF=%s",
-                        image_name,
-                        pnp_resid,
-                        qnp_resid,
-                        f"{qnp_kf_resid:.3f}" if not np.isnan(qnp_kf_resid) else "nan",
-                    )
 
             except Exception as e:
                 LOG.error("solveQnP failed for %s: %s", image_name, e)
@@ -2628,35 +2784,14 @@ class CameraGui(CTkFrame):
                     "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
                 }
 
-            # Track QnP row
             qnp_rows.append(row_qnp)
             qnp_batch.append(row_qnp)
 
-            # Flush only on checkpoint cadence
+            # Count exactly ONCE per processed row (the success path used to increment twice)
             if checkpoint_every > 0:
                 rows_since_ckpt += 1
                 if rows_since_ckpt >= checkpoint_every:
-                    if pnp_batch:
-                        DataFrame(pnp_batch).to_csv(
-                            out_pnp,
-                            mode="a" if pnp_header_written else "w",
-                            index=False,
-                            header=not pnp_header_written,
-                        )
-                        pnp_header_written = True
-                        pnp_batch.clear()
-
-                    if qnp_batch:
-                        DataFrame(qnp_batch).to_csv(
-                            out_qnp,
-                            mode="a" if qnp_header_written else "w",
-                            index=False,
-                            header=not qnp_header_written,
-                        )
-                        qnp_header_written = True
-                        qnp_batch.clear()
-
-                    rows_since_ckpt = 0
+                    _flush_and_log_checkpoint(image_name_str, pnp_resid, qnp_resid, qnp_kf_resid)
 
         # Final flush: always write any remaining rows
         LOG.info("Final CSV update...")
@@ -2693,27 +2828,21 @@ class CameraGui(CTkFrame):
                 f"max={arr.max():.3f}"
             )
 
-
-        print("start")
-
         if resid_stats["pnp_unw"]:
             LOG.info(
                 "Reproj norm summary (unweighted PnP):  %s",
                 _summ(resid_stats["pnp_unw"]),
             )
-        print("2")
         if resid_stats["pnp_wt"]:
             LOG.info(
                 "Reproj norm summary (weighted PnP):  %s",
                 _summ(resid_stats["pnp_wt"]),
             )
-        print("3")
         if resid_stats["qnp_unw"]:
             LOG.info(
                 "Reproj norm summary (unweighted QnP):  %s",
                 _summ(resid_stats["qnp_unw"]),
             )
-        print("4")
         if resid_stats["qnp_kf"]:
             LOG.info(
                 "Reproj norm summary (KF-weighted QnP): %s",
@@ -2734,25 +2863,13 @@ class CameraGui(CTkFrame):
         """
         Run per-feature pixel Kalman filters over a YOLO detection CSV.
 
-        For each feat_{id}_x / feat_{id}_y column pair we run a 4-state KF:
-            x = [px, py, vx, vy]^T
+        Bank-update version:
+          - Preloads all feat_{id}_x_undistPX / feat_{id}_y_undistPX into dense arrays (N,M)
+          - Uses a single Numba-parallel bank step per row (updates all features in compiled code)
+          - Keeps output schema identical to the prior version
 
-        This function:
-          * Processes rows strictly sequentially in CSV order (no threading here).
-          * Uses only Pixel_KalmanFilter.KalmanFilter.update_KF for
-            predict + update (no manual Kalman math).
-          * Optionally reports progress via progress_cb(done_rows, total_rows, image_name).
-          * Writes a new CSV with Kalman-estimated states and a simple trust metric.
-          * Drops the original feat_*_x / feat_*_y columns in the output.
-
-        Added columns per feature id 'fid':
-          feat_{fid}_kf_x
-          feat_{fid}_kf_y
-          feat_{fid}_kf_trust
-          feat_{fid}_kf_vx
-          feat_{fid}_kf_vy
-          feat_{fid}_kf_sigma_px
-          feat_{fid}_kf_sigma_py
+        Requirements:
+          - df["image_time"] is numeric seconds (float/int). (Per your note, it is.)
         """
 
         if not os.path.exists(csv_path):
@@ -2766,7 +2883,7 @@ class CameraGui(CTkFrame):
 
         total_rows = len(df)
 
-        # --- Discover feature ids from columns (feat_<id>_x) ---
+        # --- Discover feature ids from columns (feat_<id>_x_undistPX) ---
         feat_ids: list[int] = []
         for col in df.columns:
             m = re.match(r"feat_(\d+)_x_undistPX$", col)
@@ -2780,141 +2897,171 @@ class CameraGui(CTkFrame):
             LOG.error("run_kalman_tracks_from_detection_csv: no feat_*_x columns in %s", csv_path)
             return
 
+        M = len(feat_ids)
+
         # --- Optional normalization using camera intrinsics ---
         K = None
         fx = fy = cx = cy = None
+        width = height = None
         if getattr(self, "calibration", None) is not None and getattr(self.calibration, "validCal", False):
             try:
                 K = self.calibration.getCameraMatrix()
                 fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
-                width = self.calibration.width
-                height = self.calibration.height
+                width = float(self.calibration.width)
+                height = float(self.calibration.height)
             except Exception:
                 K = None
-
-        def normalize_xy(x, y):
-            """
-            Convert pixel coordinates to a normalized image plane if K is available.
-            Otherwise pass through raw pixels.
-            """
-            if K is None:
-                return float(x), float(y)
-            return (float(x) / width, float(y) / height)
 
         # --- Output path ---
         base = Path(csv_path)
         if out_csv is None:
-            out_csv = str(base.with_name(base.stem + "__kalman.csv"))
+            out_csv = str(base.with_name(base.stem + ".csv")).replace("1_yolo_detections", "2_kalman")
 
-        # --- Create a KalmanFilter instance per feature id ---
-        kf_by_id = {fid: PixelKalmanFilter() for fid in feat_ids}
+        # --- Pull time vector (numeric seconds) ---
+        if "image_time" not in df.columns:
+            LOG.error("run_kalman_tracks_from_detection_csv: missing image_time column in %s", csv_path)
+            return
+        t_sec = df["image_time"].to_numpy(dtype=np.float64)  # (N,)
 
-        rows_out: list[dict] = []
-        prev_dt: datetime | None = None
+        # --- Build dense measurement matrices (N,M) ---
+        x_cols = [f"feat_{fid}_x_undistPX" for fid in feat_ids]
+        y_cols = [f"feat_{fid}_y_undistPX" for fid in feat_ids]
 
-        # Simple throttling for progress_cb (avoid calling it 100k times a second)
+        # Ensure missing columns behave as all-NaN rather than KeyError
+        for c in x_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+        for c in y_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+
+        Xraw = df[x_cols].to_numpy(dtype=np.float64, copy=False)  # shape (N,M)
+        Yraw = df[y_cols].to_numpy(dtype=np.float64, copy=False)
+
+        # Normalize in bulk if calibration available, else pass-through
+        if K is None:
+            Xmeas = Xraw
+            Ymeas = Yraw
+        else:
+            # Your previous normalize_xy used x/width, y/height
+            inv_w = 1.0 / max(width, 1.0)
+            inv_h = 1.0 / max(height, 1.0)
+            Xmeas = Xraw * inv_w
+            Ymeas = Yraw * inv_h
+
+        # Valid mask in bulk: finite and not sentinel -1
+        valid = np.isfinite(Xmeas) & np.isfinite(Ymeas) & (Xmeas != -1.0) & (Ymeas != -1.0)
+        valid_u8 = valid.astype(np.uint8, copy=False)  # (N,M) uint8
+
+        # --- KF bank storage (M tracks) ---
+        # We'll use the numba-enabled bank step in the KF class.
+        # Note: This uses raw arrays, not Python objects, for speed.
+        kf0 = PixelKalmanFilter()
+        var_proc = float(kf0.var_proc)
+        var_meas = float(kf0.var_meas)
+        max_pixel_jump = float(kf0.max_pixel_jump)
+        max_mahalanobis_sq = float(kf0.max_mahalanobis_sq)
+
+        X = np.zeros((M, 4), dtype=np.float64)
+        P = np.zeros((M, 4, 4), dtype=np.float64)
+        for j in range(M):
+            P[j] = np.eye(4, dtype=np.float64) * 10.0
+
+        last_t = np.zeros(M, dtype=np.float64)
+        init = np.zeros(M, dtype=np.uint8)
+
+        # --- Output buffers (N,M) for per-feature fields ---
+        out_kf_x = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_y = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_vx = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_vy = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_sig_px = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_sig_py = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_trust = np.zeros((total_rows, M), dtype=np.float64)
+
+        # --- Progress throttling (same behavior as before) ---
         last_report_t = 0.0
         last_report_row = 0
 
-        for idx, (_, row) in enumerate(df.iterrows(), start=1):
-            image_name = row.get("image_name", "")
-            image_time = row.get("image_time", np.nan)
+        # --- Main loop over rows (KF math happens inside numba bank step) ---
+        for idx in range(total_rows):
+            image_name = df.iloc[idx].get("image_name", "")
 
             # Progress callback (throttled)
             if progress_cb is not None:
                 now = time.monotonic()
                 dt = now - last_report_t
-                dr = idx - last_report_row
-                step_rows = max(1, total_rows // 100)  # ~1% or at least 1 row
+                dr = (idx + 1) - last_report_row
+                step_rows = max(1, total_rows // 100)
 
-                if idx == 1 or idx == total_rows or dt >= 0.1 or dr >= step_rows:
+                if (idx == 0) or (idx == total_rows - 1) or (dt >= 0.1) or (dr >= step_rows):
                     try:
-                        progress_cb(idx, total_rows, str(image_name))
+                        progress_cb(idx + 1, total_rows, str(image_name))
                     except Exception:
                         pass
                     last_report_t = now
-                    last_report_row = idx
+                    last_report_row = (idx + 1)
 
-            # Convert time to datetime (with fallback to previous time if needed)
-            rec = dict(row)
+            # One bank-step: updates ALL tracks for this row in compiled code
+            # NOTE: This assumes you've added KalmanFilter._kf_bank_step_inplace(...)
+            # inside Pixel_KalmanFilter.py, and that it internally calls _kf_step_inplace.
+            PixelKalmanFilter._kf_bank_step_inplace(
+                float(t_sec[idx]),
+                Xmeas[idx], Ymeas[idx], valid_u8[idx],
+                X, P, last_t, init,
+                var_proc, var_meas,
+                max_pixel_jump, max_mahalanobis_sq
+            )
 
-            for fid in feat_ids:
-                x_key = f"feat_{fid}_x_undistPX"
-                y_key = f"feat_{fid}_y_undistPX"
-
-                x_val = row.get(x_key, None)
-                y_val = row.get(y_key, None)
-
-                kf = kf_by_id[fid]
-
-                # Default outputs for this feature in this row
-                rec.setdefault(f"feat_{fid}_kf_x", np.nan)
-                rec.setdefault(f"feat_{fid}_kf_y", np.nan)
-                rec.setdefault(f"feat_{fid}_kf_trust", 0.0)
-                rec.setdefault(f"feat_{fid}_kf_vx", np.nan)
-                rec.setdefault(f"feat_{fid}_kf_vy", np.nan)
-                rec.setdefault(f"feat_{fid}_kf_sigma_px", np.nan)
-                rec.setdefault(f"feat_{fid}_kf_sigma_py", np.nan)
-
-                # If no measurement, we only propagate if the filter has a state
-                if (
-                        x_val is None or x_val == -1.0
-                        or y_val is None or y_val == -1.0
-                        or isna(x_val)
-                        or isna(y_val)
-                ):
-                    # Predict-only (z=None) if we already have a state
-                    if kf.x is not None:
-                        kf.update_KF(image_time, None)
-                        x_state, sqrt_diag = kf.updated_state()
-                        if x_state is not None and sqrt_diag is not None:
-                            rec[f"feat_{fid}_kf_x"] = float(x_state[0])
-                            rec[f"feat_{fid}_kf_y"] = float(x_state[1])
-                            sigma_px = float(sqrt_diag[0])
-                            sigma_py = float(sqrt_diag[1])
-                            rec[f"feat_{fid}_kf_trust"] = 1.00 / max(sigma_px * sigma_px, 1e-6)
-                            rec[f"feat_{fid}_kf_vx"] = float(x_state[2])
-                            rec[f"feat_{fid}_kf_vy"] = float(x_state[3])
-                            rec[f"feat_{fid}_kf_sigma_px"] = sigma_px
-                            rec[f"feat_{fid}_kf_sigma_py"] = sigma_py
-                    continue  # next feature
-
-                # We have a measurement: normalize or use raw
-                mx, my = normalize_xy(x_val, y_val)
-                z = np.array([mx, my], dtype=float)
-
-                # Single call handles init + predict + update internally
-                kf.update_KF(image_time, z)
-
-                x_state, sqrt_diag = kf.updated_state()
-                if x_state is None or sqrt_diag is None:
+            # Write outputs for all initialized tracks
+            for j in range(M):
+                if init[j] == 0:
                     continue
-                # State layout in Pixel_KalmanFilter: [px, py, vx, vy]
-                rec[f"feat_{fid}_kf_x"] = float(x_state[0])
-                rec[f"feat_{fid}_kf_y"] = float(x_state[1])
-                rec[f"feat_{fid}_kf_vx"] = float(x_state[2])
-                rec[f"feat_{fid}_kf_vy"] = float(x_state[3])
 
-                # sqrt_diag: [sigma_px, sigma_py, sigma_vx, sigma_vy]
-                sigma_px = float(sqrt_diag[0])
-                sigma_py = float(sqrt_diag[1])
-                rec[f"feat_{fid}_kf_sigma_px"] = sigma_px
-                rec[f"feat_{fid}_kf_sigma_py"] = sigma_py
+                out_kf_x[idx, j] = X[j, 0]
+                out_kf_y[idx, j] = X[j, 1]
+                out_kf_vx[idx, j] = X[j, 2]
+                out_kf_vy[idx, j] = X[j, 3]
 
-                # Simple trust metric: inverse of positional uncertainty
-                rec[f"feat_{fid}_kf_trust"] = 0.03 / max(sigma_px + sigma_py, 1e-6)
+                # sigma from diag(P) (position only)
+                sig_px = float(np.sqrt(P[j, 0, 0]))
+                sig_py = float(np.sqrt(P[j, 1, 1]))
+                out_sig_px[idx, j] = sig_px
+                out_sig_py[idx, j] = sig_py
 
-            # Drop raw measurement columns; comment this out if you want to keep them.
-            for fid in feat_ids:
-                rec.pop(f"feat_{fid}_x_distPX", None)
-                rec.pop(f"feat_{fid}_y_distPX", None)
+                # Same trust metric as before: inverse sigma_px (clamped)
+                out_trust[idx, j] = 1.0 / max(sig_px, 1e-5)
 
-            rows_out.append(rec)
+        # --- Build output DataFrame ---
+        # Start with original df (so you keep metadata columns)
+        out_df = df.copy()
 
-        # --- Write output CSV (single shot, no checkpointing) ---
-        out_df = DataFrame(rows_out)
+        new_cols = {}
+
+        for j, fid in enumerate(feat_ids):
+            new_cols[f"feat_{fid}_kf_x"] = out_kf_x[:, j]
+            new_cols[f"feat_{fid}_kf_y"] = out_kf_y[:, j]
+            new_cols[f"feat_{fid}_kf_vx"] = out_kf_vx[:, j]
+            new_cols[f"feat_{fid}_kf_vy"] = out_kf_vy[:, j]
+            new_cols[f"feat_{fid}_kf_sigma_px"] = out_sig_px[:, j]
+            new_cols[f"feat_{fid}_kf_sigma_py"] = out_sig_py[:, j]
+            new_cols[f"feat_{fid}_kf_trust"] = out_trust[:, j]
+
+        out_df = concat([out_df, DataFrame(new_cols)], axis=1)
+
+        # Drop raw measurement columns (your original code only dropped *_distPX,
+        # but your docstring says drop original feat_*_x/feat_*_y; keep consistent
+        # with your current behavior: drop only distPX here.)
+        cols_to_drop = []
+        for fid in feat_ids:
+            cols_to_drop.append(f"feat_{fid}_x_distPX")
+            cols_to_drop.append(f"feat_{fid}_y_distPX")
+
+        out_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+
         out_df.to_csv(out_csv, index=False)
         LOG.info("Kalman tracks CSV written: %s", out_csv)
+
 
     def launch_checkerboard(self):
         import subprocess

@@ -33,14 +33,26 @@ with noisy measurements, the initializer results, and the final optimized pose.
 """
 
 from sys import maxsize
-import numpy as np
 from SupportModules.quaternions import Quaternion as q
 from SupportModules.quaternions import *
 from SupportModules.Calibration import Calibration
 from SupportModules.include_numba import njit, prange
 from numpy.linalg import norm
 from numpy.typing import NDArray
-from copy import deepcopy
+from enum import Enum
+from itertools import cycle
+
+class robust_cost(Enum):
+    none = None,
+    huber = 'huber',
+    cauchy = 'cauchy',
+    tukey = 'tukey'
+
+    def next(self):
+        iterator = cycle(self.__class__)
+        for member in iterator:
+            if member is self:
+                return next(iterator)
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
@@ -105,6 +117,196 @@ def _deriv_kernel_numba(RX: np.ndarray, xyz_cam: np.ndarray, fx: float, fy: floa
         L[r + 1, 5] = vZ
 
     return L
+@njit(cache=True, fastmath=False)
+def _quat_to_R_numba(qw, qx, qy, qz):
+    # Assumes q is unit-ish; still works if slightly off.
+    # Returns 3x3 rotation matrix.
+    ww = qw*qw; xx = qx*qx; yy = qy*qy; zz = qz*qz
+    wx = qw*qx; wy = qw*qy; wz = qw*qz
+    xy = qx*qy; xz = qx*qz; yz = qy*qz
+
+    R = np.empty((3, 3), dtype=np.float64)
+    R[0, 0] = ww + xx - yy - zz
+    R[0, 1] = 2.0*(xy - wz)
+    R[0, 2] = 2.0*(xz + wy)
+
+    R[1, 0] = 2.0*(xy + wz)
+    R[1, 1] = ww - xx + yy - zz
+    R[1, 2] = 2.0*(yz - wx)
+
+    R[2, 0] = 2.0*(xz - wy)
+    R[2, 1] = 2.0*(yz + wx)
+    R[2, 2] = ww - xx - yy + zz
+    return R
+
+
+@njit(parallel=True, cache=True, fastmath=False)
+def _project_and_jacobian_numba(object_pts, qw, qx, qy, qz, tx, ty, tz, fx, fy, cx, cy,
+                               proj_2N_out, RX_out, xyz_cam_out, L_out):
+    """
+    Fills:
+      proj_2N_out: (2N,)
+      RX_out      : (N,3)   = R*X
+      xyz_cam_out : (N,3)   = R*X + t
+      L_out       : (2N,6)  Jacobian wrt [drx,dry,drz, tx,ty,tz]
+    """
+    N = object_pts.shape[0]
+    R = _quat_to_R_numba(qw, qx, qy, qz)
+
+    for i in prange(N):
+        X = object_pts[i, 0]
+        Y = object_pts[i, 1]
+        Z = object_pts[i, 2]
+
+        rx = R[0, 0]*X + R[0, 1]*Y + R[0, 2]*Z
+        ry = R[1, 0]*X + R[1, 1]*Y + R[1, 2]*Z
+        rz = R[2, 0]*X + R[2, 1]*Y + R[2, 2]*Z
+
+        RX_out[i, 0] = rx
+        RX_out[i, 1] = ry
+        RX_out[i, 2] = rz
+
+        x = rx + tx
+        y = ry + ty
+        z = rz + tz
+
+        xyz_cam_out[i, 0] = x
+        xyz_cam_out[i, 1] = y
+        xyz_cam_out[i, 2] = z
+
+        # projection
+        invz = 1.0 / z
+        invz2 = invz * invz
+
+        u = fx * (x * invz) + cx
+        v = fy * (y * invz) + cy
+
+        r2 = 2 * i
+        proj_2N_out[r2]     = u
+        proj_2N_out[r2 + 1] = v
+
+        # Jacobian (same algebra as your _deriv_kernel_numba) :contentReference[oaicite:3]{index=3}
+        uX = fx * invz
+        uZ = -fx * x * invz2
+        vY = fy * invz
+        vZ = -fy * y * invz2
+
+        a = rx
+        b = ry
+        c = rz
+
+        Lurx = uZ * b
+        Lury = uX * c - uZ * a
+        Lurz = -uX * b
+
+        Lvrx = -vY * c + vZ * b
+        Lvry = -vZ * a
+        Lvrz = vY * a
+
+        # rot cols
+        L_out[r2, 0] = Lurx
+        L_out[r2, 1] = Lury
+        L_out[r2, 2] = Lurz
+        L_out[r2 + 1, 0] = Lvrx
+        L_out[r2 + 1, 1] = Lvry
+        L_out[r2 + 1, 2] = Lvrz
+
+        # trans cols
+        L_out[r2, 3] = uX
+        L_out[r2, 4] = 0.0
+        L_out[r2, 5] = uZ
+
+        L_out[r2 + 1, 3] = 0.0
+        L_out[r2 + 1, 4] = vY
+        L_out[r2 + 1, 5] = vZ
+
+@njit(fastmath=False, cache=True)
+def _accum_LtL_Lty_numba(L: np.ndarray, y: np.ndarray, sqrtw: np.ndarray):
+    """
+    Accumulate LtL and Lty for weighted least squares without forming Q or
+    modifying L/y in-place.
+
+    Inputs:
+      L     : (2N,6)
+      y     : (2N,)
+      sqrtw : (2N,)  left-multipliers (sqrt weights)
+
+    Returns:
+      LtL : (6,6)
+      Lty : (6,)
+      y2  : scalar sum of squares of weighted residuals (||Q y||^2)
+    """
+    # Per-thread partials to reduce contention (numba supports this pattern)
+    # Shape: (nthreads, 6, 6) etc would be ideal, but numba doesn't expose nthreads
+    # reliably in all configs. We'll do a manual reduction via prange over rows and
+    # use local accumulators + atomic add pattern on a small array.
+
+    LtL = np.zeros((6, 6), dtype=np.float64)
+    Lty = np.zeros(6, dtype=np.float64)
+    y2  = 0.0
+
+    M = L.shape[0]
+
+    for i in range(M):
+        wi = sqrtw[i]
+        yi = wi * y[i]
+
+        # weighted Jacobian row
+        r0 = wi * L[i, 0]
+        r1 = wi * L[i, 1]
+        r2 = wi * L[i, 2]
+        r3 = wi * L[i, 3]
+        r4 = wi * L[i, 4]
+        r5 = wi * L[i, 5]
+
+        # Accumulate Lty
+        # (J^T r) where r == yi (scalar residual for this row)
+        Lty[0] += r0 * yi
+        Lty[1] += r1 * yi
+        Lty[2] += r2 * yi
+        Lty[3] += r3 * yi
+        Lty[4] += r4 * yi
+        Lty[5] += r5 * yi
+
+        # Accumulate LtL (outer product of weighted row)
+        # Fill upper triangle then mirror (cheaper)
+        LtL[0, 0] += r0 * r0
+        LtL[0, 1] += r0 * r1
+        LtL[0, 2] += r0 * r2
+        LtL[0, 3] += r0 * r3
+        LtL[0, 4] += r0 * r4
+        LtL[0, 5] += r0 * r5
+
+        LtL[1, 1] += r1 * r1
+        LtL[1, 2] += r1 * r2
+        LtL[1, 3] += r1 * r3
+        LtL[1, 4] += r1 * r4
+        LtL[1, 5] += r1 * r5
+
+        LtL[2, 2] += r2 * r2
+        LtL[2, 3] += r2 * r3
+        LtL[2, 4] += r2 * r4
+        LtL[2, 5] += r2 * r5
+
+        LtL[3, 3] += r3 * r3
+        LtL[3, 4] += r3 * r4
+        LtL[3, 5] += r3 * r5
+
+        LtL[4, 4] += r4 * r4
+        LtL[4, 5] += r4 * r5
+
+        LtL[5, 5] += r5 * r5
+
+        y2 += yi * yi
+
+    # Mirror upper -> lower
+    for r in range(6):
+        for c in range(r + 1, 6):
+            LtL[c, r] = LtL[r, c]
+
+    return LtL, Lty, y2
+
+
 def _row_normed(A, eps=1e-12):
     """Row-normalize a 2D array.
 
@@ -180,9 +382,81 @@ def print_rayPts(ray_proj: np.array):
         print(f"Feature: {n:3d}, px: {ray[0]: .5f}, py: {ray[1]: .5f}")
 
 
+def _expand_to_2N_weights(w, N):
+    """Accept per-point (N,) or per-residual (2N,) weights; return (2N,)."""
+    w = np.asarray(w, dtype=float).reshape(-1)
+    if w.size == N:
+        return np.repeat(w, 2)
+    if w.size == 2 * N:
+        return w
+    raise ValueError(f"weight length must be N or 2N; got {w.size}, N={N}")
+
+def _robust_sqrt_weights_from_residual(y_2N, N,
+                                       kind: robust_cost = robust_cost.huber,
+                                       param=2.0,
+                                       sigma_2N=None, eps=1e-12):
+    """
+    Return per-residual sqrt-weights (2N,) for IRLS.
+
+    We robustify per *feature* using the 2D residual norm:
+        r_i = sqrt(du^2 + dv^2)
+    Optionally normalize by sigma (pixel std-dev) before applying robust loss.
+
+    kind:
+      - "huber": param = delta  (in sigma units if sigma provided, else pixels)
+      - "cauchy": param = c
+      - "tukey": param = c (Tukey biweight)
+    """
+    y = np.asarray(y_2N, float).reshape(-1)
+    y2 = y.reshape(N, 2)
+
+    if sigma_2N is not None:
+        s = np.asarray(sigma_2N, float).reshape(-1)
+        s = np.clip(s, eps, None)
+        s2 = s.reshape(N, 2)
+        # scalar sigma per feature (RMS of u/v sigmas)
+        sigma_i = np.sqrt(0.5 * (s2[:, 0]**2 + s2[:, 1]**2))
+        r = np.linalg.norm(y2, axis=1) / np.clip(sigma_i, eps, None)
+    else:
+        r = np.linalg.norm(y2, axis=1)
+
+    r = np.clip(r, eps, None)
+
+    c = float(param)
+
+    if kind == robust_cost.huber:
+        # w = 1                    if r <= c
+        # w = c / r                if r >  c
+        w = np.ones_like(r)
+        mask = r > c
+        w[mask] = c / r[mask]
+
+    elif kind == robust_cost.cauchy:
+        # rho = (c^2/2) log(1 + (r/c)^2)  ->  w = 1 / (1 + (r/c)^2)
+        t = (r / c)
+        w = 1.0 / (1.0 + t * t)
+
+    elif kind == robust_cost.tukey:
+        # Tukey biweight: w = (1 - (r/c)^2)^2 for r < c else 0
+        t = r / c
+        w = np.zeros_like(r)
+        mask = t < 1.0
+        w[mask] = (1.0 - t[mask]**2)**2
+
+    else:
+        raise ValueError(f"Unknown robust kind '{kind}'")
+
+    # IRLS uses sqrt(w) as left-multipliers of residual/J
+    sqrtw_2N = np.repeat(np.sqrt(np.clip(w, 0.0, None)), 2)
+    return sqrtw_2N
+
 def opt(img_pts: NDArray, object_pts: NDArray,
         cal: Calibration, seed_q: q = None, seed_t: NDArray = None,
-        trust_weighting: NDArray = None):
+        trust_weighting: NDArray = None,
+        robust_kind: robust_cost = robust_cost.none,          # e.g. "huber", "cauchy", "tukey"
+        robust_param=2.0,          # delta (Huber) or c (Cauchy/Tukey)
+        sigma_2N=None):            # optional per-residual sigma (2N,) in pixels
+
     """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
 
     Uses a *minimal* 6D state:
@@ -195,13 +469,25 @@ def opt(img_pts: NDArray, object_pts: NDArray,
     """
 
     # ----------------- Initialization -----------------
+    if np.linalg.norm(seed_t) > 500.0 or seed_q.norm > 500.0:
+        seed_q = seed_t = None
+
     if seed_q is None or seed_t is None:
-        est_q, est_t = DLT(object_pts, img_pts, cal, trust_weighting)
+        est_q, est_t = DLT(object_pts, img_pts, cal)
     else:
-        est_q = deepcopy(seed_q)
-        est_t = deepcopy(seed_t)
+        est_q = seed_q.copy()
+        est_t = seed_t.copy()
 
     meas_pix = img_pts.flatten()
+    N = img_pts.shape[0]
+
+    proj = np.empty(2 * N, dtype=np.float64)
+    y = np.empty(2 * N, dtype=np.float64)
+    RX = np.empty((N, 3), dtype=np.float64)
+    xyz = np.empty((N, 3), dtype=np.float64)
+    L = np.empty((2 * N, 6), dtype=np.float64)
+
+    object_pts64 = np.ascontiguousarray(object_pts, dtype=np.float64)
 
     keep_going = True
     iter_num = 0
@@ -209,27 +495,58 @@ def opt(img_pts: NDArray, object_pts: NDArray,
         iter_num += 1
 
         # Residual and Jacobian at current pose
-        y = meas_pix - h(est_q, est_t, object_pts, cal)
-        old_y_mag = norm(y)
-        L = deriv(est_q, est_t, object_pts, cal)      # (2N, 6)
+        # Convert current quaternion object -> 4 scalars (cheap)
+        qw = float(est_q.s)
+        qx = float(est_q.vec[0])
+        qy = float(est_q.vec[1])
+        qz = float(est_q.vec[2])
+        tx = float(est_t[0])
+        ty = float(est_t[1])
+        tz = float(est_t[2])
 
+        _project_and_jacobian_numba(
+            object_pts64,
+            qw, qx, qy, qz, tx, ty, tz,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            proj, RX, xyz, L
+        )
+
+        # y := meas - proj (in-place)
+        y[:] = meas_pix - proj
+
+        # ---- Build combined sqrt-weights (2N,) ----
+        sqrtw = np.ones(2 * N, dtype=float)
+
+        # (A) trust weighting (accept N or 2N)
         if trust_weighting is not None:
-            Q = np.diag(trust_weighting)
-            y = Q.dot(y)
-            L = Q.dot(L)
-        else:
-            Q = None
+            tw = _expand_to_2N_weights(trust_weighting, N)
+            tw = np.clip(tw / np.mean(tw), 0.25, 4.0)
+
+            # if your trust_weighting is intended as *cost* weights, use sqrt:
+            sqrtw *= np.sqrt(tw)
+
+            # if you intentionally tuned with your old behavior (w applied directly),
+            # comment out the sqrt line above and instead do:
+            # sqrtw *= tw
+
+        # (B) robust weighting (depends on current residual)
+        if robust_kind is not robust_kind.none:
+            rw = _robust_sqrt_weights_from_residual(
+                y_2N=y, N=N, kind=robust_kind, param=robust_param, sigma_2N=sigma_2N
+            )
+            sqrtw *= rw
 
         # ------------- Damped normal equations -------------
-        lam = 1e-1  # tune; 1e-4 to 1e-1 is a reasonable range
-        LtL = L.T @ L                                  # (6, 6)
-        Lty = L.T @ y                                  # (6,)
+        LtL, Lty, y2 = _accum_LtL_Lty_numba(L, y, sqrtw)
+        old_y_mag = np.sqrt(y2)
+
+        lam = 1e-1
 
         LAMBDA = lam * np.eye(LtL.shape[0])
 
         LtL_damped = LtL + LAMBDA
 
-        delta_x = np.linalg.solve(LtL, Lty)     # (6,)
+        delta_x = np.linalg.solve(LtL_damped, Lty)     # (6,)
 
         # ------------- Backtracking line search -------------
         scale = 1.0
@@ -241,17 +558,38 @@ def opt(img_pts: NDArray, object_pts: NDArray,
             trial_q = q.from_rodrigues(delta_r) * est_q
             trial_t = est_t + delta_t
 
-            if Q is not None:
-                new_y_mag = norm(Q.dot(
-                    meas_pix - h(trial_q, trial_t, object_pts, cal)
-                ))
-            else:
-                new_y_mag = norm(
-                    meas_pix - h(trial_q, trial_t, object_pts, cal)
-                )
+            # Reject poses with points too close/behind camera (prevents 1/Z blowups)
+            XYZ_trial = trial_q * object_pts + trial_t
+            if np.mean(XYZ_trial[:, 2]> 1e-3) < 0.9:
+                scale *= 0.5
+                lam *= 3.0
+                if scale < 1e-4:
+                    break
+                continue
+
+            # compute weighted residual norm without Q
+            qw = float(trial_q.s)
+            qx = float(trial_q.vec[0])
+            qy = float(trial_q.vec[1])
+            qz = float(trial_q.vec[2])
+            tx = float(trial_t[0])
+            ty = float(trial_t[1])
+            tz = float(trial_t[2])
+
+            # We only need proj here; L_out can be reused (still filled, harmless)
+            _project_and_jacobian_numba(
+                object_pts64,
+                qw, qx, qy, qz, tx, ty, tz,
+                float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+                proj, RX, xyz, L
+            )
+
+            y[:] = meas_pix - proj
+            new_y_mag = float(np.linalg.norm(sqrtw * y))
 
             # Linear prediction of residual magnitude
-            y_pred_mag = norm(y - L.dot(scale * delta_x))
+            y_pred = y - L.dot(scale * delta_x)
+            y_pred_mag = float(np.linalg.norm(sqrtw * y_pred))
 
             # If perfect agreement between nonlinear and linear prediction, stop
             if np.abs(old_y_mag - y_pred_mag) < 1e-5:
@@ -266,12 +604,14 @@ def opt(img_pts: NDArray, object_pts: NDArray,
                     ratio = (old_y_mag - new_y_mag) / denom
 
                 if 0.25 < ratio < 4.0:
+                    lam *= 0.3
                     scale_is_good = True
                     # Commit step
                     est_q = q.from_rodrigues(delta_r) * est_q
                     est_t = est_t + delta_t
                 else:
                     # Backtrack
+                    lam *= 3.0
                     scale /= 2.0
                     if scale < 1e-4:
                         # Don't get stuck forever
@@ -295,55 +635,88 @@ def enforce_chirality(q_est, t_est, object_pts, cal):
 
     # If most points are behind the camera, flip
     if front_fraction < 0.5:
-        q_est = q(-q_est.s, -q_est.vec)
         t_est = -t_est
         return True, q_est, t_est,
     return False, q_est, t_est
 
-def DLT(object_pts: NDArray, img_pts: NDArray, cal: Calibration, trust_weighting: np.array = None):
+def DLT(object_pts: NDArray,
+        img_pts: NDArray,
+        cal: Calibration,
+        trust_weighting: np.ndarray = None):
+    """
+    DLT initializer using *normalized* image coordinates (x~, y~),
+    with correct handling of trust_weighting.
 
-    num_points = len(img_pts)
+    - img_pts: (N,2) pixels (u,v)
+    - object_pts: (N,3)
+    - trust_weighting:
+        * None
+        * length N  (one weight per point)  -> expanded to 2N
+        * length 2N (one weight per residual row) used directly
+      (weights are assumed to be sqrt-weights, i.e., multiply rows by w)
+    """
 
-    A = np.zeros((2 * num_points, 12))
+    object_pts = np.asarray(object_pts, dtype=np.float64)
+    img_pts    = np.asarray(img_pts,    dtype=np.float64)
+
+    num_points = img_pts.shape[0]
+    if num_points < 6:
+        raise ValueError(f"DLT needs >= 6 points, got {num_points}")
+
+    # --- normalized coordinates ---
+    xtil = (img_pts[:, 0] - cal.cx) / cal.fx
+    ytil = (img_pts[:, 1] - cal.cy) / cal.fy
+
+    # --- build A in normalized space ---
+    # Same structure as your original, but x,y are replaced with xtil,ytil.
+    A = np.zeros((2 * num_points, 12), dtype=np.float64)
 
     for i in range(num_points):
         X, Y, Z = object_pts[i]
-        x, y = img_pts[i]
+        x = xtil[i]
+        y = ytil[i]
 
-        A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
+        A[2 * i]     = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
         A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
 
+    # --- apply trust weighting correctly ---
     if trust_weighting is not None:
-        Q = np.diag( trust_weighting)
-        A = Q @ A
+        w = np.asarray(trust_weighting, dtype=np.float64).ravel()
 
-    # 2. Solve the linear system Ap = 0 using SVD
-    _, _, Vt = np.linalg.svd(A)
+        # Allow N weights (per point) or 2N weights (per row)
+        if w.size == num_points:
+            w = np.repeat(w, 2)
+        elif w.size != 2 * num_points:
+            raise ValueError(
+                f"trust_weighting must have length N={num_points} or 2N={2*num_points}, got {w.size}"
+            )
 
-    # The solution is the last column of V (or last row of Vt)
+        # Row-scale A by w (equivalent to diag(w) @ A, but faster/safer)
+        A = (w[:, None] * A)
+
+    # --- solve Ap=0 via SVD ---
+    _, _, Vt = np.linalg.svd(A, full_matrices=False)
     p = Vt[-1, :]
     P = p.reshape((3, 4))
 
-    # 3. Extract K, R, and t from the projection matrix P
-    # P = K[R|t] => M = inv(K) * P
-    M = cal.inv @ P
-    R_init, t_init = M[:, :3], M[:, 3]
+    # In normalized form, K = I, so M == P.
+    # We still extract R_init, t_init for completeness.
+    R_init, t_init = P[:, :3], P[:, 3]
 
-    # 4. Enforce orthogonality on R
+    # --- enforce orthogonality on R ---
     U, _, Vt_r = np.linalg.svd(R_init)
     R = U @ Vt_r
     if np.linalg.det(R) < 0:
-        R *= -1.0
+        # keep proper rotation
+        U[:, -1] *= -1.0
+        R = U @ Vt_r
+        t_init *= -1.0  # keep projective sign consistent
 
-
-    xtil = (img_pts[:, 0] - cal.cx) / cal.fx
-    ytil = (img_pts[:, 1] - cal.cy) / cal.fy
+    # --- translation solve (your existing method) ---
     t = _solve_t_given_R(object_pts, xtil, ytil, R)
 
-    # 5. Get the final rvec
-    # rvec, _ = cv2.Rodrigues(R)
+    # --- return quaternion + translation ---
     q_init = mat2quat(R)
-
     return q_init, t
 
 def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
@@ -409,13 +782,13 @@ def solveQnP(object_pts: np.array,
     # ------------------------------------------------------------------
     if (user_seed_q is not None) and (user_seed_t is not None):
         # Use caller-provided seed (e.g., previous frame, or PnP pose)
-        seed_q = deepcopy(user_seed_q)
-        seed_t = deepcopy(user_seed_t)
+        seed_q = user_seed_q.copy()
+        seed_t = user_seed_t.copy()
     else:
         # Use DLT initializer to mirror PnP-style behavior
-        seed_q, seed_t = DLT(object_pts, img_pts, cal, trust_weighting=trust_weighting)
+        seed_q, seed_t = DLT(object_pts, img_pts, cal)
 
-
+    flipped, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts, cal)
     # ------------------------------------------------------------------
     # 2) Nonlinear refinement around the seed (Gauss–Newton / LM-like)
     #    This is where trust_weighting gives us an advantage over PnP.
@@ -427,6 +800,7 @@ def solveQnP(object_pts: np.array,
         seed_q=seed_q,
         seed_t=seed_t,
         trust_weighting=trust_weighting,
+        robust_kind=robust_cost.cauchy
     )
 
     # ------------------------------------------------------------------

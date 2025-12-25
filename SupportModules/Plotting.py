@@ -1,13 +1,23 @@
 import pandas as pd
 import matplotlib.pyplot as plt
+from SupportModules.Logging import LOG
+from pathlib import Path
 
 class Plotter:
     @staticmethod
-    def plot(conf: float):
+    def plot(conf: float, img_dir: Path):
 
         # Input CSVs
-        pnp = pd.read_csv(fr"./Images/2024_12 Calspan Subset/yolo_detections_conf{conf:.2f}__pnp.csv")
-        qnp = pd.read_csv(fr"./Images/2024_12 Calspan Subset/yolo_detections_conf{conf:.2f}__qnp.csv")
+        try:
+            pnp = pd.read_csv(img_dir / f"3_pnp_conf{conf:.2f}.csv")
+        except FileNotFoundError:
+            LOG.warning(fr'Tried to find ' + str(img_dir / f"3_pnp_conf{conf:.2f}.csv" ))
+            return
+        try:
+            qnp = pd.read_csv(img_dir / f"4_qnp_conf{conf:.2f}.csv")
+        except FileNotFoundError:
+            LOG.warning(fr'Tried to find ' + str(img_dir / f"4_qnp_conf{conf:.2f}.csv" ))
+            return
 
         # Merge on image name + time
         merged = pd.merge(
@@ -24,8 +34,6 @@ class Plotter:
         has_kf_pos = all(f"qnp_kf_{c}" in merged.columns for c in ["x", "y", "z"])
         has_kf_quat = all(f"qnp_kf_{c}" in merged.columns for c in ["qw", "qx", "qy", "qz"])
         has_kf = has_kf_pos and has_kf_quat
-
-        print("KF-weighted QnP available:", has_kf)
 
         # -------------------------------
         # Position comparison: PnP vs QnP vs QnP-KF

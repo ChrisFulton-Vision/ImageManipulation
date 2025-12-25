@@ -56,6 +56,153 @@ class Calibration:
         if not self.fisheye:
             return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2, self.k3
 
+    def randomize(
+            self,
+            rng=None,
+            *,
+            # camera geometry
+            width=None,
+            height=None,
+            keep_intrinsics=True,
+            fx_range=(600.0, 4500.0),
+            fy_range=None,  # if None -> fy ~ fx * (1+small jitter)
+            principal_jitter_px=5.0,  # if keep_intrinsics=False; cx/cy jitter about center
+            # distortion regime controls
+            profile="mixed",  # "radial_only", "tangential_only", "mixed"
+            strength="medium",  # "low", "medium", "high"
+            # safety / validity
+            ensure_invertible=True,
+            min_abs_L=0.20,  # enforce |L(r)| >= this on [0, r_max]
+            max_attempts=200
+    ):
+        """
+        Randomize calibration parameters for benchmarking.
+
+        - profile:
+            "radial_only"      -> p1=p2=0, random k1,k2,k3
+            "tangential_only"  -> k1=k2=k3=0, random p1,p2
+            "mixed"            -> random both
+        - strength: controls typical magnitude ranges.
+        - ensure_invertible: rejects samples where radial scale L(r) gets too small
+          over the image FOV (helps avoid pathological inversions).
+
+        Returns: self (mutates in place).
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        # -----------------------
+        # Decide resolution
+        # -----------------------
+        if width is None:
+            width = self.width if self.width is not None else 864
+        if height is None:
+            height = self.height if self.height is not None else 864
+        self.width = int(width)
+        self.height = int(height)
+
+        # -----------------------
+        # Intrinsics
+        # -----------------------
+        if not keep_intrinsics or (self.fx is None or self.fy is None or self.cx is None or self.cy is None):
+            fx_lo, fx_hi = fx_range
+            self.fx = float(rng.uniform(fx_lo, fx_hi))
+
+            if fy_range is None:
+                # keep near-square pixels but not exact
+                self.fy = float(self.fx * rng.uniform(0.97, 1.03))
+            else:
+                fy_lo, fy_hi = fy_range
+                self.fy = float(rng.uniform(fy_lo, fy_hi))
+
+            # principal point near image center with mild jitter
+            self.cx = float((self.width - 1) * 0.5 + rng.uniform(-principal_jitter_px, principal_jitter_px))
+            self.cy = float((self.height - 1) * 0.5 + rng.uniform(-principal_jitter_px, principal_jitter_px))
+
+        # -----------------------
+        # Distortion magnitude presets (Brown–Conrady)
+        # These are *practical* ranges; adjust as you learn what you want to stress.
+        # -----------------------
+        if strength == "low":
+            k1_rng = (-0.05, 0.05)
+            k2_rng = (-0.05, 0.05)
+            k3_rng = (-0.02, 0.02)
+            p_rng = (-5e-4, 5e-4)
+        elif strength == "medium":
+            k1_rng = (-0.20, 0.20)
+            k2_rng = (-0.20, 0.20)
+            k3_rng = (-0.10, 0.10)
+            p_rng = (-2e-3, 2e-3)
+        else:  # "high"
+            k1_rng = (-0.80, 0.80)
+            k2_rng = (-0.80, 0.80)
+            k3_rng = (-0.60, 0.60)
+            p_rng = (-1e-2, 1e-2)
+
+        # We'll sample until we pass safety checks (or give up).
+        # Use r_max at the image corner in normalized coords.
+        def r_max_norm():
+            # corners relative to principal point, normalized by focal length
+            xs = np.array([0.0, self.width - 1.0])
+            ys = np.array([0.0, self.height - 1.0])
+            X, Y = np.meshgrid(xs, ys)
+            xn = (X.ravel() - self.cx) / self.fx
+            yn = (Y.ravel() - self.cy) / self.fy
+            return float(np.sqrt((xn * xn + yn * yn).max()))
+
+        rmax = r_max_norm()
+
+        def min_abs_L_over_fov(k1, k2, k3):
+            # sample L(r) over [0, rmax] to avoid L near 0 in-view
+            rs = np.linspace(0.0, rmax, 64, dtype=np.float64)
+            r2 = rs * rs
+            L = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            return float(np.min(np.abs(L)))
+
+        for _ in range(max_attempts):
+            if profile == "tangential_only":
+                k1 = k2 = k3 = 0.0
+                p1 = float(rng.uniform(*p_rng))
+                p2 = float(rng.uniform(*p_rng))
+            elif profile == "radial_only":
+                p1 = p2 = 0.0
+                k1 = float(rng.uniform(*k1_rng))
+                k2 = float(rng.uniform(*k2_rng))
+                k3 = float(rng.uniform(*k3_rng))
+            else:  # "mixed"
+                k1 = float(rng.uniform(*k1_rng))
+                k2 = float(rng.uniform(*k2_rng))
+                k3 = float(rng.uniform(*k3_rng))
+                p1 = float(rng.uniform(*p_rng))
+                p2 = float(rng.uniform(*p_rng))
+
+            if ensure_invertible:
+                if min_abs_L_over_fov(k1, k2, k3) < float(min_abs_L):
+                    continue
+
+            # accept
+            self.k1 = k1
+            self.k2 = k2
+            self.k3 = k3
+            self.p1 = p1
+            self.p2 = p2
+            break
+        else:
+            raise RuntimeError("Failed to sample a stable calibration (increase max_attempts or relax min_abs_L).")
+
+        # Accessories (keep validCal happy)
+        self.fisheye = False
+        self.calTime = 0.0
+        self.numCBUsed = 0
+        self.rmsError = 0.0
+        # hfov is optional; leave if already present, otherwise approximate from fx
+        if self.hfov is None:
+            # approximate horizontal FOV in degrees
+            self.hfov = float(2.0 * np.degrees(np.arctan((self.width * 0.5) / self.fx)))
+
+        # validCal cache will be marked dirty automatically via __setattr__
+        return self
+
     def setCameraMatrix(self, mtx=None, fx=None, fy=None, cx=None, cy=None):
         if mtx is not None:
             self.fx = mtx[0, 0]
@@ -80,9 +227,19 @@ class Calibration:
 
     @property
     def inv(self):
-        return np.array([[1.0 / self.fx, 0.0, -self.cx / self.fx],
-                         [0.0, 1.0 / self.fy, -self.cy / self.fy],
-                         [0.0, 0.0, 1.0]])
+        if not hasattr(self, "scale"):
+            self.scale = 1.0
+
+        if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None and self.scale is not None:
+            fx = self.scale * self.fx
+            fy = self.scale * self.fy
+            cx = self.scale * (self.cx + 0.5) - 0.5
+            cy = self.scale * (self.cy + 0.5) - 0.5
+            return np.array([[1.0 / fx, 0.0, -cx / fx],
+                             [0.0, 1.0 / fy, -cy / fy],
+                             [0.0, 0.0, 1.0]])
+
+        return None
 
     def getCameraMatrix(self):
         # Included for backwards compatibility
@@ -97,8 +254,8 @@ class Calibration:
             return np.array([[fx, 0.0, cx],
                              [0.0, fy, cy],
                              [0.0, 0.0, 1.0]])
-        else:
-            return None
+
+        return None
 
     def setDistortion(self, dist=None, k1=None, k2=None, p1=None, p2=None, k3=None):
         if dist is not None and self.fisheye:
@@ -385,6 +542,99 @@ class Calibration:
                                 pixel.norm_coords[1] * self.fy + self.cy]
             return
         raise ValueError("Norm_coords must exist before calling this function.")
+
+    def max_corner_distortion_px(self, corners_px_und: np.ndarray | None = None) -> tuple[float, np.ndarray]:
+        """Return the maximum *forward* distortion magnitude (in pixels) at image corners.
+
+        This is a simple "calibration nastiness" proxy: how far the forward model
+        moves ideal (undistorted) corner pixels when mapped into the distorted image.
+
+        Parameters
+        ----------
+        corners_px_und : np.ndarray | None
+            Optional array of undistorted pixel points, shape (N,2).
+            If None, uses the four image corners:
+            (0,0), (W-1,0), (W-1,H-1), (0,H-1).
+
+        Returns
+        -------
+        max_mag_px : float
+            Maximum Euclidean displacement magnitude in pixels.
+        mags_px : np.ndarray
+            Per-point displacement magnitudes in pixels (shape (N,)).
+        """
+        if not self.validCal:
+            raise ValueError("Calibration invalid.")
+        if self.width is None or self.height is None:
+            raise ValueError("Calibration missing width/height.")
+
+        if corners_px_und is None:
+            w = int(self.width)
+            h = int(self.height)
+            corners_px_und = np.array(
+                [[0.0, 0.0],
+                 [float(w - 1), 0.0],
+                 [float(w - 1), float(h - 1)],
+                 [0.0, float(h - 1)]],
+                dtype=np.float64,
+            )
+        else:
+            corners_px_und = np.asarray(corners_px_und, dtype=np.float64)
+            if corners_px_und.ndim != 2 or corners_px_und.shape[1] != 2:
+                raise ValueError(f"corners_px_und must have shape (N,2); got {corners_px_und.shape}")
+
+        corners_px_dist = distort_points_px(self, corners_px_und)
+        d = corners_px_dist - corners_px_und
+        mags = np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1])
+        return float(np.max(mags)), mags
+
+    def orientation_preservation_metrics(self, *, grid=25, eps_px=1.0):
+        """
+        Numerical Jacobian diagnostics for the forward distortion map in PIXEL SPACE.
+
+        Returns:
+          min_detJ
+          frac_neg_detJ
+          min_abs_detJ
+          max_kappa_proxy   (conditioning proxy; larger is worse)
+        """
+        assert self.validCal
+
+        xs = np.linspace(0.0, self.width - 1.0, grid, dtype=np.float64)
+        ys = np.linspace(0.0, self.height - 1.0, grid, dtype=np.float64)
+
+        dets = []
+        kappas = []
+
+        for y in ys:
+            for x in xs:
+                p = np.array([[x, y]], dtype=np.float64)
+                px = np.array([[x + eps_px, y]], dtype=np.float64)
+                py = np.array([[x, y + eps_px]], dtype=np.float64)
+
+                d = distort_points_px(self, p)[0]
+                dx = distort_points_px(self, px)[0]
+                dy = distort_points_px(self, py)[0]
+
+                jx = (dx - d) / eps_px  # column for +x
+                jy = (dy - d) / eps_px  # column for +y
+
+                # J = [jx jy] with jx,jy as 2-vectors
+                a, c = jx[0], jx[1]
+                b, d_ = jy[0], jy[1]
+
+                detJ = a * d_ - b * c
+                dets.append(detJ)
+
+                # conditioning proxy: ||J||_F / |detJ|
+                fro = np.sqrt(a * a + b * b + c * c + d_ * d_)
+                kappas.append(fro / (abs(detJ) + 1e-12))
+
+        dets = np.asarray(dets)
+        kappas = np.asarray(kappas)
+
+        # min_detJ, min_abs_detJ, frac_neg_detJ, max_kappa_proxy
+        return float(dets.min()), float(np.min(np.abs(dets))), float(np.mean(dets <= 0.0)),float(kappas.max()),
 
     def distort_point(self, pixel: pxl):
         '''
@@ -720,7 +970,7 @@ def _newton_update_in_place(
     x[do] -= del_x
     y[do] -= del_y
 
-def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-6):
+def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
     pts = np.asarray(pts_px_dist, dtype=np.float64)
     scalar = (pts.ndim == 1)
     if scalar:
@@ -743,7 +993,7 @@ def undistort_points_px_numba(
     k1, k2, p1, p2, k3,
     has_tangential,
     mode_opencv_5fp,         # True => 5 FP, False => 2 FP + gated Newton
-    eps_px=1e-4
+    eps_px
 ):
     N = pts_px_dist.shape[0]
     out = np.empty((N, 2), dtype=np.float64)

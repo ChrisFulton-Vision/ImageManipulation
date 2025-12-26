@@ -33,11 +33,10 @@ with noisy measurements, the initializer results, and the final optimized pose.
 """
 
 from sys import maxsize
-from SupportModules.quaternions import Quaternion as q
-from SupportModules.quaternions import *
-from SupportModules.Calibration import Calibration
-from SupportModules.include_numba import njit, prange
-from numpy.linalg import norm
+from support.core.quaternions import Quaternion as q
+from support.core.quaternions import *
+from support.io.Calibration import Calibration
+from support.include_numba import _njit as njit, prange
 from numpy.typing import NDArray
 from enum import Enum
 from itertools import cycle
@@ -53,6 +52,15 @@ class robust_cost(Enum):
         for member in iterator:
             if member is self:
                 return next(iterator)
+
+    def val(self):
+        if self == robust_cost.huber:
+            return 1
+        if self == robust_cost.cauchy:
+            return 2
+        if self == robust_cost.tukey:
+            return 3
+        return 0
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
@@ -391,96 +399,109 @@ def _expand_to_2N_weights(w, N):
         return w
     raise ValueError(f"weight length must be N or 2N; got {w.size}, N={N}")
 
-def _robust_sqrt_weights_from_residual(y_2N, N,
-                                       kind: robust_cost = robust_cost.huber,
-                                       param=2.0,
-                                       sigma_2N=None, eps=1e-12):
+@njit(cache=True, fastmath=True)
+def _robust_sqrt_weights_inplace_numba(
+    y_2N, N, kind_int, c, inv_sigma_2N, out_sqrtw_2N
+):
     """
-    Return per-residual sqrt-weights (2N,) for IRLS.
+    Fill out_sqrtw_2N (2N,) with per-residual sqrt-weights for robust IRLS.
+    Robust is computed per-feature from 2D residual magnitude.
 
-    We robustify per *feature* using the 2D residual norm:
-        r_i = sqrt(du^2 + dv^2)
-    Optionally normalize by sigma (pixel std-dev) before applying robust loss.
-
-    kind:
-      - "huber": param = delta  (in sigma units if sigma provided, else pixels)
-      - "cauchy": param = c
-      - "tukey": param = c (Tukey biweight)
+    kind_int: 0=none, 1=huber, 2=cauchy, 3=tukey
+    If inv_sigma_2N is provided, robust operates on whitened residuals:
+        r = sqrt((du*iu)^2 + (dv*iv)^2)
     """
-    y = np.asarray(y_2N, float).reshape(-1)
-    y2 = y.reshape(N, 2)
+    eps = 1e-12
+    if c <= 0.0:
+        c = 1.0
 
-    if sigma_2N is not None:
-        s = np.asarray(sigma_2N, float).reshape(-1)
-        s = np.clip(s, eps, None)
-        s2 = s.reshape(N, 2)
-        # scalar sigma per feature (RMS of u/v sigmas)
-        sigma_i = np.sqrt(0.5 * (s2[:, 0]**2 + s2[:, 1]**2))
-        r = np.linalg.norm(y2, axis=1) / np.clip(sigma_i, eps, None)
-    else:
-        r = np.linalg.norm(y2, axis=1)
+    for i in range(N):
+        du = y_2N[2 * i + 0]
+        dv = y_2N[2 * i + 1]
 
-    r = np.clip(r, eps, None)
+        # Robust decision variable: whitened residual magnitude if available
+        if inv_sigma_2N is not None:
+            iu = inv_sigma_2N[2 * i + 0]
+            iv = inv_sigma_2N[2 * i + 1]
+            ru = du * iu
+            rv = dv * iv
+            r = (ru * ru + rv * rv) ** 0.5
+        else:
+            r = (du * du + dv * dv) ** 0.5
 
-    c = float(param)
+        # Weight function w(r) (NOT sqrt yet)
+        if kind_int == 0 or r < eps:
+            w = 1.0
 
-    if kind == robust_cost.huber:
-        # w = 1                    if r <= c
-        # w = c / r                if r >  c
-        w = np.ones_like(r)
-        mask = r > c
-        w[mask] = c / r[mask]
+        elif kind_int == 1:  # huber
+            if r <= c:
+                w = 1.0
+            else:
+                w = c / r
 
-    elif kind == robust_cost.cauchy:
-        # rho = (c^2/2) log(1 + (r/c)^2)  ->  w = 1 / (1 + (r/c)^2)
-        t = (r / c)
-        w = 1.0 / (1.0 + t * t)
+        elif kind_int == 2:  # cauchy
+            t = r / c
+            w = 1.0 / (1.0 + t * t)
 
-    elif kind == robust_cost.tukey:
-        # Tukey biweight: w = (1 - (r/c)^2)^2 for r < c else 0
-        t = r / c
-        w = np.zeros_like(r)
-        mask = t < 1.0
-        w[mask] = (1.0 - t[mask]**2)**2
+        else:  # kind_int == 3: tukey
+            t = r / c
+            if t >= 1.0:
+                w = 0.0
+            else:
+                a = 1.0 - t * t
+                w = a * a
 
-    else:
-        raise ValueError(f"Unknown robust kind '{kind}'")
+        sw = w ** 0.5
+        out_sqrtw_2N[2 * i + 0] = sw
+        out_sqrtw_2N[2 * i + 1] = sw
 
-    # IRLS uses sqrt(w) as left-multipliers of residual/J
-    sqrtw_2N = np.repeat(np.sqrt(np.clip(w, 0.0, None)), 2)
-    return sqrtw_2N
+def _inv_sigma_2N_from_sigma(sigma_2N, N: int, eps: float = 1e-6, big: float = 1e6):
+    """
+    Returns inv_sigma_2N (2N,) where inv_sigma[i] = 1/sigma[i].
+    Accepts sigma length N or 2N. Missing/invalid -> big sigma -> tiny inv weight.
+    """
+    if sigma_2N is None:
+        return None
 
-def opt(img_pts: NDArray, object_pts: NDArray,
-        cal: Calibration, seed_q: q = None, seed_t: NDArray = None,
-        trust_weighting: NDArray = None,
-        robust_kind: robust_cost = robust_cost.none,          # e.g. "huber", "cauchy", "tukey"
-        robust_param=2.0,          # delta (Huber) or c (Cauchy/Tukey)
-        sigma_2N=None):            # optional per-residual sigma (2N,) in pixels
+    s = np.asarray(sigma_2N, dtype=np.float64).ravel()
+    if s.size == N:
+        s = np.repeat(s, 2)
+    if s.size != 2 * N:
+        raise ValueError(f"sigma_2N must be N or 2N; got {s.size}, N={N}")
 
-    """Refine pose to minimize ||meas_pix - h(q, t)|| using a GN-like loop.
+    s = s.copy()
+    bad = (~np.isfinite(s)) | (s <= 0.0)
+    s[bad] = big
+    s = np.maximum(s, eps)
+    return 1.0 / s
 
-    Uses a *minimal* 6D state:
-        x = [δr_x, δr_y, δr_z, δt_x, δt_y, δt_z]^T
 
-    where δr is a small Rodrigues vector in the camera frame, applied via:
-        q_new = Quaternion.from_rodrigues(δr) * q_old
-
-    Translation is updated additively: t_new = t_old + δt.
+def opt(
+    img_pts: NDArray,
+    object_pts: NDArray,
+    cal: Calibration,
+    seed_q: q = None,
+    seed_t: NDArray = None,
+    robust_kind: robust_cost = robust_cost.none,
+    robust_param: float = 2.0,
+    sigma_2N=None,
+):
+    """
+    Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN.
+    State: [δr, δt] (6 DOF), minimal tangent update.
     """
 
     # ----------------- Initialization -----------------
-    if np.linalg.norm(seed_t) > 500.0 or seed_q.norm > 500.0:
-        seed_q = seed_t = None
-
     if seed_q is None or seed_t is None:
         est_q, est_t = DLT(object_pts, img_pts, cal)
     else:
         est_q = seed_q.copy()
         est_t = seed_t.copy()
 
-    meas_pix = img_pts.flatten()
+    meas_pix = img_pts.reshape(-1).astype(np.float64)
     N = img_pts.shape[0]
 
+    # Work buffers (allocated once)
     proj = np.empty(2 * N, dtype=np.float64)
     y = np.empty(2 * N, dtype=np.float64)
     RX = np.empty((N, 3), dtype=np.float64)
@@ -489,142 +510,132 @@ def opt(img_pts: NDArray, object_pts: NDArray,
 
     object_pts64 = np.ascontiguousarray(object_pts, dtype=np.float64)
 
+    # ----------- Sigma whitening (once) -----------
+    inv_sigma_2N = _inv_sigma_2N_from_sigma(sigma_2N, N)
+    if inv_sigma_2N is not None:
+        SIGMA_FLOOR_PX = 1.0  # tune 0.5–2.0
+        inv_sigma_2N = np.minimum(inv_sigma_2N, 1.0 / SIGMA_FLOOR_PX)
+
+    sqrtw = np.empty(2 * N, dtype=np.float64)
+    rw = np.empty(2 * N, dtype=np.float64)
+
+    # Robust enum → int
+    kind_int = 0
+    if robust_kind == robust_cost.huber:
+        kind_int = 1
+    elif robust_kind == robust_cost.cauchy:
+        kind_int = 2
+    elif robust_kind == robust_cost.tukey:
+        kind_int = 3
+
+    lam = 1e-1
     keep_going = True
     iter_num = 0
+
+    # ================= GN LOOP =================
     while keep_going:
         iter_num += 1
 
-        # Residual and Jacobian at current pose
-        # Convert current quaternion object -> 4 scalars (cheap)
-        qw = float(est_q.s)
-        qx = float(est_q.vec[0])
-        qy = float(est_q.vec[1])
-        qz = float(est_q.vec[2])
-        tx = float(est_t[0])
-        ty = float(est_t[1])
-        tz = float(est_t[2])
+        # ---- Projection + Jacobian ----
+        qw, qx, qy, qz = est_q.s, *est_q.vec
+        tx, ty, tz = est_t
 
         _project_and_jacobian_numba(
             object_pts64,
-            qw, qx, qy, qz, tx, ty, tz,
+            float(qw), float(qx), float(qy), float(qz),
+            float(tx), float(ty), float(tz),
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
             proj, RX, xyz, L
         )
 
-        # y := meas - proj (in-place)
         y[:] = meas_pix - proj
 
-        # ---- Build combined sqrt-weights (2N,) ----
-        sqrtw = np.ones(2 * N, dtype=float)
+        # ---- Build sqrtw = R^{-1/2} * robust ----
+        if inv_sigma_2N is None:
+            sqrtw[:] = 1.0
+        else:
+            sqrtw[:] = inv_sigma_2N
 
-        # (A) trust weighting (accept N or 2N)
-        if trust_weighting is not None:
-            tw = _expand_to_2N_weights(trust_weighting, N)
-            tw = np.clip(tw / np.mean(tw), 0.25, 4.0)
-
-            # if your trust_weighting is intended as *cost* weights, use sqrt:
-            sqrtw *= np.sqrt(tw)
-
-            # if you intentionally tuned with your old behavior (w applied directly),
-            # comment out the sqrt line above and instead do:
-            # sqrtw *= tw
-
-        # (B) robust weighting (depends on current residual)
-        if robust_kind is not robust_kind.none:
-            rw = _robust_sqrt_weights_from_residual(
-                y_2N=y, N=N, kind=robust_kind, param=robust_param, sigma_2N=sigma_2N
+        if kind_int != 0:
+            _robust_sqrt_weights_inplace_numba(
+                y, N, kind_int, float(robust_param), inv_sigma_2N, rw
             )
             sqrtw *= rw
 
-        # ------------- Damped normal equations -------------
         LtL, Lty, y2 = _accum_LtL_Lty_numba(L, y, sqrtw)
         old_y_mag = np.sqrt(y2)
 
-        lam = 1e-1
+        # ---- Damped solve ----
+        delta_x = np.linalg.solve(LtL + lam * np.eye(6), Lty)
 
-        LAMBDA = lam * np.eye(LtL.shape[0])
-
-        LtL_damped = LtL + LAMBDA
-
-        delta_x = np.linalg.solve(LtL_damped, Lty)     # (6,)
-
-        # ------------- Backtracking line search -------------
+        # ---- Line search ----
         scale = 1.0
-        scale_is_good = False
-        while not scale_is_good:
-            delta_r = scale * delta_x[0:3]
-            delta_t = scale * delta_x[3:6]
+        accepted = False
+
+        while not accepted:
+            delta_r = scale * delta_x[:3]
+            delta_t = scale * delta_x[3:]
 
             trial_q = q.from_rodrigues(delta_r) * est_q
             trial_t = est_t + delta_t
 
-            # Reject poses with points too close/behind camera (prevents 1/Z blowups)
-            XYZ_trial = trial_q * object_pts + trial_t
-            if np.mean(XYZ_trial[:, 2]> 1e-3) < 0.9:
-                scale *= 0.5
+            XYZ = trial_q * object_pts + trial_t
+            if np.mean(XYZ[:, 2] > 1e-3) < 0.9:
                 lam *= 3.0
+                scale *= 0.5
                 if scale < 1e-4:
-                    break
+                    accepted = True
                 continue
 
-            # compute weighted residual norm without Q
-            qw = float(trial_q.s)
-            qx = float(trial_q.vec[0])
-            qy = float(trial_q.vec[1])
-            qz = float(trial_q.vec[2])
-            tx = float(trial_t[0])
-            ty = float(trial_t[1])
-            tz = float(trial_t[2])
+            qw, qx, qy, qz = trial_q.s, *trial_q.vec
+            tx, ty, tz = trial_t
 
-            # We only need proj here; L_out can be reused (still filled, harmless)
             _project_and_jacobian_numba(
                 object_pts64,
-                qw, qx, qy, qz, tx, ty, tz,
+                float(qw), float(qx), float(qy), float(qz),
+                float(tx), float(ty), float(tz),
                 float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
                 proj, RX, xyz, L
             )
 
             y[:] = meas_pix - proj
-            new_y_mag = float(np.linalg.norm(sqrtw * y))
 
-            # Linear prediction of residual magnitude
-            y_pred = y - L.dot(scale * delta_x)
-            y_pred_mag = float(np.linalg.norm(sqrtw * y_pred))
-
-            # If perfect agreement between nonlinear and linear prediction, stop
-            if np.abs(old_y_mag - y_pred_mag) < 1e-5:
-                scale_is_good = True
-                keep_going = False
+            if inv_sigma_2N is None:
+                sqrtw[:] = 1.0
             else:
-                # Accept step if the ratio is in a reasonable trust range
-                denom = (old_y_mag - y_pred_mag)
-                if denom == 0:
-                    ratio = 0.0
-                else:
-                    ratio = (old_y_mag - new_y_mag) / denom
+                sqrtw[:] = inv_sigma_2N
 
-                if 0.25 < ratio < 4.0:
-                    lam *= 0.3
-                    scale_is_good = True
-                    # Commit step
-                    est_q = q.from_rodrigues(delta_r) * est_q
-                    est_t = est_t + delta_t
-                else:
-                    # Backtrack
-                    lam *= 3.0
-                    scale /= 2.0
-                    if scale < 1e-4:
-                        # Don't get stuck forever
-                        scale_is_good = True
+            if kind_int != 0:
+                _robust_sqrt_weights_inplace_numba(
+                    y, N, kind_int, float(robust_param), inv_sigma_2N, rw
+                )
+                sqrtw *= rw
 
-        # ------------- Termination -------------
-        if norm(scale * delta_x) < 1e-7 or iter_num > 20:
+            new_y_mag = np.linalg.norm(sqrtw * y)
+
+            # GN ratio test
+            y_pred = y - L.dot(scale * delta_x)
+            y_pred_mag = np.linalg.norm(sqrtw * y_pred)
+
+            denom = old_y_mag - y_pred_mag
+            ratio = 0.0 if denom == 0 else (old_y_mag - new_y_mag) / denom
+
+            if 0.25 < ratio < 4.0:
+                lam *= 0.3
+                est_q = trial_q
+                est_t = trial_t
+                accepted = True
+            else:
+                lam *= 3.0
+                scale *= 0.5
+                if scale < 1e-4:
+                    accepted = True
+
+        if np.linalg.norm(scale * delta_x) < 1e-7 or iter_num > 20:
             keep_going = False
 
-    # Enforce sign convention once at the end
     est_q.force_s_pos()
     return est_q, est_t
-
 
 def enforce_chirality(q_est, t_est, object_pts, cal):
     # Camera-frame points
@@ -763,7 +774,7 @@ def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
 def solveQnP(object_pts: np.array,
              img_pts: np.array,
              cal: Calibration,
-             trust_weighting=None,
+             sigma_2N=None,
              user_seed_q=None,
              user_seed_t=None):
     """
@@ -774,8 +785,6 @@ def solveQnP(object_pts: np.array,
     - Optional 'trust_weighting' (length 2N) down-weights residuals in pixel space
       during the nonlinear refinement (but not in DLT).
     """
-    # trust_weighting = np.ones(img_pts.size)
-    # trust_weighting[0] = trust_weighting[1] = 0.1
 
     # ------------------------------------------------------------------
     # 1) Choose a good initial seed
@@ -799,8 +808,8 @@ def solveQnP(object_pts: np.array,
         cal,
         seed_q=seed_q,
         seed_t=seed_t,
-        trust_weighting=trust_weighting,
-        robust_kind=robust_cost.cauchy
+        sigma_2N=sigma_2N,
+        robust_kind=robust_cost.huber
     )
 
     # ------------------------------------------------------------------

@@ -4,13 +4,15 @@ import glob
 import os
 import re
 
-from cv2 import (resize, putText, FONT_HERSHEY_PLAIN, rectangle, putText, FONT_HERSHEY_SIMPLEX,
+from support.io.Logging import LOG
+
+from cv2 import (resize, FONT_HERSHEY_PLAIN, rectangle, putText, FONT_HERSHEY_SIMPLEX,
                  solvePnPRansac, SOLVEPNP_ITERATIVE, Rodrigues, projectPoints)
 from cv2.dnn import NMSBoxes
 
-from SupportModules.Calibration import Calibration, undistort_points_px_numba, distort_points_px
-from SupportModules.metaYoloReader import MetaYoloReader
-from SupportModules.quaternions import *
+from support.io.Calibration import Calibration, undistort_points_px_numba
+from support.io.metaYoloReader import MetaYoloReader
+from support.core.quaternions import *
 
 CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
 CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6"
@@ -30,8 +32,8 @@ for key in ("CUDA_PATH", "CUDNN_PATH"):
 # Ensure CUDNN_PATH is in environment: C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6
 import onnxruntime as ort
 
-print(f'OnnxVersion: {ort.__version__}')
-print(f'Onnx Providers: {ort.get_available_providers()}')
+LOG.info(f'OnnxVersion: {ort.__version__}')
+LOG.info(f'Onnx Providers: {ort.get_available_providers()}')
 
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
@@ -291,7 +293,8 @@ class YOLO:
             centers_und = undistort_points_px_numba(np.array(centers_dist, dtype=np.float64),
                                                     *self.calibration.iteratable_params,
                                                     self.calibration.has_tangential,
-                                                    mode_opencv_5fp=False)
+                                                    mode_opencv_5fp=False,
+                                                    eps_px=1e-6)
             centers_und = centers_und.tolist()
 
         centers_for_draw = centers_dist

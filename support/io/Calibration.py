@@ -6,8 +6,8 @@ from datetime import datetime
 from os.path import join
 import sys, types
 import numpy as np
-from SupportModules.PixelHandler import Pixel as pxl
-from SupportModules.include_numba import njit, prange
+from support.runtime.PixelHandler import Pixel as pxl
+from support.include_numba import _njit as njit, prange
 
 class Calibration:
     def __init__(self, filepath=None):

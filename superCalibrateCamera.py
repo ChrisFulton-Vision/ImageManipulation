@@ -7,58 +7,32 @@ import time
 import sys
 import queue
 
-import vmbpy.c_binding
-from vmbpy import *
+# import vmbpy.c_binding
+# from vmbpy import *
 
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
-from enum import Enum
-from itertools import cycle
 from tkinter import filedialog
 from yaml import safe_load, dump
-from datetime import datetime
 
 from concurrent.futures import ThreadPoolExecutor, wait
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
                            StringVar, CTkProgressBar, END)
-from pandas import isna, read_csv, DataFrame, to_datetime, concat
-from pynvml import (
-    nvmlInit, nvmlShutdown,
-    nvmlDeviceGetHandleByIndex,
-    nvmlDeviceGetUtilizationRates)
+from pandas import isna, read_csv, DataFrame, concat
 
-from cv2 import (cvtColor, COLOR_BGR2RGB, COLOR_BGR2GRAY, destroyWindow, waitKey, imread, namedWindow,
-                 WND_PROP_VISIBLE, rectangle, getWindowProperty, WINDOW_NORMAL, VideoCapture, CAP_DSHOW, CAP_PROP_FPS,
-                 resizeWindow, IMREAD_COLOR, getTextSize, FONT_HERSHEY_SIMPLEX, putText, INPAINT_TELEA, fillConvexPoly,
-                 getStructuringElement, dilate, MORPH_ELLIPSE, inpaint, GaussianBlur, fisheye, remap, INTER_LINEAR,
-                 BORDER_CONSTANT, cornerHarris, TERM_CRITERIA_EPS, TERM_CRITERIA_MAX_ITER, cornerSubPix, polylines,
-                 FILLED, solvePnP, SOLVEPNP_ITERATIVE, projectPoints, LINE_AA, FONT_HERSHEY_DUPLEX, Canny, HoughLinesP,
-                 line, circle, phaseCorrelate, arrowedLine, imshow, imwrite, getWindowImageRect, bitwise_and, aruco,
-                 setNumThreads, getOptimalNewCameraMatrix, initUndistortRectifyMap, CV_16SC2, COLOR_GRAY2BGR, error,
-                 COLOR_RGB2BGR, resize, setUseOptimized, ellipse, bitwise_not, add, undistortPoints, solvePnPRansac,
-                 VideoWriter, INTER_AREA, CAP_PROP_AUTO_EXPOSURE, CAP_PROP_EXPOSURE, CALIB_CB_EXHAUSTIVE,
-                 CAP_PROP_AUTOFOCUS, CAP_PROP_AUTO_WB, CAP_PROP_GAIN, findChessboardCorners, findChessboardCornersSB,
-                 CALIB_CB_ACCURACY, drawChessboardCorners, error as cv_error, fitLine, DIST_L2, COLOR_HSV2BGR)
-from PIL.Image import fromarray
+import cv2
 from cv2_enumerate_cameras import enumerate_cameras
 
-from SupportModules import yolo
-from SupportModules.Calibration import Calibration, distort_points_px
-from SupportModules.FG_DrogueOnly import FactorGraph
-from SupportModules.ImageTimeReader import ImageTimeReader
-from SupportModules.LidarTruth import TruthPoints
-from SupportModules.FilterImage import ImageKernel, GaborGUI, applyConvolutionFilter
-from SupportModules.HUD_draw import HUD_Marker
-from SupportModules.TwoD_to_ThreeD import solveQnP
-from SupportModules.bufferImageLoader import BufferedImageLoader as imgBuf
-from SupportModules.convertToGif import make_gif, ExportQuality
-from SupportModules.quaternions import *
-from SupportModules.quaternions import Quaternion as q
-from SupportModules.CVFontScaling import small_text, med_text, lrg_text
-from SupportModules.Pixel_KalmanFilter import KalmanFilter as PixelKalmanFilter
-from SupportModules.Plotting import Plotter
-from SupportModules.Logging import LOG
+from support.core.TwoD_to_ThreeD import solveQnP
+from support.core.quaternions import Quaternion as q, mat2quat
+from support.core.Pixel_KalmanFilter import KalmanFilter as PixelKalmanFilter
+from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
+from support.io.Logging import LOG
+from support.io.Calibration import Calibration, distort_points_px
+from support.io.ImageTimeReader import ImageTimeReader
+from support.viz.CVFontScaling import small_text, med_text, lrg_text
 
 from copy import deepcopy
 from math import pow
@@ -67,8 +41,8 @@ from math import pow
 SPEED_STEP = pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
 SPEED_STEP_INV = 1.0 / SPEED_STEP
 
-setNumThreads(0)
-setUseOptimized(True)
+# cv2.setNumThreads(0)
+cv2.setUseOptimized(True)
 
 #  pip install cv2_enumerate_cameras
 #  or
@@ -160,23 +134,6 @@ class ThreadStopper:
 
     def is_set(self) -> bool:
         return self._ev.is_set()
-
-
-class ImageSource(Enum):
-    Camera_Stream = 'Camera Stream'
-    Static_Image = 'Static Image'
-    Stream_from_Folder = 'Stream from Folder'
-
-
-class PlaybackSpeed(Enum):
-    Fixed_fps = 'fixed_fps'
-    Real_time = 'realtime'
-
-    def next(self):
-        iterator = cycle(self.__class__)
-        for member in iterator:
-            if member is self:
-                return next(iterator)
 
 
 @dataclass
@@ -303,12 +260,12 @@ class CameraGui(CTkFrame):
             "cubemap", "hud", "hideAprilTags", "draw_chessboard"
         ]
         self.recording = False
-        self.yoloSession = yolo.YOLO()
+        self.yoloSession = None
         self.camConfig = CameraConfig()
         self.detector = None
-        self.arucoDict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_36H11)
+        self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
 
-        self.arucoParams = aruco.DetectorParameters()
+        self.arucoParams = cv2.aruco.DetectorParameters()
         # self.arucoParams.adaptiveThreshWinSizeMin = 5
         # self.arucoParams.adaptiveThreshWinSizeMax = 35
         # self.arucoParams.adaptiveThreshWinSizeStep = 5
@@ -340,7 +297,7 @@ class CameraGui(CTkFrame):
         self.last_yolo_center = (400, 400)
         self.last_yolo_3d_estimate = (10, 0, 0)
         self.current_center_est = (400, 400)
-        self.FG = FactorGraph()
+        self.FG = None
         self.curr_frame = None
         self.curr_frame_gray = None
         self.markup_frame = None
@@ -361,11 +318,11 @@ class CameraGui(CTkFrame):
         self.cubemap_faces = None
         self.map_x = None
         self.map_y = None
-        self.hud_marker = HUD_Marker()
+        self.hud_marker = None
         self.lowPassFPS = 20.0
         self.pnpResult = None
         self.qnpResult = None
-        self.plotter = Plotter()
+        self.plotter = None
 
         # Checkerboard Handlers
         self.btn_checkerboard = None
@@ -375,8 +332,7 @@ class CameraGui(CTkFrame):
         self._cb_last_corners = None
         self._cb_throttle_sec = 0.05  # 10 Hz overlay update
 
-        nvmlInit()
-        self._gpu_handle = nvmlDeviceGetHandleByIndex(0)
+        self._gpu_handle = None
 
         self.vc = None
 
@@ -447,7 +403,7 @@ class CameraGui(CTkFrame):
         else:
             self.selectFlightLogLabel = CTkLabel(self.cam_frame, text='No Flight Log Loaded')
 
-        self.lidarTruthPoints = TruthPoints()
+        self.lidarTruthPoints = None
         self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=CTK_GREEN,
                                                  command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = CTkLabel(self.cam_frame,
@@ -533,7 +489,9 @@ class CameraGui(CTkFrame):
 
     def destroy(self):
         try:
-            nvmlShutdown()
+            if self._gpu_handle is not None:
+                from pynvml import nvmlShutdown
+                nvmlShutdown()
         except Exception:
             pass
         super().destroy()
@@ -569,6 +527,8 @@ class CameraGui(CTkFrame):
     def _sync_flags_from_model(self):
         for n in self._flags:
             self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
+        if self.camConfig.detectTags:
+            self.createDetector()
 
     def _sync_dp_from_model(self):
         """Resync batch-processing (DP) UI controls from camConfig.
@@ -653,7 +613,8 @@ class CameraGui(CTkFrame):
         self.ingestCalibration()
         self.updateYOLOLabel()
         self.updateLidarLabel()
-        self.loadTruthPoints()
+        if self.lidarTruthPoints is not None:
+            self.loadTruthPoints()
 
         # --- model -> UI resync on config load (batch DP + flags) ---
         try:
@@ -762,7 +723,8 @@ class CameraGui(CTkFrame):
             self.updateLogFile()
 
     def updateLogFile(self):
-        self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
+        if self.hud_marker is not None:
+            self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
         self.updateFlightLogLabel()
         self.saveToCache()
 
@@ -785,7 +747,8 @@ class CameraGui(CTkFrame):
     def updateYOLOLabel(self):
         if self.camConfig.yoloFilepath:
             self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+            if self.yoloSession is not None:
+                self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
     def loadTruthPoints(self):
         if not self.camConfig.lidarFilepath:
@@ -798,7 +761,8 @@ class CameraGui(CTkFrame):
             )
             return
 
-        from SupportModules.LidarTruth import TruthPoints
+        from support.io.LidarTruth import TruthPoints
+        self.lidarTruthPoints = TruthPoints()
 
         try:
             with lidar_path.open('rb') as f:
@@ -826,13 +790,15 @@ class CameraGui(CTkFrame):
 
     def confSlider(self, confValue):
         self.camConfig.yolo_conf = confValue
-        self.yoloSession.conf = confValue
+        if self.yoloSession is not None:
+            self.yoloSession.conf = confValue
         self.confSliderLabel.configure(text='Conf: ' + f'{confValue:.2f}')
         self.saveToCache()
 
     def iouSlider(self, iouValue):
         self.camConfig.yolo_iou = iouValue
-        self.yoloSession.iou = iouValue
+        if self.yoloSession is not None:
+            self.yoloSession.iou = iouValue
         self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
         self.saveToCache()
 
@@ -872,52 +838,54 @@ class CameraGui(CTkFrame):
             self.cubemapCheckbox.deselect()
         self.cubemapCheckbox.configure(state=cube_state)
 
-        self.yoloSession.set_calibration(self.calibration)
+        if self.yoloSession is not None:
+            self.yoloSession.set_calibration(self.calibration)
 
         w, h = self.calibration.width, self.calibration.height
         K = self.calibration.getCameraMatrix()
         D = self.calibration.getDistortion()
 
-        newK, _ = getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
+        newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
 
-        self.map1, self.map2 = initUndistortRectifyMap(
-            K, D, R=None, newCameraMatrix=newK, size=(w, h), m1type=CV_16SC2
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            K, D, R=None, newCameraMatrix=newK, size=(w, h), m1type=cv2.CV_16SC2
         )
 
         self.saveToCache()
 
     def scanForCameras(self):
         self.indexDict = {}
-        for camera_info in enumerate_cameras(CAP_DSHOW):
+        for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
             self.indexDict[camera_info.name] = camera_info.index
-        with VmbSystem.get_instance() as vmb:
-            cams = vmb.get_all_cameras()
-            if cams:
-                cam = cams[0]
-                try:
-                    cam._open()
-                except vmbpy.c_binding.VmbError as e:
-                    LOG.warning(f'Could not open camera: {e}')
-                    return
-                try:
-                    cam.start_streaming(
-                        lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
-                    time.sleep(5)
-                    cam.stop_streaming()
-                finally:
-                    cam._close()
+            
+        # with VmbSystem.get_instance() as vmb:
+        #     cams = vmb.get_all_cameras()
+        #     if cams:
+        #         cam = cams[0]
+        #         try:
+        #             cam._open()
+        #         except vmbpy.c_binding.VmbError as e:
+        #             LOG.warning(f'Could not open camera: {e}')
+        #             return
+        #         try:
+        #             cam.start_streaming(
+        #                 lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
+        #             time.sleep(5)
+        #             cam.stop_streaming()
+        #         finally:
+        #             cam._close()
 
-    def display_frame(self, cam, stream, frame, title):
-        try:
-            numpy_buffer = frame.as_numpy_ndarray()
-            if len(numpy_buffer.shape) == 2:
-                numpy_buffer = cvtColor(numpy_buffer, COLOR_GRAY2BGR)
-            else:
-                numpy_buffer = cvtColor(numpy_buffer, COLOR_RGB2BGR)
-            imshow(title, resize(numpy_buffer, (864, 864)))
-            waitKey(1)
-        except vmbpy.c_binding.VmbError as e:
-            LOG.error("Error processing frame: %s", e)
+    # def display_frame(self, cam, stream, frame, title):
+    #     try:
+    #         numpy_buffer = frame.as_numpy_ndarray()
+    #         if len(numpy_buffer.shape) == 2:
+    #             numpy_buffer = cvtColor(numpy_buffer, COLOR_GRAY2BGR)
+    #         else:
+    #             numpy_buffer = cvtColor(numpy_buffer, COLOR_RGB2BGR)
+    #         imshow(title, resize(numpy_buffer, (864, 864)))
+    #         waitKey(1)
+    #     except vmbpy.c_binding.VmbError as e:
+    #         LOG.error("Error processing frame: %s", e)
 
     def selectCamera(self, key):
         self.camConfig.cam_index = self.indexDict[key]
@@ -1102,7 +1070,6 @@ class CameraGui(CTkFrame):
         self.undistortCheckbox.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky='nsew')
 
         rowID += 1
-        self.createDetector()
         self.detectAprilTagsCheckbox.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
         self.hideAprilTagsCheckbox.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
 
@@ -1280,6 +1247,8 @@ class CameraGui(CTkFrame):
         so we never desync UI state vs. actual polling behavior.
         """
 
+
+
         # If checkbox exists, read it; otherwise fall back to toggling.
 
         if hasattr(self, "_dp_gpu_var") and self._dp_gpu_var is not None:
@@ -1305,6 +1274,12 @@ class CameraGui(CTkFrame):
             self.after(250, self._poll_gpu)
 
     def _poll_gpu(self):
+        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
+
+        if self._gpu_handle is None:
+            nvmlInit()
+            self._gpu_handle = nvmlDeviceGetHandleByIndex(0)
+
         if not bool(getattr(self.camConfig, "dp_gpu", False)):
             return
 
@@ -1742,6 +1717,9 @@ class CameraGui(CTkFrame):
 
         # Cancel button in its own full-width row below
         def plot_sequential():
+            from support.viz.Plotting import Plotter
+            if self.plotter is None:
+                self.plotter = Plotter()
             vars = self._get_dp_conf_values()
             img_dir = Path(str(os.path.dirname(getattr(self.camConfig, "imageFilepath", "")) or "")) / "_ProcessedData"
             for var in vars:
@@ -1753,10 +1731,16 @@ class CameraGui(CTkFrame):
             command=plot_sequential,
         ).grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
+        def _plotter_close_plot_alias():
+            from support.viz.Plotting import Plotter
+            if self.plotter is None:
+                self.plotter = Plotter()
+            self.plotter.close_plot()
+
         dp_close_plot_btn = CTkButton(
             f,
             text="Close Plots",
-            command=self.plotter.close_plot,
+            command=_plotter_close_plot_alias,
         ).grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
     def _write_csv_atomic(self, out_csv: str, columns: list[str], completed_map: dict[str, dict]):
@@ -1795,6 +1779,16 @@ class CameraGui(CTkFrame):
             self._dp_run_btn.configure(state="disabled")
         if hasattr(self, "_dp_cancel_btn"):
             self._dp_cancel_btn.configure(state="normal")
+
+        # lazy import yolo
+        from support.vision import yolo
+        if self.yoloSession is None:
+            self.yoloSession = yolo.YOLO()
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+            self.yoloSession.set_calibration(self.calibration)
+            self.yoloSession.iou = self.camConfig.yolo_iou
+
+
         # launch worker
         self._dp_worker = threading.Thread(target=self._run_yolo_batch_worker, daemon=True)
         self._dp_worker.start()
@@ -2052,7 +2046,7 @@ class CameraGui(CTkFrame):
                     if rp.exists():
                         p = rp
 
-                img = imread(str(p), IMREAD_COLOR)
+                img = cv2.imread(str(p), cv2.IMREAD_COLOR)
                 if img is None:
                     item = (name, None, (0, 0))
                 else:
@@ -2193,6 +2187,380 @@ class CameraGui(CTkFrame):
         self._dp_cancel_flag = False
         return
 
+    def run_kalman_tracks_from_detection_csv(
+            self,
+            csv_path: str,
+            out_csv: str | None = None,
+            progress_cb: Callable[[int, int, str], None] | None = None,
+    ) -> None:
+        """
+        Run per-feature pixel Kalman filters over a YOLO detection CSV.
+
+        Bank-update version:
+          - Preloads all feat_{id}_x_undistPX / feat_{id}_y_undistPX into dense arrays (N,M)
+          - Uses a single Numba bank step per row (updates all features in compiled code)
+          - Writes per-feature KF outputs + per-row NIS diagnostics for later analysis
+
+        Robust-to-flight-phase R logic (Strategy B):
+          - Build an initial R estimate from accepted measurements (evidence burn-in)
+          - Freeze R once confident
+          - If NIS p95 drifts high for sustained "good frames", unfreeze and re-adapt
+          - Re-freeze once stable again
+
+        Requirements:
+          - df["image_time"] is numeric seconds (float/int)
+          - self.calibration exists and is valid (raises ValueError otherwise)
+        """
+
+        if not os.path.exists(csv_path):
+            LOG.error("run_kalman_tracks_from_detection_csv: missing CSV: %s", csv_path)
+            return
+
+        df = read_csv(csv_path)
+        if df.empty:
+            LOG.warning("run_kalman_tracks_from_detection_csv: empty CSV: %s", csv_path)
+            return
+
+        total_rows = len(df)
+
+        # --- Discover feature ids from columns (feat_<id>_x_undistPX) ---
+        feat_ids: list[int] = []
+        for col in df.columns:
+            m = re.match(r"feat_(\d+)_x_undistPX$", col)
+            if m:
+                fid = int(m.group(1))
+                if fid not in feat_ids:
+                    feat_ids.append(fid)
+        feat_ids.sort()
+
+        if not feat_ids:
+            LOG.error("run_kalman_tracks_from_detection_csv: no feat_*_x columns in %s", csv_path)
+            return
+
+        M = len(feat_ids)
+
+        # --- Require calibration (hard-fail) ---
+        width = height = None
+        if getattr(self, "calibration", None) is None or not getattr(self.calibration, "validCal", False):
+            raise ValueError("No calibration (self.calibration missing or invalid).")
+
+        try:
+            _K = self.calibration.getCameraMatrix()
+            width = float(self.calibration.width)
+            height = float(self.calibration.height)
+        except Exception as e:
+            raise ValueError(f"No calibration (failed to access intrinsics): {e}")
+
+        # --- Output path ---
+        base = Path(csv_path)
+        if out_csv is None:
+            out_csv = str(base.with_name(base.stem + ".csv")).replace("1_yolo_detections", "2_kalman")
+
+        # --- Pull time vector (numeric seconds) ---
+        if "image_time" not in df.columns:
+            LOG.error("run_kalman_tracks_from_detection_csv: missing image_time column in %s", csv_path)
+            return
+        t_sec = df["image_time"].to_numpy(dtype=np.float64)  # (N,)
+
+        # --- Build dense measurement matrices (N,M) ---
+        x_cols = [f"feat_{fid}_x_undistPX" for fid in feat_ids]
+        y_cols = [f"feat_{fid}_y_undistPX" for fid in feat_ids]
+
+        for c in x_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+        for c in y_cols:
+            if c not in df.columns:
+                df[c] = np.nan
+
+        Xraw = df[x_cols].to_numpy(dtype=np.float64, copy=False)  # (N,M)
+        Yraw = df[y_cols].to_numpy(dtype=np.float64, copy=False)
+
+        # normalize (match KF internal convention)
+        inv_w = 1.0 / max(width, 1.0)
+        inv_h = 1.0 / max(height, 1.0)
+        Xmeas = Xraw * inv_w
+        Ymeas = Yraw * inv_h
+
+        valid = np.isfinite(Xmeas) & np.isfinite(Ymeas) & (Xmeas != -1.0) & (Ymeas != -1.0)
+        valid_u8 = valid.astype(np.uint8, copy=False)
+
+        # --- KF parameter seed ---
+        kf0 = PixelKalmanFilter()
+        kf0.set_image_size(width, height)
+        kf0.set_sigma_meas_px(1.0, 1.0)  # initial guess; NIS adaptation will refine
+        kf0.set_max_pixel_jump_px(500.0)  # large gate
+        kf0.max_mahalanobis_sq = 13.82  # gating
+
+        var_proc = float(kf0.var_proc)
+        var_meas_x = float(kf0.var_meas_x)
+        var_meas_y = float(kf0.var_meas_y)
+        max_pixel_jump = float(kf0.max_pixel_jump)
+        max_mahalanobis_sq = float(kf0.max_mahalanobis_sq)
+
+        # --- NIS adaptation parameters ---
+        # We tune to p95 ~ chi2_2(0.95)=5.991 (your current “p95 ratio” story)
+        nis_p95_target = 5.991
+        nis_beta = 0.01
+        nis_clip_lo = 0.25
+        nis_clip_hi = 4.0
+        min_var_meas = 1e-12  # normalized^2 floor
+
+        # --- Strategy B: freeze/unfreeze based on sustained drift, robust to no-detection phases ---
+        # Only consider frames "good" if enough accepted measurements exist.
+        min_used_frac_for_good = 0.10  # >=10% accepted features
+        min_used_abs_for_good = 5  # and at least 5 accepted features
+
+        # Evidence burn-in based on accepted measurements (ignores long no-detection stretches)
+        burn_in_good_frames = 30
+        accepted_feat_target = int(max(50, burn_in_good_frames * M * min_used_frac_for_good))
+        accepted_feat_accum = 0
+
+        # Freeze control
+        freeze_r = True
+        frozen = False
+        var_meas_x_frozen = None
+        var_meas_y_frozen = None
+
+        # Drift detection (unfreeze if p95 is too high for long enough during good frames)
+        drift_hi = 9.21  # chi2_2(0.99) – sustained > this means R too small / model mismatch
+        drift_trigger_good_frames = 20
+        drift_count = 0
+
+        # Re-freeze detection (once unfrozen, re-freeze after being "stable" long enough)
+        stable_hi = 5.991  # target band at 95%
+        stable_trigger_good_frames = 30
+        stable_count = 0
+
+        # --- KF bank state ---
+        X = np.zeros((M, 4), dtype=np.float64)
+        P = np.zeros((M, 4, 4), dtype=np.float64)
+        for j in range(M):
+            P[j] = np.eye(4, dtype=np.float64) * 10.0
+        last_t = np.zeros(M, dtype=np.float64)
+        init = np.zeros(M, dtype=np.uint8)
+
+        # --- Output buffers ---
+        out_kf_x = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_y = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_vx = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_kf_vy = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_sig_px = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_sig_py = np.full((total_rows, M), np.nan, dtype=np.float64)
+
+        out_used = np.zeros((total_rows, M), dtype=np.uint8)
+        out_nis = np.full((total_rows, M), np.nan, dtype=np.float64)
+
+        # Per-row summary buffers
+        out_used_rate = np.full(total_rows, np.nan, dtype=np.float64)
+        out_nis_med_used = np.full(total_rows, np.nan, dtype=np.float64)
+        out_nis_p95_used = np.full(total_rows, np.nan, dtype=np.float64)
+        out_var_meas_x = np.full(total_rows, np.nan, dtype=np.float64)
+        out_var_meas_y = np.full(total_rows, np.nan, dtype=np.float64)
+        out_sig_meas_px = np.full(total_rows, np.nan, dtype=np.float64)
+        out_sig_meas_py = np.full(total_rows, np.nan, dtype=np.float64)
+
+        # --- Progress throttling ---
+        last_report_t = 0.0
+        last_report_row = 0
+
+        nis_out = np.empty(M, dtype=np.float64)
+
+        for idx in range(total_rows):
+            image_name = df.iloc[idx].get("image_name", "")
+
+            if progress_cb is not None:
+                now = time.monotonic()
+                dt = now - last_report_t
+                dr = (idx + 1) - last_report_row
+                step_rows = max(1, total_rows // 100)
+                if (idx == 0) or (idx == total_rows - 1) or (dt >= 0.1) or (dr >= step_rows):
+                    try:
+                        progress_cb(idx + 1, total_rows, str(image_name))
+                    except Exception:
+                        pass
+                    last_report_t = now
+                    last_report_row = (idx + 1)
+
+            used_u8 = PixelKalmanFilter._kf_bank_step_inplace(
+                float(t_sec[idx]),
+                Xmeas[idx], Ymeas[idx], valid_u8[idx],
+                X, P, last_t, init,
+                var_proc, var_meas_x, var_meas_y,
+                max_pixel_jump, max_mahalanobis_sq,
+                nis_out
+            )
+
+            out_used[idx, :] = used_u8
+            out_nis[idx, :] = nis_out
+
+            # accepted measurement mask + stats
+            used_bool = used_u8.astype(bool)
+            used_count = int(used_bool.sum())
+            used_rate = float(used_count) / float(max(1, M))
+            out_used_rate[idx] = used_rate
+
+            nis_used = nis_out[used_bool]
+            good_frame = (used_count >= min_used_abs_for_good) and (used_rate >= min_used_frac_for_good) and (
+                        nis_used.size > 0)
+
+            if nis_used.size > 0:
+                nis_med = float(np.median(nis_used))
+                nis_p95 = float(np.percentile(nis_used, 95.0))
+                out_nis_med_used[idx] = nis_med
+                out_nis_p95_used[idx] = nis_p95
+            else:
+                nis_med = np.nan
+                nis_p95 = np.nan
+
+            # --- Strategy B state machine ---
+            # 1) Build initial R from evidence (accepted measurements only)
+            # 2) Freeze once evidence is sufficient
+            # 3) If frozen and sustained drift, unfreeze
+            # 4) If unfrozen and sustained stability, re-freeze
+
+            if good_frame:
+                # evidence accumulation ignores no-detection frames
+                accepted_feat_accum += used_count
+
+            # Decide whether to adapt this frame
+            do_adapt = (not freeze_r) or (not frozen)
+
+            if do_adapt and good_frame:
+                ratio = nis_p95 / nis_p95_target
+                ratio = max(nis_clip_lo, min(ratio, nis_clip_hi))  # correct clamp
+                scale = ratio ** nis_beta
+                var_meas_x = max(min_var_meas, var_meas_x * scale)
+                var_meas_y = max(min_var_meas, var_meas_y * scale)
+
+            # Freeze after enough accepted evidence has accumulated
+            if freeze_r and (not frozen) and (accepted_feat_accum >= accepted_feat_target):
+                frozen = True
+                var_meas_x_frozen = float(var_meas_x)
+                var_meas_y_frozen = float(var_meas_y)
+                LOG.info(
+                    "Freezing KF measurement noise after evidence: accepted_feat=%d target=%d "
+                    "var_meas=(%.3e, %.3e) sigma_px=(%.3f, %.3f)",
+                    accepted_feat_accum, accepted_feat_target,
+                    var_meas_x_frozen, var_meas_y_frozen,
+                    np.sqrt(var_meas_x_frozen) * width, np.sqrt(var_meas_y_frozen) * height,
+                )
+
+            # Drift detection: if frozen and p95 stays very high on good frames, unfreeze
+            if freeze_r and frozen and good_frame and (not np.isnan(nis_p95)):
+                if nis_p95 > drift_hi:
+                    drift_count += 1
+                else:
+                    drift_count = max(0, drift_count - 1)
+
+                if drift_count >= drift_trigger_good_frames:
+                    frozen = False
+                    drift_count = 0
+                    stable_count = 0
+                    LOG.info(
+                        "Unfreezing KF measurement noise due to sustained NIS drift: p95>%.3f for %d good frames",
+                        drift_hi, drift_trigger_good_frames
+                    )
+
+            # Re-freeze detection: if unfrozen and p95 stays under the “stable” threshold, re-freeze
+            if freeze_r and (not frozen) and good_frame and (not np.isnan(nis_p95)):
+                if nis_p95 <= stable_hi:
+                    stable_count += 1
+                else:
+                    stable_count = max(0, stable_count - 1)
+
+                if stable_count >= stable_trigger_good_frames:
+                    frozen = True
+                    stable_count = 0
+                    var_meas_x_frozen = float(var_meas_x)
+                    var_meas_y_frozen = float(var_meas_y)
+                    LOG.info(
+                        "Re-freezing KF measurement noise after stability: var_meas=(%.3e, %.3e) sigma_px=(%.3f, %.3f)",
+                        var_meas_x_frozen, var_meas_y_frozen,
+                        np.sqrt(var_meas_x_frozen) * width, np.sqrt(var_meas_y_frozen) * height,
+                    )
+
+            # Apply frozen R if currently frozen
+            if freeze_r and frozen and (var_meas_x_frozen is not None):
+                var_meas_x = var_meas_x_frozen
+                var_meas_y = var_meas_y_frozen
+
+            # Log/store R actually used
+            out_var_meas_x[idx] = var_meas_x
+            out_var_meas_y[idx] = var_meas_y
+            out_sig_meas_px[idx] = (np.sqrt(var_meas_x) * width)
+            out_sig_meas_py[idx] = (np.sqrt(var_meas_y) * height)
+
+            # Throttled print
+            if (idx == 0) or (idx == total_rows - 1) or ((idx + 1) % max(1, total_rows // 100) == 0):
+                if nis_used.size > 0:
+                    LOG.info(
+                        "KF NIS: idx=%d/%d used=%.1f%% med=%.3f p95=%.3f frozen=%s var_meas=(%.3e,%.3e) sigma_px=(%.3f,%.3f)",
+                        idx + 1, total_rows,
+                        100.0 * used_rate,
+                        float(out_nis_med_used[idx]), float(out_nis_p95_used[idx]),
+                        str(bool(frozen)),
+                        var_meas_x, var_meas_y,
+                        out_sig_meas_px[idx], out_sig_meas_py[idx],
+                    )
+                else:
+                    LOG.info(
+                        "KF NIS: idx=%d/%d used=%.1f%% (no accepted) frozen=%s var_meas=(%.3e,%.3e) sigma_px=(%.3f,%.3f)",
+                        idx + 1, total_rows,
+                        100.0 * used_rate,
+                        str(bool(frozen)),
+                        var_meas_x, var_meas_y,
+                        out_sig_meas_px[idx], out_sig_meas_py[idx],
+                    )
+
+            # write per-feature outputs
+            for j in range(M):
+                if init[j] == 0:
+                    continue
+
+                out_kf_x[idx, j] = X[j, 0]
+                out_kf_y[idx, j] = X[j, 1]
+                out_kf_vx[idx, j] = X[j, 2]
+                out_kf_vy[idx, j] = X[j, 3]
+
+                sig_px = float(width * np.sqrt(max(P[j, 0, 0], 0.0)))
+                sig_py = float(height * np.sqrt(max(P[j, 1, 1], 0.0)))
+                out_sig_px[idx, j] = sig_px
+                out_sig_py[idx, j] = sig_py
+
+        # --- Build output DataFrame ---
+        out_df = df.copy()
+
+        new_cols = {}
+        new_cols["kf_used_rate"] = out_used_rate
+        new_cols["kf_nis_med_used"] = out_nis_med_used
+        new_cols["kf_nis_p95_used"] = out_nis_p95_used
+        new_cols["kf_var_meas_x"] = out_var_meas_x
+        new_cols["kf_var_meas_y"] = out_var_meas_y
+        new_cols["kf_sigma_meas_px"] = out_sig_meas_px
+        new_cols["kf_sigma_meas_py"] = out_sig_meas_py
+
+        for j, fid in enumerate(feat_ids):
+            new_cols[f"feat_{fid}_kf_x"] = out_kf_x[:, j]
+            new_cols[f"feat_{fid}_kf_y"] = out_kf_y[:, j]
+            new_cols[f"feat_{fid}_kf_vx"] = out_kf_vx[:, j]
+            new_cols[f"feat_{fid}_kf_vy"] = out_kf_vy[:, j]
+            new_cols[f"feat_{fid}_kf_sigma_px"] = np.clip(out_sig_px[:, j], 1e-6, None)
+            new_cols[f"feat_{fid}_kf_sigma_py"] = np.clip(out_sig_py[:, j], 1e-6, None)
+            new_cols[f"feat_{fid}_kf_used"] = out_used[:, j].astype(np.uint8)
+            new_cols[f"feat_{fid}_kf_nis"] = out_nis[:, j]
+
+        out_df = concat([out_df, DataFrame(new_cols)], axis=1)
+
+        cols_to_drop = []
+        for fid in feat_ids:
+            cols_to_drop.append(f"feat_{fid}_x_distPX")
+            cols_to_drop.append(f"feat_{fid}_y_distPX")
+        out_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
+
+        out_df.to_csv(out_csv, index=False)
+        LOG.info("Kalman tracks CSV written: %s", out_csv)
+
     def run_pnp_qnp_from_detection_csv(
             self,
             csv_path: str,
@@ -2203,9 +2571,6 @@ class CameraGui(CTkFrame):
 
         if not getattr(self.calibration, "validCal", False):
             LOG.error("run_pnp_qnp_from_detection_csv: calibration is not valid.")
-            return
-        if not getattr(self.lidarTruthPoints, "truthPoints", None):
-            LOG.error("run_pnp_qnp_from_detection_csv: no LiDAR truth points loaded.")
             return
 
         csv_path = str(csv_path)
@@ -2393,13 +2758,85 @@ class CameraGui(CTkFrame):
         # ------------------------------------------------------------------
         # Reprojection residual metric
         # ------------------------------------------------------------------
+        import numpy as np
+        from cv2 import projectPoints  # if you're already importing it
+
+        _BIG_SIGMA = 1e6  # pixels, effectively "ignore"
+        _MIN_SIGMA = 1e-6  # pixels, numerical safety
+
+        def _prep_sigma_2N(sigma_2N, N: int) -> np.ndarray | None:
+            """
+            Returns sigma vector of shape (2N,) in pixels.
+            Accepts:
+              - None
+              - (N,) per-point isotropic sigma => expanded to (2N,)
+              - (2N,) per-component sigma
+            Invalid / missing entries become BIG sigma.
+            """
+            if sigma_2N is None:
+                return None
+
+            s = np.asarray(sigma_2N, dtype=np.float64).ravel()
+            if s.size == N:
+                s = np.repeat(s, 2)
+            if s.size != 2 * N:
+                return None
+
+            # sanitize
+            bad = ~np.isfinite(s) | (s <= 0.0)
+            if np.any(bad):
+                s = s.copy()
+                s[bad] = _BIG_SIGMA
+            s = np.maximum(s, _MIN_SIGMA)
+            return s
+
+        def _reproj_metrics_from_proj_meas(proj_xy: np.ndarray,
+                                           meas_xy: np.ndarray,
+                                           sigma_2N=None,
+                                           mode: str = "chi") -> float:
+            """
+            proj_xy, meas_xy: shape (N,2) in pixels
+            mode:
+              - "chi": sqrt(sum((r/sigma)^2))  (dimensionless)
+              - "rms_px": sqrt(mean(r^2))      (pixels)
+              - "nrms": sqrt(mean((r/sigma)^2)) (dimensionless)
+            """
+            if proj_xy is None or meas_xy is None:
+                return float("nan")
+            if proj_xy.shape != meas_xy.shape or proj_xy.ndim != 2 or proj_xy.shape[1] != 2:
+                return float("nan")
+
+            r = (meas_xy.astype(np.float64) - proj_xy.astype(np.float64)).ravel()
+            N = proj_xy.shape[0]
+            if r.size != 2 * N:
+                return float("nan")
+
+            # Classic pixel RMS
+            if mode == "rms_px":
+                return float(np.sqrt(np.mean(r * r)))
+
+            # Statistically normalized
+            s = _prep_sigma_2N(sigma_2N, N)
+            if s is None:
+                # fall back: plain L2 norm (what you used before)
+                return float(np.linalg.norm(r))
+
+            rw = r / s  # whitening
+
+            if mode == "nrms":
+                return float(np.sqrt(np.mean(rw * rw)))
+
+            # default: "chi" (Mahalanobis norm)
+            return float(np.sqrt(np.sum(rw * rw)))
+
         def _reproj_norm_pnp(K_norm,
                              distCoeffs_norm,
                              object_pts_norm,
                              img_pts_norm,
                              rvec_norm,
                              tvec_norm,
-                             weights=None) -> float:
+                             sigma_2N=None,
+                             mode: str = "chi") -> float:
             if rvec_norm is None or tvec_norm is None:
                 return float("nan")
             if object_pts_norm is None or img_pts_norm is None or len(object_pts_norm) == 0:
@@ -2412,24 +2849,18 @@ class CameraGui(CTkFrame):
                 K_norm.astype(np.float64),
                 distCoeffs_norm.astype(np.float64) if distCoeffs_norm is not None else None,
             )
-            proj = proj.reshape(-1, 2).astype(np.float64)
+            proj_xy = proj.reshape(-1, 2).astype(np.float64)
+            meas_xy = img_pts_norm.reshape(-1, 2).astype(np.float64)
 
-            meas = img_pts_norm.astype(np.float64)
-            if proj.shape != meas.shape:
-                return float("nan")
+            return _reproj_metrics_from_proj_meas(proj_xy, meas_xy, sigma_2N=sigma_2N, mode=mode)
 
-            r = (meas - proj).ravel()
-
-            if weights is not None:
-                w = np.asarray(weights, dtype=np.float64).ravel()
-                if w.size == img_pts_norm.shape[0]:
-                    w = np.repeat(w, 2)
-                if w.size == r.size:
-                    r = np.sqrt(w) * r
-
-            return float(np.linalg.norm(r))
-
-        def _reproj_norm(cal, object_pts, img_pts, quat, vect, weights=None) -> float:
+        def _reproj_norm(cal,
+                         object_pts,
+                         img_pts,
+                         quat,
+                         vect,
+                         sigma_2N=None,
+                         mode: str = "chi") -> float:
             if quat is None or vect is None:
                 return float("nan")
             if object_pts is None or img_pts is None or len(object_pts) == 0:
@@ -2441,29 +2872,16 @@ class CameraGui(CTkFrame):
             Y = X_cam[:, 1]
             Z = X_cam[:, 2]
 
-            valid_z = Z > 1e-6
-            if not np.all(valid_z):
-                Z = np.where(valid_z, Z, 1e-6)
+            # keep projection finite
+            Z = np.where(Z > 1e-6, Z, 1e-6)
 
             u = cal.fx * (X / Z) + cal.cx
             v = cal.fy * (Y / Z) + cal.cy
 
-            proj_flat = np.column_stack([u, v]).astype(np.float64).ravel()
-            meas_flat = img_pts.astype(np.float64).ravel()
+            proj_xy = np.column_stack([u, v]).astype(np.float64)
+            meas_xy = img_pts.reshape(-1, 2).astype(np.float64)
 
-            if proj_flat.shape != meas_flat.shape:
-                return float("nan")
-
-            r = meas_flat - proj_flat
-
-            if weights is not None:
-                w = np.asarray(weights, dtype=np.float64).ravel()
-                if w.size == img_pts.shape[0]:
-                    w = np.repeat(w, 2)
-                if w.size == r.size:
-                    r = np.sqrt(w) * r
-
-            return float(np.linalg.norm(r))
+            return _reproj_metrics_from_proj_meas(proj_xy, meas_xy, sigma_2N=sigma_2N, mode=mode)
 
         resid_stats = {
             "pnp_unw": [],
@@ -2474,6 +2892,14 @@ class CameraGui(CTkFrame):
 
         K = self.calibration.getCameraMatrix()
         D_full = self.calibration.getDistortion()
+
+        from support.vision import yolo
+        if self.yoloSession is None:
+            self.yoloSession = yolo.YOLO()
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+            self.yoloSession.set_calibration(self.calibration)
+            self.yoloSession.iou = self.camConfig.yolo_iou
+
         truth_dict = self.yoloSession.reader.idsNamesLocs
 
         pnp_rows: list[dict] = []
@@ -2608,28 +3034,48 @@ class CameraGui(CTkFrame):
             # ------------------------------------------------------------------
             # Kalman trust weights for this row (if available)
             # ------------------------------------------------------------------
-            trust_weights = None
+            sigma_2N = None
             if kalman_available:
                 row_kf = df_kf.iloc[idx - 1]
-                weights_1d: list[float] = []
-                for fid in ids_use:
-                    col_name = f"feat_{fid}_kf_trust"
-                    val = row_kf.get(col_name, None)
-                    if val is None or isna(val):
-                        w = 0.0
-                    else:
-                        try:
-                            w = float(val)
-                        except Exception:
-                            w = 0.0
-                    if w < 0.0:
-                        w = 0.0
-                    weights_1d.append(w)
+                sig_2N_list: list[float] = []
+                any_valid = False
 
-                if any(w > 0.0 for w in weights_1d):
-                    trust_weights = []
-                    for w in weights_1d:
-                        trust_weights.extend([self.calibration.width * w, self.calibration.height * w])
+                for fid in ids_use:
+                    px_name = f"feat_{fid}_kf_sigma_px"
+                    py_name = f"feat_{fid}_kf_sigma_py"
+
+                    px_val = row_kf.get(px_name, None)
+                    py_val = row_kf.get(py_name, None)
+
+                    # parse + validate
+                    try:
+                        sx = float(px_val)
+                    except Exception:
+                        sx = float("nan")
+                    try:
+                        sy = float(py_val)
+                    except Exception:
+                        sy = float("nan")
+
+                    if not np.isfinite(sx) or sx <= 0.0:
+                        sx = float("nan")
+                    if not np.isfinite(sy) or sy <= 0.0:
+                        sy = float("nan")
+
+                    if np.isfinite(sx) and np.isfinite(sy):
+                        any_valid = True
+
+                    sig_2N_list.extend([sx, sy])
+
+                if any_valid:
+                    # Missing features get effectively zero weight later via 1/sigma
+                    BIG = 1e6  # pixels; large enough to be ~ignored
+                    sigma_2N = np.asarray(
+                        [BIG if (not np.isfinite(s)) else max(s, 1e-6) for s in sig_2N_list],
+                        dtype=np.float64
+                    )
+                else:
+                    sigma_2N = None
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
@@ -2639,14 +3085,14 @@ class CameraGui(CTkFrame):
             ret = False
             rvec = tvec = None
             try:
-                ret, rvec, tvec, inliers = solvePnPRansac(
+                ret, rvec, tvec, inliers = cv2.solvePnPRansac(
                     objectPoints=obj_pts,
                     imagePoints=img_pts,
                     cameraMatrix=K,
                     distCoeffs=distCoeffs,
-                    flags=SOLVEPNP_ITERATIVE
+                    flags=cv2.SOLVEPNP_ITERATIVE
                 )
-            except error as e:
+            except cv2.error as e:
                 LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
                 ret = False
 
@@ -2697,13 +3143,13 @@ class CameraGui(CTkFrame):
                 prev_qnp_q = quatQ
                 prev_qnp_t = vectQ
 
-                if trust_weights is not None:
+                if sigma_2N is not None:
                     try:
                         quatQ_kf, vectQ_kf = solveQnP(
                             obj_pts,
                             img_pts,
                             self.calibration,
-                            trust_weights,
+                            sigma_2N,
                             user_seed_q=prev_qnp_kf_q,
                             user_seed_t=prev_qnp_kf_t
                         )
@@ -2751,23 +3197,23 @@ class CameraGui(CTkFrame):
                 # ---- residuals for this frame ----
                 if ret and rvec is not None and tvec is not None:
                     pnp_resid = _reproj_norm_pnp(
-                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, weights=None
+                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, sigma_2N=None
                     )
                 qnp_resid = _reproj_norm(
-                    self.calibration, obj_pts, img_pts, quatQ, vectQ, weights=None
+                    self.calibration, obj_pts, img_pts, quatQ, vectQ, sigma_2N=None
                 )
 
                 resid_stats["pnp_unw"].append(pnp_resid)
                 resid_stats["qnp_unw"].append(qnp_resid)
 
-                if trust_weights is not None and quatQ_kf is not None and vectQ_kf is not None:
+                if sigma_2N is not None and quatQ_kf is not None and vectQ_kf is not None:
                     qnp_kf_resid = _reproj_norm(
-                        self.calibration, obj_pts, img_pts, quatQ_kf, vectQ_kf, weights=trust_weights
+                        self.calibration, obj_pts, img_pts, quatQ_kf, vectQ_kf, sigma_2N=sigma_2N
                     )
                     resid_stats["qnp_kf"].append(qnp_kf_resid)
 
                     pnp_resid_w = _reproj_norm_pnp(
-                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, weights=trust_weights
+                        K, distCoeffs, obj_pts, img_pts, rvec, tvec, sigma_2N=sigma_2N
                     )
                 else:
                     pnp_resid_w = float("nan")
@@ -2854,215 +3300,6 @@ class CameraGui(CTkFrame):
             len(pnp_rows), len(qnp_rows)
         )
 
-    def run_kalman_tracks_from_detection_csv(
-            self,
-            csv_path: str,
-            out_csv: str | None = None,
-            progress_cb: Callable[[int, int, str], None] | None = None,
-    ) -> None:
-        """
-        Run per-feature pixel Kalman filters over a YOLO detection CSV.
-
-        Bank-update version:
-          - Preloads all feat_{id}_x_undistPX / feat_{id}_y_undistPX into dense arrays (N,M)
-          - Uses a single Numba-parallel bank step per row (updates all features in compiled code)
-          - Keeps output schema identical to the prior version
-
-        Requirements:
-          - df["image_time"] is numeric seconds (float/int). (Per your note, it is.)
-        """
-
-        if not os.path.exists(csv_path):
-            LOG.error("run_kalman_tracks_from_detection_csv: missing CSV: %s", csv_path)
-            return
-
-        df = read_csv(csv_path)
-        if df.empty:
-            LOG.warning("run_kalman_tracks_from_detection_csv: empty CSV: %s", csv_path)
-            return
-
-        total_rows = len(df)
-
-        # --- Discover feature ids from columns (feat_<id>_x_undistPX) ---
-        feat_ids: list[int] = []
-        for col in df.columns:
-            m = re.match(r"feat_(\d+)_x_undistPX$", col)
-            if m:
-                fid = int(m.group(1))
-                if fid not in feat_ids:
-                    feat_ids.append(fid)
-        feat_ids.sort()
-
-        if not feat_ids:
-            LOG.error("run_kalman_tracks_from_detection_csv: no feat_*_x columns in %s", csv_path)
-            return
-
-        M = len(feat_ids)
-
-        # --- Optional normalization using camera intrinsics ---
-        K = None
-        fx = fy = cx = cy = None
-        width = height = None
-        if getattr(self, "calibration", None) is not None and getattr(self.calibration, "validCal", False):
-            try:
-                K = self.calibration.getCameraMatrix()
-                fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
-                width = float(self.calibration.width)
-                height = float(self.calibration.height)
-            except Exception:
-                K = None
-
-        # --- Output path ---
-        base = Path(csv_path)
-        if out_csv is None:
-            out_csv = str(base.with_name(base.stem + ".csv")).replace("1_yolo_detections", "2_kalman")
-
-        # --- Pull time vector (numeric seconds) ---
-        if "image_time" not in df.columns:
-            LOG.error("run_kalman_tracks_from_detection_csv: missing image_time column in %s", csv_path)
-            return
-        t_sec = df["image_time"].to_numpy(dtype=np.float64)  # (N,)
-
-        # --- Build dense measurement matrices (N,M) ---
-        x_cols = [f"feat_{fid}_x_undistPX" for fid in feat_ids]
-        y_cols = [f"feat_{fid}_y_undistPX" for fid in feat_ids]
-
-        # Ensure missing columns behave as all-NaN rather than KeyError
-        for c in x_cols:
-            if c not in df.columns:
-                df[c] = np.nan
-        for c in y_cols:
-            if c not in df.columns:
-                df[c] = np.nan
-
-        Xraw = df[x_cols].to_numpy(dtype=np.float64, copy=False)  # shape (N,M)
-        Yraw = df[y_cols].to_numpy(dtype=np.float64, copy=False)
-
-        # Normalize in bulk if calibration available, else pass-through
-        if K is None:
-            Xmeas = Xraw
-            Ymeas = Yraw
-        else:
-            # Your previous normalize_xy used x/width, y/height
-            inv_w = 1.0 / max(width, 1.0)
-            inv_h = 1.0 / max(height, 1.0)
-            Xmeas = Xraw * inv_w
-            Ymeas = Yraw * inv_h
-
-        # Valid mask in bulk: finite and not sentinel -1
-        valid = np.isfinite(Xmeas) & np.isfinite(Ymeas) & (Xmeas != -1.0) & (Ymeas != -1.0)
-        valid_u8 = valid.astype(np.uint8, copy=False)  # (N,M) uint8
-
-        # --- KF bank storage (M tracks) ---
-        # We'll use the numba-enabled bank step in the KF class.
-        # Note: This uses raw arrays, not Python objects, for speed.
-        kf0 = PixelKalmanFilter()
-        var_proc = float(kf0.var_proc)
-        var_meas = float(kf0.var_meas)
-        max_pixel_jump = float(kf0.max_pixel_jump)
-        max_mahalanobis_sq = float(kf0.max_mahalanobis_sq)
-
-        X = np.zeros((M, 4), dtype=np.float64)
-        P = np.zeros((M, 4, 4), dtype=np.float64)
-        for j in range(M):
-            P[j] = np.eye(4, dtype=np.float64) * 10.0
-
-        last_t = np.zeros(M, dtype=np.float64)
-        init = np.zeros(M, dtype=np.uint8)
-
-        # --- Output buffers (N,M) for per-feature fields ---
-        out_kf_x = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_y = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_vx = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_vy = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_sig_px = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_sig_py = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_trust = np.zeros((total_rows, M), dtype=np.float64)
-
-        # --- Progress throttling (same behavior as before) ---
-        last_report_t = 0.0
-        last_report_row = 0
-
-        # --- Main loop over rows (KF math happens inside numba bank step) ---
-        for idx in range(total_rows):
-            image_name = df.iloc[idx].get("image_name", "")
-
-            # Progress callback (throttled)
-            if progress_cb is not None:
-                now = time.monotonic()
-                dt = now - last_report_t
-                dr = (idx + 1) - last_report_row
-                step_rows = max(1, total_rows // 100)
-
-                if (idx == 0) or (idx == total_rows - 1) or (dt >= 0.1) or (dr >= step_rows):
-                    try:
-                        progress_cb(idx + 1, total_rows, str(image_name))
-                    except Exception:
-                        pass
-                    last_report_t = now
-                    last_report_row = (idx + 1)
-
-            # One bank-step: updates ALL tracks for this row in compiled code
-            # NOTE: This assumes you've added KalmanFilter._kf_bank_step_inplace(...)
-            # inside Pixel_KalmanFilter.py, and that it internally calls _kf_step_inplace.
-            PixelKalmanFilter._kf_bank_step_inplace(
-                float(t_sec[idx]),
-                Xmeas[idx], Ymeas[idx], valid_u8[idx],
-                X, P, last_t, init,
-                var_proc, var_meas,
-                max_pixel_jump, max_mahalanobis_sq
-            )
-
-            # Write outputs for all initialized tracks
-            for j in range(M):
-                if init[j] == 0:
-                    continue
-
-                out_kf_x[idx, j] = X[j, 0]
-                out_kf_y[idx, j] = X[j, 1]
-                out_kf_vx[idx, j] = X[j, 2]
-                out_kf_vy[idx, j] = X[j, 3]
-
-                # sigma from diag(P) (position only)
-                sig_px = float(np.sqrt(P[j, 0, 0]))
-                sig_py = float(np.sqrt(P[j, 1, 1]))
-                out_sig_px[idx, j] = sig_px
-                out_sig_py[idx, j] = sig_py
-
-                # Same trust metric as before: inverse sigma_px (clamped)
-                out_trust[idx, j] = 1.0 / max(sig_px, 1e-5)
-
-        # --- Build output DataFrame ---
-        # Start with original df (so you keep metadata columns)
-        out_df = df.copy()
-
-        new_cols = {}
-
-        for j, fid in enumerate(feat_ids):
-            new_cols[f"feat_{fid}_kf_x"] = out_kf_x[:, j]
-            new_cols[f"feat_{fid}_kf_y"] = out_kf_y[:, j]
-            new_cols[f"feat_{fid}_kf_vx"] = out_kf_vx[:, j]
-            new_cols[f"feat_{fid}_kf_vy"] = out_kf_vy[:, j]
-            new_cols[f"feat_{fid}_kf_sigma_px"] = out_sig_px[:, j]
-            new_cols[f"feat_{fid}_kf_sigma_py"] = out_sig_py[:, j]
-            new_cols[f"feat_{fid}_kf_trust"] = out_trust[:, j]
-
-        out_df = concat([out_df, DataFrame(new_cols)], axis=1)
-
-        # Drop raw measurement columns (your original code only dropped *_distPX,
-        # but your docstring says drop original feat_*_x/feat_*_y; keep consistent
-        # with your current behavior: drop only distPX here.)
-        cols_to_drop = []
-        for fid in feat_ids:
-            cols_to_drop.append(f"feat_{fid}_x_distPX")
-            cols_to_drop.append(f"feat_{fid}_y_distPX")
-
-        out_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
-
-        out_df.to_csv(out_csv, index=False)
-        LOG.info("Kalman tracks CSV written: %s", out_csv)
-
-
     def launch_checkerboard(self):
         import subprocess
         import importlib.util
@@ -3145,7 +3382,7 @@ class CameraGui(CTkFrame):
         # Safely wait for window to be gone
         while True:
             try:
-                vis = getWindowProperty(self.windowName, WND_PROP_VISIBLE)
+                vis = cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
                 if vis <= 0:
                     break
             except Exception:
@@ -3204,7 +3441,7 @@ class CameraGui(CTkFrame):
         start = self.camConfig.start_export_idx
         end = self.camConfig.end_export_idx + 1
         for idx, img_path in zip(range(start, end), paths[start:end]):
-            frame = imread(str(img_path))
+            frame = cv2.imread(str(img_path))
             ts = self.ImageTimeReader.idsTimes[idx][1]
             cv_img = self.analyze_image(
                 frame,
@@ -3240,6 +3477,7 @@ class CameraGui(CTkFrame):
 
     def exportToGif_worker(self):
         try:
+            from support.io.convertToGif import make_gif
             frames = self._gather_annotated_frames()
             make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
         finally:
@@ -3249,8 +3487,8 @@ class CameraGui(CTkFrame):
         try:
             frames = self._gather_annotated_frames()
             h, w = frames[0].shape[:2]
-            fourcc = VideoWriter.fourcc(*'mp4v')
-            out = VideoWriter('output_video.mp4', fourcc, 10, (w, h))
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+            out = cv2.VideoWriter('output_video.mp4', fourcc, 10, (w, h))
             for f in frames:
                 out.write(f)
             out.release()
@@ -3291,12 +3529,12 @@ class CameraGui(CTkFrame):
         self.showWindow = False
 
     def startStreamOff(self):
-        waitKey(1)
+        cv2.waitKey(1)
 
         self.threadStopper.set()
         try:
-            destroyWindow(self.windowName)
-        except cv_error as e:
+            cv2.destroyWindow(self.windowName)
+        except cv2.cv_error as e:
             pass  # Window not yet open
 
 
@@ -3325,8 +3563,8 @@ class CameraGui(CTkFrame):
             self.showWindow = False
 
         try:
-            destroyWindow(self.windowName)
-        except cv_error:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error:
             pass # window not yet open
 
     def recordOn(self):
@@ -3353,31 +3591,32 @@ class CameraGui(CTkFrame):
         self.saveToCache()
 
     def createDetector(self):
-        self.detector = aruco.ArucoDetector(self.arucoDict, self.arucoParams)
+        self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
     def run_detectSingleImage(self):
-        namedWindow(self.windowName, WINDOW_NORMAL)
-        frame = imread(str(Path(self.camConfig.imageFilepath)))
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+        frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
         while (not self.threadStopper.is_set()
-               and getWindowProperty(self.windowName, WND_PROP_VISIBLE) > 0
+               and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0
                and self.showWindow):
 
             self.analyze_image(frame)
 
-            key = waitKey(1)
+            key = cv2.waitKey(1)
             if key == 27:
                 self.threadStopper.set()
                 break
 
         try:
-            destroyWindow(self.windowName)
-        except cv_error as e:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error as e:
             pass
         self.after(0, self._on_worker_exit)
 
     @staticmethod
     def convert_cv_to_pil(img):
-        return fromarray(cvtColor(img, COLOR_BGR2RGB))
+        from PIL.Image import fromarray
+        return fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
     def run(self):
 
@@ -3392,21 +3631,21 @@ class CameraGui(CTkFrame):
 
     def run_video_stream(self):
 
-        self.vc = VideoCapture(self.camConfig.cam_index, CAP_DSHOW)
+        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
 
-        self.vc.set(CAP_PROP_FPS, 60)
+        self.vc.set(cv2.CAP_PROP_FPS, 60)
 
-        namedWindow(self.windowName, WINDOW_NORMAL)
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         rval, self.curr_frame = self.vc.read()
         if rval:
-            resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
+            cv2.resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
             self.lastHeight = self.curr_frame.shape[0]
             self.lastWidth = self.curr_frame.shape[1]
 
         stop_display_time = None
 
         while (rval and not self.threadStopper.is_set() and
-               getWindowProperty(self.windowName, WND_PROP_VISIBLE) > 0 and
+               cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0 and
                self.showWindow and not self.making_gifOrVid):
             rval, frame = self.vc.read()
 
@@ -3414,7 +3653,7 @@ class CameraGui(CTkFrame):
                 self._draw_chessboard_state(frame)
 
             self.analyze_image(frame)
-            key = waitKey(1)
+            key = cv2.waitKey(1)
 
             if key == 27:  # exit on ESC
                 self.threadStopper.set()
@@ -3437,8 +3676,8 @@ class CameraGui(CTkFrame):
             self.vc = None
 
         try:
-            destroyWindow(self.windowName)
-        except cv_error:
+            cv2.destroyWindow(self.windowName)
+        except cv2.cv_error:
             pass
 
         self.after(0, self._on_worker_exit)
@@ -3453,14 +3692,14 @@ class CameraGui(CTkFrame):
         instr_text_b = f'{self._cb_pattern[1]} inner col corners'
 
         # Draw on A
-        putText(frame, instr_text_a, org1,
-                    FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
-        putText(frame, instr_text_a, org1,
-                    FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
-        putText(frame, instr_text_b, org2,
-                    FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
-        putText(frame, instr_text_b, org2,
-                    FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+        cv2.putText(frame, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        cv2.putText(frame, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+        cv2.putText(frame, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        cv2.putText(frame, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
 
     def _handle_chessboard_hotkeys(self, key: int):
         # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
@@ -3522,7 +3761,7 @@ class CameraGui(CTkFrame):
     @staticmethod
     def _poll_keys(max_ms: int = 8) -> list[int]:
         # One-shot poll: wait up to max_ms for a key
-        k = waitKey(max_ms) & 0xFF
+        k = cv2.waitKey(max_ms) & 0xFF
         if k not in (0, 0xFF, 255, -1):
             return [k]
         return []
@@ -3593,10 +3832,10 @@ class CameraGui(CTkFrame):
 
     def run_folder_reader(self):
         try:
-            destroyWindow(self.windowName)
-        except cv_error:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error:
             pass
-        namedWindow(self.windowName, WINDOW_NORMAL)
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
 
         directory = Path(self.camConfig.imageFilepath).parent
 
@@ -3616,6 +3855,8 @@ class CameraGui(CTkFrame):
         # time offset
         self.camConfig.cam_to_log_time_offset = self.load_time_offset(directory)
 
+        from support.runtime.bufferImageLoader import BufferedImageLoader as imgBuf
+
         # --- start background loader ---
         loader = imgBuf(
             filepaths=[str(p) for p in paths],
@@ -3623,7 +3864,7 @@ class CameraGui(CTkFrame):
             preprocess=None,
             start_index=0,
             loop=True,
-            read_flags=IMREAD_COLOR,
+            read_flags=cv2.IMREAD_COLOR,
         ).start()
 
         # one-shot key handling
@@ -3644,7 +3885,7 @@ class CameraGui(CTkFrame):
 
         try:
             while (not self.threadStopper.is_set()
-                   and getWindowProperty(self.windowName, WND_PROP_VISIBLE)
+                   and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
                    and self.showWindow
                    and not self.making_gifOrVid):
 
@@ -3877,14 +4118,14 @@ class CameraGui(CTkFrame):
                         time.sleep(0.1)
 
                 pending_keys.extend(self._poll_keys(1))
-                if getWindowProperty(self.windowName, WND_PROP_VISIBLE) <= 0:
+                if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
                     self.threadStopper.set()
                     break
 
         finally:
             try:
-                destroyWindow(self.windowName)
-            except cv_error:
+                cv2.destroyWindow(self.windowName)
+            except cv2.error:
                 pass
             self.after(0, self._on_worker_exit)
             loader.stop()
@@ -4045,6 +4286,12 @@ class CameraGui(CTkFrame):
             self.after(500, self._poll_gpu)
 
     def _poll_gpu(self):
+        from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetUtilizationRates
+
+        if self._gpu_handle is None:
+            nvmlInit()
+            self._gpu_handle = nvmlDeviceGetHandleByIndex(0)
+
         if self.camConfig.dp_gpu:
             try:
                 util = nvmlDeviceGetUtilizationRates(self._gpu_handle)
@@ -4248,37 +4495,41 @@ class CameraGui(CTkFrame):
             self.last_yolo_3d_estimate = None
 
         if self.camConfig.hud and img_time is not None:
+            from support.viz.HUD_draw import HUD_Marker
+            if self.hud_marker is None:
+                self.hud_marker = HUD_Marker()
+                self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
             self.hud_marker.draw_HUD(self.markup_frame, img_time)
 
         if box_around:
             x, y, _ = self.markup_frame.shape
-            rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
+            cv2.rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = getTextSize(os.path.basename(name), FONT_HERSHEY_SIMPLEX,
+            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX,
                                                 med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
-            putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                    FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+            cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
         if img_time is not None:
             time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-            (time_width, time_height), base = getTextSize(time_str, FONT_HERSHEY_SIMPLEX,
+            (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
                                                           med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
-            putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
-                    FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+            cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
 
         if display_in_realtime:
             if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
                 (h, w) = self.markup_frame.shape[:2]
                 self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
-                putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                        (int(0.015 * w), int(0.030 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
+                cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                        (int(0.015 * w), int(0.030 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
                         HUD_YELLOW, 2)
-                putText(self.markup_frame,
+                cv2.putText(self.markup_frame,
                         f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                        (int(0.015 * w), int(0.060 * h)), FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
+                        (int(0.015 * w), int(0.060 * h)), cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]),
                         HUD_YELLOW, 2)
             self.cleanup()
 
@@ -4298,7 +4549,7 @@ class CameraGui(CTkFrame):
             return float("nan")
 
         # cv2.fitLine returns normalized direction (vx,vy) and a point (x0,y0) on the line
-        vx, vy, x0, y0 = fitLine(pts_xy.astype(np.float32), DIST_L2, 0, 0.01, 0.01).flatten()
+        vx, vy, x0, y0 = cv2.fitLine(pts_xy.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
 
         # Perpendicular distance from point p to line through x0 with direction v:
         # dist = |(p-x0) x v| / ||v||, but ||v||≈1 from fitLine
@@ -4316,7 +4567,7 @@ class CameraGui(CTkFrame):
         if pts_xy.shape[0] < 2:
             return np.full((pts_xy.shape[0],), np.nan, dtype=np.float32)
 
-        vx, vy, x0, y0 = fitLine(pts_xy.astype(np.float32), DIST_L2, 0, 0.01, 0.01).flatten()
+        vx, vy, x0, y0 = cv2.fitLine(pts_xy.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).flatten()
         dx = pts_xy[:, 0] - x0
         dy = pts_xy[:, 1] - y0
         dist = np.abs(dx * vy - dy * vx)  # since ||v|| ~ 1
@@ -4378,14 +4629,14 @@ class CameraGui(CTkFrame):
 
     def draw_chessboard(self):
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cvtColor(self.markup_frame, COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(self.markup_frame, cv2.COLOR_BGR2GRAY)
 
         now = time.monotonic()
         if (now - self._cb_last_ts) >= self._cb_throttle_sec:
             self._cb_last_ts = now
 
-            flags = CALIB_CB_EXHAUSTIVE | CALIB_CB_ACCURACY
-            found, corners = findChessboardCornersSB(self.curr_frame_gray,
+            flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+            found, corners = cv2.findChessboardCornersSB(self.curr_frame_gray,
                                                      self._cb_pattern,
                                                      flags)
 
@@ -4422,10 +4673,10 @@ class CameraGui(CTkFrame):
                     bgr = self.residual_to_bgr(r)
 
                     cx, cy = int(round(x)), int(round(y))
-                    circle(self.markup_frame, (cx, cy), 4,
-                           (0, 0, 0), -1, LINE_AA)  # black underlay
-                    circle(self.markup_frame, (cx, cy), 3,
-                           bgr, -1, LINE_AA)
+                    cv2.circle(self.markup_frame, (cx, cy), 4,
+                           (0, 0, 0), -1, cv2.LINE_AA)  # black underlay
+                    cv2.circle(self.markup_frame, (cx, cy), 3,
+                           bgr, -1, cv2.LINE_AA)
 
             # NEW: overlay residual
             if getattr(self, "_cb_last_resid", None) is not None:
@@ -4439,14 +4690,14 @@ class CameraGui(CTkFrame):
 
         # Put text on the image (top-left)
         org = (20, 40)
-        putText(self.markup_frame,
-                txt, org, FONT_HERSHEY_SIMPLEX,
+        cv2.putText(self.markup_frame,
+                txt, org, cv2.FONT_HERSHEY_SIMPLEX,
                 lrg_text(self.curr_frame.shape[0]), (0, 0, 0),
-                4, LINE_AA)
-        putText(self.markup_frame,
-                txt, org, FONT_HERSHEY_SIMPLEX,
+                4, cv2.LINE_AA)
+        cv2.putText(self.markup_frame,
+                txt, org, cv2.FONT_HERSHEY_SIMPLEX,
                 lrg_text(self.curr_frame.shape[0]), (255, 255, 0),
-                2, LINE_AA)
+                2, cv2.LINE_AA)
 
     @staticmethod
     def residual_to_bgr(r_px, hot_px=1.0):
@@ -4463,13 +4714,13 @@ class CameraGui(CTkFrame):
         v = 255
 
         hsv = np.uint8([[[h, s, v]]])
-        bgr = cvtColor(hsv, COLOR_HSV2BGR)[0, 0]
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
         return int(bgr[0]), int(bgr[1]), int(bgr[2])
 
     def inpaint_apriltags(self,
                           radius_px: int = 3,
                           dilate_px: int = 2,
-                          method: int = INPAINT_TELEA,
+                          method: int = cv2.INPAINT_TELEA,
                           feather: bool = True):
         if self.curr_frame_gray is None or self.markup_frame is None:
             return
@@ -4525,24 +4776,24 @@ class CameraGui(CTkFrame):
             pts_roi[:, 1] -= y_min
             pts_int = pts_roi.astype(np.int32)
 
-            fillConvexPoly(mask_roi, pts_int, 255)
+            cv2.fillConvexPoly(mask_roi, pts_int, 255)
 
             # optional dilation to cover borders
             if dilate_px > 0:
-                k = getStructuringElement(
-                    MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+                k = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
                 )
-                mask_roi = dilate(mask_roi, k)
+                mask_roi = cv2.dilate(mask_roi, k)
 
             # slice out the ROI from the big frame
             frame_roi = self.markup_frame[y_min:y_max + 1, x_min:x_max + 1]
 
             # inpaint only this small region
-            inpainted_roi = inpaint(frame_roi, mask_roi, radius_px, method)
+            inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
 
             if feather:
                 blur_ks = max(3, 2 * radius_px + 1)
-                soft = GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
+                soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
                 soft = soft[..., None]  # (H,W,1)
 
                 base = frame_roi.astype(np.float32)
@@ -4555,6 +4806,9 @@ class CameraGui(CTkFrame):
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
+
+        if self.lidarTruthPoints is None:
+            self.loadTruthPoints()
 
         points = None
         if self.centers is not None and len(self.centers) >= 6:
@@ -4666,7 +4920,7 @@ class CameraGui(CTkFrame):
 
             if valid_dirs.size > 0:
                 # Project valid directions
-                img_points, _ = fisheye.projectPoints(
+                img_points, _ = cv2.fisheye.projectPoints(
                     valid_dirs, np.zeros(3), np.zeros(3),
                     self.calibration.getCameraMatrix(),
                     self.calibration.getDistortion()
@@ -4687,10 +4941,10 @@ class CameraGui(CTkFrame):
             self.cubemap_faces[face] = self.remap(face, frame)
 
     def remap(self, face, frame):
-        return remap(
+        return cv2.remap(
             frame, self.map_x[face], self.map_y[face],
-            interpolation=INTER_LINEAR,
-            borderMode=BORDER_CONSTANT,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0))
 
     def stitch_cubemap_faces(self, layout, cells=3):
@@ -4742,8 +4996,8 @@ class CameraGui(CTkFrame):
                 # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
                 self.curr_frame = self.cubemap_faces['front']
         else:
-            self.curr_frame = remap(frame, self.map1, self.map2, interpolation=INTER_LINEAR,
-                                    borderMode=BORDER_CONSTANT)
+            self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT)
 
     def applyKernel(self):
         if self.camConfig.processingKernel != ImageKernel.Gabor and self.GaborGUI is not None:
@@ -4751,6 +5005,7 @@ class CameraGui(CTkFrame):
             self.GaborGUI = None
 
         if self.camConfig.processingKernel == ImageKernel.Gabor:
+            from support.vision.FilterImage import GaborGUI, applyConvolutionFilter
             if self.GaborGUI is None:
                 self.GaborGUI = GaborGUI()
             self.markup_frame = applyConvolutionFilter(self.markup_frame,
@@ -4758,13 +5013,14 @@ class CameraGui(CTkFrame):
                                                        self.GaborGUI.gaborFilter)
             return
 
+        from support.vision.FilterImage import applyConvolutionFilter
         self.markup_frame = applyConvolutionFilter(self.markup_frame,
                                                    self.camConfig.processingKernel)
 
     def corner_detection(self):
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cvtColor(self.curr_frame, COLOR_BGR2GRAY)
-        harris_corners = cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
+            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
+        harris_corners = cv2.cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
 
         self.markup_frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
 
@@ -4776,7 +5032,7 @@ class CameraGui(CTkFrame):
           - refine on full-res gray image with cornerSubPix
         """
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cvtColor(self.curr_frame, COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
         if self.detector is None:
             return
 
@@ -4786,8 +5042,8 @@ class CameraGui(CTkFrame):
         # 1) Downscale for detection
         if not (0.2 <= scale < 1.0):
             scale = 0.6
-        small = resize(gray_full, (int(w * scale), int(h * scale)),
-                       interpolation=INTER_AREA)
+        small = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
+                       interpolation=cv2.INTER_AREA)
 
         # 2) Detect on smaller image
         corners_small, ids, rejected = self.detector.detectMarkers(small)
@@ -4812,11 +5068,11 @@ class CameraGui(CTkFrame):
         # 4) Subpixel refine on full-res gray image
         #    (this is what gives you precise centers back)
         criteria = (
-            TERM_CRITERIA_EPS + TERM_CRITERIA_MAX_ITER,
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
             20,  # max iterations
             0.01  # epsilon
         )
-        cornerSubPix(gray_full, all_pts, (5, 5), (-1, -1), criteria)
+        cv2.cornerSubPix(gray_full, all_pts, (5, 5), (-1, -1), criteria)
 
         # 5) Split back per marker and draw / accumulate centers
         refined_corners_per_marker = []
@@ -4833,11 +5089,11 @@ class CameraGui(CTkFrame):
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
 
             if not self.camConfig.hideAprilTags:
-                polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=FILLED)
-                putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                        FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
-                putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                        FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
+                cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
+                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
+                        cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
+                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
+                        cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 
@@ -4847,6 +5103,9 @@ class CameraGui(CTkFrame):
                 self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
 
     def pnpLidarPoints(self):
+
+        if self.lidarTruthPoints is None:
+            self.loadTruthPoints()
 
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = deepcopy(self.lidarTruthPoints.truthPoints)
@@ -4868,14 +5127,14 @@ class CameraGui(CTkFrame):
             if len(points) < 6:
                 return
 
-            ret, rvec, tvec = solvePnP(objectPoints=points,
+            ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
                                        imagePoints=centers,
                                        cameraMatrix=self.calibration.getCameraMatrix(),
                                        distCoeffs=distParams,
-                                       flags=SOLVEPNP_ITERATIVE)
+                                       flags=cv2.SOLVEPNP_ITERATIVE)
 
             if ret:
-                projectedPoints_orig, _ = projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
+                projectedPoints_orig, _ = cv2.projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
                                                         rvec=rvec,
                                                         tvec=tvec,
                                                         cameraMatrix=self.calibration.getCameraMatrix(),
@@ -4888,16 +5147,20 @@ class CameraGui(CTkFrame):
 
                 self.pnpResult = (quatPnP, vectPnP)
 
-                putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
-                        FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
+                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
+                        cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                         (255, 255, 0), 3,
-                        LINE_AA)
-                putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
-                        (50, 150), FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
+                        cv2.LINE_AA)
+                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
+                        (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                         (255, 255, 0), 3,
-                        LINE_AA)
+                        cv2.LINE_AA)
 
     def qnpLidarPoints(self):
+
+        if self.lidarTruthPoints is None:
+            self.loadTruthPoints()
+
         if self.centers is not None and len(self.centers) >= 6:
             truthPoints = deepcopy(self.lidarTruthPoints.truthPoints)
 
@@ -4937,16 +5200,16 @@ class CameraGui(CTkFrame):
             self.plotOnImg(us_vs_s_proj.astype(int),
                            list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
             self.qnpResult = (quat, vect)
-            putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
-                    FONT_HERSHEY_DUPLEX,
+            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
+                    cv2.FONT_HERSHEY_DUPLEX,
                     small_text(self.markup_frame.shape[0]),
                     (255, 255, 0), 3,
-                    LINE_AA)
-            putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
-                    FONT_HERSHEY_DUPLEX,
+                    cv2.LINE_AA)
+            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
+                    cv2.FONT_HERSHEY_DUPLEX,
                     small_text(self.markup_frame.shape[0]),
                     (255, 255, 0), 3,
-                    LINE_AA)
+                    cv2.LINE_AA)
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
@@ -4963,11 +5226,11 @@ class CameraGui(CTkFrame):
     def detectHorizon(self):
 
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cvtColor(self.curr_frame, COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
 
-        edges = Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
+        edges = cv2.Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
-        lines = HoughLinesP(edges, 1, np.pi / 180.0, 50,
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, 50,
                             minLineLength=np.sum(self.curr_frame.shape) / 10.0,
                             maxLineGap=20)
 
@@ -5015,14 +5278,15 @@ class CameraGui(CTkFrame):
                 self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
                     1] + self.radius * 4.0) / 5.0
             else:
-                self.confSlider(self.yoloSession.conf)
+                self.confSlider(self.camConfig.yolo_conf)
 
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.50)
 
             self.radius = min(800.0, self.radius + 12.0)
-            self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
-            self.confSliderBar.set(self.yoloSession.conf)
+            if self.yoloSession is not None:
+                self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
+                self.confSliderBar.set(self.yoloSession.conf)
         else:
             if self.last_bounding_box_size is not None:
                 # 1.0 for single feature, 1.5 for drogue
@@ -5048,6 +5312,14 @@ class CameraGui(CTkFrame):
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         '''
+        from support.vision import yolo
+        if self.yoloSession is None:
+            self.yoloSession = yolo.YOLO()
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+            self.yoloSession.set_calibration(self.calibration)
+            self.yoloSession.iou = self.camConfig.yolo_iou
+            self.yoloSession.conf = self.camConfig.yolo_conf
+
         (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
                                                                                self.camConfig.undistort,
                                                                                self.camConfig.yoloBiasTracking)
@@ -5083,12 +5355,12 @@ class CameraGui(CTkFrame):
             if self.check_above_horizon(self.last_yolo_center):
                 self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                 w, h, _ = self.curr_frame.shape
-                putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), FONT_HERSHEY_SIMPLEX,
+                cv2.putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                         med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
-                putText(self.markup_frame,
+                cv2.putText(self.markup_frame,
                         f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
                         (25, w - 50),
-                        FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
                 # circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
                 #            3, (255, 0, 255), 3)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
@@ -5099,6 +5371,9 @@ class CameraGui(CTkFrame):
         self.last_yolo_center = None
 
     def factor_graph(self, time):
+        from support.runtime.FG_DrogueOnly import FactorGraph
+        if self.FG is None:
+            self.FG = FactorGraph()
         color = (120, 255, 120)
 
         if self.last_yolo_3d_estimate is not None:
@@ -5123,23 +5398,23 @@ class CameraGui(CTkFrame):
             h, w, _ = self.markup_frame.shape
             size = 15
             thickness = 2
-            circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
+            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
                    thickness)
-            line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
                  [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
-            line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                  [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
-            putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), FONT_HERSHEY_SIMPLEX,
+            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(self.markup_frame.shape[0]), (0, 0, 0), thickness)
 
             thickness = 1
-            circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
+            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
                    thickness)
-            line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
                  [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
-            line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                  [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
-            putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), FONT_HERSHEY_SIMPLEX,
+            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(self.markup_frame.shape[0]), color, thickness)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
@@ -5162,13 +5437,13 @@ class CameraGui(CTkFrame):
             cy = int(self.curr_frame.shape[1] / 2)
 
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cvtColor(self.markup_frame, COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(self.markup_frame, cv2.COLOR_BGR2GRAY)
 
         if self.last_image is not None and self.last_image.shape == self.curr_frame_gray.shape:
-            lft_rt, ret = phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
+            lft_rt, ret = cv2.phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
                                          self.last_image.astype(np.float64) / 255.0)
             lft, rt = lft_rt
-            arrowedLine(self.markup_frame, (cx, cy), (int(cx + 10 * lft), int(cy + 10 * rt)), (0, 0, 255), 3)
+            cv2.arrowedLine(self.markup_frame, (cx, cy), (int(cx + 10 * lft), int(cy + 10 * rt)), (0, 0, 255), 3)
 
         self.last_image = copy.deepcopy(self.curr_frame_gray)
 
@@ -5189,45 +5464,45 @@ class CameraGui(CTkFrame):
             crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
             crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
 
-            polylines(self.markup_frame, [crosshairsH], True, HUD_GREEN, thickness)
-            polylines(self.markup_frame, [crosshairsV], True, HUD_GREEN, thickness)
+            cv2.polylines(self.markup_frame, [crosshairsH], True, HUD_GREEN, thickness)
+            cv2.polylines(self.markup_frame, [crosshairsV], True, HUD_GREEN, thickness)
 
         self.potentialResize()
 
-        imshow(self.windowName, resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
+        cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
 
         if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
-            imwrite(os.path.join(self.filepath, str(self.img_idx) + '.png'), self.markup_frame)
+            cv2.imwrite(os.path.join(self.filepath, str(self.img_idx) + '.png'), self.markup_frame)
             self.img_idx += 1
             self.lastImageTime = time.time()
             self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
 
     def plotOnImg(self, points, names, color):
         for idx, pxPt in enumerate(points):
-            circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
+            cv2.circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX,
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(self.markup_frame.shape[0]), (0, 0, 0),
                     12,
-                    LINE_AA)
-            putText(self.markup_frame, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX,
+                    cv2.LINE_AA)
+            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(self.markup_frame.shape[0]), color, 3,
-                    LINE_AA)
+                    cv2.LINE_AA)
 
     def potentialResize(self):
-        if getWindowProperty(self.windowName, WND_PROP_VISIBLE) <= 0:
+        if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
             return
-        x, y, width, height = getWindowImageRect(self.windowName)
+        x, y, width, height = cv2.getWindowImageRect(self.windowName)
         aspectRatio = self.curr_frame.shape[1] / self.curr_frame.shape[0]
-        if not getWindowProperty(self.windowName, WND_PROP_VISIBLE):
+        if not cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
             return
 
         if not self.lastHeight == height and height != 0:
-            resizeWindow(self.windowName, int(height * aspectRatio), height)
+            cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
             self.lastHeight = height
             self.lastWidth = int(height * aspectRatio)
         elif not self.lastWidth == width and width != 0:
-            resizeWindow(self.windowName, width, int(width / aspectRatio))
+            cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
             self.lastWidth = width
             self.lastHeight = int(width / aspectRatio)
 
@@ -5256,29 +5531,29 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
 
         # 1. Create a mask
         mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
-        circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
+        cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
 
     else:
         mask = np.zeros(frame.shape[:2], dtype='uint8')
         # rectangle(mask, (int(center[0]-x_axes),int(center[1]-y_axes)),(int(center[0]+x_axes),int(center[1]+y_axes)),
         #               color=255, thickness=-1)
-        ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
+        cv2.ellipse(mask, (int(center[0]), int(center[1])), (int(x_axes), int(y_axes)),
                 angle=0, startAngle=0, endAngle=360, color=(255, 255, 255), thickness=-1)
 
     # 2. Dim the entire image
     dimmed_img = (frame * dim_factor).astype("uint8")
 
     # 3. Copy the original circle area back to the dimmed image
-    masked_circle = bitwise_and(frame, frame, mask=mask)
+    masked_circle = cv2.bitwise_and(frame, frame, mask=mask)
 
     # Invert the mask to select the area outside the circle
-    inverted_mask = bitwise_not(mask)
+    inverted_mask = cv2.bitwise_not(mask)
 
     # Apply the mask to the dimmed image
-    masked_dimmed = bitwise_and(dimmed_img, dimmed_img, mask=inverted_mask)
+    masked_dimmed = cv2.bitwise_and(dimmed_img, dimmed_img, mask=inverted_mask)
 
     # Add the original circle back
-    frame = add(masked_circle, masked_dimmed)
+    frame = cv2.add(masked_circle, masked_dimmed)
 
     return frame
 
@@ -5295,10 +5570,10 @@ def dim_entirely(frame, center, radius):
 
     # 1. Create a mask
     mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
-    circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
+    cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
 
     # 3. Copy the original circle area back to the dimmed image
-    return bitwise_and(frame, frame, mask=mask)
+    return cv2.bitwise_and(frame, frame, mask=mask)
 
 
 def natural_sort(l):

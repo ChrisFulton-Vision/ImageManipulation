@@ -23,6 +23,6 @@ class MetaYoloReader:
                     self.idsNamesLocs.append([int(row[0]), row[1], float(row[3]),float(row[4]),float(row[5])])
 
 if __name__ == '__main__':
-    reader = MetaYoloReader('../YOLOModels/GIII_01172025_10_100M_MoreFeatures/meta_yolo.csv')
+    reader = MetaYoloReader('../../YOLOModels/GIII_01172025_10_100M_MoreFeatures/meta_yolo.csv')
     for stuff in reader.idsNamesLocs:
         print(stuff)

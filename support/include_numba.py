@@ -1,4 +1,4 @@
-from SupportModules.Logging import LOG
+from support.io.Logging import LOG
 
 try:
     from numba import njit, prange
@@ -16,10 +16,10 @@ except Exception:
 def _njit(*dargs, **dkwargs):
     """
     Usage:
-        @_njit
+        @njit
         def f(...): ...
 
-        @_njit(cache=True, fastmath=False)
+        @njit(cache=True, fastmath=False)
         def g(...): ...
     """
     if not _HAVE_NUMBA:

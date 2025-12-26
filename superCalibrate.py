@@ -18,14 +18,14 @@ from cv2 import (CALIB_ZERO_TANGENT_DIST, CALIB_FIX_ASPECT_RATIO, CALIB_FIX_PRIN
                  resize, FONT_HERSHEY_SIMPLEX, bitwise_not, imwrite, cvtColor, COLOR_BGR2GRAY, rotate,
                  ROTATE_90_CLOCKWISE, ROTATE_90_COUNTERCLOCKWISE, namedWindow, imshow, setMouseCallback, waitKey,
                  destroyAllWindows, EVENT_RBUTTONDOWN, EVENT_FLAG_RBUTTON, EVENT_MOUSEMOVE, EVENT_LBUTTONDOWN,
-                 EVENT_FLAG_LBUTTON, rectangle, EVENT_LBUTTONUP, findChessboardCorners, ADAPTIVE_THRESH_GAUSSIAN_C,
+                 EVENT_FLAG_LBUTTON, rectangle, EVENT_LBUTTONUP, ADAPTIVE_THRESH_GAUSSIAN_C,
                  findCirclesGrid, estimateChessboardSharpness, TERM_CRITERIA_MAX_ITER, TERM_CRITERIA_EPS, cornerSubPix,
                  drawChessboardCorners, fisheye, initCameraMatrix2D, CALIB_USE_INTRINSIC_GUESS, calibrateCameraROExtended,
-                 calibrationMatrixValues, CALIB_FIX_FOCAL_LENGTH, findChessboardCornersSB)
+                 calibrationMatrixValues, findChessboardCornersSB)
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
 
-from SupportModules.Calibration import Calibration
+from support.io.Calibration import Calibration
 
 sys.path.append(os.getcwd())
 GREEN = '#2FA572'
@@ -1100,8 +1100,11 @@ class CalibrateGui(CTkFrame):
                 return
 
         if os.path.exists(join(self.filepath, IMAGE_CACHE)):
-            with open(join(self.filepath, IMAGE_CACHE), 'rb') as imageConfigOpen:
-                self.imageConfig.copy(pickle.load(imageConfigOpen))
+            try:
+                with open(join(self.filepath, IMAGE_CACHE), 'rb') as imageConfigOpen:
+                    self.imageConfig.copy(pickle.load(imageConfigOpen))
+            except ModuleNotFoundError:
+                pass
         else:
             self.imageConfig = ImageryCalibrationConfig()
             if not self.imageConfig.camCal.fromFile(self.filepath):

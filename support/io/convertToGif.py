@@ -1,13 +1,7 @@
 from PIL import Image
 from dataclasses import dataclass
 from cv2 import cvtColor, COLOR_BGR2RGB
-from enum import Enum
-
-
-class ExportQuality(Enum):
-    low_quality = 'Low Quality'
-    med_quality = 'Medium Quality'
-    hgh_quality = 'High Quality'
+from support.core.enums import ExportQuality
 
 
 @dataclass

@@ -3,7 +3,7 @@ import pickle, copy
 
 import numpy as np
 
-from SupportModules.sensor_datum_mat4_bundle import parse_sensor_datum_mat4_bundle
+from support.core.sensor_datum_mat4_bundle import parse_sensor_datum_mat4_bundle
 
 class TruthPoints:
     def __init__(self):
@@ -98,7 +98,7 @@ class TruthPoints:
 
     def saveToCache(self):
         # Store only the data dict, not the whole class instance
-        with open('../LIDAR_Truth_Points.pkl', 'wb') as f:
+        with open('../../LIDAR_Truth_Points.pkl', 'wb') as f:
             pickle.dump(self.truthPoints, f)
 
     def copy(self, classToCopy):

@@ -25,7 +25,7 @@ from cv2 import (CALIB_ZERO_TANGENT_DIST, CALIB_FIX_ASPECT_RATIO, CALIB_FIX_PRIN
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
 
-from support.io.Calibration import Calibration
+from support.io.calibration import Calibration
 
 sys.path.append(os.getcwd())
 GREEN = '#2FA572'

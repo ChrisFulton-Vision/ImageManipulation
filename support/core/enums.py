@@ -69,3 +69,24 @@ class ImageSource(Enum):
     Camera_Stream = 'Camera Stream'
     Static_Image = 'Static Image'
     Stream_from_Folder = 'Stream from Folder'
+
+class robust_cost(Enum):
+    none = None,
+    huber = 'huber',
+    cauchy = 'cauchy',
+    tukey = 'tukey'
+
+    def next(self):
+        iterator = cycle(self.__class__)
+        for member in iterator:
+            if member is self:
+                return next(iterator)
+
+    def val(self):
+        if self == robust_cost.huber:
+            return 1
+        if self == robust_cost.cauchy:
+            return 2
+        if self == robust_cost.tukey:
+            return 3
+        return 0

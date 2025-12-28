@@ -32,38 +32,25 @@ The code is written as an end-to-end script. Run directly to see a synthetic tes
 with noisy measurements, the initializer results, and the final optimized pose.
 """
 
+import numpy as np
 from sys import maxsize
-from support.core.quaternions import Quaternion as q
-from support.core.quaternions import *
-from support.io.Calibration import Calibration
+from support.core.quaternions import Quaternion as q, mat2quat
+from support.io.calibration import Calibration
 from support.include_numba import _njit as njit, prange
+from support.core.enums import robust_cost
 from numpy.typing import NDArray
-from enum import Enum
-from itertools import cycle
-
-class robust_cost(Enum):
-    none = None,
-    huber = 'huber',
-    cauchy = 'cauchy',
-    tukey = 'tukey'
-
-    def next(self):
-        iterator = cycle(self.__class__)
-        for member in iterator:
-            if member is self:
-                return next(iterator)
-
-    def val(self):
-        if self == robust_cost.huber:
-            return 1
-        if self == robust_cost.cauchy:
-            return 2
-        if self == robust_cost.tukey:
-            return 3
-        return 0
+from dataclasses import dataclass
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
+
+@dataclass
+class QnPStats:
+    N: int
+    dof: int
+    sse_w: float
+    s2: float
+    cov6: np.ndarray
 
 # --- Small helpers --------------------------------------------------------------
 @njit(parallel=True, fastmath=False, cache=True)
@@ -455,7 +442,10 @@ def _robust_sqrt_weights_inplace_numba(
         out_sqrtw_2N[2 * i + 0] = sw
         out_sqrtw_2N[2 * i + 1] = sw
 
-def _inv_sigma_2N_from_sigma(sigma_2N, N: int, eps: float = 1e-6, big: float = 1e6):
+def _inv_sigma_2N_from_sigma(sigma_2N,
+                             N: int,
+                             eps: float = 1e-6,
+                             big: float = 1e6):
     """
     Returns inv_sigma_2N (2N,) where inv_sigma[i] = 1/sigma[i].
     Accepts sigma length N or 2N. Missing/invalid -> big sigma -> tiny inv weight.
@@ -480,12 +470,13 @@ def opt(
     img_pts: NDArray,
     object_pts: NDArray,
     cal: Calibration,
+    return_stats: bool,
     seed_q: q = None,
     seed_t: NDArray = None,
     robust_kind: robust_cost = robust_cost.none,
     robust_param: float = 2.0,
     sigma_2N=None,
-):
+    sigma_floor_px: float = 1.0):
     """
     Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN.
     State: [δr, δt] (6 DOF), minimal tangent update.
@@ -513,8 +504,12 @@ def opt(
     # ----------- Sigma whitening (once) -----------
     inv_sigma_2N = _inv_sigma_2N_from_sigma(sigma_2N, N)
     if inv_sigma_2N is not None:
-        SIGMA_FLOOR_PX = 1.0  # tune 0.5–2.0
-        inv_sigma_2N = np.minimum(inv_sigma_2N, 1.0 / SIGMA_FLOOR_PX)
+        # Prevent absurdly tiny sigmas from dominating the solve.
+        # We cap inv_sigma <= 1/sigma_floor.
+        sf = float(sigma_floor_px)
+        if (not np.isfinite(sf)) or (sf <= 0.0):
+            sf = 1.0
+        inv_sigma_2N = np.minimum(inv_sigma_2N, 1.0 / sf)
 
     sqrtw = np.empty(2 * N, dtype=np.float64)
     rw = np.empty(2 * N, dtype=np.float64)
@@ -635,9 +630,27 @@ def opt(
             keep_going = False
 
     est_q.force_s_pos()
-    return est_q, est_t
+    if not return_stats:
+        return est_q, est_t
 
-def enforce_chirality(q_est, t_est, object_pts, cal):
+    LtL, _Lty, y2 = _accum_LtL_Lty_numba(L, y, sqrtw)
+
+    dof = 2 * N - 6
+    if dof < 1:
+        dof = 1
+    s2 = float(y2) / float(dof)
+
+    # Cov = s2 * inv(LtL)
+    I = np.eye(6, dtype=np.float64)
+    cov6 = s2 * np.linalg.solve(LtL, I)
+
+    return est_q, est_t, QnPStats(N=int(N),
+                                  dof=int(dof),
+                                  sse_w=float(y2),
+                                  s2=float(s2),
+                                  cov6=cov6)
+
+def enforce_chirality(q_est, t_est, object_pts):
     # Camera-frame points
     XYZ = q_est * object_pts + t_est
     Z = XYZ[:, 2]
@@ -774,9 +787,12 @@ def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
 def solveQnP(object_pts: np.array,
              img_pts: np.array,
              cal: Calibration,
+             return_stats:bool = False,
              sigma_2N=None,
              user_seed_q=None,
-             user_seed_t=None):
+             user_seed_t=None,
+             robust_kind:robust_cost = robust_cost.huber,
+             robust_param:float =2.0):
     """
     Quaternion-based PnP solver.
 
@@ -797,45 +813,29 @@ def solveQnP(object_pts: np.array,
         # Use DLT initializer to mirror PnP-style behavior
         seed_q, seed_t = DLT(object_pts, img_pts, cal)
 
-    flipped, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts, cal)
+    flipped, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts)
     # ------------------------------------------------------------------
     # 2) Nonlinear refinement around the seed (Gauss–Newton / LM-like)
     #    This is where trust_weighting gives us an advantage over PnP.
     # ------------------------------------------------------------------
-    est_q, est_t = opt(
+
+    # If caller provided sigma, use a robust loss by default (outlier safety).
+    if sigma_2N is not None and robust_kind == robust_cost.none:
+        robust_kind = robust_cost.huber
+        robust_param = 2.0  # 2-sigma in whitened units when sigma_2N is provided
+
+    return opt(
         img_pts,
         object_pts,
         cal,
+        return_stats=return_stats,
         seed_q=seed_q,
         seed_t=seed_t,
         sigma_2N=sigma_2N,
-        robust_kind=robust_cost.huber
+        robust_kind=robust_kind,
+        robust_param=robust_param,
+        sigma_floor_px=1.0
     )
-
-    # ------------------------------------------------------------------
-    # 3) Enforce chirality (points in front of camera), then optionally
-    #    re-optimize from the corrected pose.
-    # ------------------------------------------------------------------
-    # flipped, est_q, est_t = enforce_chirality(est_q, est_t, object_pts, cal)
-    # if flipped:
-    #     # Small re-optimization starting from the chirality-corrected pose
-    #     est_q, est_t = opt(
-    #         img_pts,
-    #         object_pts,
-    #         cal,
-    #         seed_q=est_q,
-    #         seed_t=est_t,
-    #         trust_weighting=trust_weighting,
-    #     )
-
-    # ------------------------------------------------------------------
-    # 4) Clean up quaternion sign convention (avoid random sign flips)
-    # ------------------------------------------------------------------
-    est_q.force_s_pos()
-
-    return est_q, est_t
-
-
 
 if __name__ == '__main__':
     pass

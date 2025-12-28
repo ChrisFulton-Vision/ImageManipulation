@@ -5,7 +5,7 @@ import numpy as np
 import scipy.linalg as la
 from pupil_apriltags import Detector
 from math import sqrt, acos
-from superCalibrateCamera import TruthPoints
+from support.io.lidar_truth import TruthPoints
 
 tag_size=0.168
 scale = 2848.0 / 1424

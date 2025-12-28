@@ -44,9 +44,8 @@ from typing import Optional, Tuple
 from sys import maxsize
 from numpy.linalg import norm
 from numpy.typing import NDArray
-
-from support.core.quaternions import Quaternion as Quat
-from support.core.quaternions import *  # mat2quat, randomQuat, etc.
+import numpy as np
+from support.core.quaternions import Quaternion as Quat, mat2quat, randomQuat
 
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 
@@ -58,8 +57,8 @@ class ThreeD_to_ThreeD:
     """Estimate a rigid transform between two corresponding 3D point sets."""
 
     def __init__(self, points1: NDArray[np.floating], points2: NDArray[np.floating]) -> None:
-        self.points1: NDArray[np.floating] = deepcopy(points1).reshape(-1, 3)
-        self.points2: NDArray[np.floating] = deepcopy(points2).reshape(-1, 3)
+        self.points1: NDArray[np.floating] = points1.reshape(-1, 3).copy()
+        self.points2: NDArray[np.floating] = points2.reshape(-1, 3).copy()
         self.num_points: int = self.points1.shape[0]
 
         seed = self.init_pose(self.points1, self.points2)
@@ -115,9 +114,9 @@ class ThreeD_to_ThreeD:
 
     def create_y(self, new_q: Optional[Quat] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
         if new_q is None:
-            new_q = deepcopy(self.q)
+            new_q = self.q.copy
         if new_t is None:
-            new_t = deepcopy(self.t)
+            new_t = self.t.copy()
 
         residuals: NDArray[np.floating] = self.points2 - (new_q * self.points1) - new_t
         return residuals.reshape(-1)
@@ -190,7 +189,7 @@ class ThreeD_to_ThreeD:
 
 
 def print_3dPts(threeD_proj: NDArray[np.floating]) -> None:
-    pts = deepcopy(threeD_proj).reshape(-1, 3)
+    pts = threeD_proj.reshape(-1, 3).copy()
     print(f"Norm: {np.linalg.norm(pts)}")
     for n, point in enumerate(pts):
         print(f"Feature: {n:3d}, x: {point[0]: .5f}, y: {point[1]: .5f}, z: {point[2]: .5f}")

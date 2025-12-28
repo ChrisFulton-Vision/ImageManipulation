@@ -260,7 +260,7 @@ class Checkerboard:
 
         # Setup fullscreen window
         win_name = "Fast Checkerboard"
-        cv2.namedWindow(win_name, cv2.WND_PROP_FULLSCREEN)
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
         self._apply_monitor_geometry(win_name)
 
         # Timing and state for A/B toggling

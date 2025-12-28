@@ -1,5 +1,5 @@
 # AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
-from support.io.Logging import LOG
+from support.io.my_logging import LOG
 
 import pandas as pd
 import numpy as np

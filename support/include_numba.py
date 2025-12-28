@@ -1,4 +1,4 @@
-from support.io.Logging import LOG
+from support.io.my_logging import LOG
 
 try:
     from numba import njit, prange

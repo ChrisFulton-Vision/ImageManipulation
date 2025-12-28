@@ -30,8 +30,7 @@ The code is written as an end-to-end script. Run directly to see a synthetic tes
 with noisy measurements, the initializer results, and the final optimized pose.
 """
 
-from support.core.quaternions import Quaternion as q
-from support.core.quaternions import *
+from support.core.quaternions import Quaternion as q, mat2quat
 import numpy as np
 from numpy import square as sq
 from numpy.linalg import norm

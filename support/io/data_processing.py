@@ -14,20 +14,39 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.io.my_logging import LOG
+import support.gui.utils as utils
 
 
-ProgressCb = Callable[[float, str], None]   # (overall_frac, text)
-StatusCb   = Callable[[str], None]
-FinishCb   = Callable[[str], None]
+def natural_sort(l):
+    convert = lambda text: int(text) if text.isdigit() else text.lower()
+    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
+    return sorted(l, key=alphanum_key)
+
+
+ProgressCb = Callable[[float, str], None]  # (overall_frac, text)
+StatusCb = Callable[[str], None]
+FinishCb = Callable[[str], None]
+
+ProgressUiCb = Callable[[float, str], None]   # (overall_frac, text)
+StatusUiCb   = Callable[[str], None]
+
+@dataclass
+class PnpQnpSweepPaths:
+    img_dir: Path
+    processed_dir: Path
+
+    def yolo_csv_for_conf(self, conf: float) -> Path:
+        return self.processed_dir / f"1_yolo_detections_conf{conf:.2f}.csv"
 
 @dataclass
 class YoloSweepParams:
     img_dir: Path
-    out_csv_base: Path                 # .../_ProcessedData/1_yolo_detections.csv (base name)
-    conf_list_var: object              # Tk var or string; parsed by parse_conf_list()
-    ckpt_every_var: object | None      # Tk var or int/str
-    prefetch_var: object | None        # Tk var or int/str
+    out_csv_base: Path  # .../_ProcessedData/1_yolo_detections.csv (base name)
+    conf_list_var: object  # Tk var or string; parsed by parse_conf_list()
+    ckpt_every_var: object | None  # Tk var or int/str
+    prefetch_var: object | None  # Tk var or int/str
     cam_to_log_time_offset: float
+
 
 def _is_completed_row(row: dict, n_cls: int) -> bool:
     """Row is 'complete' if it has image_name, image_time and all feat_<cid>_x/y present (even if -1)."""
@@ -37,6 +56,7 @@ def _is_completed_row(row: dict, n_cls: int) -> bool:
         if f"feat_{cid}_x" not in row or f"feat_{cid}_y" not in row:
             return False
     return True
+
 
 def parse_conf_list(raw_var_or_str: str) -> list[float]:
     """
@@ -73,6 +93,7 @@ def parse_conf_list(raw_var_or_str: str) -> list[float]:
     except Exception:
         return default
 
+
 def _write_csv_atomic(out_csv: str, columns: list[str], completed_map: dict[str, dict]):
     """Write CSV atomically and sort by numeric portion of image_name."""
     import pandas as pd
@@ -97,6 +118,7 @@ def _write_csv_atomic(out_csv: str, columns: list[str], completed_map: dict[str,
     df.to_csv(tmp, index=False)
     os.replace(tmp, out_csv)  # atomic replace
 
+
 class DataProcessorRunner:
     def __init__(self) -> None:
         self.cancel_event = threading.Event()
@@ -110,18 +132,18 @@ class DataProcessorRunner:
     ############### YOLO PROCESSING ####################
 
     def run_yolo_conf_sweep(
-        self,
-        *,
-        yolo_session,
-        calibration,
-        ids_times_pairs: list[tuple[str, float | None]],
-        params: YoloSweepParams,
-        sweep_timer,                    # your utils.SweepTimer instance
-        fmt_mmss: Callable[[float], str],
-        post_progress: ProgressCb,
-        post_status: StatusCb,
-        post_finish: FinishCb,
-        distort_points_px: Callable[[object, tuple[float, float]], tuple[float, float]],
+            self,
+            *,
+            yolo_session,
+            calibration,
+            ids_times_pairs: list[tuple[str, float | None]],
+            params: YoloSweepParams,
+            sweep_timer,  # your utils.SweepTimer instance
+            fmt_mmss: Callable[[float], str],
+            post_progress: ProgressCb,
+            post_status: StatusCb,
+            post_finish: FinishCb,
+            distort_points_px: Callable[[object, tuple[float, float]], tuple[float, float]],
     ) -> None:
         """
         Runs YOLO across all images for each conf in conf_list.
@@ -366,7 +388,8 @@ class DataProcessorRunner:
                         f"(total done: {len(completed_map)}/{len(pairs)})",
                     )
 
-                    if checkpoint_every > 0 and (not self.cancel_event.is_set()) and processed_since_ckpt >= checkpoint_every:
+                    if checkpoint_every > 0 and (
+                    not self.cancel_event.is_set()) and processed_since_ckpt >= checkpoint_every:
                         try:
                             _write_csv_atomic(out_csv_conf, columns, completed_map)
                             processed_since_ckpt = 0
@@ -383,7 +406,7 @@ class DataProcessorRunner:
                 try:
                     _write_csv_atomic(out_csv_conf, columns, completed_map)
                     msg = ("Partial CSV written (resume later): " + out_csv_conf) if self.cancel_event.is_set() else (
-                        "Done. CSV written: " + out_csv_conf
+                            "Done. CSV written: " + out_csv_conf
                     )
                 except Exception as e:
                     msg = f"Failed to write CSV: {e}"
@@ -592,7 +615,7 @@ class DataProcessorRunner:
 
             nis_used = nis_out[used_bool]
             good_frame = (used_count >= min_used_abs_for_good) and (used_rate >= min_used_frac_for_good) and (
-                        nis_used.size > 0)
+                    nis_used.size > 0)
 
             if nis_used.size > 0:
                 nis_med = float(np.median(nis_used))
@@ -718,7 +741,6 @@ class DataProcessorRunner:
         LOG.info("Kalman tracks CSV written: %s", out_csv)
         return out_csv
 
-
     def run_kalman_conf_sweep(
             self,
             *,
@@ -771,3 +793,762 @@ class DataProcessorRunner:
             progress_cb(overall_done / overall_total, f"[{i}/{n_conf}] finished conf={conf:.2f}")
 
         status_cb("Kalman confidence sweep completed.")
+
+    def run_pnp_qnp_conf_sweep(
+            self,
+            *,
+            img_dir: Path,
+            conf_list_var,
+            run_pnp_qnp_from_detection_csv: Callable[..., object],
+            post_progress: ProgressUiCb,
+            post_status: StatusUiCb,
+            sweep_timer,  # utils.SweepTimer()
+            fmt_mmss: Callable[[float], str],
+    ) -> None:
+        """
+        Runs PnP/QnP for each YOLO detection CSV across the confidence list.
+        Uses the provided callable `run_pnp_qnp_from_detection_csv(csv_path, progress_cb=...)`.
+        """
+
+        img_dir = Path(img_dir)
+        if not img_dir.exists():
+            post_status("No valid image directory selected.")
+            return
+
+        processed_dir = img_dir / "_ProcessedData"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+
+        paths = PnpQnpSweepPaths(img_dir=img_dir, processed_dir=processed_dir)
+
+        conf_values = parse_conf_list(conf_list_var)
+        total = len(conf_values)
+
+        if total <= 0:
+            post_status("No conf values provided.")
+            return
+
+        sweep_timer.start()
+
+        for i, conf in enumerate(conf_values, start=1):
+            if self.cancel_event.is_set():
+                post_status("SolvePnP/QnP canceled.")
+                return
+
+            conf = float(conf)
+            target = paths.yolo_csv_for_conf(conf)
+
+            post_status(f"[{i}/{total}] Checking conf={conf:.2f}…")
+
+            if not target.exists():
+                overall = i / max(total, 1)
+                eta_txt = fmt_mmss(sweep_timer.eta_from_fraction(overall))
+                post_progress(overall, f"[{i}/{total}] Skipped (missing file) • ETA {eta_txt}")
+                continue
+
+            # -------- throttled per-row callback adapter --------
+            last_report_t = 0.0
+            last_report_row = 0
+
+            def row_progress(done_rows: int, total_rows: int, img_name: str):
+                nonlocal last_report_t, last_report_row
+
+                now = time.monotonic()
+
+                # Same throttling conditions you had
+                if done_rows == 1 or done_rows == total_rows:
+                    do_update = True
+                else:
+                    dt = now - last_report_t
+                    dr = done_rows - last_report_row
+                    step_rows = max(1, total_rows // 100)
+                    do_update = (dt >= 0.1) or (dr >= step_rows)
+
+                if not do_update:
+                    return
+
+                last_report_t = now
+                last_report_row = done_rows
+
+                base_frac = (i - 1) / max(total, 1)
+                inner_frac = done_rows / max(total_rows, 1)
+                overall = base_frac + inner_frac / max(total, 1)
+
+                eta_txt = fmt_mmss(sweep_timer.eta_from_fraction(overall))
+
+                post_progress(
+                    overall,
+                    f"[{i}/{total}] {os.path.basename(str(target))} – "
+                    f"{done_rows}/{total_rows} images (last: {img_name}) • ETA {eta_txt}",
+                )
+
+                # Optional: allow cancel to take effect faster even if inner algorithm is slow
+                if self.cancel_event.is_set():
+                    return
+
+            # -------- end adapter --------
+
+            post_status(f"[{i}/{total}] Running SolvePnP/QnP on {target.name}")
+            try:
+                # Keep your existing algorithm in the GUI for now; we just call it.
+                run_pnp_qnp_from_detection_csv(
+                    str(target),
+                    progress_cb=row_progress,
+                    cancel_cb=self.cancel_event.is_set,
+                )
+            except Exception as e:
+                print(e)
+                post_status(f"Error on {target.name}: {e}")
+                continue
+
+            # advance progress to end-of-file if algorithm doesn't report final row
+            overall = i / max(total, 1)
+            eta_txt = fmt_mmss(sweep_timer.eta_from_fraction(overall))
+            post_progress(overall, f"[{i}/{total}] Finished {target.name} • ETA {eta_txt}")
+
+        post_status(f"Done! Processed {total} SolvePnP/QnP files.")
+
+    def run_pnp_qnp_from_detection_csv(
+            self,
+            *,
+            csv_path: str,
+            calibration,
+            truth_dict: dict,
+            checkpoint_every: int = 0,
+            out_pnp: str | None = None,
+            out_qnp: str | None = None,
+            progress_cb: Callable[[int, int, str], None] | None = None,
+            cancel_event=None,
+    ) -> None:
+        """
+        Reads a 1_yolo_detections_*.csv and produces:
+          - 3_pnp_*.csv
+          - 4_qnp_*.csv
+
+        Inputs expected (per feature ID):
+          feat_<id>_x_distPX, feat_<id>_y_distPX,
+          feat_<id>_x_undistPX, feat_<id>_y_undistPX
+
+        If cancel_event is provided, it must have .is_set().
+        """
+        import pandas as pd
+        # -------------------- sanity --------------------
+        if not getattr(calibration, "validCal", False):
+            LOG.error("run_pnp_qnp_from_detection_csv: calibration is not valid.")
+            return
+
+        csv_path = str(csv_path)
+        base = Path(csv_path)
+
+        df = pd.read_csv(csv_path)
+        total_rows = int(len(df))
+        if total_rows <= 0:
+            LOG.warning("run_pnp_qnp_from_detection_csv: %s is empty", csv_path)
+            return
+
+        if out_pnp is None:
+            # base.stem is like "1_yolo_detections_XXXX"; 18 chars matches your prior convention
+            out_pnp = str(base.with_name("3_pnp_" + base.stem[18:] + ".csv"))
+        if out_qnp is None:
+            out_qnp = str(base.with_name("4_qnp_" + base.stem[18:] + ".csv"))
+
+        # ------------------------------------------------------------------
+        # Optional Kalman-trust CSV (for KF-weighted QnP)
+        # ------------------------------------------------------------------
+        df_kf = None
+        kalman_available = False
+        kalman_csv = base.with_name("2_kalman_" + base.stem[18:] + ".csv")
+        if kalman_csv.exists():
+            try:
+                df_kf = pd.read_csv(kalman_csv)
+                if len(df_kf) == len(df):
+                    kalman_available = True
+                    LOG.info("run_pnp_qnp_from_detection_csv: using Kalman trust from %s", kalman_csv)
+                else:
+                    LOG.warning(
+                        "run_pnp_qnp_from_detection_csv: %s has %d rows but %s has %d; disabling Kalman weighting",
+                        kalman_csv, len(df_kf), csv_path, len(df),
+                    )
+            except Exception as e:
+                LOG.warning(
+                    "run_pnp_qnp_from_detection_csv: could not read Kalman CSV %s: %s; disabling Kalman weighting",
+                    kalman_csv, e,
+                )
+
+        # --- Resume support ----------------------------------------------
+        processed_pnp: set[str] = set()
+        processed_qnp: set[str] = set()
+
+        if os.path.exists(out_pnp):
+            try:
+                df_pnp = pd.read_csv(out_pnp)
+                if "image_name" in df_pnp.columns:
+                    processed_pnp = set(df_pnp["image_name"].astype(str).tolist())
+                LOG.info("Existing PnP file %s with %d rows", out_pnp, len(processed_pnp))
+            except Exception as e:
+                LOG.warning("Could not read existing PnP file %s: %s; recomputing all rows", out_pnp, e)
+
+        if os.path.exists(out_qnp):
+            try:
+                df_qnp = pd.read_csv(out_qnp)
+                if "image_name" in df_qnp.columns:
+                    processed_qnp = set(df_qnp["image_name"].astype(str).tolist())
+                LOG.info("Existing QnP file %s with %d rows", out_qnp, len(processed_qnp))
+            except Exception as e:
+                LOG.warning("Could not read existing QnP file %s: %s; recomputing all rows", out_qnp, e)
+
+        already_done = processed_pnp & processed_qnp
+        if already_done:
+            LOG.info("Will skip %d rows already in BOTH outputs", len(already_done))
+
+        pnp_header_written = os.path.exists(out_pnp)
+        qnp_header_written = os.path.exists(out_qnp)
+
+        checkpoint_every = int(checkpoint_every or 0)
+        LOG.info("Checkpoint cadence: every %d processed rows.", checkpoint_every)
+
+        pnp_batch: list[dict] = []
+        qnp_batch: list[dict] = []
+        rows_since_ckpt = 0
+        ckpt_idx = 0
+
+        def _flush_and_log_checkpoint(image_name_str, pnp_resid=np.nan, qnp_resid=np.nan, qnp_kf_resid=np.nan):
+            nonlocal ckpt_idx, rows_since_ckpt, pnp_header_written, qnp_header_written
+            ckpt_idx += 1
+
+            if pnp_batch:
+                pd.DataFrame(pnp_batch).to_csv(
+                    out_pnp,
+                    mode="a" if pnp_header_written else "w",
+                    index=False,
+                    header=not pnp_header_written,
+                )
+                pnp_header_written = True
+                pnp_batch.clear()
+
+            if qnp_batch:
+                pd.DataFrame(qnp_batch).to_csv(
+                    out_qnp,
+                    mode="a" if qnp_header_written else "w",
+                    index=False,
+                    header=not qnp_header_written,
+                )
+                qnp_header_written = True
+                qnp_batch.clear()
+
+            rows_since_ckpt = 0
+
+            LOG.info(
+                "Checkpoint %d: Reproj norms [%s]: PnP=%.3f, QnP=%.3f, QnP-KF=%s",
+                ckpt_idx,
+                image_name_str,
+                float(pnp_resid) if np.isfinite(pnp_resid) else float("nan"),
+                float(qnp_resid) if np.isfinite(qnp_resid) else float("nan"),
+                f"{float(qnp_kf_resid):.3f}" if np.isfinite(qnp_kf_resid) else "nan",
+            )
+
+        # -------------------- feature id discovery (your header format) --------------------
+        cols = set(df.columns)
+        feat_ids: set[int] = set()
+        for col in cols:
+            if not col.startswith("feat_"):
+                continue
+            parts = col.split("_")
+            # feat_<id>_x_distPX  OR feat_<id>_x_undistPX
+            if len(parts) >= 4:
+                try:
+                    feat_ids.add(int(parts[1]))
+                except Exception:
+                    pass
+        feat_ids = sorted(feat_ids)
+
+        if not feat_ids:
+            LOG.error("run_pnp_qnp_from_detection_csv: no feat_* columns found in %s", csv_path)
+            return
+
+        def _valid(v) -> bool:
+            # -1.0 is your "no detection" sentinel
+            try:
+                if v is None:
+                    return False
+                fv = float(v)
+                return np.isfinite(fv) and (fv > -0.5)
+            except Exception:
+                return False
+
+        # ------------------------------------------------------------------
+        # Reprojection residual metric (same as your current version)
+        # ------------------------------------------------------------------
+        _BIG_SIGMA = 1e6
+        _MIN_SIGMA = 1e-6
+
+        def _prep_sigma_2N(sigma_2N, N: int) -> np.ndarray | None:
+            if sigma_2N is None:
+                return None
+            s = np.asarray(sigma_2N, dtype=np.float64).ravel()
+            if s.size == N:
+                s = np.repeat(s, 2)
+            if s.size != 2 * N:
+                return None
+            bad = ~np.isfinite(s) | (s <= 0.0)
+            if np.any(bad):
+                s = s.copy()
+                s[bad] = _BIG_SIGMA
+            return np.maximum(s, _MIN_SIGMA)
+
+        def _reproj_metrics_from_proj_meas(proj_xy: np.ndarray, meas_xy: np.ndarray, sigma_2N=None,
+                                           mode: str = "chi") -> float:
+            if proj_xy is None or meas_xy is None:
+                return float("nan")
+            if proj_xy.shape != meas_xy.shape or proj_xy.ndim != 2 or proj_xy.shape[1] != 2:
+                return float("nan")
+
+            r = (meas_xy.astype(np.float64) - proj_xy.astype(np.float64)).ravel()
+            N = proj_xy.shape[0]
+            if r.size != 2 * N:
+                return float("nan")
+
+            if mode == "rms_px":
+                return float(np.sqrt(np.mean(r * r)))
+
+            s = _prep_sigma_2N(sigma_2N, N)
+            if s is None:
+                return float(np.linalg.norm(r))
+
+            rw = r / s
+            if mode == "nrms":
+                return float(np.sqrt(np.mean(rw * rw)))
+            return float(np.sqrt(np.sum(rw * rw)))
+
+        # imports local so data_processing stays “lighter” at import time
+        import cv2
+        from support.core.quaternions import mat2quat  # adjust if your path differs
+        from support.core.quaternions import Quaternion as q  # must contain fromOpenCV_toAftr_rvec
+        from support.core.twoD_to_threeD import solveQnP  # adjust if your solveQnP lives elsewhere
+
+        K = calibration.getCameraMatrix()
+        D_full = calibration.getDistortion()
+
+        q_aftr_from_cv = mat2quat(np.array([
+            [0., 0., 1.],
+            [-1., 0., 0.],
+            [0., -1., 0.],
+        ], dtype=float))
+
+        resid_stats = {"pnp_unw": [], "pnp_wt": [], "qnp_unw": [], "qnp_kf": []}
+
+        prev_qnp_q = prev_qnp_t = None
+        prev_qnp_kf_q = prev_qnp_kf_t = None
+
+        for idx, (_, row) in enumerate(df.iterrows(), start=1):
+            if cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set():
+                LOG.info("PnP/QnP canceled at row %d/%d", idx, total_rows)
+                break
+
+            image_name = row.get("image_name", "")
+            image_time = row.get("image_time", np.nan)
+            image_name_str = str(image_name)
+
+            if progress_cb is not None:
+                try:
+                    progress_cb(idx, total_rows, image_name_str)
+                except Exception:
+                    pass
+
+            if image_name_str in already_done:
+                continue
+
+            # --------------------------
+            # Build point sets from your actual header format
+            # Prefer undist if present; else use dist
+            # --------------------------
+            centers: list[list[float]] = []
+            ids_use: list[int] = []
+            use_ud = True
+
+            ud_centers: list[list[float]] = []
+            ud_ids: list[int] = []
+            dist_centers: list[list[float]] = []
+            dist_ids: list[int] = []
+
+            for fid in feat_ids:
+                ux = row.get(f"feat_{fid}_x_undistPX", None)
+                uy = row.get(f"feat_{fid}_y_undistPX", None)
+                if _valid(ux) and _valid(uy):
+                    ud_centers.append([float(ux), float(uy)])
+                    ud_ids.append(fid)
+                    continue
+
+                dx = row.get(f"feat_{fid}_x_distPX", None)
+                dy = row.get(f"feat_{fid}_y_distPX", None)
+                if _valid(dx) and _valid(dy):
+                    dist_centers.append([float(dx), float(dy)])
+                    dist_ids.append(fid)
+
+            if len(ud_centers) >= 6:
+                centers = ud_centers
+                ids_use = ud_ids
+                use_ud = True
+            elif len(dist_centers) >= 6:
+                centers = dist_centers
+                ids_use = dist_ids
+                use_ud = False
+            else:
+                # Not enough features -> emit NaNs
+                row_pnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                }
+                row_qnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "qnp_used_n": np.nan,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                    "qnp_s2": np.nan, "qnp_dof": np.nan, "qnp_sse_w": np.nan,
+                    "qnp_sig_rx": np.nan, "qnp_sig_ry": np.nan, "qnp_sig_rz": np.nan,
+                    "qnp_sig_tx": np.nan, "qnp_sig_ty": np.nan, "qnp_sig_tz": np.nan,
+                    "qnp_kf_used_n": np.nan,
+                    "qnp_kf_qw": np.nan, "qnp_kf_qx": np.nan, "qnp_kf_qy": np.nan, "qnp_kf_qz": np.nan,
+                    "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
+                    "qnp_kf_s2": np.nan, "qnp_kf_dof": np.nan, "qnp_kf_sse_w": np.nan,
+                    "qnp_kf_sig_rx": np.nan, "qnp_kf_sig_ry": np.nan, "qnp_kf_sig_rz": np.nan,
+                    "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
+                }
+                pnp_batch.append(row_pnp)
+                qnp_batch.append(row_qnp)
+
+                if checkpoint_every > 0:
+                    rows_since_ckpt += 1
+                    if rows_since_ckpt >= checkpoint_every:
+                        _flush_and_log_checkpoint(image_name_str)
+                continue
+
+            # Map ids -> 3D truth points; drop unknown ids safely
+            obj_pts = []
+            img_pts = []
+            kept_ids = []
+            for fid, (u, v) in zip(ids_use, centers):
+                rec = truth_dict[fid]
+
+                # idsNamesLocs is commonly [id, name, x, y, z] -> take xyz
+                # but tolerate it already being xyz
+                if hasattr(rec, "__len__") and len(rec) >= 5:
+                    xyz = rec[2:5]
+                else:
+                    xyz = rec
+
+                obj_pts.append(xyz)
+                img_pts.append([u, v])
+                kept_ids.append(fid)
+
+            if len(obj_pts) < 6:
+                # emit NaNs (same as above)
+                row_pnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                }
+                row_qnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "qnp_used_n": np.nan,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                    "qnp_s2": np.nan, "qnp_dof": np.nan, "qnp_sse_w": np.nan,
+                    "qnp_sig_rx": np.nan, "qnp_sig_ry": np.nan, "qnp_sig_rz": np.nan,
+                    "qnp_sig_tx": np.nan, "qnp_sig_ty": np.nan, "qnp_sig_tz": np.nan,
+                    "qnp_kf_used_n": np.nan,
+                    "qnp_kf_qw": np.nan, "qnp_kf_qx": np.nan, "qnp_kf_qy": np.nan, "qnp_kf_qz": np.nan,
+                    "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
+                    "qnp_kf_s2": np.nan, "qnp_kf_dof": np.nan, "qnp_kf_sse_w": np.nan,
+                    "qnp_kf_sig_rx": np.nan, "qnp_kf_sig_ry": np.nan, "qnp_kf_sig_rz": np.nan,
+                    "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
+                }
+                pnp_batch.append(row_pnp)
+                qnp_batch.append(row_qnp)
+
+                if checkpoint_every > 0:
+                    rows_since_ckpt += 1
+                    if rows_since_ckpt >= checkpoint_every:
+                        _flush_and_log_checkpoint(image_name_str)
+                continue
+
+            obj_pts = np.asarray(obj_pts, dtype=np.float32)
+            img_pts = np.asarray(img_pts, dtype=np.float32)
+
+            # ------------------------------------------------------------------
+            # Kalman trust weights for this row (if available) - keyed by kept_ids
+            # ------------------------------------------------------------------
+            sigma_2N = None
+            if kalman_available:
+                row_kf = df_kf.iloc[idx - 1]
+                sig_2N_list: list[float] = []
+                any_valid = False
+
+                for fid in kept_ids:
+                    px_name = f"feat_{fid}_kf_sigma_px"
+                    py_name = f"feat_{fid}_kf_sigma_py"
+
+                    try:
+                        sx = float(row_kf.get(px_name, np.nan))
+                    except Exception:
+                        sx = float("nan")
+                    try:
+                        sy = float(row_kf.get(py_name, np.nan))
+                    except Exception:
+                        sy = float("nan")
+
+                    if np.isfinite(sx) and sx > 0.0 and np.isfinite(sy) and sy > 0.0:
+                        any_valid = True
+                        sig_2N_list.extend([sx, sy])
+                    else:
+                        sig_2N_list.extend([np.nan, np.nan])
+
+                if any_valid:
+                    sigma_2N = np.asarray(
+                        [_BIG_SIGMA if (not np.isfinite(s)) else max(float(s), _MIN_SIGMA) for s in sig_2N_list],
+                        dtype=np.float64,
+                    )
+
+            # ----------------- PnP (OpenCV, RANSAC) -----------------
+            distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
+
+            rvec = tvec = None
+            quatPnP = vectPnP = None
+            ret = False
+            try:
+                ret, rvec, tvec, _inliers = cv2.solvePnPRansac(
+                    objectPoints=obj_pts,
+                    imagePoints=img_pts,
+                    cameraMatrix=K,
+                    distCoeffs=distCoeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+            except cv2.error as e:
+                LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
+                ret = False
+
+            if ret:
+                quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
+                row_pnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "pnp_qw": float(quatPnP.s),
+                    "pnp_qx": float(quatPnP.vec[0]),
+                    "pnp_qy": float(quatPnP.vec[1]),
+                    "pnp_qz": float(quatPnP.vec[2]),
+                    "pnp_x": float(vectPnP[0]),
+                    "pnp_y": float(vectPnP[1]),
+                    "pnp_z": float(vectPnP[2]),
+                }
+            else:
+                row_pnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
+                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                }
+
+            pnp_batch.append(row_pnp)
+
+            # ----------------- QnP (unweighted + KF-weighted) -----------------
+            pnp_resid = float("nan")
+            qnp_resid = float("nan")
+            qnp_kf_resid = float("nan")
+
+            try:
+                quatQ, vectQ, stats = solveQnP(
+                    obj_pts,
+                    img_pts,
+                    calibration,
+                    True,
+                    None,
+                    user_seed_q=prev_qnp_q,
+                    user_seed_t=prev_qnp_t,
+                )
+                prev_qnp_q, prev_qnp_t = quatQ, vectQ
+
+                quatQ_kf = vectQ_kf = None
+                kf_stats = None
+                if sigma_2N is not None:
+                    try:
+                        quatQ_kf, vectQ_kf, kf_stats = solveQnP(
+                            obj_pts,
+                            img_pts,
+                            calibration,
+                            True,
+                            sigma_2N,
+                            user_seed_q=prev_qnp_kf_q,
+                            user_seed_t=prev_qnp_kf_t,
+                        )
+                        prev_qnp_kf_q, prev_qnp_kf_t = quatQ_kf, vectQ_kf
+                    except Exception as e_kf:
+                        LOG.error("solveQnP (Kalman-weighted) failed for %s: %s", image_name, e_kf)
+                        quatQ_kf = vectQ_kf = None
+                        kf_stats = None
+
+                # Convert to AFTR convention
+                quatQ_aftr = q_aftr_from_cv * quatQ
+                vectQ_aftr = q_aftr_from_cv * vectQ
+
+                if quatQ_kf is not None and vectQ_kf is not None and kf_stats is not None:
+                    quatQ_kf_aftr = q_aftr_from_cv * quatQ_kf
+                    vectQ_kf_aftr = q_aftr_from_cv * vectQ_kf
+                    kf_fields = {
+                        "qnp_kf_qw": float(quatQ_kf_aftr.s),
+                        "qnp_kf_qx": float(quatQ_kf_aftr.vec[0]),
+                        "qnp_kf_qy": float(quatQ_kf_aftr.vec[1]),
+                        "qnp_kf_qz": float(quatQ_kf_aftr.vec[2]),
+                        "qnp_kf_x": float(vectQ_kf_aftr[0]),
+                        "qnp_kf_y": float(vectQ_kf_aftr[1]),
+                        "qnp_kf_z": float(vectQ_kf_aftr[2]),
+                        "qnp_kf_used_n": int(kf_stats.N),
+                        "qnp_kf_s2": float(kf_stats.s2),
+                        "qnp_kf_dof": int(kf_stats.dof),
+                        "qnp_kf_sse_w": float(kf_stats.sse_w),
+                        "qnp_kf_sig_rx": float(np.sqrt(kf_stats.cov6[0, 0])),
+                        "qnp_kf_sig_ry": float(np.sqrt(kf_stats.cov6[1, 1])),
+                        "qnp_kf_sig_rz": float(np.sqrt(kf_stats.cov6[2, 2])),
+                        "qnp_kf_sig_tx": float(np.sqrt(kf_stats.cov6[3, 3])),
+                        "qnp_kf_sig_ty": float(np.sqrt(kf_stats.cov6[4, 4])),
+                        "qnp_kf_sig_tz": float(np.sqrt(kf_stats.cov6[5, 5])),
+                    }
+                else:
+                    kf_fields = {
+                        "qnp_kf_qw": np.nan, "qnp_kf_qx": np.nan, "qnp_kf_qy": np.nan, "qnp_kf_qz": np.nan,
+                        "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
+                        "qnp_kf_used_n": np.nan,
+                        "qnp_kf_s2": np.nan, "qnp_kf_dof": np.nan, "qnp_kf_sse_w": np.nan,
+                        "qnp_kf_sig_rx": np.nan, "qnp_kf_sig_ry": np.nan, "qnp_kf_sig_rz": np.nan,
+                        "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
+                    }
+
+                row_qnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "qnp_qw": float(quatQ_aftr.s),
+                    "qnp_qx": float(quatQ_aftr.vec[0]),
+                    "qnp_qy": float(quatQ_aftr.vec[1]),
+                    "qnp_qz": float(quatQ_aftr.vec[2]),
+                    "qnp_x": float(vectQ_aftr[0]),
+                    "qnp_y": float(vectQ_aftr[1]),
+                    "qnp_z": float(vectQ_aftr[2]),
+                    "qnp_used_n": int(stats.N),
+                    "qnp_s2": float(stats.s2),
+                    "qnp_dof": int(stats.dof),
+                    "qnp_sse_w": float(stats.sse_w),
+                    "qnp_sig_rx": float(np.sqrt(stats.cov6[0, 0])),
+                    "qnp_sig_ry": float(np.sqrt(stats.cov6[1, 1])),
+                    "qnp_sig_rz": float(np.sqrt(stats.cov6[2, 2])),
+                    "qnp_sig_tx": float(np.sqrt(stats.cov6[3, 3])),
+                    "qnp_sig_ty": float(np.sqrt(stats.cov6[4, 4])),
+                    "qnp_sig_tz": float(np.sqrt(stats.cov6[5, 5])),
+                    **kf_fields,
+                }
+
+                # --- residuals (kept identical in spirit; uses your whitening helper) ---
+                # pnp_resid uses unweighted
+                if ret and rvec is not None and tvec is not None:
+                    proj, _ = cv2.projectPoints(
+                        obj_pts.astype(np.float32),
+                        rvec.astype(np.float64),
+                        tvec.astype(np.float64),
+                        K.astype(np.float64),
+                        distCoeffs.astype(np.float64) if distCoeffs is not None else None,
+                    )
+                    pnp_resid = _reproj_metrics_from_proj_meas(proj.reshape(-1, 2), img_pts.reshape(-1, 2), None, "chi")
+
+                # qnp_resid (unweighted)
+                X_cam = quatQ * obj_pts + vectQ
+                Z = np.where(X_cam[:, 2] > 1e-6, X_cam[:, 2], 1e-6)
+                u = calibration.fx * (X_cam[:, 0] / Z) + calibration.cx
+                v = calibration.fy * (X_cam[:, 1] / Z) + calibration.cy
+                qnp_resid = _reproj_metrics_from_proj_meas(np.column_stack([u, v]), img_pts.reshape(-1, 2), None, "chi")
+
+                resid_stats["pnp_unw"].append(pnp_resid)
+                resid_stats["qnp_unw"].append(qnp_resid)
+
+                # qnp_kf_resid (weighted)
+                if sigma_2N is not None and quatQ_kf is not None and vectQ_kf is not None:
+                    X_cam_kf = quatQ_kf * obj_pts + vectQ_kf
+                    Zk = np.where(X_cam_kf[:, 2] > 1e-6, X_cam_kf[:, 2], 1e-6)
+                    uk = calibration.fx * (X_cam_kf[:, 0] / Zk) + calibration.cx
+                    vk = calibration.fy * (X_cam_kf[:, 1] / Zk) + calibration.cy
+                    qnp_kf_resid = _reproj_metrics_from_proj_meas(
+                        np.column_stack([uk, vk]), img_pts.reshape(-1, 2), sigma_2N, "chi"
+                    )
+                    resid_stats["qnp_kf"].append(qnp_kf_resid)
+
+                    # PnP weighted metric (for reporting only)
+                    if ret and rvec is not None and tvec is not None:
+                        proj, _ = cv2.projectPoints(
+                            obj_pts.astype(np.float32),
+                            rvec.astype(np.float64),
+                            tvec.astype(np.float64),
+                            K.astype(np.float64),
+                            distCoeffs.astype(np.float64) if distCoeffs is not None else None,
+                        )
+                        pnp_resid_w = _reproj_metrics_from_proj_meas(proj.reshape(-1, 2), img_pts.reshape(-1, 2),
+                                                                     sigma_2N, "chi")
+                    else:
+                        pnp_resid_w = float("nan")
+                else:
+                    pnp_resid_w = float("nan")
+                resid_stats["pnp_wt"].append(pnp_resid_w)
+
+            except Exception as e:
+                LOG.error("solveQnP failed for %s: %s", image_name, e)
+                row_qnp = {
+                    "image_name": image_name, "image_time": image_time,
+                    "qnp_used_n": np.nan,
+                    "qnp_qw": np.nan, "qnp_qx": np.nan, "qnp_qy": np.nan, "qnp_qz": np.nan,
+                    "qnp_x": np.nan, "qnp_y": np.nan, "qnp_z": np.nan,
+                    "qnp_s2": np.nan, "qnp_dof": np.nan, "qnp_sse_w": np.nan,
+                    "qnp_sig_rx": np.nan, "qnp_sig_ry": np.nan, "qnp_sig_rz": np.nan,
+                    "qnp_sig_tx": np.nan, "qnp_sig_ty": np.nan, "qnp_sig_tz": np.nan,
+                    "qnp_kf_used_n": np.nan,
+                    "qnp_kf_qw": np.nan, "qnp_kf_qx": np.nan, "qnp_kf_qy": np.nan, "qnp_kf_qz": np.nan,
+                    "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
+                    "qnp_kf_s2": np.nan, "qnp_kf_dof": np.nan, "qnp_kf_sse_w": np.nan,
+                    "qnp_kf_sig_rx": np.nan, "qnp_kf_sig_ry": np.nan, "qnp_kf_sig_rz": np.nan,
+                    "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
+                }
+
+            qnp_batch.append(row_qnp)
+
+            # Count exactly once per processed row
+            if checkpoint_every > 0:
+                rows_since_ckpt += 1
+                if rows_since_ckpt >= checkpoint_every:
+                    _flush_and_log_checkpoint(image_name_str, pnp_resid, qnp_resid, qnp_kf_resid)
+
+        # Final flush
+        LOG.info("Final CSV update...")
+        if pnp_batch:
+            pd.DataFrame(pnp_batch).to_csv(
+                out_pnp,
+                mode="a" if pnp_header_written else "w",
+                index=False,
+                header=not pnp_header_written,
+            )
+        if qnp_batch:
+            pd.DataFrame(qnp_batch).to_csv(
+                out_qnp,
+                mode="a" if qnp_header_written else "w",
+                index=False,
+                header=not qnp_header_written,
+            )
+
+        # Summaries
+        def _summ(vals: list[float]) -> str:
+            arr = np.asarray([v for v in vals if np.isfinite(v)], dtype=float)
+            if arr.size == 0:
+                return "n/a"
+            return f"n={arr.size}, mean={arr.mean():.3f}, median={np.median(arr):.3f}, min={arr.min():.3f}, max={arr.max():.3f}"
+
+        if resid_stats["pnp_unw"]:
+            LOG.info("Reproj norm summary (unweighted PnP):  %s", _summ(resid_stats["pnp_unw"]))
+        if resid_stats["pnp_wt"]:
+            LOG.info("Reproj norm summary (weighted PnP):    %s", _summ(resid_stats["pnp_wt"]))
+        if resid_stats["qnp_unw"]:
+            LOG.info("Reproj norm summary (unweighted QnP):  %s", _summ(resid_stats["qnp_unw"]))
+        if resid_stats["qnp_kf"]:
+            LOG.info("Reproj norm summary (KF-weighted QnP): %s", _summ(resid_stats["qnp_kf"]))
+
+        LOG.info("run_pnp_qnp_from_detection_csv: finished (%s -> %s, %s)", csv_path, out_pnp, out_qnp)

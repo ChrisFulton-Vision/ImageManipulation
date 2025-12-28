@@ -13,6 +13,8 @@ class Checkerboard:
 
         self.xy_num_squares = [12, 9]
 
+        self._is_fullScreen = True
+
         self._refresh_monitors()
 
     def _refresh_monitors(self):
@@ -45,7 +47,8 @@ class Checkerboard:
         cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
         cv2.moveWindow(win_name, x, y)
         cv2.resizeWindow(win_name, int(m.width), int(m.height))
-        cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        if self._is_fullScreen:
+            cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
         # Sync dims for buffer rebuilds
         self.screen_width = int(m.width)
@@ -179,7 +182,7 @@ class Checkerboard:
         org3 = (int(screen_width * 0.1), int(screen_height * 0.15))
 
         instr_text_a = 'a/d: freq | n: next monitor | Esc/q: quit'
-        instr_text_b = 'Numpad-Rows/Cols'
+        instr_text_b = 'Numpad-Rows/Cols | f: fullscreen'
         instr_text_c = 'Space to flash (for EBS)'
 
         # Draw on A
@@ -399,6 +402,10 @@ class Checkerboard:
 
             elif key == 32:
                 pause = not pause
+
+            elif key == ord('f'):
+                self._is_fullScreen = not self._is_fullScreen
+                self._apply_monitor_geometry(win_name)
 
             # Any other key (non-255): show instructions overlay for a bit
             elif key != 255:

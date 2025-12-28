@@ -1,0 +1,13 @@
+# General
+LIGHTBLUE = (255, 255, 0)
+YELLOW = (50, 255, 255)
+RED = (120, 120, 255)
+BLACK = (0, 0, 0)
+
+# HUD
+HUD_GREEN = (0, 255, 0)
+HUD_YELLOW = (0, 255, 255)
+
+# CTK
+CTK_BUTTON_RED = 'red3'
+CTK_GREEN = '#2FA572'

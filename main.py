@@ -260,6 +260,7 @@ class App(ctk.CTk):
             if hasattr(p, 'camGui'):
                 p.camGui.func_to_refit(self.passToChild_fit_to_content(p))
 
+        self.protocol("WM_DELETE_WINDOW", self.pages["Camera"].camGui.on_app_close)
 
         self._build_mainnav()
         self.current_page = None

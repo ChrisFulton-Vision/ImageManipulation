@@ -34,6 +34,7 @@ from support.viz.CVFontScaling import small_text, med_text, lrg_text
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
 from support.vision.draw_circle_and_mask import dim_except_circle
+import support.viz.colors as clr
 
 from copy import deepcopy
 from math import pow
@@ -49,10 +50,7 @@ cv2.setUseOptimized(True)
 #  pip install git+https://github.com/chinaheyu/cv2_enumerate_cameras.git
 
 
-CTK_GREEN = '#2FA572'
-HUD_GREEN = (0, 255, 0)
-HUD_YELLOW = (0, 255, 255)
-BUTTON_RED = 'red3'
+
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 class CameraGui(CTkFrame):
@@ -178,7 +176,7 @@ class CameraGui(CTkFrame):
 
         self.streamOrImgCombo = CTkComboBox(self.cam_frame, values=self.available_sources,
                                             command=self.sourceUpdate)
-        self.startStreamButton = CTkButton(master=self.cam_frame, text='Start Stream', fg_color=BUTTON_RED,
+        self.startStreamButton = CTkButton(master=self.cam_frame, text='Start Stream', fg_color=clr.CTK_BUTTON_RED,
                                            hover_color='blue')
 
         self.configSelectButton = CTkButton(self.cam_frame, text='Select Config File',
@@ -223,7 +221,7 @@ class CameraGui(CTkFrame):
             self.selectFlightLogLabel = CTkLabel(self.cam_frame, text='No Flight Log Loaded')
 
         self.lidarTruthPoints = None
-        self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=CTK_GREEN,
+        self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=clr.CTK_GREEN,
                                                  command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = CTkLabel(self.cam_frame,
                                                text="../" + Path(
@@ -306,13 +304,38 @@ class CameraGui(CTkFrame):
 
         self.setupFrame()
 
-    def destroy(self):
+    def on_app_close(self):
+
+        root = self.winfo_toplevel()
+
         try:
             if self.gpu_monitor is not None:
                 self.gpu_monitor.stop()
         except Exception as e:
             pass
-        super().destroy()
+
+        try:
+            # returns a list of after handler IDs
+            after_ids = root.tk.call("after", "info")
+            for aid in after_ids:
+                try:
+                    root.after_cancel(aid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._plotter_close_plot_alias()
+
+        try:
+            root.quit()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
 
     def func_to_refit(self, func):
         self.func_that_refits = func
@@ -1168,11 +1191,7 @@ class CameraGui(CTkFrame):
         )
         self._dp_cancel_btn.grid(row=11, column=0, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
-        def _plotter_close_plot_alias():
-            from support.viz.Plotting import Plotter
-            if self.plotter is None:
-                self.plotter = Plotter()
-            self.plotter.close_plot()
+
 
         # Cancel button in its own full-width row below
         def plot_sequential():
@@ -1186,7 +1205,7 @@ class CameraGui(CTkFrame):
                 try:
                     self.winfo_exists()
                 except:
-                    _plotter_close_plot_alias()
+                    self._plotter_close_plot_alias()
                     return
 
         dp_plotter_btn = CTkButton(
@@ -1198,8 +1217,18 @@ class CameraGui(CTkFrame):
         dp_close_plot_btn = CTkButton(
             f,
             text="Close Plots",
-            command=_plotter_close_plot_alias,
+            command=self._plotter_close_plot_alias,
         ).grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+
+
+    def _plotter_close_plot_alias(self):
+        if self.plotter is None:
+            return False
+
+        from support.viz.Plotting import Plotter
+        self.plotter = Plotter()
+        self.plotter.close_plot()
+        return True
 
     def runPnP_QnP_on_folders_threaded(self):
         img_dir_str = (
@@ -2017,8 +2046,8 @@ class CameraGui(CTkFrame):
             self.after(0, self._exportToGifOrVid_done)
 
     def _exportToGifOrVid_done(self):
-        self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=CTK_GREEN)
-        self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=CTK_GREEN)
+        self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_GREEN)
+        self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_GREEN)
         self.making_gifOrVid = False
 
     def startStreamToggle(self):
@@ -2032,11 +2061,11 @@ class CameraGui(CTkFrame):
     def startStreamOn(self):
         self.showWindow = True
         self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying',
-                                             fg_color=CTK_GREEN,
+                                             fg_color=clr.CTK_GREEN,
                                              hover_color='navy')
-        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=CTK_GREEN,
+        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=clr.CTK_GREEN,
                                          hover_color='navy')
-        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=CTK_GREEN, hover_color='navy')
+        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=clr.CTK_GREEN, hover_color='navy')
 
         self.selectCameraCombo.configure(state='disabled')
 
@@ -2070,11 +2099,11 @@ class CameraGui(CTkFrame):
         if not self.shutting_down:
             if self.camConfig.imageFilepath is not None:
                 self.singleImageTextButton.configure(
-                    command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue',
+                    command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
                     text=os.path.basename(self.camConfig.imageFilepath)
                 )
-            self.startStreamButton.configure(command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue')
-            self.multiImageTextButton.configure(command=self.startStreamOn, fg_color=BUTTON_RED, hover_color='blue')
+            self.startStreamButton.configure(command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED, hover_color='blue')
+            self.multiImageTextButton.configure(command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED, hover_color='blue')
 
             self.selectCameraCombo.configure(state='normal')
             self.startStreamButton.configure(text='Start Stream')
@@ -2092,7 +2121,7 @@ class CameraGui(CTkFrame):
         self.recording = True
 
     def recordOff(self):
-        self.recordButton.configure(fg_color=BUTTON_RED, text=f'Saved Imagery: #{self.img_idx}', hover_color='blue',
+        self.recordButton.configure(fg_color=clr.CTK_BUTTON_RED, text=f'Saved Imagery: #{self.img_idx}', hover_color='blue',
                                     command=self.recordOn)
         self.recording = False
 
@@ -2205,7 +2234,7 @@ class CameraGui(CTkFrame):
 
         try:
             cv2.destroyWindow(self.windowName)
-        except cv2.cv_error:
+        except cv2.error:
             pass
 
         self.after(0, self._on_worker_exit)
@@ -2767,24 +2796,24 @@ class CameraGui(CTkFrame):
         if self.camConfig.imageFilepath is not None:
             self.singleImageTextButton.configure(
                 command=self.startStreamOn,
-                fg_color=BUTTON_RED, hover_color='blue',
+                fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
                 text=os.path.basename(self.camConfig.imageFilepath)
             )
         else:
             self.singleImageTextButton.configure(
                 command=self.startStreamOn,
-                fg_color=BUTTON_RED, hover_color='blue',
+                fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
                 text='No Image Selected'
             )
 
         self.startStreamButton.configure(
             command=self.startStreamOn,
-            fg_color=BUTTON_RED, hover_color='blue',
+            fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
             text='Start Stream'
         )
         self.multiImageTextButton.configure(
             command=self.startStreamOn,
-            fg_color=BUTTON_RED, hover_color='blue'
+            fg_color=clr.CTK_BUTTON_RED, hover_color='blue'
         )
 
         # Re-enable selectors
@@ -3013,36 +3042,43 @@ class CameraGui(CTkFrame):
 
         if box_around:
             x, y, _ = self.markup_frame.shape
-            cv2.rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), HUD_YELLOW, 10)
+            cv2.rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
 
         height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX,
                                                     med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
-            cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width, img_h - height),
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+            cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width - 10, img_h - height),
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
         if img_time is not None:
             time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
             (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
                                                               med_text(self.curr_frame.shape[0]), 4)
             img_w, img_h, *_ = self.curr_frame.shape
-            cv2.putText(self.markup_frame, time_str, (img_w - time_width, img_h - time_height - height - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), HUD_GREEN, 2)
+            cv2.putText(self.markup_frame, time_str, (img_w - time_width - 10, img_h - time_height - height - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
 
         if display_in_realtime:
             if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
                 (h, w) = self.markup_frame.shape[:2]
                 self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
+                (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+                txt_pix_start_perRow = txt_height + 10
                 cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                            (int(0.015 * w), int(0.100 * h)), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(self.curr_frame.shape[0]),
-                            HUD_YELLOW, 2)
+                            (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.BLACK, 4)
+                cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                            (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.HUD_YELLOW, 2)
                 cv2.putText(self.markup_frame,
                             f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                            (int(0.015 * w), int(0.130 * h)), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(self.curr_frame.shape[0]),
-                            HUD_YELLOW, 2)
+                            (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.BLACK, 4)
+                cv2.putText(self.markup_frame,
+                            f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                            (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.HUD_YELLOW, 2)
             self.cleanup()
 
         if self.printLidar:
@@ -3603,9 +3639,9 @@ class CameraGui(CTkFrame):
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
 
             if not self.camConfig.hideAprilTags:
-                cv2.polylines(self.markup_frame, polyline, True, HUD_GREEN, 4, lineType=cv2.FILLED)
+                cv2.polylines(self.markup_frame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
                 cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), HUD_GREEN, 4)
+                            cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 4)
                 cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
                             cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
 
@@ -3978,8 +4014,8 @@ class CameraGui(CTkFrame):
             crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
             crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
 
-            cv2.polylines(self.markup_frame, [crosshairsH], True, HUD_GREEN, thickness)
-            cv2.polylines(self.markup_frame, [crosshairsV], True, HUD_GREEN, thickness)
+            cv2.polylines(self.markup_frame, [crosshairsH], True, clr.HUD_GREEN, thickness)
+            cv2.polylines(self.markup_frame, [crosshairsV], True, clr.HUD_GREEN, thickness)
 
         self.potentialResize()
 

@@ -7,12 +7,13 @@ import numpy as np
 
 from support.io.my_logging import LOG
 
-from cv2 import (resize, FONT_HERSHEY_PLAIN, rectangle, putText, FONT_HERSHEY_SIMPLEX,
-                 solvePnPRansac, SOLVEPNP_ITERATIVE, Rodrigues, projectPoints)
+import cv2
 from cv2.dnn import NMSBoxes
 
 from support.io.calibration import Calibration, undistort_points_px_numba
 from support.io.meta_yolo_reader import MetaYoloReader
+import support.viz.colors as clr
+from support.viz.CVFontScaling import small_text, med_text, lrg_text
 
 CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
 CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6"
@@ -38,11 +39,6 @@ LOG.info(f'Onnx Providers: {ort.get_available_providers()}')
 # ort.preload_dlls()
 # ort.preload_dlls(cuda=False, cudnn=False, msvc=True, directory=None)
 ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
-
-LIGHTBLUE = (255, 255, 0)
-YELLOW = (50, 255, 255)
-RED = (120, 120, 255)
-BLACK = (0, 0, 0)
 
 
 class YOLO:
@@ -171,7 +167,7 @@ class YOLO:
         '''
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
-            image = resize(image, self.yoloSize)
+            image = cv2.resize(image, self.yoloSize)
         image = image.transpose((2, 0, 1))
         image = np.expand_dims(image, axis=0)
         image = image.astype(np.float32) / 255.0
@@ -277,9 +273,9 @@ class YOLO:
         centers_dist, boxes, scores, class_ids, time = output
 
         text = f'Inference time: {time:.3f}s'
-        putText(image, text, (10, 50), FONT_HERSHEY_PLAIN, 2, LIGHTBLUE, 4)
-
-
+        (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+        cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
+        cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
 
         centers_und = None
         if self.calibration is not None and (markup_is_undistorted or len(set(class_ids)) > 5):
@@ -352,13 +348,16 @@ class YOLO:
             y2 = int(h / y_h * y2)
 
             label = f"{class_id}: {score:.2f}"
-            rectangle(image, (x1, y1), (x2, y2), LIGHTBLUE, 1)
-            # cv2.putText(image, f"{score:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-            putText(image, f"{class_id}", (x, y), FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-            putText(image, f"{class_id}", (x, y), FONT_HERSHEY_SIMPLEX, 0.5, LIGHTBLUE, 1)
+            cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, small_text(w), clr.BLACK, 2)
+            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, small_text(w), clr.LIGHTBLUE, 1)
 
-        putText(image, 'Direct Inference', (25, h - 100), FONT_HERSHEY_SIMPLEX,
-                    0.75, LIGHTBLUE, 1)
+        (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+        txt_height_perRow = txt_height + 10
+        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                med_text(w), clr.BLACK, 4)
+        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                med_text(w), clr.LIGHTBLUE, 2)
 
         return image
 
@@ -399,14 +398,14 @@ class YOLO:
         if len(object_points) < 6:
             return
 
-        ret, rvec, tvec, inliers = solvePnPRansac(objectPoints=object_points,
+        ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
                                                       imagePoints=image_points,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=np.zeros((5,)),
                                                       confidence=0.99,
-                                                      flags=SOLVEPNP_ITERATIVE)
+                                                      flags=cv2.SOLVEPNP_ITERATIVE)
 
-        dcm, jacob = Rodrigues(rvec)
+        dcm, jacob = cv2.Rodrigues(rvec)
         np.set_printoptions(suppress=True, precision=10)
 
 
@@ -414,11 +413,20 @@ class YOLO:
             return
 
         self.orig_tvec.append(tvec)
+        vec_str = f'x:{tvec[0, 0]:+.3f}, y:{tvec[1, 0]:+.3f}, z:{tvec[2, 0]:+.3f}'
+        txt = 'SolvePnP Solution'
+        (vec_width, vec_height), base = cv2.getTextSize(vec_str, cv2.FONT_HERSHEY_SIMPLEX,
+                                                          med_text(w), 4)
 
-        putText(image, 'SolvePnP Solution', (25, w - 75), FONT_HERSHEY_SIMPLEX,
-                    0.75, YELLOW, 1)
-        putText(image, f'x:{tvec[0, 0]:.3f}, y:{tvec[1, 0]:.3f}, z:{tvec[2, 0]:.3f}', (25, w - 50),
-                    FONT_HERSHEY_SIMPLEX, 0.75, YELLOW, 1)
+        cv2.putText(image, 'SolvePnP Solution', (10, h - vec_height - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                med_text(w), clr.BLACK, 4)
+        cv2.putText(image, 'SolvePnP Solution', (10, h - vec_height - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.YELLOW, 2)
+
+        cv2.putText(image, vec_str, (10, h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
+        cv2.putText(image, vec_str, (10, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.YELLOW, 2)
 
         self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec, markup_is_undistorted)
 
@@ -443,7 +451,7 @@ class YOLO:
                 else:
                     dist_coeffs = self.calibration.getDistortion()
 
-                projectedPixel, _ = projectPoints(xyz, rvec=rvec, tvec=tvec,
+                projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=dist_coeffs)
 
@@ -467,15 +475,15 @@ class YOLO:
                     else:
                         self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
 
-                putText(image, str(id), (int(x), int(y)), FONT_HERSHEY_SIMPLEX,
-                            0.5, BLACK, 3)
-                putText(image, str(id), (int(x), int(y)), FONT_HERSHEY_SIMPLEX,
-                            0.5, YELLOW, 2)
+                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, clr.BLACK, 3)
+                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, clr.YELLOW, 2)
 
                 if self.bias_tracking_active and y_class_id in self.biasTracker:
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
-                    putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), FONT_HERSHEY_SIMPLEX,
-                                0.75, RED, 2)
+                    cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
+                                small_text(w), clr.RED, 2)
 
         bias_image_points = []
         for idx, y_class_id in enumerate(y_class_ids):
@@ -488,11 +496,11 @@ class YOLO:
                     bias_image_points.append(y_centers[idx])
         bias_image_points = np.array(bias_image_points)
 
-        ret, bias_rvec, bias_tvec, inliers = solvePnPRansac(objectPoints=object_points,
+        ret, bias_rvec, bias_tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
                                                                 imagePoints=bias_image_points,
                                                                 cameraMatrix=self.calibration.getCameraMatrix(),
                                                                 distCoeffs=np.zeros((5,)),
-                                                                flags=SOLVEPNP_ITERATIVE)
+                                                                flags=cv2.SOLVEPNP_ITERATIVE)
         self.bias_tvec.append(bias_tvec)
         self.plotCount += 1
         # print(np.squeeze(np.array(self.orig_tvec)))
@@ -514,8 +522,12 @@ class YOLO:
         #     plt.show()
         #     self.plotCount = 0
         if self.bias_tracking_active:
-            putText(image, f'x:{bias_tvec[2, 0]:.3f}, y:{-bias_tvec[0, 0]:.3f}, z:{-bias_tvec[1, 0]:.3f}', (25, w - 25),
-                    FONT_HERSHEY_SIMPLEX, 0.75, RED, 1)
+            (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+            txt_height_perRow = txt_height + 10
+            cv2.putText(image, f'x:{bias_tvec[0, 0]:+.3f}, y:{bias_tvec[1, 0]:+.3f}, z:{bias_tvec[2, 0]:+.3f}',
+                        (10, h - 3 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 2)
+            cv2.putText(image, f'x:{bias_tvec[0, 0]:+.3f}, y:{bias_tvec[1, 0]:+.3f}, z:{bias_tvec[2, 0]:+.3f}',
+                        (10, h - 3 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.RED, 2)
 
 
 def natural_sort(l):

@@ -8,6 +8,8 @@ class Plotter:
     @staticmethod
     def plot(conf: float, img_dir: Path):
 
+        plt.rcParams['figure.max_open_warning'] = 30
+
         # Input CSVs
         try:
             pnp = pd.read_csv(img_dir / f"3_pnp_conf{conf:.2f}.csv")
@@ -357,6 +359,16 @@ class Plotter:
                     plt.title("Histogram of Accepted NIS (All Features)")
                     plt.grid(True)
                     plt.legend()
+
+            # sigma_pxs_cols = list(filter(lambda x: x.endswith("sigma_px"), merged_kf.columns))
+            # sigma_pys_cols = list(filter(lambda x: x.endswith("sigma_py"), merged_kf.columns))
+            # sigma_pxs = [merged_kf[px_col] for px_col in sigma_pxs_cols]
+            #
+            # plt.figure()
+            # [plt.plot(t, sigma_px) for sigma_px in sigma_pxs]
+            # plt.yscale('log')
+            # plt.ylim([0.0, 10.0])
+
 
         plt.show()
 

@@ -1,8 +1,10 @@
+import os
 import time
 import numpy as np
 from numpy.typing import NDArray
 import cv2
 from collections import deque
+from support.include_numba import _njit as njit, prange
 
 from support.io.calibration import default_864_cam, distort_points_px, undistort_points_px, Calibration
 from support.runtime.pixel_handler import Pixel
@@ -14,6 +16,20 @@ def make_opencv_mats(cal: Calibration):
     dist = np.array([cal.k1, cal.k2, cal.p1, cal.p2, cal.k3], dtype=np.float64)
     return K, dist
 
+def build_forward_maps_supersampled_opencv(K, dist, w, h, s):
+    """
+    Build supersampled forward maps using OpenCV's initUndistortRectifyMap.
+
+    Returns:
+      fwd_d_x_ss, fwd_d_y_ss: float32 arrays of shape (h*s, w*s)
+      t_build: seconds
+    """
+    t0 = time.perf_counter()
+    map1_ss, map2_ss = cv2.initUndistortRectifyMap(
+        K, dist, None, K, (w * s, h * s), cv2.CV_32FC1
+    )
+    t1 = time.perf_counter()
+    return map1_ss, map2_ss, (t1 - t0)
 
 # ---------- Scalar (Pixel-loop) implementations ----------
 
@@ -37,13 +53,156 @@ def ours_distort_batch_scalar(cal: Calibration, pts_px_und: NDArray):
         out[i] = p.pix_coords
     return out
 
+@njit(parallel=True, fastmath=True, cache=True)
+def forward_lut_bilinear_numba(pts_px_und, fwd_d_x, fwd_d_y):
+    """
+    pts_px_und: (N,2) float64
+    fwd_d_x/y:  (H,W) float32 (map from undistorted pixel -> distorted pixel)
+    returns:    (N,2) float64
+    """
+    h, w = fwd_d_x.shape
+    out = np.empty((pts_px_und.shape[0], 2), dtype=np.float64)
 
+    for i in prange(pts_px_und.shape[0]):
+        x = pts_px_und[i, 0]
+        y = pts_px_und[i, 1]
+
+        # clamp for safe x1/y1 indexing
+        if x < 0.0:
+            x = 0.0
+        elif x > w - 1.000001:
+            x = w - 1.000001
+
+        if y < 0.0:
+            y = 0.0
+        elif y > h - 1.000001:
+            y = h - 1.000001
+
+        x0 = int(np.floor(x))
+        y0 = int(np.floor(y))
+        x1 = x0 + 1
+        y1 = y0 + 1
+        if x1 >= w: x1 = w - 1
+        if y1 >= h: y1 = h - 1
+
+        wx = x - x0
+        wy = y - y0
+
+        f00x = float(fwd_d_x[y0, x0])
+        f10x = float(fwd_d_x[y0, x1])
+        f01x = float(fwd_d_x[y1, x0])
+        f11x = float(fwd_d_x[y1, x1])
+
+        f00y = float(fwd_d_y[y0, x0])
+        f10y = float(fwd_d_y[y0, x1])
+        f01y = float(fwd_d_y[y1, x0])
+        f11y = float(fwd_d_y[y1, x1])
+
+        dx = (1.0 - wx) * (1.0 - wy) * f00x + wx * (1.0 - wy) * f10x + (1.0 - wx) * wy * f01x + wx * wy * f11x
+        dy = (1.0 - wx) * (1.0 - wy) * f00y + wx * (1.0 - wy) * f10y + (1.0 - wx) * wy * f01y + wx * wy * f11y
+
+        out[i, 0] = dx
+        out[i, 1] = dy
+
+    return out
+
+@njit(parallel=True, fastmath=True, cache=True)
+def forward_lut_bilinear_numba_supersampled(pts_px_und, fwd_d_x_ss, fwd_d_y_ss, s):
+    """
+    pts_px_und: (N,2) float64 undistorted pixel coords
+    fwd_d_x_ss/y_ss: (H*s, W*s) float32 forward maps
+    s: int supersample factor
+    returns: (N,2) float64 distorted pixel coords
+    """
+    h, w = fwd_d_x_ss.shape
+    out = np.empty((pts_px_und.shape[0], 2), dtype=np.float64)
+
+    for i in prange(pts_px_und.shape[0]):
+        # scale into supersampled grid coordinates
+        x = pts_px_und[i, 0] * s
+        y = pts_px_und[i, 1] * s
+
+        # clamp
+        if x < 0.0:
+            x = 0.0
+        elif x > w - 1.000001:
+            x = w - 1.000001
+
+        if y < 0.0:
+            y = 0.0
+        elif y > h - 1.000001:
+            y = h - 1.000001
+
+        x0 = int(np.floor(x))
+        y0 = int(np.floor(y))
+        x1 = x0 + 1
+        y1 = y0 + 1
+        if x1 >= w: x1 = w - 1
+        if y1 >= h: y1 = h - 1
+
+        wx = x - x0
+        wy = y - y0
+
+        f00x = float(fwd_d_x_ss[y0, x0])
+        f10x = float(fwd_d_x_ss[y0, x1])
+        f01x = float(fwd_d_x_ss[y1, x0])
+        f11x = float(fwd_d_x_ss[y1, x1])
+
+        f00y = float(fwd_d_y_ss[y0, x0])
+        f10y = float(fwd_d_y_ss[y0, x1])
+        f01y = float(fwd_d_y_ss[y1, x0])
+        f11y = float(fwd_d_y_ss[y1, x1])
+
+        dx = (1.0 - wx) * (1.0 - wy) * f00x + wx * (1.0 - wy) * f10x + (1.0 - wx) * wy * f01x + wx * wy * f11x
+        dy = (1.0 - wx) * (1.0 - wy) * f00y + wx * (1.0 - wy) * f10y + (1.0 - wx) * wy * f01y + wx * wy * f11y
+
+        out[i, 0] = dx
+        out[i, 1] = dy
+
+    return out
 # ---------- OpenCV implementations ----------
+def make_opencv_undistort_runner(K, dist, pts_px_dist_f64):
+    """
+    Returns a closure that runs OpenCV undistortPoints with *no per-call reshapes/copies*.
+    pts_px_dist_f64 must be float64 (N,2).
+    """
+    pts_cv = pts_px_dist_f64.reshape(-1, 1, 2)  # view, no copy
+
+    def run():
+        und = cv2.undistortPoints(pts_cv, K, dist, P=K)
+        return und.reshape(-1, 2)
+
+    return run
 
 def opencv_undistort_batch(K, dist, pts_px_dist):
-    pts = pts_px_dist.reshape(-1, 1, 2).astype(np.float64)
-    und = cv2.undistortPoints(pts, K, dist, P=K)
-    return und.reshape(-1, 2)
+    # Convenience wrapper (NOT ideal for timing)
+    pts_px_dist = np.asarray(pts_px_dist, dtype=np.float64)
+    runner = make_opencv_undistort_runner(K, dist, pts_px_dist)
+    return runner()
+
+def make_opencv_distort_runner(K, dist, pts_px_und_f64):
+    """
+    Returns a closure that runs OpenCV projectPoints with *no per-call obj/rvec/tvec allocation*.
+    pts_px_und_f64 must be float64 (N,2) and interpreted as UNDISTORTED pixels.
+    """
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+
+    x = (pts_px_und_f64[:, 0] - cx) / fx
+    y = (pts_px_und_f64[:, 1] - cy) / fy
+
+    obj = np.empty((pts_px_und_f64.shape[0], 3), dtype=np.float64)
+    obj[:, 0] = x
+    obj[:, 1] = y
+    obj[:, 2] = 1.0
+
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+
+    def run():
+        img, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
+        return img.reshape(-1, 2)
+
+    return run
 
 
 def opencv_distort_batch(K, dist, pts_px_und):
@@ -154,6 +313,72 @@ def opencv_point_undistort_via_inverse_lut(pts_px_dist, inv_u_x, inv_u_y):
     und_y = inv_u_y[y, x].astype(np.float64)
     return np.column_stack([und_x, und_y])
 
+def build_forward_point_lut_from_maps(map1, map2):
+    """
+    Build a forward LUT for POINT distortion:
+        given an undistorted integer pixel (ux,uy), return distorted pixel (dx,dy).
+
+    This is essentially just the undistortRectify maps themselves, but named explicitly
+    as a "forward point LUT" for symmetry with the inverse LUT.
+    """
+    # map1/map2 are float32 (H,W) already: u -> d
+    fwd_d_x = map1.astype(np.float32, copy=False)
+    fwd_d_y = map2.astype(np.float32, copy=False)
+    return fwd_d_x, fwd_d_y
+
+
+def opencv_point_distort_via_forward_lut_nearest(pts_px_und, fwd_d_x, fwd_d_y):
+    """
+    Point-wise undistorted -> distorted using a precomputed forward LUT
+    with nearest-neighbor lookup at integer pixel.
+    """
+    h, w = fwd_d_x.shape[:2]
+    x = np.clip(np.rint(pts_px_und[:, 0]).astype(np.int32), 0, w - 1)
+    y = np.clip(np.rint(pts_px_und[:, 1]).astype(np.int32), 0, h - 1)
+    dx = fwd_d_x[y, x].astype(np.float64)
+    dy = fwd_d_y[y, x].astype(np.float64)
+    return np.column_stack([dx, dy])
+
+
+def opencv_point_distort_via_forward_lut_bilinear(pts_px_und, fwd_d_x, fwd_d_y):
+    """
+    Point-wise undistorted -> distorted using a precomputed forward LUT
+    with bilinear interpolation (subpixel lookup).
+    """
+    h, w = fwd_d_x.shape[:2]
+
+    # Clamp to [0, w-1] / [0, h-1] but keep room for x1/y1 indexing.
+    x = np.clip(pts_px_und[:, 0], 0.0, w - 1.000001).astype(np.float64)
+    y = np.clip(pts_px_und[:, 1], 0.0, h - 1.000001).astype(np.float64)
+
+    x0 = np.floor(x).astype(np.int32)
+    y0 = np.floor(y).astype(np.int32)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    x1 = np.clip(x1, 0, w - 1)
+    y1 = np.clip(y1, 0, h - 1)
+
+    wx = x - x0
+    wy = y - y0
+
+    # Sample four corners for each map
+    f00x = fwd_d_x[y0, x0].astype(np.float64)
+    f10x = fwd_d_x[y0, x1].astype(np.float64)
+    f01x = fwd_d_x[y1, x0].astype(np.float64)
+    f11x = fwd_d_x[y1, x1].astype(np.float64)
+
+    f00y = fwd_d_y[y0, x0].astype(np.float64)
+    f10y = fwd_d_y[y0, x1].astype(np.float64)
+    f01y = fwd_d_y[y1, x0].astype(np.float64)
+    f11y = fwd_d_y[y1, x1].astype(np.float64)
+
+    # Bilinear blend
+    dx = (1.0 - wx) * (1.0 - wy) * f00x + wx * (1.0 - wy) * f10x + (1.0 - wx) * wy * f01x + wx * wy * f11x
+    dy = (1.0 - wx) * (1.0 - wy) * f00y + wx * (1.0 - wy) * f10y + (1.0 - wx) * wy * f01y + wx * wy * f11y
+
+    return np.column_stack([dx, dy])
+
+
 
 # ---------- Metrics & timing ----------
 
@@ -175,9 +400,29 @@ def bench(fn, iters=50, warmup=5):
     t1 = time.perf_counter()
     return (t1 - t0) / iters
 
+def in_bounds_mask(pts_px, width, height):
+    """
+    Boolean mask: True if point lies within image bounds [0,w-1] x [0,h-1].
+    pts_px: (N,2)
+    """
+    return (
+        (pts_px[:, 0] >= 0.0) & (pts_px[:, 0] <= (width  - 1)) &
+        (pts_px[:, 1] >= 0.0) & (pts_px[:, 1] <= (height - 1))
+    )
+
+
+def rms_err(a, b):
+    d = a - b
+    return np.sqrt(np.mean(d[:, 0]**2 + d[:, 1]**2))
+
+
+def max_err(a, b):
+    d = a - b
+    return np.sqrt(np.max(d[:, 0]**2 + d[:, 1]**2))
+
 
 def test_cal(cal: Calibration):
-    cv2.setUseOptimized(True)
+
 
     K, dist = make_opencv_mats(cal)
 
@@ -191,9 +436,25 @@ def test_cal(cal: Calibration):
 
     # --- Build OpenCV maps ONCE and an inverse point LUT ONCE ---
     t0 = time.perf_counter()
-    map1, map2 = build_undistort_maps(K, dist, cal.width, cal.height)
+    map1, map2 = build_undistort_maps(K, dist, cal.width,  cal.height)
+
+    fwd_d_x, fwd_d_y = build_forward_point_lut_from_maps(map1, map2)
+    W, H = cal.width, cal.height
+    s = 2  # LUT supersample factor
+
+    # --- Regular maps (for inverse LUT + baseline forward LUT at s=1) ---
+    t0 = time.perf_counter()
+    map1, map2 = build_undistort_maps(K, dist, W, H)
+    t_build_maps = time.perf_counter() - t0
+
+    fwd_d_x, fwd_d_y = build_forward_point_lut_from_maps(map1, map2)
+
+    t0 = time.perf_counter()
     inv_u_x, inv_u_y = build_inverse_point_lut_from_maps(map1, map2)
-    t_build_lut = time.perf_counter() - t0
+    t_build_inv_lut = time.perf_counter() - t0
+
+    # --- Supersampled maps (for forward_lut_bilinear_numba_supersampled) ---
+    fwd_d_x_ss, fwd_d_y_ss, t_build_fwd_ss = build_forward_maps_supersampled_opencv(K, dist, W, H, s)
 
     # Make undistorted pixels in-frame. (These are "truth" targets.)
     pts_px_und_truth = np.column_stack([
@@ -210,6 +471,17 @@ def test_cal(cal: Calibration):
     print("  RMS px err:", rms_err(pts_px_dist_ours, pts_px_dist_cv))
     print("  Max px err:", max_err(pts_px_dist_ours, pts_px_dist_cv))
 
+    # Forward LUT distortion
+    pts_px_dist_fwd_nn = opencv_point_distort_via_forward_lut_nearest(pts_px_und_truth, fwd_d_x, fwd_d_y)
+    pts_px_dist_fwd_bl = opencv_point_distort_via_forward_lut_bilinear(pts_px_und_truth, fwd_d_x, fwd_d_y)
+
+    print("\nFORWARD LUT distortion agreement vs OpenCV projectPoints (same undistorted input)")
+    print("  fwd LUT (nearest):         RMS px err:", rms_err(pts_px_dist_fwd_nn, pts_px_dist_cv))
+    print("                             Max px err:", max_err(pts_px_dist_fwd_nn, pts_px_dist_cv))
+    print("  fwd LUT (bilinear):        RMS px err:", rms_err(pts_px_dist_fwd_bl, pts_px_dist_cv))
+    print("                             Max px err:", max_err(pts_px_dist_fwd_bl, pts_px_dist_cv))
+
+
     # Undistort the SAME distorted set using each method and compare to truth
     # Use OpenCV-distorted points as the common input for fairness.
     pts_px_dist = pts_px_dist_cv
@@ -219,6 +491,7 @@ def test_cal(cal: Calibration):
     ours_und_vec_cv = undistort_points_px(cal, pts_px_dist, mode="opencv")
     cv_und = opencv_undistort_batch(K, dist, pts_px_dist)
     cv_lut_und = opencv_point_undistort_via_inverse_lut(pts_px_dist, inv_u_x, inv_u_y)
+
 
     print("\nUNDISTORT accuracy vs TRUTH (starting from known undistorted -> distort -> undistort)")
     print(" scalar (2fp+newton):        RMS px err:", rms_err(ours_und_scalar, pts_px_und_truth))
@@ -243,47 +516,123 @@ def test_cal(cal: Calibration):
     print(" cv undistort (inverse LUT): RMS px err:", rms_err(cv_lut_und, cv_und))
     print("                             Max px err:", max_err(cv_lut_und, cv_und))
 
+    W = cal.width  # 864
+    H = cal.height  # 864
+
+    # Truth distorted pixels (analytic or OpenCV)
+    d_truth = pts_px_dist_cv  # or pts_px_dist_ours
+
+    # LUT result you want to analyze
+    d_lut = pts_px_dist_fwd_bl  # or nn / non-numba bilinear
+
+    # In-bounds mask based on TRUTH mapping
+    mask_in = in_bounds_mask(d_truth, W, H)
+    mask_out = ~mask_in
+
+    print("\nFORWARD LUT bilinear (Numba) error vs TRUTH")
+
+    if np.any(mask_in):
+        print("  in-bounds:")
+        print("    RMS px err:", rms_err(d_lut[mask_in], d_truth[mask_in]))
+        print("    Max px err:", max_err(d_lut[mask_in], d_truth[mask_in]))
+    else:
+        print("  in-bounds: none")
+
+    if np.any(mask_out):
+        print("  out-of-bounds:")
+        print("    RMS px err:", rms_err(d_lut[mask_out], d_truth[mask_out]))
+        print("    Max px err:", max_err(d_lut[mask_out], d_truth[mask_out]))
+    else:
+        print("  out-of-bounds: none")
+
+    print("  fraction out-of-bounds:", np.mean(mask_out))
+
+    err = np.sqrt(np.sum((d_lut - d_truth) ** 2, axis=1))
+    err_in = err[mask_in]
+    print("p99:", np.percentile(err_in, 99))
+    print("p99.9:", np.percentile(err_in, 99.9))
+
     # ------------------------------------------------------------------
     # Timing: use a smaller subset so Python scalar loop is tolerable
     # ------------------------------------------------------------------
     pts_px_dist_small = pts_px_dist[:20_000]
     pts_px_und_small_truth = pts_px_und_truth[:20_000]
 
+    # Ensure OpenCV inputs are float64 once (so no per-call astype copies)
+    pts_px_dist_small_f64 = np.asarray(pts_px_dist_small, dtype=np.float64)
+    pts_px_und_small_f64 = np.asarray(pts_px_und_small_truth, dtype=np.float64)
+
+    cv_und_runner = make_opencv_undistort_runner(K, dist, pts_px_dist_small_f64)
+    cv_dist_runner = make_opencv_distort_runner(K, dist, pts_px_und_small_f64)
+    # Ensure OpenCV inputs are float64 once (so no per-call astype copies)
+
     t_scalar_und = bench(lambda: ours_undistort_batch_scalar(cal, pts_px_dist_small), iters=10)
     t_vec_und_prec = bench(lambda: undistort_points_px(cal, pts_px_dist_small, mode="precise"), iters=800)
     t_vec_und_cv = bench(lambda: undistort_points_px(cal, pts_px_dist_small, mode="opencv"), iters=800)
-    t_cv_und = bench(lambda: opencv_undistort_batch(K, dist, pts_px_dist_small), iters=800)
+    t_cv_und = bench(cv_und_runner, iters=800)
+    t_cv_dist = bench(cv_dist_runner, iters=800)
+    t_cv_und_wrapper = bench(lambda: opencv_undistort_batch(K, dist, pts_px_dist_small), iters=800)
+    t_cv_dist_wrapper = bench(lambda: opencv_distort_batch(K, dist, pts_px_und_small_truth), iters=800)
 
     t_scalar_dist = bench(lambda: ours_distort_batch_scalar(cal, pts_px_und_small_truth), iters=10)
     t_vec_dist = bench(lambda: distort_points_px(cal, pts_px_und_small_truth), iters=800)
-    t_cv_dist = bench(lambda: opencv_distort_batch(K, dist, pts_px_und_small_truth), iters=800)
+    t_cv_lut_dist_nn = bench(
+        lambda: opencv_point_distort_via_forward_lut_nearest(pts_px_und_small_truth, fwd_d_x, fwd_d_y), iters=800)
+    t_cv_lut_dist_bl = bench(
+        lambda: opencv_point_distort_via_forward_lut_bilinear(pts_px_und_small_truth, fwd_d_x, fwd_d_y), iters=800)
+
+    t_cv_lut_dist_bl_numba = bench(lambda: forward_lut_bilinear_numba_supersampled(
+        pts_px_und_small_truth, fwd_d_x_ss, fwd_d_y_ss, s),
+                                   iters=800)
+
     # --- Timing: point-wise inverse LUT (dist->und), map built once ---
     t_cv_lut_und = bench(lambda: opencv_point_undistort_via_inverse_lut(pts_px_dist_small, inv_u_x, inv_u_y),iters=800)
 
     N = pts_px_dist_small.shape[0]
     print("\nTIMING (avg seconds per call)   N=", N)
-    print(f"  ours undistort scalar:         {t_scalar_und:.6f}")
-    print(f"  ours undistort vec (precise):  {t_vec_und_prec:.6f}")
-    print(f"  ours undistort vec (opencv):   {t_vec_und_cv:.6f}")
-    print(f"  cv   undistort:                {t_cv_und:.6f}")
-    print(f"  ours distort scalar:           {t_scalar_dist:.6f}")
-    print(f"  ours distort vec:              {t_vec_dist:.6f}")
-    print(f"  cv   distort:                  {t_cv_dist:.6f}")
-    print(f"  cv   inverse LUT build (one-time): {t_build_lut:.6f} s")
-    print(f"  cv   undistort (inverse LUT):  {t_cv_lut_und:.6f}")
+    print(f"  ours undistort scalar:                    {t_scalar_und:.7f}")
+    print(f"  ours undistort vec (precise):             {t_vec_und_prec:.7f}")
+    print(f"  ours undistort vec (opencv):              {t_vec_und_cv:.7f}")
+    print(f"  cv   undistort (inverse LUT):             {t_cv_lut_und:.7f}")
+    print(f"  cv   undistort (kernel-only):             {t_cv_und:.7f}")
+    print(f"  cv   undistort (wrapper):                 {t_cv_und_wrapper:.7f}")
+    print(f"  ours distort scalar:                      {t_scalar_dist:.7f}")
+    print(f"  ours distort vec:                         {t_vec_dist:.7f}")
+    print(f"  cv   distort (kernel-only):               {t_cv_dist:.7f}")
+    print(f"  cv   distort (wrapper):                   {t_cv_dist_wrapper:.7f}")
+    print(f"  cv   distort (fwd LUT nn):                {t_cv_lut_dist_nn:.7f}")
+    print(f"  cv   distort (fwd LUT bilinear):          {t_cv_lut_dist_bl:.7f}")
+    print(f"  cv   distort (fwd LUT bilinear numba):    {t_cv_lut_dist_bl_numba:.7f}")
+    print(f"  cv   undistort maps build (one-time):     {t_build_maps:.7f}")
+    print(f"  cv   fwd LUT maps build s={s} (one-time):   {t_build_fwd_ss:.7f}")
+    print(f"  cv   inverse LUT build (one-time):        {t_build_inv_lut:.7f}")
 
     print("\nTHROUGHPUT (points/sec)")
-    print(f"  ours undistort scalar:         {N / t_scalar_und:,.0f}")
-    print(f"  ours undistort vec (precise):  {N / t_vec_und_prec:,.0f}")
-    print(f"  ours undistort vec (opencv):   {N / t_vec_und_cv:,.0f}")
-    print(f"  cv   undistort:                {N / t_cv_und:,.0f}")
-    print(f"  ours distort scalar:           {N / t_scalar_dist:,.0f}")
-    print(f"  ours distort vec:              {N / t_vec_dist:,.0f}")
-    print(f"  cv   distort:                  {N / t_cv_dist:,.0f}")
-    print(f"  cv   undistort (inverse LUT):  {N / t_cv_lut_und:,.0f}")
+    print(f"  ours undistort scalar:                  {N / t_scalar_und:,.0f}")
+    print(f"  ours undistort vec (precise):           {N / t_vec_und_prec:,.0f}")
+    print(f"  ours undistort vec (opencv):            {N / t_vec_und_cv:,.0f}")
+    print(f"  cv   undistort:                         {N / t_cv_und:,.0f}")
+    print(f"  cv   undistort (wrapper):               {N / t_cv_und_wrapper:,.0f}")
+    print(f"  cv   undistort (inverse LUT):           {N / t_cv_lut_und:,.0f}")
+    print(f"  ours distort scalar:                    {N / t_scalar_dist:,.0f}")
+    print(f"  ours distort vec:                       {N / t_vec_dist:,.0f}")
+    print(f"  cv   distort:                           {N / t_cv_dist:,.0f}")
+    print(f"  cv   distort (wrapper):                 {N / t_cv_dist_wrapper:,.0f}")
+    print(f"  cv   distort (fwd LUT nn):              {N / t_cv_lut_dist_nn:,.0f}")
+    print(f"  cv   distort (fwd LUT bilinear):        {N / t_cv_lut_dist_bl:,.0f}")
+    print(f"  cv   distort (fwd LUT bilinear numba):  {N / t_cv_lut_dist_bl_numba:,.0f}")
     print("======================================================\n")
 
 def main():
+
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(os.cpu_count())  # or a fixed N for fairness
+    cv2.ocl.setUseOpenCL(True)  # avoid surprise GPU/OpenCL paths
+
+    print("BUILD INFORMATION:")
+    print(cv2.getBuildInformation())
+    print("======================================================\n")
+
     cal = default_864_cam()
     np.set_printoptions(suppress=True)
     # sweep

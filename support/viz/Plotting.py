@@ -6,9 +6,12 @@ import numpy as np
 
 class Plotter:
     @staticmethod
-    def plot(conf: float, img_dir: Path):
+    def plot(conf: float, img_dir: Path, show: bool = True, save: bool = False):
+
+        dir_path = img_dir / Path(f"{conf:.2f}")
 
         plt.rcParams['figure.max_open_warning'] = 30
+        plt.rcParams['figure.autolayout'] = True
 
         # Input CSVs
         try:
@@ -68,9 +71,16 @@ class Plotter:
 
             plt.xlabel("Time [s]")
             plt.ylabel(f"{comp.upper()} position")
-            plt.title(f"{comp.upper()} Position vs Time")
+            # plt.title(f"{comp.upper()} Position vs Time")
             plt.legend()
             plt.grid(True)
+
+            if save:
+                if not Path.is_dir(dir_path):
+                    Path.mkdir(dir_path)
+                plt.savefig(dir_path / Path(f"1_{comp.upper()}_Position_vs_Time.pdf"))
+                if not show:
+                    plt.close()
 
         # -------------------------------
         # Quaternion components: PnP vs QnP vs QnP-KF
@@ -83,60 +93,98 @@ class Plotter:
                 plt.plot(t, merged[f"qnp_kf_{comp}"], label="QnP (KF-weighted)")
 
             plt.xlabel("Time [s]")
-            plt.ylabel(comp.upper())
-            plt.title(f"Quaternion component {comp.upper()} vs Time")
+            # plt.ylabel(comp.upper())
+            # plt.title(f"Quaternion component {comp.upper()} vs Time")
             plt.legend()
             plt.grid(True)
+
+            if save:
+                plt.savefig(dir_path / Path(f"2_{comp.upper()}_Quaternion_comp_vs_Time.pdf"))
+                if not show:
+                    plt.close()
 
         # -------------------------------
         # Position differences vs PnP
         # -------------------------------
         plt.figure()
-        for comp in ["x", "y", "z"]:
+        dt = merged[[f"qnp_{c}" for c in "xyz"]].values - \
+             merged[[f"pnp_{c}" for c in "xyz"]].values
+        plt.plot(
+            t,
+            np.linalg.norm(dt,axis=1),
+            label=f"||Δt|| (QnP − PnP)",
+        )
+        if has_kf_pos:
+            dt_kf = merged[[f"qnp_kf_{c}" for c in "xyz"]].values - \
+                 merged[[f"pnp_{c}" for c in "xyz"]].values
             plt.plot(
                 t,
-                merged[f"qnp_{comp}"] - merged[f"pnp_{comp}"],
-                label=f"{comp.upper()} (QnP - PnP)",
+                np.linalg.norm(dt_kf,axis=1),
+                linestyle="--",
+                label=f"||Δt|| (QnP-KF - PnP)",
             )
-        if has_kf_pos:
-            for comp in ["x", "y", "z"]:
-                plt.plot(
-                    t,
-                    merged[f"qnp_kf_{comp}"] - merged[f"pnp_{comp}"],
-                    linestyle="--",
-                    label=f"{comp.upper()} (QnP-KF - PnP)",
-                )
 
         plt.xlabel("Time [s]")
         plt.ylabel("Position difference")
-        plt.title("Position Difference vs Time (relative to PnP)")
+        # plt.title("Position Difference vs Time (relative to PnP)")
         plt.legend()
         plt.grid(True)
+
+        if save:
+            plt.savefig(dir_path / Path(f"3_Position_Diff_vs_time.pdf"))
+            if not show:
+                plt.close()
 
         # -------------------------------
         # Quaternion component differences vs PnP
         # -------------------------------
+        def quat_conj(q):
+            return np.column_stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]])
+
+        def quat_mul(q1, q2):
+            w1, x1, y1, z1 = q1.T
+            w2, x2, y2, z2 = q2.T
+            return np.column_stack([
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ])
+
+        def calc_theta(q1, q2):
+            q_rel = quat_mul(q1, quat_conj(q2))
+            qw = np.clip(np.abs(q_rel[:, 0]), -1.0, 1.0)
+            return np.rad2deg(2.0 * np.arccos(qw))
+
+        q_qnp = merged[[f"qnp_q{c}" for c in "wxyz"]].values
+        q_pnp = merged[[f"pnp_q{c}" for c in "wxyz"]].values
         plt.figure()
-        for comp in ["qw", "qx", "qy", "qz"]:
+        q_rel = calc_theta(q_qnp, q_pnp)
+        plt.plot(
+            t,
+            q_rel,
+            label=f"Δθ (QnP - PnP)",
+        )
+        if has_kf_quat:
+            qKF_pnp = merged[[f"qnp_kf_q{c}" for c in "wxyz"]].values
+            qKF_rel = calc_theta(qKF_pnp, q_pnp)
             plt.plot(
                 t,
-                merged[f"qnp_{comp}"] - merged[f"pnp_{comp}"],
-                label=f"{comp.upper()} (QnP - PnP)",
+                qKF_rel,
+                linestyle="--",
+                label=f"Δθ (QnP-KF - PnP)",
             )
-        if has_kf_quat:
-            for comp in ["qw", "qx", "qy", "qz"]:
-                plt.plot(
-                    t,
-                    merged[f"qnp_kf_{comp}"] - merged[f"pnp_{comp}"],
-                    linestyle="--",
-                    label=f"{comp.upper()} (QnP-KF - PnP)",
-                )
 
         plt.xlabel("Time [s]")
-        plt.ylabel("Quaternion component difference")
-        plt.title("Quaternion Component Difference vs Time (relative to PnP)")
+        plt.ylabel("Quaternion angular difference (deg)")
+        # plt.title("Quaternion Component Difference vs Time (relative to PnP)")
         plt.legend()
         plt.grid(True)
+
+        if save:
+            plt.savefig(dir_path / Path(f"4_Quaternion_Diff_vs_time.pdf"))
+            if not show:
+                plt.close()
 
         # -------------------------------
         # Optional: QnP-KF - QnP comparison
@@ -152,9 +200,14 @@ class Plotter:
                 )
             plt.xlabel("Time [s]")
             plt.ylabel("Position difference")
-            plt.title("Position Difference: QnP-KF - QnP")
+            # plt.title("Position Difference: QnP-KF - QnP")
             plt.legend()
             plt.grid(True)
+
+            if save:
+                plt.savefig(dir_path / Path(f"5_Position_Diff_QnpW_v_QnpU.pdf"))
+                if not show:
+                    plt.close()
 
             # Quaternion
             plt.figure()
@@ -166,9 +219,14 @@ class Plotter:
                 )
             plt.xlabel("Time [s]")
             plt.ylabel("Quaternion component difference")
-            plt.title("Quaternion Component Difference: QnP-KF - QnP")
+            # plt.title("Quaternion Component Difference: QnP-KF - QnP")
             plt.legend()
             plt.grid(True)
+
+            if save:
+                plt.savefig(dir_path / Path(f"6_Quat_Diff_QnpW_v_QnpU.pdf"))
+                if not show:
+                    plt.close()
 
         # ============================================================
         # NEW: SolveQnP covariance / uncertainty diagnostics (QnP vs QnP-KF)
@@ -196,9 +254,14 @@ class Plotter:
             plt.axhline(1.0, linestyle="--", label="target ~1 (whitened)")
             plt.xlabel("Time [s]")
             plt.ylabel("s2 = SSE_w / dof")
-            plt.title("SolveQnP Residual Scale (s2) vs Time")
+            # plt.title("SolveQnP Residual Scale (s2) vs Time")
             plt.grid(True)
             plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"7_QnP_Residual_vs_time.pdf"))
+                if not show:
+                    plt.close()
 
         # used_n over time (helps interpret dof jumps / gating)
         if ("qnp_used_n" in merged.columns) or ("qnp_kf_used_n" in merged.columns):
@@ -209,9 +272,14 @@ class Plotter:
                 plt.plot(t, merged["qnp_kf_used_n"], label="QnP-KF used_n")
             plt.xlabel("Time [s]")
             plt.ylabel("N points used")
-            plt.title("SolveQnP Used Feature Count vs Time")
+            # plt.title("SolveQnP Used Feature Count vs Time")
             plt.grid(True)
             plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"8_KF_Features_used.pdf"))
+                if not show:
+                    plt.close()
 
         # per-parameter 1-sigma time series
         if have_qnp_sig or have_qnp_kf_sig:
@@ -227,9 +295,14 @@ class Plotter:
                 plt.plot(t, merged["qnp_kf_sig_rz"], linestyle="--", label="QnP-KF sig_rz [rad]")
             plt.xlabel("Time [s]")
             plt.ylabel("Rotation 1σ [rad]")
-            plt.title("SolveQnP Rotation Uncertainty (Rodrigues tangent) vs Time")
+            # plt.title("SolveQnP Rotation Uncertainty (Rodrigues tangent) vs Time")
             plt.grid(True)
             plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"9_QnP_Rot_Uncertainty_vs_time.pdf"))
+                if not show:
+                    plt.close()
 
             # Translation sigmas
             plt.figure()
@@ -243,9 +316,14 @@ class Plotter:
                 plt.plot(t, merged["qnp_kf_sig_tz"], linestyle="--", label="QnP-KF sig_tz")
             plt.xlabel("Time [s]")
             plt.ylabel("Translation 1σ [m]")
-            plt.title("SolveQnP Translation Uncertainty vs Time")
+            # plt.title("SolveQnP Translation Uncertainty vs Time")
             plt.grid(True)
             plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"10_QnP_Trans_Uncertainty_vs_time.pdf"))
+                if not show:
+                    plt.close()
 
         # combined magnitudes computed on the fly (no extra CSV columns)
         if have_qnp_sig or have_qnp_kf_sig:
@@ -268,9 +346,14 @@ class Plotter:
 
             plt.xlabel("Time [s]")
             plt.ylabel("Magnitude")
-            plt.title("SolveQnP Combined Uncertainty Magnitudes vs Time")
+            # plt.title("SolveQnP Combined Uncertainty Magnitudes vs Time")
             plt.grid(True)
             plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"11_QnP_Combined_Uncertainty_vs_time.pdf"))
+                if not show:
+                    plt.close()
 
             # Ratio plots (KF-weighted / unweighted) — nice for “improvement factor” story
             if have_qnp_sig and have_qnp_kf_sig:
@@ -281,9 +364,14 @@ class Plotter:
                 plt.axhline(1.0, linestyle="--", label="=1")
                 plt.xlabel("Time [s]")
                 plt.ylabel("Ratio")
-                plt.title("Uncertainty Ratio: KF-weighted vs Unweighted")
+                # plt.title("Uncertainty Ratio: KF-weighted vs Unweighted")
                 plt.grid(True)
                 plt.legend()
+
+            if save:
+                plt.savefig(dir_path / Path(f"12_UncertaintyRatio_QnpW_v_QnpU.pdf"))
+                if not show:
+                    plt.close()
 
         # -------------------------------
         # KF/NIS diagnostics (if present)
@@ -300,9 +388,14 @@ class Plotter:
                 plt.plot(t, merged_kf["kf_used_rate"], label="KF used rate")
                 plt.xlabel("Time [s]")
                 plt.ylabel("Fraction used")
-                plt.title("KF Accepted Measurement Rate vs Time")
+                # plt.title("KF Accepted Measurement Rate vs Time")
                 plt.grid(True)
                 plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path(f"12_KF_Used_vs_time.pdf"))
+                    if not show:
+                        plt.close()
 
             if has_nis_med or has_nis_p95:
                 plt.figure()
@@ -315,9 +408,14 @@ class Plotter:
                 plt.axhline(9.21, linestyle="--", label="chi2_2 99% (9.21)")
                 plt.xlabel("Time [s]")
                 plt.ylabel("NIS")
-                plt.title("KF Normalized Innovation Squared (Accepted) vs Time")
+                # plt.title("KF Normalized Innovation Squared (Accepted) vs Time")
                 plt.grid(True)
                 plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path(f"13_KF_NIS_vs_time.pdf"))
+                    if not show:
+                        plt.close()
 
             if has_sig_px or has_sig_py:
                 plt.figure()
@@ -327,9 +425,14 @@ class Plotter:
                     plt.plot(t, merged_kf["kf_sigma_meas_py"], label="sigma_meas_y [px]")
                 plt.xlabel("Time [s]")
                 plt.ylabel("Sigma [px]")
-                plt.title("Estimated Measurement Noise Sigma vs Time")
+                # plt.title("Estimated Measurement Noise Sigma vs Time")
                 plt.grid(True)
                 plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path(f"14_Est_meas_noise_vs_time.pdf"))
+                    if not show:
+                        plt.close()
 
             nis_cols = [c for c in merged_kf.columns if c.endswith("_kf_nis")]
             used_cols = [c for c in merged_kf.columns if c.endswith("_kf_used")]
@@ -356,9 +459,14 @@ class Plotter:
                     plt.axvline(9.21, linestyle="--", label="chi2_2 99%")
                     plt.xlabel("NIS")
                     plt.ylabel("Count")
-                    plt.title("Histogram of Accepted NIS (All Features)")
+                    # plt.title("Histogram of Accepted NIS (All Features)")
                     plt.grid(True)
                     plt.legend()
+
+                    if save:
+                        plt.savefig(dir_path / Path(f"15_NIS_Accepted_Histogram_vs_time.pdf"))
+                        if not show:
+                            plt.close()
 
             # sigma_pxs_cols = list(filter(lambda x: x.endswith("sigma_px"), merged_kf.columns))
             # sigma_pys_cols = list(filter(lambda x: x.endswith("sigma_py"), merged_kf.columns))
@@ -369,8 +477,8 @@ class Plotter:
             # plt.yscale('log')
             # plt.ylim([0.0, 10.0])
 
-
-        plt.show()
+        if show:
+            plt.show()
 
     @staticmethod
     def close_plot():

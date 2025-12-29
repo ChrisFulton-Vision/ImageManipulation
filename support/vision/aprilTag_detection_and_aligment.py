@@ -1,6 +1,5 @@
 
-from cv2 import (circle, LINE_AA, putText, FONT_HERSHEY_SIMPLEX, projectPoints, cvtColor, imread, COLOR_BGR2GRAY,
-                 polylines, resize, solvePnP, Rodrigues, imshow, waitKey, destroyAllWindows, SOLVEPNP_ITERATIVE)
+import cv2
 import numpy as np
 import scipy.linalg as la
 from pupil_apriltags import Detector
@@ -74,14 +73,14 @@ def DCM2v(C):
 
 def plotOnImg(img, points, names, color):
     for idx, pxPt in enumerate(points):
-        circle(img, (int(pxPt[0]),int(pxPt[1])), 5, color, 5)
+        cv2.circle(img, (int(pxPt[0]),int(pxPt[1])), 5, color, 5)
         textLoc = (int(pxPt[0])-30,int(pxPt[1]-30))
-        putText(img, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 12,
-                    LINE_AA)
-        putText(img, str(names[idx]), textLoc, FONT_HERSHEY_SIMPLEX, 2,color, 3, LINE_AA)
+        cv2.putText(img, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 12,
+                    cv2.LINE_AA)
+        cv2.putText(img, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2,color, 3, cv2.LINE_AA)
 
 def project(rvec, tvec, objectPoints, cameraMatrix, distCoeffs):
-    projectedPoints, _ = projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix,
+    projectedPoints, _ = cv2.projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix,
                                                 distCoeffs=distCoeffs)
     return projectedPoints
 
@@ -134,8 +133,8 @@ else:
 
 detector = Detector()
 
-img = imread(aprilImage)
-gray = cvtColor(img, COLOR_BGR2GRAY)
+img = cv2.imread(aprilImage)
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 detections = detector.detect(gray, estimate_tag_pose=True, camera_params=([fx, fy, cx, cy]), tag_size=tag_size)
 centers = None
@@ -155,9 +154,9 @@ for detection in detections:
 
     pixCenter = (int(detection.center[0]), int(detection.center[1]))
 
-    polylines(img, [detection.corners.astype(int)], True, (0, 255, 0), 2)
-    putText(img, str(detection.tag_id), pixCenter,
-                FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 6)
+    cv2.polylines(img, [detection.corners.astype(int)], True, (0, 255, 0), 2)
+    cv2.putText(img, str(detection.tag_id), pixCenter,
+                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 6)
 
     if centers is None:
         centers = np.array(pixCenter)
@@ -194,32 +193,32 @@ print('IP: \n', centers)
 print('CM: \n', cameraMatrix)
 print('DP: \n', distCoeffs)
 
-ret, rvec, tvec = solvePnP(objectPoints=objectPoints, imagePoints=centers, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs, flags=SOLVEPNP_ITERATIVE)
+ret, rvec, tvec = cv2.solvePnP(objectPoints=objectPoints, imagePoints=centers, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs, flags=SOLVEPNP_ITERATIVE)
 
 print('\nRvec: \n', rvec)
-print('Rvec as DCM: \n', Rodrigues(rvec)[0])
+print('Rvec as DCM: \n', cv2.Rodrigues(rvec)[0])
 print('Tvec: \n', tvec)
 print('T-norm: \n', la.norm(tvec))
 
-projectedPoints_orig, _ = projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
+projectedPoints_orig, _ = cv2.projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
 
 probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
-probeTip_pix, _ = projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
+probeTip_pix, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
 
 plotOnImg(img, projectedPoints_orig[:,0,:].astype(int), list(validPoints.keys()), (255,255,0))
 plotOnImg(img, probeTip_pix[:,0,:].astype(int), ['Probe Tip'], (0,255,0))
 
-putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100,100), FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
-putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100,100), FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
+cv2.putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
+cv2.putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
 
-putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100,200), FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
-putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100,200), FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
+cv2.putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100,200), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
+cv2.putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100,200), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
 
-putText(img, f'Distortion applied: {applyDistortion}', (100,300), FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
-putText(img, f'Distortion applied: {applyDistortion}', (100,300), FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
+cv2.putText(img, f'Distortion applied: {applyDistortion}', (100,300), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0), 15)
+cv2.putText(img, f'Distortion applied: {applyDistortion}', (100,300), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 6)
 
-small_img = resize(img, (848, 848))
+small_img = cv2.resize(img, (848, 848))
 
-imshow("Reproject", small_img)
-waitKey(0)
-destroyAllWindows()
+cv2.imshow("Reproject", small_img)
+cv2.waitKey(0)
+cv2.destroyAllWindows()

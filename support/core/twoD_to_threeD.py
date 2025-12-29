@@ -792,7 +792,7 @@ def solveQnP(object_pts: np.array,
              user_seed_q=None,
              user_seed_t=None,
              robust_kind:robust_cost = robust_cost.huber,
-             robust_param:float =2.0):
+             robust_param:float = 2.0):
     """
     Quaternion-based PnP solver.
 

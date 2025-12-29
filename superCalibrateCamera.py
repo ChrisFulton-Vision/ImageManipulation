@@ -27,7 +27,7 @@ import support.gui.utils as utils
 from support.io.my_logging import LOG
 import support.io.camera_config as camConfig
 from support.io.config_store import ConfigStore
-from support.io.calibration import Calibration, distort_points_px
+from support.io.calibration import Calibration, undistort_points_px
 from support.io.image_time_reader import ImageTimeReader
 import support.io.data_processing as data
 from support.viz.CVFontScaling import small_text, med_text, lrg_text
@@ -625,11 +625,6 @@ class CameraGui(CTkFrame):
         if not self.calibration.validCal:
             return
 
-        # Note: this line exists because our aprilTag image was taken at 2848x2848, while calibration images
-        # were 1424x1424. Thus, the camera calibration matrix is incorrect for this specific file.
-        if self.camConfig.calibFilepath == 'C:/repos/aburn/usr/24WintCalspanFltTest/Alvium_LJ_Calib_2DecSIFTED/calibration.pkl':
-            self.calibration.scaleCalibration(2848)
-
         if self.selectCalibLabel is not None:
             self.selectCalibLabel.configure(
                 text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
@@ -1203,7 +1198,7 @@ class CameraGui(CTkFrame):
             vars = data.parse_conf_list(getattr(self, "_dp_conf_list", None))
             img_dir = Path(str(os.path.dirname(getattr(self.camConfig, "imageFilepath", "")) or "")) / "_ProcessedData"
             for var in vars:
-                self.plotter.plot(var, img_dir)
+                self.plotter.plot(var, img_dir, False, True)
                 try:
                     self.winfo_exists()
                 except:
@@ -1455,387 +1450,13 @@ class CameraGui(CTkFrame):
                     post_progress=post_progress,
                     post_status=post_status,
                     post_finish=post_finish,
-                    distort_points_px=distort_points_px,  # wherever this currently lives
+                    undistort_points_px=undistort_points_px,
                 )
             except Exception as e:
                 post_finish(f"YOLO batch failed: {e}")
 
         self._dp_worker = threading.Thread(target=_worker, daemon=True)
         self._dp_worker.start()
-
-    def run_kalman_tracks_from_detection_csv(
-            self,
-            csv_path: str,
-            out_csv: str | None = None,
-            progress_cb: Callable[[int, int, str], None] | None = None,
-    ) -> None:
-        """
-        Run per-feature pixel Kalman filters over a YOLO detection CSV.
-
-        Bank-update version:
-          - Preloads all feat_{id}_x_undistPX / feat_{id}_y_undistPX into dense arrays (N,M)
-          - Uses a single Numba bank step per row (updates all features in compiled code)
-          - Writes per-feature KF outputs + per-row NIS diagnostics for later analysis
-
-        Robust-to-flight-phase R logic (Strategy B):
-          - Build an initial R estimate from accepted measurements (evidence burn-in)
-          - Freeze R once confident
-          - If NIS p95 drifts high for sustained "good frames", unfreeze and re-adapt
-          - Re-freeze once stable again
-
-        Requirements:
-          - df["image_time"] is numeric seconds (float/int)
-          - self.calibration exists and is valid (raises ValueError otherwise)
-        """
-
-        if not os.path.exists(csv_path):
-            LOG.error("run_kalman_tracks_from_detection_csv: missing CSV: %s", csv_path)
-            return
-        import pandas as pd
-        df = pd.read_csv(csv_path)
-        if df.empty:
-            LOG.warning("run_kalman_tracks_from_detection_csv: empty CSV: %s", csv_path)
-            return
-
-        total_rows = len(df)
-
-        # --- Discover feature ids from columns (feat_<id>_x_undistPX) ---
-        feat_ids: list[int] = []
-        for col in df.columns:
-            m = re.match(r"feat_(\d+)_x_undistPX$", col)
-            if m:
-                fid = int(m.group(1))
-                if fid not in feat_ids:
-                    feat_ids.append(fid)
-        feat_ids.sort()
-
-        if not feat_ids:
-            LOG.error("run_kalman_tracks_from_detection_csv: no feat_*_x columns in %s", csv_path)
-            return
-
-        M = len(feat_ids)
-
-        # --- Require calibration (hard-fail) ---
-        width = height = None
-        if getattr(self, "calibration", None) is None or not getattr(self.calibration, "validCal", False):
-            raise ValueError("No calibration (self.calibration missing or invalid).")
-
-        try:
-            _K = self.calibration.getCameraMatrix()
-            width = float(self.calibration.width)
-            height = float(self.calibration.height)
-        except Exception as e:
-            raise ValueError(f"No calibration (failed to access intrinsics): {e}")
-
-        # --- Output path ---
-        base = Path(csv_path)
-        if out_csv is None:
-            out_csv = str(base.with_name(base.stem + ".csv")).replace("1_yolo_detections", "2_kalman")
-
-        # --- Pull time vector (numeric seconds) ---
-        if "image_time" not in df.columns:
-            LOG.error("run_kalman_tracks_from_detection_csv: missing image_time column in %s", csv_path)
-            return
-        t_sec = df["image_time"].to_numpy(dtype=np.float64)  # (N,)
-
-        # --- Build dense measurement matrices (N,M) ---
-        x_cols = [f"feat_{fid}_x_undistPX" for fid in feat_ids]
-        y_cols = [f"feat_{fid}_y_undistPX" for fid in feat_ids]
-
-        for c in x_cols:
-            if c not in df.columns:
-                df[c] = np.nan
-        for c in y_cols:
-            if c not in df.columns:
-                df[c] = np.nan
-
-        Xraw = df[x_cols].to_numpy(dtype=np.float64, copy=False)  # (N,M)
-        Yraw = df[y_cols].to_numpy(dtype=np.float64, copy=False)
-
-        # normalize (match KF internal convention)
-        inv_w = 1.0 / max(width, 1.0)
-        inv_h = 1.0 / max(height, 1.0)
-        Xmeas = Xraw * inv_w
-        Ymeas = Yraw * inv_h
-
-        valid = np.isfinite(Xmeas) & np.isfinite(Ymeas) & (Xmeas != -1.0) & (Ymeas != -1.0)
-        valid_u8 = valid.astype(np.uint8, copy=False)
-
-        # --- KF parameter seed ---
-        kf0 = PixelKalmanFilter()
-        kf0.set_image_size(width, height)
-        kf0.set_sigma_meas_px(1.0, 1.0)  # initial guess; NIS adaptation will refine
-        kf0.set_max_pixel_jump_px(500.0)  # large gate
-        kf0.max_mahalanobis_sq = 13.82  # gating
-
-        var_proc = float(kf0.var_proc)
-        var_meas_x = float(kf0.var_meas_x)
-        var_meas_y = float(kf0.var_meas_y)
-        max_pixel_jump = float(kf0.max_pixel_jump)
-        max_mahalanobis_sq = float(kf0.max_mahalanobis_sq)
-
-        # --- NIS adaptation parameters ---
-        # We tune to p95 ~ chi2_2(0.95)=5.991 (your current “p95 ratio” story)
-        nis_p95_target = 5.991
-        nis_beta = 0.01
-        nis_clip_lo = 0.25
-        nis_clip_hi = 4.0
-        min_var_meas = 1e-12  # normalized^2 floor
-
-        # --- Strategy B: freeze/unfreeze based on sustained drift, robust to no-detection phases ---
-        # Only consider frames "good" if enough accepted measurements exist.
-        min_used_frac_for_good = 0.10  # >=10% accepted features
-        min_used_abs_for_good = 5  # and at least 5 accepted features
-
-        # Evidence burn-in based on accepted measurements (ignores long no-detection stretches)
-        burn_in_good_frames = 30
-        accepted_feat_target = int(max(50, burn_in_good_frames * M * min_used_frac_for_good))
-        accepted_feat_accum = 0
-
-        # Freeze control
-        freeze_r = True
-        frozen = False
-        var_meas_x_frozen = None
-        var_meas_y_frozen = None
-
-        # Drift detection (unfreeze if p95 is too high for long enough during good frames)
-        drift_hi = 9.21  # chi2_2(0.99) – sustained > this means R too small / model mismatch
-        drift_trigger_good_frames = 20
-        drift_count = 0
-
-        # Re-freeze detection (once unfrozen, re-freeze after being "stable" long enough)
-        stable_hi = 5.991  # target band at 95%
-        stable_trigger_good_frames = 30
-        stable_count = 0
-
-        # --- KF bank state ---
-        X = np.zeros((M, 4), dtype=np.float64)
-        P = np.zeros((M, 4, 4), dtype=np.float64)
-        for j in range(M):
-            P[j] = np.eye(4, dtype=np.float64) * 10.0
-        last_t = np.zeros(M, dtype=np.float64)
-        init = np.zeros(M, dtype=np.uint8)
-
-        # --- Output buffers ---
-        out_kf_x = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_y = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_vx = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_kf_vy = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_sig_px = np.full((total_rows, M), np.nan, dtype=np.float64)
-        out_sig_py = np.full((total_rows, M), np.nan, dtype=np.float64)
-
-        out_used = np.zeros((total_rows, M), dtype=np.uint8)
-        out_nis = np.full((total_rows, M), np.nan, dtype=np.float64)
-
-        # Per-row summary buffers
-        out_used_rate = np.full(total_rows, np.nan, dtype=np.float64)
-        out_nis_med_used = np.full(total_rows, np.nan, dtype=np.float64)
-        out_nis_p95_used = np.full(total_rows, np.nan, dtype=np.float64)
-        out_var_meas_x = np.full(total_rows, np.nan, dtype=np.float64)
-        out_var_meas_y = np.full(total_rows, np.nan, dtype=np.float64)
-        out_sig_meas_px = np.full(total_rows, np.nan, dtype=np.float64)
-        out_sig_meas_py = np.full(total_rows, np.nan, dtype=np.float64)
-
-        # --- Progress throttling ---
-        last_report_t = 0.0
-        last_report_row = 0
-
-        nis_out = np.empty(M, dtype=np.float64)
-
-        for idx in range(total_rows):
-            image_name = df.iloc[idx].get("image_name", "")
-
-            if progress_cb is not None:
-                now = time.monotonic()
-                dt = now - last_report_t
-                dr = (idx + 1) - last_report_row
-                step_rows = max(1, total_rows // 100)
-                if (idx == 0) or (idx == total_rows - 1) or (dt >= 0.1) or (dr >= step_rows):
-                    try:
-                        progress_cb(idx + 1, total_rows, str(image_name))
-                    except Exception:
-                        pass
-                    last_report_t = now
-                    last_report_row = (idx + 1)
-
-            used_u8 = PixelKalmanFilter._kf_bank_step_inplace(
-                float(t_sec[idx]),
-                Xmeas[idx], Ymeas[idx], valid_u8[idx],
-                X, P, last_t, init,
-                var_proc, var_meas_x, var_meas_y,
-                max_pixel_jump, max_mahalanobis_sq,
-                nis_out
-            )
-
-            out_used[idx, :] = used_u8
-            out_nis[idx, :] = nis_out
-
-            # accepted measurement mask + stats
-            used_bool = used_u8.astype(bool)
-            used_count = int(used_bool.sum())
-            used_rate = float(used_count) / float(max(1, M))
-            out_used_rate[idx] = used_rate
-
-            nis_used = nis_out[used_bool]
-            good_frame = (used_count >= min_used_abs_for_good) and (used_rate >= min_used_frac_for_good) and (
-                    nis_used.size > 0)
-
-            if nis_used.size > 0:
-                nis_med = float(np.median(nis_used))
-                nis_p95 = float(np.percentile(nis_used, 95.0))
-                out_nis_med_used[idx] = nis_med
-                out_nis_p95_used[idx] = nis_p95
-            else:
-                nis_med = np.nan
-                nis_p95 = np.nan
-
-            # --- Strategy B state machine ---
-            # 1) Build initial R from evidence (accepted measurements only)
-            # 2) Freeze once evidence is sufficient
-            # 3) If frozen and sustained drift, unfreeze
-            # 4) If unfrozen and sustained stability, re-freeze
-
-            if good_frame:
-                # evidence accumulation ignores no-detection frames
-                accepted_feat_accum += used_count
-
-            # Decide whether to adapt this frame
-            do_adapt = (not freeze_r) or (not frozen)
-
-            if do_adapt and good_frame:
-                ratio = nis_p95 / nis_p95_target
-                ratio = max(nis_clip_lo, min(ratio, nis_clip_hi))  # correct clamp
-                scale = ratio ** nis_beta
-                var_meas_x = max(min_var_meas, var_meas_x * scale)
-                var_meas_y = max(min_var_meas, var_meas_y * scale)
-
-            # Freeze after enough accepted evidence has accumulated
-            if freeze_r and (not frozen) and (accepted_feat_accum >= accepted_feat_target):
-                frozen = True
-                var_meas_x_frozen = float(var_meas_x)
-                var_meas_y_frozen = float(var_meas_y)
-                LOG.info(
-                    "Freezing KF measurement noise after evidence: accepted_feat=%d target=%d "
-                    "var_meas=(%.3e, %.3e) sigma_px=(%.3f, %.3f)",
-                    accepted_feat_accum, accepted_feat_target,
-                    var_meas_x_frozen, var_meas_y_frozen,
-                    np.sqrt(var_meas_x_frozen) * width, np.sqrt(var_meas_y_frozen) * height,
-                )
-
-            # Drift detection: if frozen and p95 stays very high on good frames, unfreeze
-            if freeze_r and frozen and good_frame and (not np.isnan(nis_p95)):
-                if nis_p95 > drift_hi:
-                    drift_count += 1
-                else:
-                    drift_count = max(0, drift_count - 1)
-
-                if drift_count >= drift_trigger_good_frames:
-                    frozen = False
-                    drift_count = 0
-                    stable_count = 0
-                    LOG.info(
-                        "Unfreezing KF measurement noise due to sustained NIS drift: p95>%.3f for %d good frames",
-                        drift_hi, drift_trigger_good_frames
-                    )
-
-            # Re-freeze detection: if unfrozen and p95 stays under the “stable” threshold, re-freeze
-            if freeze_r and (not frozen) and good_frame and (not np.isnan(nis_p95)):
-                if nis_p95 <= stable_hi:
-                    stable_count += 1
-                else:
-                    stable_count = max(0, stable_count - 1)
-
-                if stable_count >= stable_trigger_good_frames:
-                    frozen = True
-                    stable_count = 0
-                    var_meas_x_frozen = float(var_meas_x)
-                    var_meas_y_frozen = float(var_meas_y)
-                    LOG.info(
-                        "Re-freezing KF measurement noise after stability: var_meas=(%.3e, %.3e) sigma_px=(%.3f, %.3f)",
-                        var_meas_x_frozen, var_meas_y_frozen,
-                        np.sqrt(var_meas_x_frozen) * width, np.sqrt(var_meas_y_frozen) * height,
-                    )
-
-            # Apply frozen R if currently frozen
-            if freeze_r and frozen and (var_meas_x_frozen is not None):
-                var_meas_x = var_meas_x_frozen
-                var_meas_y = var_meas_y_frozen
-
-            # Log/store R actually used
-            out_var_meas_x[idx] = var_meas_x
-            out_var_meas_y[idx] = var_meas_y
-            out_sig_meas_px[idx] = (np.sqrt(var_meas_x) * width)
-            out_sig_meas_py[idx] = (np.sqrt(var_meas_y) * height)
-
-            # Throttled print
-            if (idx == 0) or (idx == total_rows - 1) or ((idx + 1) % max(1, total_rows // 50) == 0):
-                if nis_used.size > 0:
-                    LOG.info(
-                        "KF NIS: idx=%d/%d used=%.1f%% med=%.3f p95=%.3f frozen=%s var_meas=(%.3e,%.3e) sigma_px=(%.3f,%.3f)",
-                        idx + 1, total_rows,
-                        100.0 * used_rate,
-                        float(out_nis_med_used[idx]), float(out_nis_p95_used[idx]),
-                        str(bool(frozen)),
-                        var_meas_x, var_meas_y,
-                        out_sig_meas_px[idx], out_sig_meas_py[idx],
-                    )
-                else:
-                    LOG.info(
-                        "KF NIS: idx=%d/%d used=%.1f%% (no accepted) frozen=%s var_meas=(%.3e,%.3e) sigma_px=(%.3f,%.3f)",
-                        idx + 1, total_rows,
-                        100.0 * used_rate,
-                        str(bool(frozen)),
-                        var_meas_x, var_meas_y,
-                        out_sig_meas_px[idx], out_sig_meas_py[idx],
-                    )
-
-            # write per-feature outputs
-            for j in range(M):
-                if init[j] == 0:
-                    continue
-
-                out_kf_x[idx, j] = X[j, 0]
-                out_kf_y[idx, j] = X[j, 1]
-                out_kf_vx[idx, j] = X[j, 2]
-                out_kf_vy[idx, j] = X[j, 3]
-
-                sig_px = float(width * np.sqrt(max(P[j, 0, 0], 0.0)))
-                sig_py = float(height * np.sqrt(max(P[j, 1, 1], 0.0)))
-                out_sig_px[idx, j] = sig_px
-                out_sig_py[idx, j] = sig_py
-
-        # --- Build output DataFrame ---
-        out_df = df.copy()
-
-        new_cols = {}
-        new_cols["kf_used_rate"] = out_used_rate
-        new_cols["kf_nis_med_used"] = out_nis_med_used
-        new_cols["kf_nis_p95_used"] = out_nis_p95_used
-        new_cols["kf_var_meas_x"] = out_var_meas_x
-        new_cols["kf_var_meas_y"] = out_var_meas_y
-        new_cols["kf_sigma_meas_px"] = out_sig_meas_px
-        new_cols["kf_sigma_meas_py"] = out_sig_meas_py
-
-        for j, fid in enumerate(feat_ids):
-            new_cols[f"feat_{fid}_kf_x"] = out_kf_x[:, j]
-            new_cols[f"feat_{fid}_kf_y"] = out_kf_y[:, j]
-            new_cols[f"feat_{fid}_kf_vx"] = out_kf_vx[:, j]
-            new_cols[f"feat_{fid}_kf_vy"] = out_kf_vy[:, j]
-            new_cols[f"feat_{fid}_kf_sigma_px"] = np.clip(out_sig_px[:, j], 1e-6, None)
-            new_cols[f"feat_{fid}_kf_sigma_py"] = np.clip(out_sig_py[:, j], 1e-6, None)
-            new_cols[f"feat_{fid}_kf_used"] = out_used[:, j].astype(np.uint8)
-            new_cols[f"feat_{fid}_kf_nis"] = out_nis[:, j]
-
-        out_df = pd.concat([out_df, pd.DataFrame(new_cols)], axis=1)
-
-        cols_to_drop = []
-        for fid in feat_ids:
-            cols_to_drop.append(f"feat_{fid}_x_distPX")
-            cols_to_drop.append(f"feat_{fid}_y_distPX")
-        out_df.drop(columns=cols_to_drop, inplace=True, errors="ignore")
-
-        out_df.to_csv(out_csv, index=False)
-        LOG.info("Kalman tracks CSV written: %s", out_csv)
 
     def run_pnp_qnp_from_detection_csv(
             self,
@@ -1854,9 +1475,6 @@ class CameraGui(CTkFrame):
           - GUI cancel_event
           - progress_cb forwarding
         """
-
-        # lazy import to keep GUI startup snappy
-        from support.io import data_processing as data
 
         # ---- checkpoint cadence ----
         checkpoint_every = 0
@@ -1941,18 +1559,6 @@ class CameraGui(CTkFrame):
                 break
             time.sleep(0.1)
 
-    def shutdown(self):
-        self.shutting_down = True
-        # kill checkerboard process if running
-        try:
-            self.checkerboard_launcher.stop()
-        except Exception:
-            pass
-        self._checker_proc = None
-
-        self.recordOff()
-        self.safely_close_playwindow()
-
     def setAprilTagSize(self):
 
         try:
@@ -2003,6 +1609,7 @@ class CameraGui(CTkFrame):
             )
             if cv_img is not None:
                 cv_imgs.append(cv_img)
+
         return cv_imgs
 
     def exportToGif(self):
@@ -2972,7 +2579,12 @@ class CameraGui(CTkFrame):
 
         self.camConfig.cam_to_log_time_offset = 0.0
 
-    def analyze_image(self, frame, img_time=None, name=None, display_in_realtime=True, box_around=False):
+    def analyze_image(self,
+                      frame,
+                      img_time=None,
+                      name=None,
+                      display_in_realtime=True,
+                      box_around=False):
 
         if frame is None:
             return
@@ -3036,58 +2648,71 @@ class CameraGui(CTkFrame):
             self.last_yolo_3d_estimate = None
 
         if self.camConfig.hud and img_time is not None:
-            from support.viz.HUD_draw import HUD_Marker
-            if self.hud_marker is None:
-                self.hud_marker = HUD_Marker()
-                self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-            self.hud_marker.draw_HUD(self.markup_frame, img_time)
+            self.draw_HUD(img_time)
 
         if box_around:
             x, y, _ = self.markup_frame.shape
             cv2.rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
 
-        height = 0
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX,
-                                                    med_text(self.curr_frame.shape[0]), 4)
-            img_w, img_h, *_ = self.curr_frame.shape
-            cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width - 10, img_h - height),
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
-        if img_time is not None:
-            time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-            (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
-                                                              med_text(self.curr_frame.shape[0]), 4)
-            img_w, img_h, *_ = self.curr_frame.shape
-            cv2.putText(self.markup_frame, time_str, (img_w - time_width - 10, img_h - time_height - height - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
+            self.draw_name(name)
 
-        if display_in_realtime:
-            if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-                (h, w) = self.markup_frame.shape[:2]
-                self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
-                (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-                txt_pix_start_perRow = txt_height + 10
-                cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                            (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.BLACK, 4)
-                cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
-                            (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.HUD_YELLOW, 2)
-                cv2.putText(self.markup_frame,
-                            f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                            (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.BLACK, 4)
-                cv2.putText(self.markup_frame,
-                            f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
-                            (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.HUD_YELLOW, 2)
-            self.cleanup()
+        if img_time is not None:
+            self.draw_time(img_time)
 
         if self.printLidar:
             self.print_pnp_results()
 
+        if display_in_realtime:
+            if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+                self.draw_playbackStats()
+            self.cleanup()
+
         if not display_in_realtime:
-            return self.markup_frame
+            return np.ascontiguousarray(self.markup_frame).copy()
+
+    def draw_playbackStats(self):
+
+        (h, w) = self.markup_frame.shape[:2]
+        self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
+        (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+        txt_pix_start_perRow = txt_height + 10
+        cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                    (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.BLACK, 4)
+        cv2.putText(self.markup_frame, f"Offset: {self.camConfig.cam_to_log_time_offset:+.2f}s",
+                    (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.HUD_YELLOW, 2)
+        cv2.putText(self.markup_frame,
+                    f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                    (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.BLACK, 4)
+        cv2.putText(self.markup_frame,
+                    f'Realtime: {self.camConfig.rt_speed:.2f}' if self.camConfig.playback_mode == PlaybackSpeed.Real_time else f'FPS: {self.lowPassFPS:.2f}/{self.camConfig.target_fps:.2f}',
+                    (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.HUD_YELLOW, 2)
+
+    def draw_time(self, img_time):
+        time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
+        (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
+                                                          med_text(self.curr_frame.shape[0]), 4)
+        img_w, img_h, *_ = self.curr_frame.shape
+        cv2.putText(self.markup_frame, time_str, (img_w - time_width - 10, img_h - time_height * 2 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
+
+    def draw_name(self, name):
+        (width, height), base = cv2.getTextSize(os.path.basename(name), cv2.FONT_HERSHEY_SIMPLEX,
+                                                med_text(self.curr_frame.shape[0]), 4)
+        img_w, img_h, *_ = self.curr_frame.shape
+        cv2.putText(self.markup_frame, os.path.basename(name), (img_w - width - 10, img_h - height),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 2)
+
+    def draw_HUD(self, img_time):
+        from support.viz.HUD_draw import HUD_Marker
+        if self.hud_marker is None:
+            self.hud_marker = HUD_Marker()
+            self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
+        self.hud_marker.draw_HUD(self.markup_frame, img_time)
 
     def draw_chessboard(self):
         if self.curr_frame_gray is None:

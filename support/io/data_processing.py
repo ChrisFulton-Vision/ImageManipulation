@@ -143,7 +143,7 @@ class DataProcessorRunner:
             post_progress: ProgressCb,
             post_status: StatusCb,
             post_finish: FinishCb,
-            distort_points_px: Callable[[object, tuple[float, float]], tuple[float, float]],
+            undistort_points_px: Callable[[object, tuple[float, float]], tuple[float, float]],
     ) -> None:
         """
         Runs YOLO across all images for each conf in conf_list.
@@ -363,7 +363,7 @@ class DataProcessorRunner:
                                 cidi = int(cid)
                                 x = float(cx) * sx
                                 y = float(cy) * sy
-                                xp, yp = distort_points_px(calibration, (x, y))
+                                xp, yp = undistort_points_px(calibration, (x, y))
                                 rec[f"feat_{cidi}_x_distPX"] = x
                                 rec[f"feat_{cidi}_y_distPX"] = y
                                 rec[f"feat_{cidi}_x_undistPX"] = xp
@@ -508,9 +508,9 @@ class DataProcessorRunner:
         # --- KF parameter seed ---
         kf0 = PixelKalmanFilter()
         kf0.set_image_size(width, height)
-        kf0.set_sigma_meas_px(1.0, 1.0)
-        kf0.set_max_pixel_jump_px(500.0)
-        kf0.max_mahalanobis_sq = 13.82
+        kf0.set_sigma_meas_px(2.0, 2.0)
+        kf0.set_max_pixel_jump_px(100.0)
+        kf0.max_mahalanobis_sq = 9.99
 
         var_proc = float(kf0.var_proc)
         var_meas_x = float(kf0.var_meas_x)
@@ -1311,6 +1311,7 @@ class DataProcessorRunner:
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
+
 
             rvec = tvec = None
             quatPnP = vectPnP = None

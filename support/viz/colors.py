@@ -1,4 +1,5 @@
 # General
+WHITE = (255, 255, 255)
 LIGHTBLUE = (255, 255, 0)
 YELLOW = (50, 255, 255)
 RED = (120, 120, 255)

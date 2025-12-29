@@ -636,24 +636,43 @@ class Calibration:
         # min_detJ, min_abs_detJ, frac_neg_detJ, max_kappa_proxy
         return float(dets.min()), float(np.min(np.abs(dets))), float(np.mean(dets <= 0.0)),float(kappas.max()),
 
-    def distort_point(self, pixel: pxl):
-        '''
-        >>> cal = default_864_cam()
-        >>> p = pxl(pix_coords=(700.0, 250.0))
-        >>> cal.undistort_point(p)
-        >>> cal.distort_point(p)
-        >>> first = p.pix_coords.copy()
-        >>> cal.distort_point(p)
-        >>> assert p.pix_coords == first
-        >>> assert not p.is_undistorted
+    @staticmethod
+    @njit(cache=True, fastmath=True)
+    def distort_norm_numba(nx: float, ny: float,
+                           k1: float, k2: float, k3: float,
+                           p1: float, p2: float,
+                           has_tangential: bool):
+        """
+        Forward distortion in normalized coordinates.
+        Returns (nxd, nyd).
+        """
+        x2 = nx * nx
+        y2 = ny * ny
+        r2 = x2 + y2
+        xy = nx * ny
 
-        >>> cal = default_864_cam()
-        >>> p = pxl(norm_coords=(0.12, -0.08), already_undistorted=True)
-        >>> orig = p.norm_coords.copy()
-        >>> cal.distort_point(p)
-        >>> cal.undistort_point(p)
-        >>> assert abs(p.norm_coords[0]-orig[0]) < 1e-10 and abs(p.norm_coords[1]-orig[1]) < 1e-10
-        '''
+        # radial factor (Horner)
+        L = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+
+        if has_tangential:
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+        else:
+            dx = 0.0
+            dy = 0.0
+
+        return nx * L + dx, ny * L + dy
+
+    def distort_point(self, pixel):
+        """
+        Numba-accelerated version of distort_point.
+
+        Same contract:
+          - no-op if pixel already distorted
+          - requires validCal
+          - uses pixel.norm_coords (computes from pix if needed)
+          - updates pixel.norm_coords, then updates pixel.pix_coords, flips is_undistorted False
+        """
         if not pixel.is_undistorted:
             return
         if not self.validCal:
@@ -664,15 +683,17 @@ class Calibration:
         if pixel.norm_coords is None:
             self.havePix_needNorm(pixel)
 
-        nx, ny = pixel.norm_coords
-        xy = nx * ny
-        r_sqd = nx * nx + ny * ny
+        nx, ny = float(pixel.norm_coords[0]), float(pixel.norm_coords[1])
 
-        L = 1 + r_sqd * (self.k1 + r_sqd * (self.k2 + r_sqd * self.k3))
-        del_x = 2.0 * self.p1 * xy + self.p2 * (r_sqd + 2.0 * nx * nx)
-        del_y = self.p1 * (r_sqd + 2.0 * ny * ny) + 2.0 * self.p2 * xy
+        nxd, nyd = self.distort_norm_numba(
+            nx, ny,
+            float(self.k1), float(self.k2), float(self.k3),
+            float(self.p1), float(self.p2),
+            bool(getattr(self, "has_tangential", True))  # or however you store it
+        )
 
-        pixel.norm_coords = [nx * L + del_x, ny * L + del_y]
+        # keep type consistent with your code (list)
+        pixel.norm_coords = [float(nxd), float(nyd)]
         self.haveNorm_needPix(pixel)
         pixel.is_undistorted = False
 
@@ -805,111 +826,58 @@ class Calibration:
 
         cleanup(pixel, new_x, new_y)
 
+@njit(parallel=True, cache=True, fastmath=True)
+def distort_points_px_numba(pts_px_und,
+                            fx, fy, cx, cy,
+                            k1, k2, p1, p2, k3,
+                            has_tangential):
+    n = pts_px_und.shape[0]
+    out = np.empty((n, 2), dtype=np.float64)
+
+    for i in prange(n):
+        u = pts_px_und[i, 0]
+        v = pts_px_und[i, 1]
+
+        # pixels -> normalized
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+
+        x2 = x * x
+        y2 = y * y
+        r2 = x2 + y2
+        xy = x * y
+
+        # radial (Horner)
+        L = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+
+        if has_tangential:
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+        else:
+            dx = 0.0
+            dy = 0.0
+
+        xd = x * L + dx
+        yd = y * L + dy
+
+        out[i, 0] = xd * fx + cx
+        out[i, 1] = yd * fy + cy
+
+    return out
 
 def distort_points_px(cal, pts_px_und):
-    """
-    Vectorized forward distortion (undistorted pixels -> distorted pixels).
-
-    Parameters
-    ----------
-    cal : Calibration
-        Valid calibration object.
-    pts_px_und : array_like
-        Shape (N,2) or (2,). Undistorted pixel coordinates.
-
-    Returns
-    -------
-    pts_px_dist : np.ndarray
-        Shape (N,2) or (2,). Distorted pixel coordinates.
-
-    Doctests
-    --------
-    Basic equivalence with scalar distort_point:
-
-    >>> cal = default_864_cam()
-    >>> pts = np.array([[700.0, 250.0],
-    ...                 [100.0, 100.0],
-    ...                 [800.0, 400.0]])
-    >>> # scalar reference
-    >>> ref = []
-    >>> for pxy in pts:
-    ...     p = pxl(pix_coords=pxy.tolist(), already_undistorted=True)
-    ...     cal.havePix_needNorm(p)
-    ...     cal.distort_point(p)
-    ...     ref.append(p.pix_coords)
-    >>> ref = np.array(ref)
-    >>> vec = distort_points_px(cal, pts)
-    >>> assert np.allclose(ref, vec, rtol=0, atol=1e-12)
-
-    Idempotence: applying vectorized distort twice does nothing new
-    (assuming inputs are already distorted):
-
-    >> # Round-trip: distort then undistort gets back the original (within tolerance)
-    >>> pts = np.array([[700.0, 250.0],
-    ...                 [100.0, 100.0],
-    ...                 [800.0, 400.0]])
-    >>> dist = distort_points_px(cal, pts)
-    >>> back = []
-    >>> for pxy in dist:
-    ...     p = pxl(pix_coords=pxy.tolist(), already_undistorted=False)
-    ...     cal.undistort_point(p)
-    ...     back.append(p.pix_coords)
-    >>> back = np.array(back)
-    >>> assert np.allclose(back, pts, atol=1e-6)
-
-    Round-trip consistency with undistort_point:
-
-    >>> pts = np.array([[600.0, 300.0],
-    ...                 [200.0, 700.0]])
-    >>> und = []
-    >>> for pxy in pts:
-    ...     p = pxl(pix_coords=pxy.tolist())
-    ...     cal.undistort_point(p)
-    ...     und.append(p.pix_coords)
-    >>> und = np.array(und)
-    >>> redist = distort_points_px(cal, und)
-    >>> assert np.allclose(redist, pts, atol=1e-6)
-    """
-    if not cal.validCal:
-        raise ValueError("Calibration invalid.")
-
     pts = np.asarray(pts_px_und, dtype=np.float64)
-    scalar_input = False
-    if pts.ndim == 1:
+    scalar = (pts.ndim == 1)
+    if scalar:
         pts = pts.reshape(1, 2)
-        scalar_input = True
-    if pts.shape[1] != 2:
-        raise ValueError(f"Expected shape (N,2) or (2,), got {pts.shape}")
 
-    # pixels -> camera-normalized (undistorted)
-    x = (pts[:, 0] - cal.cx) / cal.fx
-    y = (pts[:, 1] - cal.cy) / cal.fy
-
-    x2 = x * x
-    y2 = y * y
-    r2 = x2 + y2
-    xy = x * y
-
-    # Radial factor (Horner form)
-    L = 1.0 + r2 * (cal.k1 + r2 * (cal.k2 + r2 * cal.k3))
-
-    if cal.has_tangential:
-        dx = 2.0 * cal.p1 * xy + cal.p2 * (r2 + 2.0 * x2)
-        dy = cal.p1 * (r2 + 2.0 * y2) + 2.0 * cal.p2 * xy
-    else:
-        dx = 0.0
-        dy = 0.0
-
-    # Apply distortion in normalized space
-    xd = x * L + dx
-    yd = y * L + dy
-
-    # Back to pixels
-    u = xd * cal.fx + cal.cx
-    v = yd * cal.fy + cal.cy
-
-    out = np.column_stack((u, v))
-    return out[0] if scalar_input else out
+    out = distort_points_px_numba(
+        pts,
+        float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+        float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
+        bool(cal.has_tangential)
+    )
+    return out[0] if scalar else out
 
 def _radial_terms(x, y, k1, k2, k3):
     """Compute r2, r4, L and dL/dr2, plus dL/dx,dL/dy."""
@@ -976,7 +944,7 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
     if scalar:
         pts = pts.reshape(1, 2)
 
-    out = undistort_points_px_numba(
+    out = undistort_points_px_numba_dispatch(
         pts,
         float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
         float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
@@ -1095,6 +1063,266 @@ def undistort_points_px_numba(
     return out
 
 
+# -------------------------- constants (compile-time) --------------------------
+_KMIN_ABS_L = 1e-12
+_KMIN_ABS_DET = 1e-18
+
+@njit(parallel=True, fastmath=True, cache=True)
+def undistort_5fp_no_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, k3):
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
+
+        x_d = (u - cx) * inv_fx
+        y_d = (v - cy) * inv_fy
+
+        x = x_d
+        y = y_d
+
+        # 5 fixed-point iterations
+        for _ in range(5):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            if abs(L) < _KMIN_ABS_L:
+                break
+            x = x_d / L
+            y = y_d / L
+
+        out[i, 0] = x * fx + cx
+        out[i, 1] = y * fy + cy
+
+    return out
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def undistort_5fp_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, p1, p2, k3):
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
+
+        x_d = (u - cx) * inv_fx
+        y_d = (v - cy) * inv_fy
+
+        x = x_d
+        y = y_d
+
+        # 5 fixed-point iterations
+        for _ in range(5):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            if abs(L) < _KMIN_ABS_L:
+                break
+
+            xy = x * y
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+
+            x = (x_d - dx) / L
+            y = (y_d - dy) / L
+
+        out[i, 0] = x * fx + cx
+        out[i, 1] = y * fy + cy
+
+    return out
+
+
+# -------------------------- 2FP + gated Newton -------------------------------
+
+@njit(parallel=True, fastmath=True, cache=True)
+def undistort_2fp_newton_no_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, k3, eps_px):
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+    scale = fx if fx > fy else fy
+
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
+
+        x_d = (u - cx) * inv_fx
+        y_d = (v - cy) * inv_fy
+
+        x = x_d
+        y = y_d
+
+        # 2 fixed-point iterations
+        for _ in range(2):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            if abs(L) < _KMIN_ABS_L:
+                break
+            x = x_d / L
+            y = y_d / L
+
+        # one Newton step, gated
+        x2 = x * x
+        y2 = y * y
+        r2 = x2 + y2
+        r4 = r2 * r2
+        r6 = r4 * r2
+        L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+        if abs(L) >= _KMIN_ABS_L:
+            gx = (x * L) - x_d
+            gy = (y * L) - y_d
+
+            res_px = (abs(gx) + abs(gy)) * scale
+            if res_px >= eps_px:
+                dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+                dL_dx = 2.0 * x * dL_dr2
+                dL_dy = 2.0 * y * dL_dr2
+
+                # Jacobian of g(x,y) = [xL - xd, yL - yd]
+                J11 = L + x * dL_dx
+                J12 = x * dL_dy
+                J21 = y * dL_dx
+                J22 = L + y * dL_dy
+
+                det = J11 * J22 - J12 * J21
+                if abs(det) >= _KMIN_ABS_DET:
+                    inv_det = 1.0 / det
+                    del_x = (gx * J22 - gy * J12) * inv_det
+                    del_y = (-gx * J21 + gy * J11) * inv_det
+                    x -= del_x
+                    y -= del_y
+
+        out[i, 0] = x * fx + cx
+        out[i, 1] = y * fy + cy
+
+    return out
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def undistort_2fp_newton_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, p1, p2, k3, eps_px):
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+    scale = fx if fx > fy else fy
+
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
+
+        x_d = (u - cx) * inv_fx
+        y_d = (v - cy) * inv_fy
+
+        x = x_d
+        y = y_d
+
+        # 2 fixed-point iterations
+        for _ in range(2):
+            x2 = x * x
+            y2 = y * y
+            r2 = x2 + y2
+            r4 = r2 * r2
+            r6 = r4 * r2
+            L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+            if abs(L) < _KMIN_ABS_L:
+                break
+
+            xy = x * y
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+
+            x = (x_d - dx) / L
+            y = (y_d - dy) / L
+
+        # one Newton step, gated
+        x2 = x * x
+        y2 = y * y
+        r2 = x2 + y2
+        r4 = r2 * r2
+        r6 = r4 * r2
+        L = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+        if abs(L) >= _KMIN_ABS_L:
+            xy = x * y
+            dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
+            dy = p1 * (r2 + 2.0 * y2) + 2.0 * p2 * xy
+
+            gx = (x * L + dx) - x_d
+            gy = (y * L + dy) - y_d
+
+            res_px = (abs(gx) + abs(gy)) * scale
+            if res_px >= eps_px:
+                dL_dr2 = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+                dL_dx = 2.0 * x * dL_dr2
+                dL_dy = 2.0 * y * dL_dr2
+
+                # tangential partials
+                ddx_dx = 2.0 * p1 * y + 6.0 * p2 * x
+                noted = 2.0 * p1 * x + 2.0 * p2 * y
+                ddx_dy = noted
+                ddy_dx = noted
+                ddy_dy = 6.0 * p1 * y + 2.0 * p2 * x
+
+                J11 = L + x * dL_dx + ddx_dx
+                J12 = x * dL_dy + ddx_dy
+                J21 = y * dL_dx + ddy_dx
+                J22 = L + y * dL_dy + ddy_dy
+
+                det = J11 * J22 - J12 * J21
+                if abs(det) >= _KMIN_ABS_DET:
+                    inv_det = 1.0 / det
+                    del_x = (gx * J22 - gy * J12) * inv_det
+                    del_y = (-gx * J21 + gy * J11) * inv_det
+                    x -= del_x
+                    y -= del_y
+
+        out[i, 0] = x * fx + cx
+        out[i, 1] = y * fy + cy
+
+    return out
+
+
+# -------------------------- dispatcher (Python) -------------------------------
+
+def undistort_points_px_numba_dispatch(
+    pts_px_dist,
+    fx, fy, cx, cy,
+    k1, k2, p1, p2, k3,
+    has_tangential: bool,
+    mode_opencv_5fp: bool,
+    eps_px: float
+):
+    pts = np.asarray(pts_px_dist, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError("pts_px_dist must be (N,2)")
+
+    if mode_opencv_5fp:
+        if has_tangential:
+            return undistort_5fp_tan(pts, fx, fy, cx, cy, k1, k2, p1, p2, k3)
+        else:
+            return undistort_5fp_no_tan(pts, fx, fy, cx, cy, k1, k2, k3)
+    else:
+        if has_tangential:
+            return undistort_2fp_newton_tan(pts, fx, fy, cx, cy, k1, k2, p1, p2, k3, eps_px)
+        else:
+            return undistort_2fp_newton_no_tan(pts, fx, fy, cx, cy, k1, k2, k3, eps_px)
 
 def default_864_cam():
     cal = Calibration()

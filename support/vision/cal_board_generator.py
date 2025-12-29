@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import time
 from screeninfo import get_monitors
+import support.viz.colors as clr
 
 class Checkerboard:
     def __init__(self):
@@ -16,6 +17,9 @@ class Checkerboard:
         self._is_fullScreen = True
 
         self._refresh_monitors()
+
+        self.lp_freq_track = 20.0
+        self.last_toggle = 0.0
 
     def _refresh_monitors(self):
         # Keep a stable list; fall back to a fake primary if screeninfo is odd.
@@ -88,8 +92,8 @@ class Checkerboard:
 
     # -------------------- HUD helpers --------------------
 
-    @staticmethod
-    def build_timer_frames(checker_a, checker_b, flash_freq_hz, period, screen_width, screen_height):
+
+    def build_timer_frames(self, checker_a, checker_b, flash_freq_hz, period, screen_width, screen_height):
         """
         Build HUD-annotated versions of checker_a and checker_b for temporary display.
         """
@@ -99,28 +103,36 @@ class Checkerboard:
         org1 = (int(screen_width * 0.1), int(screen_height * 0.05))
         org2 = (int(screen_width * 0.1), int(screen_height * 0.10))
 
-        freq_text = f'Freq(Hz): {flash_freq_hz:.2f}'
+        freq_text = f'Freq(Hz): {flash_freq_hz:.2f} / ({self.lp_freq_track:.2f})'
         period_text = f'Period(s): {period:.4f}'
 
         # Draw on A
         cv2.putText(timer_frame_a, freq_text, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, freq_text, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, freq_text, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_a, period_text, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, period_text, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, period_text, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         # Draw on B (same text)
         cv2.putText(timer_frame_b, freq_text, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, freq_text, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, freq_text, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_b, period_text, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, period_text, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, period_text, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         return timer_frame_a, timer_frame_b
 
@@ -142,23 +154,31 @@ class Checkerboard:
 
         # Draw on A
         cv2.putText(timer_frame_a, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_a, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         # Draw on B (same text)
         cv2.putText(timer_frame_b, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_b, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         display_until = now + hud_duration
 
@@ -187,31 +207,43 @@ class Checkerboard:
 
         # Draw on A
         cv2.putText(timer_frame_a, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_a, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_a, instr_text_c, org3,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_a, instr_text_c, org3,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_a, instr_text_c, org3,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         # Draw on B (same text)
         cv2.putText(timer_frame_b, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_b, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
         cv2.putText(timer_frame_b, instr_text_c, org3,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (0, 0, 0), 4)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.WHITE, 10)
         cv2.putText(timer_frame_b, instr_text_c, org3,
-                    cv2.FONT_HERSHEY_PLAIN, 2.0, (255, 255, 0), 1)
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.BLACK, 6)
+        cv2.putText(timer_frame_b, instr_text_c, org3,
+                    cv2.FONT_HERSHEY_PLAIN, 2.0, clr.LIGHTBLUE, 2)
 
         display_until = now + hud_duration
 
@@ -283,7 +315,12 @@ class Checkerboard:
         pause = True
         last_frame_id = None
 
+        alpha = 0.50
+        last_toggle_actual = None
+
         while True:
+            did_toggle = False
+
             now = time.perf_counter()
             dt = now - last_time
             last_time = now
@@ -297,7 +334,16 @@ class Checkerboard:
             # Catch up on toggles if we fell behind
             while now >= next_toggle:
                 use_a = not use_a
+                did_toggle = True
                 next_toggle += period
+
+            if did_toggle:
+                if last_toggle_actual is not None:
+                    measured_period = now - last_toggle_actual
+                    if measured_period > 1e-6:
+                        inst_hz = 1.0 / measured_period
+                        self.lp_freq_track = (1.0 - alpha) * self.lp_freq_track + alpha * inst_hz
+                last_toggle_actual = now
 
             # Choose which frame to display (HUD vs plain)
             show_hud = (display_until is not None and now < display_until)

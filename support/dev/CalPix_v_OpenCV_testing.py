@@ -4,10 +4,185 @@ import numpy as np
 from numpy.typing import NDArray
 import cv2
 from collections import deque
-from support.include_numba import _njit as njit, prange
+from support.mathHelpers.include_numba import _njit as njit, prange
 
-from support.io.calibration import default_864_cam, distort_points_px, undistort_points_px, Calibration
+from support.vision.calibration import default_864_cam, distort_points_px, undistort_points_px, Calibration
 from support.runtime.pixel_handler import Pixel
+
+METHOD_COLORS = {
+    # UNDISTORT
+    "cv undistort (inverse LUT)":     "#1f77b4",  # blue
+    "cv undistortPoints":             "#ff7f0e",  # orange
+    "ours undistort scalar":          "#2ca02c",  # green
+    "ours undistort vec (5fp)":    "#d62728",  # red
+    "ours undistort vec (2fp+N)":   "#9467bd",  # purple
+
+    # DISTORT
+    "cv projectPoints":               "#8c564b",  # brown
+    "ours distort scalar":            "#17becf",  # cyan
+    "ours distort vec":               "#bcbd22",  # olive
+
+    "fwd LUT nearest":                "#7f7f7f",  # gray
+    "fwd LUT bilinear":               "#e377c2",  # pink
+    "fwd LUT bilinear (numba)":       "#ff9896",  # light red
+    "fwd LUT bilinear (numba ss)":    "#c5b0d5",  # light purple
+}
+
+def err_stats(est: np.ndarray, truth: np.ndarray, mask: np.ndarray | None = None):
+    """
+    Returns RMS, Max, p99, p99.9 of pointwise Euclidean error.
+    If mask is provided, uses only masked points.
+    """
+    e = est - truth
+    en = np.sqrt(e[:, 0] * e[:, 0] + e[:, 1] * e[:, 1])
+
+    if mask is not None:
+        en = en[mask]
+
+    if en.size == 0:
+        return dict(rms=np.nan, max=np.nan, p99=np.nan, p999=np.nan)
+
+    return dict(
+        rms=float(np.sqrt(np.mean(en * en))),
+        max=float(np.max(en)),
+        p99=float(np.percentile(en, 99)),
+        p999=float(np.percentile(en, 99.9)),
+    )
+
+
+def plot_tradeoff(all_results, title_prefix="speed vs precision (across all runs)"):
+    """
+    all_results: list[dict] with keys:
+      task: "UNDISTORT" or "DISTORT"
+      method: str
+      time_s: float
+      rms: float
+      run_id: str   # e.g. "high|mixed"
+      (optional) source: str  # if you add it; otherwise method drives legend
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # stable color assignment per method
+    all_methods = sorted(set(r["method"] for r in all_results))
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    method_to_color = {
+        m: color_cycle[i % len(color_cycle)]
+        for i, m in enumerate(all_methods)
+    }
+
+    # ---- marker mapping for run_id ----
+    run_ids = sorted(set(r["run_id"] for r in all_results if "run_id" in r))
+    markers = ['o', 's', '^', 'D', 'P', 'X', 'v', '<', '>', '*', 'h', '8']
+    run_to_marker = {rid: markers[i % len(markers)] for i, rid in enumerate(run_ids)}
+
+    # ---- method ordering (keeps legend stable) ----
+    def _methods_for_task(rows):
+        return sorted(set(r["method"] for r in rows))
+
+    # ---- helper: robust-ish "outlier" rule within each method ----
+    # Labels points that are much worse than that method's typical RMS.
+    def _outlier_mask(method_rms):
+        med = np.median(method_rms)
+        # label anything > 10x median (tweak if you want)
+        return method_rms > (10.0 * med)
+
+    for task in ["UNDISTORT", "DISTORT"]:
+        rows = [r for r in all_results if r["task"] == task]
+        if not rows:
+            continue
+        missing = {r["method"] for r in rows} - METHOD_COLORS.keys()
+        if missing:
+            raise KeyError(f"Missing color definitions for methods: {missing}")
+
+        plt.figure(figsize=(14, 6))
+
+        # plot each method in its own color; within that, marker shape indicates run_id
+        for method in _methods_for_task(rows):
+            #  OpenCV uses exact method down to numerical precision
+            if task == "DISTORT" and method == "cv projectPoints":
+                continue
+
+            rr = [r for r in rows if r["method"] == method]
+            xs = np.array([r["time_s"] for r in rr])
+            ys = np.array([r["rms"] for r in rr])
+            rids = [r["run_id"] for r in rr]
+
+            color = METHOD_COLORS[method]
+
+            first = True
+            for rid in sorted(set(rids)):
+                sel = [i for i, x in enumerate(rids) if x == rid]
+                label = method if first else None
+
+                plt.scatter(
+                    xs[sel],
+                    ys[sel],
+                    color=color,
+                    marker=run_to_marker[rid],
+                    alpha=0.7,
+                    label=label,
+                )
+                first = False
+
+            # # annotate outliers with (run_id + method)
+            # mask = _outlier_mask(ys)
+            # for i in np.where(mask)[0]:
+            #     plt.annotate(
+            #         f"{rr[i]['run_id']} | {method}",
+            #         (xs[i], ys[i]),
+            #         textcoords="offset points",
+            #         xytext=(6, 6),
+            #         fontsize=8,
+            #     )
+
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel("Avg time per call (seconds)")
+        plt.ylabel("RMS px error")
+        plt.title(f"{task}: {title_prefix}")
+        plt.grid(True, which="both")
+
+        # Legend 1: methods (colors)
+        leg_methods = plt.legend(
+            title="Method (color)",
+            fontsize=8,
+            title_fontsize=9,
+            loc="upper right",
+            bbox_to_anchor=(1.0, 1.0),  # top-right corner
+        )
+        plt.gca().add_artist(leg_methods)
+
+        # Legend 2: run markers
+        # Make a compact marker legend with dummy handles:
+        handles = []
+        labels = []
+        for rid in run_ids:
+            h = plt.Line2D(
+                [],
+                [],
+                color="black",
+                marker=run_to_marker[rid],
+                linestyle="None",
+                markersize=7,
+            )
+            handles.append(h)
+            labels.append(rid)
+
+        leg_runs = plt.legend(
+            handles,
+            labels,
+            title="Run (marker)",
+            fontsize=8,
+            title_fontsize=9,
+            loc="upper right",
+            bbox_to_anchor=(1.0, 0.72),  # ↓ shift down; tweak if needed
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+
 
 def make_opencv_mats(cal: Calibration):
     K = np.array([[cal.fx, 0.0, cal.cx],
@@ -24,9 +199,15 @@ def build_forward_maps_supersampled_opencv(K, dist, w, h, s):
       fwd_d_x_ss, fwd_d_y_ss: float32 arrays of shape (h*s, w*s)
       t_build: seconds
     """
+    Kss = K.copy()
+    Kss[0, 0] *= s  # fx
+    Kss[1, 1] *= s  # fy
+    Kss[0, 2] *= s  # cx
+    Kss[1, 2] *= s  # cy
+
     t0 = time.perf_counter()
     map1_ss, map2_ss = cv2.initUndistortRectifyMap(
-        K, dist, None, K, (w * s, h * s), cv2.CV_32FC1
+        Kss, dist, None, Kss, (w * s, h * s), cv2.CV_32FC1
     )
     t1 = time.perf_counter()
     return map1_ss, map2_ss, (t1 - t0)
@@ -156,8 +337,8 @@ def forward_lut_bilinear_numba_supersampled(pts_px_und, fwd_d_x_ss, fwd_d_y_ss, 
         dx = (1.0 - wx) * (1.0 - wy) * f00x + wx * (1.0 - wy) * f10x + (1.0 - wx) * wy * f01x + wx * wy * f11x
         dy = (1.0 - wx) * (1.0 - wy) * f00y + wx * (1.0 - wy) * f10y + (1.0 - wx) * wy * f01y + wx * wy * f11y
 
-        out[i, 0] = dx
-        out[i, 1] = dy
+        out[i, 0] = dx / s
+        out[i, 1] = dy / s
 
     return out
 # ---------- OpenCV implementations ----------
@@ -382,15 +563,6 @@ def opencv_point_distort_via_forward_lut_bilinear(pts_px_und, fwd_d_x, fwd_d_y):
 
 # ---------- Metrics & timing ----------
 
-def rms_err(a, b):
-    d = a - b
-    return np.sqrt(np.mean(np.sum(d * d, axis=1)))
-
-
-def max_err(a, b):
-    return np.max(np.abs(a - b))
-
-
 def bench(fn, iters=50, warmup=5):
     for _ in range(warmup):
         fn()
@@ -421,7 +593,7 @@ def max_err(a, b):
     return np.sqrt(np.max(d[:, 0]**2 + d[:, 1]**2))
 
 
-def test_cal(cal: Calibration):
+def test_cal(cal: Calibration, run_id: str):
 
 
     K, dist = make_opencv_mats(cal)
@@ -464,23 +636,44 @@ def test_cal(cal: Calibration):
 
     # Distort them using OpenCV and our forward model.
     pts_px_dist_cv = opencv_distort_batch(K, dist, pts_px_und_truth)
+    pts_px_dist_ours_scalar = ours_distort_batch_scalar(cal, pts_px_und_truth)
     pts_px_dist_ours = distort_points_px(cal, pts_px_und_truth)
 
     # Confirm forward distortion agreement (should be ~1e-13 px)
-    print("FORWARD DISTORTION agreement (our distort_points_px vs OpenCV projectPoints)")
-    print("  RMS px err:", rms_err(pts_px_dist_ours, pts_px_dist_cv))
-    print("  Max px err:", max_err(pts_px_dist_ours, pts_px_dist_cv))
+    print_title("FORWARD DISTORTION agreement ")
+    row = [("Direct Comparison (scalar):",
+            rms_err(pts_px_dist_ours_scalar, pts_px_dist_cv),
+            max_err(pts_px_dist_ours_scalar, pts_px_dist_cv)),
+
+           ("Direct Comparison (vec):",
+            rms_err(pts_px_dist_ours, pts_px_dist_cv),
+            max_err(pts_px_dist_ours, pts_px_dist_cv))]
+    print_rmsSection('(our distort_points_px vs OpenCV projectPoints)', row)
 
     # Forward LUT distortion
     pts_px_dist_fwd_nn = opencv_point_distort_via_forward_lut_nearest(pts_px_und_truth, fwd_d_x, fwd_d_y)
     pts_px_dist_fwd_bl = opencv_point_distort_via_forward_lut_bilinear(pts_px_und_truth, fwd_d_x, fwd_d_y)
+    pts_px_dist_fwd_bl_numba = forward_lut_bilinear_numba(pts_px_und_truth, fwd_d_x, fwd_d_y)
+    pts_px_dist_fwd_bl_numba_ss = forward_lut_bilinear_numba_supersampled(pts_px_und_truth, fwd_d_x_ss, fwd_d_y_ss, s)
 
-    print("\nFORWARD LUT distortion agreement vs OpenCV projectPoints (same undistorted input)")
-    print("  fwd LUT (nearest):         RMS px err:", rms_err(pts_px_dist_fwd_nn, pts_px_dist_cv))
-    print("                             Max px err:", max_err(pts_px_dist_fwd_nn, pts_px_dist_cv))
-    print("  fwd LUT (bilinear):        RMS px err:", rms_err(pts_px_dist_fwd_bl, pts_px_dist_cv))
-    print("                             Max px err:", max_err(pts_px_dist_fwd_bl, pts_px_dist_cv))
+    print_title("FORWARD LUT distortion agreement vs OpenCV projectPoints")
+    row = [('fwd LUT (nearest):',
+            rms_err(pts_px_dist_fwd_nn, pts_px_dist_cv),
+            max_err(pts_px_dist_fwd_nn, pts_px_dist_cv)),
 
+           ('fwd LUT (bilinear):',
+           rms_err(pts_px_dist_fwd_bl, pts_px_dist_cv),
+           max_err(pts_px_dist_fwd_bl, pts_px_dist_cv)),
+
+           ('fwd LUT (bilinear - numba):',
+           rms_err(pts_px_dist_fwd_bl_numba, pts_px_dist_cv),
+           max_err(pts_px_dist_fwd_bl_numba, pts_px_dist_cv)),
+
+           ('fwd LUT (BL/numba/supersampled):',
+           rms_err(pts_px_dist_fwd_bl_numba_ss, pts_px_dist_cv),
+           max_err(pts_px_dist_fwd_bl_numba_ss, pts_px_dist_cv)),]
+    print_rmsSection('(same undistorted input)',
+                     row)
 
     # Undistort the SAME distorted set using each method and compare to truth
     # Use OpenCV-distorted points as the common input for fairness.
@@ -493,28 +686,46 @@ def test_cal(cal: Calibration):
     cv_lut_und = opencv_point_undistort_via_inverse_lut(pts_px_dist, inv_u_x, inv_u_y)
 
 
-    print("\nUNDISTORT accuracy vs TRUTH (starting from known undistorted -> distort -> undistort)")
-    print(" scalar (2fp+newton):        RMS px err:", rms_err(ours_und_scalar, pts_px_und_truth))
-    print("                             Max px err:", max_err(ours_und_scalar, pts_px_und_truth))
-    print(" vectorized (precise):       RMS px err:", rms_err(ours_und_vec_prec, pts_px_und_truth))
-    print("                             Max px err:", max_err(ours_und_vec_prec, pts_px_und_truth))
-    print(" vectorized (opencv-5fp):    RMS px err:", rms_err(ours_und_vec_cv, pts_px_und_truth))
-    print("                             Max px err:", max_err(ours_und_vec_cv, pts_px_und_truth))
-    print(" cv   undistortPoints:       RMS px err:", rms_err(cv_und, pts_px_und_truth))
-    print("                             Max px err:", max_err(cv_und, pts_px_und_truth))
-    print(" cv undistort (inverse LUT): RMS px err:", rms_err(cv_lut_und, pts_px_und_truth))
-    print("                             Max px err:", max_err(cv_lut_und, pts_px_und_truth))
+    print_title('UNDISTORT accuracy vs TRUTH')
+    row = [('scalar (2fp+newton):',
+            rms_err(ours_und_scalar, pts_px_und_truth),
+            max_err(ours_und_scalar, pts_px_und_truth)),
+
+           ('vectorized (2fp+N):',
+            rms_err(ours_und_vec_prec, pts_px_und_truth),
+            max_err(ours_und_vec_prec, pts_px_und_truth)),
+
+           ('vectorized (5fp):',
+            rms_err(ours_und_vec_cv, pts_px_und_truth),
+            max_err(ours_und_vec_cv, pts_px_und_truth)),
+
+           ('cv   undistortPoints:',
+            rms_err(cv_und, pts_px_und_truth),
+            max_err(cv_und, pts_px_und_truth)),
+
+           ('cv undistort (inverse LUT):',
+            rms_err(cv_lut_und, pts_px_und_truth),
+            max_err(cv_lut_und, pts_px_und_truth)),
+           ]
+    print_rmsSection('(starting from known undistorted -> distort -> undistort)', row)
 
     # Also report how far each method is from OpenCV undistortPoints
-    print("\nUNDISTORT agreement vs OpenCV (same distorted input)")
-    print("  scalar (2fp+newton):       RMS px err:", rms_err(ours_und_scalar, cv_und))
-    print("                             Max px err:", max_err(ours_und_scalar, cv_und))
-    print("  vectorized (precise):      RMS px err:", rms_err(ours_und_vec_prec, cv_und))
-    print("                             Max px err:", max_err(ours_und_vec_prec, cv_und))
-    print("  vectorized (opencv-5fp):   RMS px err:", rms_err(ours_und_vec_cv, cv_und))
-    print("                             Max px err:", max_err(ours_und_vec_cv, cv_und))
-    print(" cv undistort (inverse LUT): RMS px err:", rms_err(cv_lut_und, cv_und))
-    print("                             Max px err:", max_err(cv_lut_und, cv_und))
+    row = [("  scalar (2fp+N):",
+            rms_err(ours_und_scalar, cv_und),
+            max_err(ours_und_scalar, cv_und)),
+
+           ("  vectorized (2fp+N):",
+            rms_err(ours_und_vec_prec, cv_und),
+            max_err(ours_und_vec_prec, cv_und)),
+
+           ("  vectorized (5fp):",
+            rms_err(ours_und_vec_cv, cv_und),
+            max_err(ours_und_vec_cv, cv_und)),
+
+           (" cv undistort (inverse LUT):",
+            rms_err(cv_lut_und, cv_und),
+            max_err(cv_lut_und, cv_und))]
+    print_rmsSection("UNDISTORT agreement vs OpenCV (same distorted input)", row)
 
     W = cal.width  # 864
     H = cal.height  # 864
@@ -523,34 +734,27 @@ def test_cal(cal: Calibration):
     d_truth = pts_px_dist_cv  # or pts_px_dist_ours
 
     # LUT result you want to analyze
-    d_lut = pts_px_dist_fwd_bl  # or nn / non-numba bilinear
+    d_lut = pts_px_dist_fwd_bl_numba  # or nn / non-numba bilinear
 
     # In-bounds mask based on TRUTH mapping
     mask_in = in_bounds_mask(d_truth, W, H)
     mask_out = ~mask_in
 
-    print("\nFORWARD LUT bilinear (Numba) error vs TRUTH")
-
-    if np.any(mask_in):
-        print("  in-bounds:")
-        print("    RMS px err:", rms_err(d_lut[mask_in], d_truth[mask_in]))
-        print("    Max px err:", max_err(d_lut[mask_in], d_truth[mask_in]))
-    else:
-        print("  in-bounds: none")
-
-    if np.any(mask_out):
-        print("  out-of-bounds:")
-        print("    RMS px err:", rms_err(d_lut[mask_out], d_truth[mask_out]))
-        print("    Max px err:", max_err(d_lut[mask_out], d_truth[mask_out]))
-    else:
-        print("  out-of-bounds: none")
-
-    print("  fraction out-of-bounds:", np.mean(mask_out))
-
-    err = np.sqrt(np.sum((d_lut - d_truth) ** 2, axis=1))
-    err_in = err[mask_in]
-    print("p99:", np.percentile(err_in, 99))
-    print("p99.9:", np.percentile(err_in, 99.9))
+    print_title("FORWARD LUT bilinear (Numba) error vs TRUTH")
+    forward_luts = [
+        ("FORWARD LUT nearest", pts_px_dist_fwd_nn),
+        ("FORWARD LUT bilinear (numpy)", pts_px_dist_fwd_bl),
+        ("FORWARD LUT bilinear (numba)", pts_px_dist_fwd_bl_numba),
+        ("FORWARD LUT bilinear (numba ss)", pts_px_dist_fwd_bl_numba_ss),
+    ]
+    for name, pts_est in forward_luts:
+        print_lut_error_block(
+            title=f"{name} error vs TRUTH",
+            pts_est=pts_est,
+            pts_truth=d_truth,
+            W=W,
+            H=H,
+        )
 
     # ------------------------------------------------------------------
     # Timing: use a smaller subset so Python scalar loop is tolerable
@@ -571,8 +775,6 @@ def test_cal(cal: Calibration):
     t_vec_und_cv = bench(lambda: undistort_points_px(cal, pts_px_dist_small, mode="opencv"), iters=800)
     t_cv_und = bench(cv_und_runner, iters=800)
     t_cv_dist = bench(cv_dist_runner, iters=800)
-    t_cv_und_wrapper = bench(lambda: opencv_undistort_batch(K, dist, pts_px_dist_small), iters=800)
-    t_cv_dist_wrapper = bench(lambda: opencv_distort_batch(K, dist, pts_px_und_small_truth), iters=800)
 
     t_scalar_dist = bench(lambda: ours_distort_batch_scalar(cal, pts_px_und_small_truth), iters=10)
     t_vec_dist = bench(lambda: distort_points_px(cal, pts_px_und_small_truth), iters=800)
@@ -589,39 +791,111 @@ def test_cal(cal: Calibration):
     t_cv_lut_und = bench(lambda: opencv_point_undistort_via_inverse_lut(pts_px_dist_small, inv_u_x, inv_u_y),iters=800)
 
     N = pts_px_dist_small.shape[0]
+
     print("\nTIMING (avg seconds per call)   N=", N)
-    print(f"  ours undistort scalar:                    {t_scalar_und:.7f}")
-    print(f"  ours undistort vec (precise):             {t_vec_und_prec:.7f}")
-    print(f"  ours undistort vec (opencv):              {t_vec_und_cv:.7f}")
-    print(f"  cv   undistort (inverse LUT):             {t_cv_lut_und:.7f}")
-    print(f"  cv   undistort (kernel-only):             {t_cv_und:.7f}")
-    print(f"  cv   undistort (wrapper):                 {t_cv_und_wrapper:.7f}")
-    print(f"  ours distort scalar:                      {t_scalar_dist:.7f}")
-    print(f"  ours distort vec:                         {t_vec_dist:.7f}")
-    print(f"  cv   distort (kernel-only):               {t_cv_dist:.7f}")
-    print(f"  cv   distort (wrapper):                   {t_cv_dist_wrapper:.7f}")
-    print(f"  cv   distort (fwd LUT nn):                {t_cv_lut_dist_nn:.7f}")
-    print(f"  cv   distort (fwd LUT bilinear):          {t_cv_lut_dist_bl:.7f}")
-    print(f"  cv   distort (fwd LUT bilinear numba):    {t_cv_lut_dist_bl_numba:.7f}")
-    print(f"  cv   undistort maps build (one-time):     {t_build_maps:.7f}")
-    print(f"  cv   fwd LUT maps build s={s} (one-time):   {t_build_fwd_ss:.7f}")
-    print(f"  cv   inverse LUT build (one-time):        {t_build_inv_lut:.7f}")
+
+    row = [('ours undistort scalar:', t_scalar_und),
+           ('ours undistort vec (2fp+N):', t_vec_und_prec),
+           ('ours undistort vec (5fp):', t_vec_und_cv),
+           ('cv   undistort:', t_cv_und),
+           ('cv   undistort (inverse LUT):', t_cv_lut_und),
+           ]
+    print_floatSection('UNDISTORT', row)
+
+    row = [('ours distort scalar:', t_scalar_dist),
+           ('ours distort vec:', t_vec_dist),
+           ('cv   distort:', t_cv_dist),
+           ('cv   distort (fwd LUT nn):', t_cv_lut_dist_nn),
+           ('cv   distort (fwd LUT bilinear):', t_cv_lut_dist_bl),
+           ('cv   distort (fwd LUT bilinear numba):', t_cv_lut_dist_bl_numba),
+           ]
+    print_floatSection('DISTORT', row)
+
+
+    row = [('cv   undistort maps build (one-time):',t_build_maps),
+           (f'cv   fwd LUT maps build s={s} (one-time):',t_build_fwd_ss),
+           ('cv   inverse LUT build (one-time):',t_build_inv_lut),
+           ]
+    print_floatSection('ONE TIME BUILD COSTS', row)
 
     print("\nTHROUGHPUT (points/sec)")
-    print(f"  ours undistort scalar:                  {N / t_scalar_und:,.0f}")
-    print(f"  ours undistort vec (precise):           {N / t_vec_und_prec:,.0f}")
-    print(f"  ours undistort vec (opencv):            {N / t_vec_und_cv:,.0f}")
-    print(f"  cv   undistort:                         {N / t_cv_und:,.0f}")
-    print(f"  cv   undistort (wrapper):               {N / t_cv_und_wrapper:,.0f}")
-    print(f"  cv   undistort (inverse LUT):           {N / t_cv_lut_und:,.0f}")
-    print(f"  ours distort scalar:                    {N / t_scalar_dist:,.0f}")
-    print(f"  ours distort vec:                       {N / t_vec_dist:,.0f}")
-    print(f"  cv   distort:                           {N / t_cv_dist:,.0f}")
-    print(f"  cv   distort (wrapper):                 {N / t_cv_dist_wrapper:,.0f}")
-    print(f"  cv   distort (fwd LUT nn):              {N / t_cv_lut_dist_nn:,.0f}")
-    print(f"  cv   distort (fwd LUT bilinear):        {N / t_cv_lut_dist_bl:,.0f}")
-    print(f"  cv   distort (fwd LUT bilinear numba):  {N / t_cv_lut_dist_bl_numba:,.0f}")
-    print("======================================================\n")
+
+    row = [('ours undistort scalar:', N / t_scalar_und),
+           ('ours undistort vec (2fp+N):', N / t_vec_und_prec),
+           ('ours undistort vec (5fp):', N / t_vec_und_cv),
+           ('cv  undistort:', N / t_cv_und),
+           ('cv  undistort (inverse LUT):', N / t_cv_lut_und),
+           ]
+    print_intSection('UNDISTORT', row)
+
+    row = [('ours distort scalar:', N / t_scalar_dist),
+           ('ours distort vec:', N / t_vec_dist),
+           ('cv   distort:', N / t_cv_dist),
+           ('cv   distort (fwd LUT nn):', N / t_cv_lut_dist_nn),
+           ('cv   distort (fwd LUT bilinear):', N / t_cv_lut_dist_bl),
+           ('cv   distort (fwd LUT bilinear numba):', N / t_cv_lut_dist_bl_numba),
+           ]
+    print_intSection('DISTORT', row)
+    print_break(rows=3)
+
+    # ------------------------------------------------------------
+    # Collect speed + precision (for plotting across ALL main() runs)
+    # ------------------------------------------------------------
+    results = []
+
+    # UNDISTORT precision vs truth (all points; truth is in-frame by construction)
+    und_methods = [
+        ("ours undistort scalar", ours_und_scalar, t_scalar_und),
+        ("ours undistort vec (2fp+N)", ours_und_vec_prec, t_vec_und_prec),
+        ("ours undistort vec (5fp)", ours_und_vec_cv, t_vec_und_cv),
+        ("cv undistortPoints", cv_und, t_cv_und),
+        ("cv undistort (inverse LUT)", cv_lut_und, t_cv_lut_und),
+    ]
+    for name, est, t_s in und_methods:
+        st = err_stats(est, pts_px_und_truth)  # no mask
+        results.append(dict(
+            run_id=run_id,
+            task="UNDISTORT",
+            method=name,
+            time_s=float(t_s),
+            **st
+        ))
+
+    # DISTORT precision vs truth (use in-bounds mask based on truth distorted pixel)
+    # truth distorted pixels:
+    d_truth = pts_px_dist_cv  # you already define this :contentReference[oaicite:4]{index=4}
+    mask_in = in_bounds_mask(d_truth, W, H)
+
+    # build the missing forward-LUT numba outputs on the FULL set (for precision),
+    # matching your earlier NN/bilinear outputs:
+    pts_px_dist_fwd_bl_numba = forward_lut_bilinear_numba(pts_px_und_truth, fwd_d_x, fwd_d_y)
+    pts_px_dist_fwd_bl_numba_ss = forward_lut_bilinear_numba_supersampled(
+        pts_px_und_truth, fwd_d_x_ss, fwd_d_y_ss, s
+    )
+
+    dist_methods = [
+        ("ours distort scalar", pts_px_dist_ours_scalar, t_scalar_dist),
+        ("ours distort vec", pts_px_dist_ours, t_vec_dist),
+        ("cv projectPoints", pts_px_dist_cv, t_cv_dist),
+
+        ("fwd LUT nearest", pts_px_dist_fwd_nn, t_cv_lut_dist_nn),
+        ("fwd LUT bilinear", pts_px_dist_fwd_bl, t_cv_lut_dist_bl),
+        ("fwd LUT bilinear (numba)", pts_px_dist_fwd_bl_numba, t_cv_lut_dist_bl),  # or bench separately
+        ("fwd LUT bilinear (numba ss)", pts_px_dist_fwd_bl_numba_ss, t_cv_lut_dist_bl_numba),
+    ]
+
+    for name, est, t_s in dist_methods:
+        st = err_stats(est, d_truth, mask=mask_in)
+        results.append(dict(
+            run_id=run_id,
+            task="DISTORT",
+            method=name,
+            time_s=float(t_s),
+            **st
+        ))
+
+    return results
+
 
 def main():
 
@@ -631,18 +905,21 @@ def main():
 
     print("BUILD INFORMATION:")
     print(cv2.getBuildInformation())
-    print("======================================================\n")
 
     cal = default_864_cam()
     np.set_printoptions(suppress=True)
     # sweep
+
+    all_results = []
+
     for strength in ["low", "medium", "high"]:
         for profile in ["radial_only", "tangential_only", "mixed"]:
             cal.randomize(keep_intrinsics=False, strength=strength, profile=profile)
             assert cal.validCal
 
-            print("Testing Calibration: ")
-            print(f"Strength: {strength}, Profile: {profile}")
+            print_break()
+            print_title("Testing Calibration:")
+            print_title(f"Strength: {strength}, Profile: {profile}")
             print(f"Projection Matrix:\n{cal.getCameraMatrix()}")
             print(f"Distortion Coefficients:\n{cal.getDistortion()}")
             print(f"Image Size, Width: {cal.width}px x Height: {cal.height}px")
@@ -654,8 +931,94 @@ def main():
             print(f"  Image Flip Fraction:      {frac_neg_detJ}")
             print(f"  Max Kappa:                {max_kappa}")
             print()
-            test_cal(cal)
+            run_id = f'{strength}|{profile}'
+            all_results.extend(test_cal(cal, run_id))
+    plot_tradeoff(all_results)
 
+
+def print_lut_error_block(
+    title: str,
+    pts_est: np.ndarray,
+    pts_truth: np.ndarray,
+    W: int,
+    H: int,
+):
+    err = pts_est - pts_truth
+    err_norm = np.linalg.norm(err, axis=1)
+
+    mask_in = in_bounds_mask(pts_truth, W, H)
+    mask_out = ~mask_in
+
+    print_title(title)
+
+    print("  in-bounds:")
+    if np.any(err_norm[mask_in]):
+        print(f"    RMS px err: {np.sqrt(np.mean(err_norm[mask_in] ** 2))}")
+        print(f"    Max px err: {np.max(err_norm[mask_in])}")
+    else:
+        print(f'     No points remain in bounds.')
+
+    print("  out-of-bounds:")
+    if np.any(err_norm[mask_out]):
+        print(f"    RMS px err: {np.sqrt(np.mean(err_norm[mask_out] ** 2))}")
+        print(f"    Max px err: {np.max(err_norm[mask_out])}")
+    else:
+        print(f'     No points exceeded boundary.')
+
+    print(f"  fraction out-of-bounds: {np.mean(mask_out)}")
+
+    print(f"  p99:   {np.percentile(err_norm[mask_in], 99)}")
+    print(f"  p99.9: {np.percentile(err_norm[mask_in], 99.9)}")
+
+def print_intSection(title: str, row: list, size: int = 60):
+    print_title(title, size)
+    print_intRow(row)
+    print_break()
+
+def print_floatSection(title: str, row: list, size: int = 60):
+    print_title(title, size)
+    print_floatRow(row)
+    print_break()
+
+def print_rmsSection(title: str, row: list, size: int = 60):
+    print_title(title, size)
+    print_rmsRow(row)
+    print_break()
+
+def print_rmsRow(row: list, size: int = 60):
+    rms_label = 'RMS px err: '
+    max_label = 'Max px err: '
+    for name, rms, max in row:
+        rms_txt = f'{rms:.6e}'
+        max_txt = f'{max:.6e}'
+        empty_space = size - len(name) - len(rms_label) - len(rms_txt) - 1
+        print(f' {name}' + empty_space * ' ' + rms_label + rms_txt)
+        empty_space = size - len(max_label) - len(max_txt)
+        print(empty_space * ' ' + max_label + max_txt)
+
+def print_floatRow(row: list, size: int = 60):
+    for text, num in row:
+        num_txt = f'{num:>10,.7f}'
+        empty_space = size - len(text) - len(num_txt) - 1
+        print(f' {text}' + ' ' * empty_space + num_txt)
+
+def print_intRow(row: list, size: int = 60):
+    # text_width = max(len(text) for text, _ in row)
+    numb_width = max(len(f'{num:,.0f}') for _, num in row)
+    for text, num in row:
+        empty_space = size - len(text) - numb_width - 1
+        print(f' {text}' + ' ' * empty_space + f'{num:>{numb_width},.0f}')
+
+def print_title(title: str, size: int = 60):
+    title_len = len(title)
+    corr_odd = 0 if (size - title_len) % 2 == 0 else 1
+    size_sides = int((size - title_len)/2) - 1
+    print(size_sides * '=' + ' ' + title + ' ' + (corr_odd + size_sides) * '=')
+
+def print_break(size: int = 60, rows: int = 1):
+    for _ in range(max(rows,1)):
+        print(size * '=')
+    print()
 
 if __name__ == "__main__":
     main()

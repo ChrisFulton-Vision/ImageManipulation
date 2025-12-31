@@ -10,7 +10,7 @@ from support.io.my_logging import LOG
 import cv2
 from cv2.dnn import NMSBoxes
 
-from support.io.calibration import Calibration, undistort_points_px_numba
+from support.vision.calibration import Calibration, undistort_points_px_numba
 from support.io.meta_yolo_reader import MetaYoloReader
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text, lrg_text

@@ -1,7 +1,6 @@
 import copy
 import os
 import pickle
-import re
 import time
 import sys
 import threading
@@ -11,7 +10,6 @@ import threading
 
 import numpy as np
 from pathlib import Path
-from typing import Callable
 from tkinter import filedialog
 from yaml import safe_load, dump
 
@@ -19,18 +17,17 @@ from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, C
                            StringVar, CTkProgressBar, END)
 import cv2
 
-from support.core.twoD_to_threeD import solveQnP
-from support.core.quaternions import Quaternion as q, mat2quat
-from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
+from support.mathHelpers.twoD_to_threeD import solveQnP
+from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
 import support.gui.utils as utils
 from support.io.my_logging import LOG
 import support.io.camera_config as camConfig
 from support.io.config_store import ConfigStore
-from support.io.calibration import Calibration, undistort_points_px
+from support.vision.calibration import Calibration, undistort_points_px
 from support.io.image_time_reader import ImageTimeReader
 import support.io.data_processing as data
-from support.viz.CVFontScaling import small_text, med_text, lrg_text
+from support.viz.CVFontScaling import small_text, med_text
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
 from support.vision.draw_circle_and_mask import dim_except_circle

@@ -45,7 +45,7 @@ from sys import maxsize
 from numpy.linalg import norm
 from numpy.typing import NDArray
 import numpy as np
-from support.core.quaternions import Quaternion as Quat, mat2quat, randomQuat
+from support.mathHelpers.quaternions import Quaternion as Quat, mat2quat, randomQuat
 
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 

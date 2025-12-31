@@ -34,9 +34,9 @@ with noisy measurements, the initializer results, and the final optimized pose.
 
 import numpy as np
 from sys import maxsize
-from support.core.quaternions import Quaternion as q, mat2quat
-from support.io.calibration import Calibration
-from support.include_numba import _njit as njit, prange
+from support.mathHelpers.quaternions import Quaternion as q, mat2quat
+from support.vision.calibration import Calibration
+from support.mathHelpers.include_numba import _njit as njit, prange
 from support.core.enums import robust_cost
 from numpy.typing import NDArray
 from dataclasses import dataclass

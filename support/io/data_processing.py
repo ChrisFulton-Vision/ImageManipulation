@@ -6,7 +6,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 import numpy as np
 
 import cv2
@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.io.my_logging import LOG
-import support.gui.utils as utils
 
 
 def natural_sort(l):
@@ -510,7 +509,7 @@ class DataProcessorRunner:
         kf0.set_image_size(width, height)
         kf0.set_sigma_meas_px(2.0, 2.0)
         kf0.set_max_pixel_jump_px(100.0)
-        kf0.max_mahalanobis_sq = 9.99
+        kf0.max_mahalanobis_sq = 9.21
 
         var_proc = float(kf0.var_proc)
         var_meas_x = float(kf0.var_meas_x)
@@ -896,7 +895,6 @@ class DataProcessorRunner:
                     cancel_cb=self.cancel_event.is_set,
                 )
             except Exception as e:
-                print(e)
                 post_status(f"Error on {target.name}: {e}")
                 continue
 
@@ -1121,9 +1119,9 @@ class DataProcessorRunner:
 
         # imports local so data_processing stays “lighter” at import time
         import cv2
-        from support.core.quaternions import mat2quat  # adjust if your path differs
-        from support.core.quaternions import Quaternion as q  # must contain fromOpenCV_toAftr_rvec
-        from support.core.twoD_to_threeD import solveQnP  # adjust if your solveQnP lives elsewhere
+        from support.mathHelpers.quaternions import mat2quat  # adjust if your path differs
+        from support.mathHelpers.quaternions import Quaternion as q  # must contain fromOpenCV_toAftr_rvec
+        from support.mathHelpers.twoD_to_threeD import solveQnP  # adjust if your solveQnP lives elsewhere
 
         K = calibration.getCameraMatrix()
         D_full = calibration.getDistortion()
@@ -1279,23 +1277,35 @@ class DataProcessorRunner:
             # Kalman trust weights for this row (if available) - keyed by kept_ids
             # ------------------------------------------------------------------
             sigma_2N = None
+            kf_img_pts = []
+            width, height = calibration.width, calibration.height
+
             if kalman_available:
                 row_kf = df_kf.iloc[idx - 1]
                 sig_2N_list: list[float] = []
                 any_valid = False
 
                 for fid in kept_ids:
-                    px_name = f"feat_{fid}_kf_sigma_px"
-                    py_name = f"feat_{fid}_kf_sigma_py"
+                    px_name = f"feat_{fid}_kf_x"
+                    py_name = f"feat_{fid}_kf_y"
+                    px_sig_name = f"feat_{fid}_kf_sigma_px"
+                    py_sig_name = f"feat_{fid}_kf_sigma_py"
 
                     try:
-                        sx = float(row_kf.get(px_name, np.nan))
+                        sx = float(row_kf.get(px_sig_name, np.nan))
                     except Exception:
                         sx = float("nan")
                     try:
-                        sy = float(row_kf.get(py_name, np.nan))
+                        sy = float(row_kf.get(py_sig_name, np.nan))
                     except Exception:
                         sy = float("nan")
+
+                    try:
+                        kf_u, kf_v = float(row_kf.get(px_name, np.nan)), float(row_kf.get(py_name, np.nan))
+                    except Exception:
+                        kf_u, kf_v = np.nan, np.nan
+
+                    kf_img_pts.append([float(kf_u * width), float(kf_v * height)])
 
                     if np.isfinite(sx) and sx > 0.0 and np.isfinite(sy) and sy > 0.0:
                         any_valid = True
@@ -1308,6 +1318,8 @@ class DataProcessorRunner:
                         [_BIG_SIGMA if (not np.isfinite(s)) else max(float(s), _MIN_SIGMA) for s in sig_2N_list],
                         dtype=np.float64,
                     )
+
+            kf_img_pts = np.asarray(kf_img_pts, dtype=np.float32)
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full

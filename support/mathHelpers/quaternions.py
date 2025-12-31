@@ -21,7 +21,7 @@ from typing_extensions import Self, Union
 # Import overwritten Numba decorator
 # if user has Numba, allows for njit decorator and prange
 # if user doesn't have Numba, njit decorator does nothing and prange is aliased of range
-from support.include_numba import _njit as njit, prange
+from support.mathHelpers.include_numba import _njit as njit, prange
 
 _FLOAT_EPS = np.finfo(np.float64).eps
 

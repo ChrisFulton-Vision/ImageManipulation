@@ -1,7 +1,7 @@
 import numpy as np
 from numpy import cos, sin, deg2rad
 from datetime import datetime as dt, timedelta
-from support.include_numba import _njit as njit, prange
+from support.mathHelpers.include_numba import _njit as njit, prange
 
 @njit(cache=True, fastmath=True)
 def _kf_step_inplace_with_nis(

@@ -7,7 +7,7 @@ from os.path import join
 import sys, types
 import numpy as np
 from support.runtime.pixel_handler import Pixel as pxl
-from support.include_numba import _njit as njit, prange
+from support.mathHelpers.include_numba import _njit as njit, prange
 
 class Calibration:
     def __init__(self, filepath=None):
@@ -612,22 +612,22 @@ class Calibration:
                 px = np.array([[x + eps_px, y]], dtype=np.float64)
                 py = np.array([[x, y + eps_px]], dtype=np.float64)
 
-                d = distort_points_px(self, p)[0]
+                do = distort_points_px(self, p)[0]
                 dx = distort_points_px(self, px)[0]
                 dy = distort_points_px(self, py)[0]
 
-                jx = (dx - d) / eps_px  # column for +x
-                jy = (dy - d) / eps_px  # column for +y
+                jx = (dx - do) / eps_px  # column for +x
+                jy = (dy - do) / eps_px  # column for +y
 
                 # J = [jx jy] with jx,jy as 2-vectors
                 a, c = jx[0], jx[1]
-                b, d_ = jy[0], jy[1]
+                b, d = jy[0], jy[1]
 
-                detJ = a * d_ - b * c
+                detJ = a * d - b * c
                 dets.append(detJ)
 
                 # conditioning proxy: ||J||_F / |detJ|
-                fro = np.sqrt(a * a + b * b + c * c + d_ * d_)
+                fro = np.sqrt(a * a + b * b + c * c + d * d)
                 kappas.append(fro / (abs(detJ) + 1e-12))
 
         dets = np.asarray(dets)

@@ -148,6 +148,7 @@ class DataProcessorRunner:
         Runs YOLO across all images for each conf in conf_list.
         Writes one CSV per confidence: ..._conf0.80.csv etc.
         """
+        yolo_wall_start = time.perf_counter()
         img_dir = Path(params.img_dir)
         if not img_dir.exists():
             post_status("No valid image directory selected.")
@@ -412,6 +413,13 @@ class DataProcessorRunner:
 
                 post_status(msg)
                 self.cancel_event.clear()
+        yolo_wall_end = time.perf_counter()
+        LOG.info(
+            "YOLO sweep timing: total=%.2f s, images=%d, avg=%.3f ms/img",
+            yolo_wall_end - yolo_wall_start,
+            all_total_imgs * conf_n,
+            1000.0 * (yolo_wall_end - yolo_wall_start) / max(1, all_total_imgs * conf_n),
+        )
 
         post_finish("All confidence sweeps completed.")
         self.cancel_event.clear()
@@ -495,6 +503,8 @@ class DataProcessorRunner:
 
         Xraw = df[x_cols].to_numpy(dtype=np.float64, copy=False)  # (N,M)
         Yraw = df[y_cols].to_numpy(dtype=np.float64, copy=False)
+
+        kf_start = time.perf_counter()
 
         inv_w = 1.0 / max(width, 1.0)
         inv_h = 1.0 / max(height, 1.0)
@@ -703,6 +713,13 @@ class DataProcessorRunner:
                 sig_py = float(height * np.sqrt(max(P[j, 1, 1], 0.0)))
                 out_sig_px[idx, j] = sig_px
                 out_sig_py[idx, j] = sig_py
+        kf_end = time.perf_counter()
+        LOG.info(
+            "KF feature tracking timing: total=%.2f s, rows=%d, avg=%.3f ms/frame",
+            kf_end - kf_start,
+            total_rows,
+            1000.0 * (kf_end - kf_start) / max(1, total_rows),
+        )
 
         # --- Build output DataFrame ---
         import pandas as pd
@@ -749,6 +766,7 @@ class DataProcessorRunner:
             progress_cb: Callable[[float, str], None],
             status_cb: Callable[[str], None],
     ) -> None:
+        start_time = time.time()
         confs = parse_conf_list(conf_list_var)
         proc_dir = img_dir / "_ProcessedData"
         proc_dir.mkdir(parents=True, exist_ok=True)
@@ -928,6 +946,12 @@ class DataProcessorRunner:
 
         If cancel_event is provided, it must have .is_set().
         """
+
+        t_pnp = 0.0
+        t_qnp = 0.0
+        t_qnp_kf = 0.0
+        n_pose = 0
+
         import pandas as pd
         # -------------------- sanity --------------------
         if not getattr(calibration, "validCal", False):
@@ -1328,6 +1352,7 @@ class DataProcessorRunner:
             rvec = tvec = None
             quatPnP = vectPnP = None
             ret = False
+            t0 = time.perf_counter()
             try:
                 ret, rvec, tvec, _inliers = cv2.solvePnPRansac(
                     objectPoints=obj_pts,
@@ -1339,7 +1364,7 @@ class DataProcessorRunner:
             except cv2.error as e:
                 LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
                 ret = False
-
+            t_pnp += time.perf_counter() - t0
             if ret:
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
                 row_pnp = {
@@ -1365,7 +1390,7 @@ class DataProcessorRunner:
             pnp_resid = float("nan")
             qnp_resid = float("nan")
             qnp_kf_resid = float("nan")
-
+            t0 = time.perf_counter()
             try:
                 quatQ, vectQ, stats = solveQnP(
                     obj_pts,
@@ -1376,12 +1401,15 @@ class DataProcessorRunner:
                     user_seed_q=prev_qnp_q,
                     user_seed_t=prev_qnp_t,
                 )
+                t_qnp += time.perf_counter() - t0
+
                 prev_qnp_q, prev_qnp_t = quatQ, vectQ
 
                 quatQ_kf = vectQ_kf = None
                 kf_stats = None
                 if sigma_2N is not None:
                     try:
+                        t0 = time.perf_counter()
                         quatQ_kf, vectQ_kf, kf_stats = solveQnP(
                             obj_pts,
                             img_pts,
@@ -1391,6 +1419,7 @@ class DataProcessorRunner:
                             user_seed_q=prev_qnp_kf_q,
                             user_seed_t=prev_qnp_kf_t,
                         )
+                        t_qnp_kf += time.perf_counter() - t0
                         prev_qnp_kf_q, prev_qnp_kf_t = quatQ_kf, vectQ_kf
                     except Exception as e_kf:
                         LOG.error("solveQnP (Kalman-weighted) failed for %s: %s", image_name, e_kf)
@@ -1531,6 +1560,8 @@ class DataProcessorRunner:
                 if rows_since_ckpt >= checkpoint_every:
                     _flush_and_log_checkpoint(image_name_str, pnp_resid, qnp_resid, qnp_kf_resid)
 
+            n_pose += 1
+
         # Final flush
         LOG.info("Final CSV update...")
         if pnp_batch:
@@ -1565,3 +1596,13 @@ class DataProcessorRunner:
             LOG.info("Reproj norm summary (KF-weighted QnP): %s", _summ(resid_stats["qnp_kf"]))
 
         LOG.info("run_pnp_qnp_from_detection_csv: finished (%s -> %s, %s)", csv_path, out_pnp, out_qnp)
+
+        if n_pose > 0:
+            LOG.info(
+                "Pose solve timing (avg per frame): "
+                "PnP=%.3f ms | QnP=%.3f ms | QnP-KF=%.3f ms",
+                1000.0 * t_pnp / n_pose,
+                1000.0 * t_qnp / n_pose,
+                1000.0 * t_qnp_kf / max(1, n_pose),
+            )
+

@@ -527,6 +527,9 @@ def opt(
     keep_going = True
     iter_num = 0
 
+    eye6 = np.eye(6, dtype=np.float64)
+
+
     # ================= GN LOOP =================
     while keep_going:
         iter_num += 1
@@ -561,38 +564,41 @@ def opt(
         old_y_mag = np.sqrt(y2)
 
         # ---- Damped solve ----
-        delta_x = np.linalg.solve(LtL + lam * np.eye(6), Lty)
+        # Avoid allocating a new eye(6) every iteration
+        # (put `eye6 = np.eye(6, dtype=np.float64)` once above the GN loop)
+        A = LtL.copy()
+        A[0, 0] += lam;
+        A[1, 1] += lam;
+        A[2, 2] += lam
+        A[3, 3] += lam;
+        A[4, 4] += lam;
+        A[5, 5] += lam
+        delta_x = np.linalg.solve(A, Lty)
 
-        # ---- Line search ----
+        # ---- Single-shot LM step (no backtracking line search) ----
         scale = 1.0
-        accepted = False
+        delta_r = delta_x[:3]
+        delta_t = delta_x[3:]
 
-        while not accepted:
-            delta_r = scale * delta_x[:3]
-            delta_t = scale * delta_x[3:]
+        # One quaternion update per GN iter (not per scale attempt)
+        trial_q = q.from_rodrigues(delta_r) * est_q
+        trial_t = est_t + delta_t
 
-            trial_q = q.from_rodrigues(delta_r) * est_q
-            trial_t = est_t + delta_t
+        qw, qx, qy, qz = trial_q.s, *trial_q.vec
+        tx, ty, tz = trial_t
 
-            XYZ = trial_q * object_pts + trial_t
-            if np.mean(XYZ[:, 2] > 1e-3) < 0.9:
-                lam *= 3.0
-                scale *= 0.5
-                if scale < 1e-4:
-                    accepted = True
-                continue
+        _project_and_jacobian_numba(
+            object_pts64,
+            float(qw), float(qx), float(qy), float(qz),
+            float(tx), float(ty), float(tz),
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            proj, RX, xyz, L
+        )
 
-            qw, qx, qy, qz = trial_q.s, *trial_q.vec
-            tx, ty, tz = trial_t
-
-            _project_and_jacobian_numba(
-                object_pts64,
-                float(qw), float(qx), float(qy), float(qz),
-                float(tx), float(ty), float(tz),
-                float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
-                proj, RX, xyz, L
-            )
-
+        # Chirality check using xyz from numba (no Python quat * points)
+        if np.mean(xyz[:, 2] > 1e-3) < 0.9:
+            lam *= 3.0
+        else:
             y[:] = meas_pix - proj
 
             if inv_sigma_2N is None:
@@ -608,8 +614,8 @@ def opt(
 
             new_y_mag = np.linalg.norm(sqrtw * y)
 
-            # GN ratio test
-            y_pred = y - L.dot(scale * delta_x)
+            # GN ratio test (same logic, just no scaling loop)
+            y_pred = y - L.dot(delta_x)
             y_pred_mag = np.linalg.norm(sqrtw * y_pred)
 
             denom = old_y_mag - y_pred_mag
@@ -619,12 +625,8 @@ def opt(
                 lam *= 0.3
                 est_q = trial_q
                 est_t = trial_t
-                accepted = True
             else:
                 lam *= 3.0
-                scale *= 0.5
-                if scale < 1e-4:
-                    accepted = True
 
         if np.linalg.norm(scale * delta_x) < 1e-7 or iter_num > 20:
             keep_going = False

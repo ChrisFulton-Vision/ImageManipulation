@@ -54,6 +54,49 @@ class Plotter:
 
         t = merged["image_time"]
 
+        def _pick_time_col(df, preferred=("image_time", "img_time", "time", "t")):
+            for c in preferred:
+                if c in df.columns:
+                    return c
+            raise KeyError(f"No time column found. Tried: {preferred}. Have: {list(df.columns)[:20]}...")
+
+        def _merge_kf_used_rate_into_merged(merged: pd.DataFrame, kf_csv_path) -> pd.DataFrame:
+            kf = pd.read_csv(kf_csv_path)
+
+            # Find time columns
+            t_merged = _pick_time_col(merged)
+            t_kf = _pick_time_col(kf)
+
+            if "kf_used_rate" not in kf.columns:
+                raise KeyError(
+                    f"'kf_used_rate' not found in KF CSV. "
+                    f"Available columns include: {list(kf.columns)[:30]}..."
+                )
+
+            kf_small = kf[[t_kf, "kf_used_rate"]].copy()
+
+            # Ensure numeric + sorted for merge_asof
+            merged2 = merged.copy()
+            merged2[t_merged] = pd.to_numeric(merged2[t_merged], errors="coerce")
+            kf_small[t_kf] = pd.to_numeric(kf_small[t_kf], errors="coerce")
+            merged2 = merged2.sort_values(t_merged)
+            kf_small = kf_small.sort_values(t_kf)
+
+            # Rename KF time column to match merged
+            if t_kf != t_merged:
+                kf_small = kf_small.rename(columns={t_kf: t_merged})
+
+            # Merge (nearest time match)
+            merged2 = pd.merge_asof(
+                merged2,
+                kf_small,
+                on=t_merged,
+                direction="nearest",
+                tolerance=1e-3,  # adjust if needed (see note below)
+            )
+
+            return merged2
+
         # Detect if KF-weighted QnP is available
         has_kf_pos = all(f"qnp_kf_{c}" in merged.columns for c in ["x", "y", "z"])
         has_kf_quat = all(f"qnp_kf_{c}" in merged.columns for c in ["qw", "qx", "qy", "qz"])
@@ -263,23 +306,54 @@ class Plotter:
                 if not show:
                     plt.close()
 
-        # used_n over time (helps interpret dof jumps / gating)
-        if ("qnp_used_n" in merged.columns) or ("qnp_kf_used_n" in merged.columns):
-            plt.figure()
-            if "qnp_used_n" in merged.columns:
-                plt.plot(t, merged["qnp_used_n"], label="QnP used_n")
-            if "qnp_kf_used_n" in merged.columns:
-                plt.plot(t, merged["qnp_kf_used_n"], label="QnP-KF used_n")
-            plt.xlabel("Time [s]")
-            plt.ylabel("N points used")
-            # plt.title("SolveQnP Used Feature Count vs Time")
-            plt.grid(True)
-            plt.legend()
+        # Bring kf_used_rate from merged_kf into merged (time-aligned)
+        if ("kf_used_rate" not in merged.columns) and ("kf_used_rate" in merged_kf.columns):
+            # choose time column names (adjust if yours differs)
+            t_col_merged = "image_time" if "image_time" in merged.columns else "img_time"
+            t_col_kf = "image_time" if "image_time" in merged_kf.columns else "img_time"
 
-            if save:
-                plt.savefig(dir_path / Path(f"8_KF_Features_used.pdf"))
-                if not show:
-                    plt.close()
+            kf_small = merged_kf[[t_col_kf, "kf_used_rate"]].copy()
+
+            # ensure numeric + sorted
+            merged = merged.sort_values(t_col_merged).copy()
+            kf_small = kf_small.sort_values(t_col_kf).copy()
+            merged[t_col_merged] = pd.to_numeric(merged[t_col_merged], errors="coerce")
+            kf_small[t_col_kf] = pd.to_numeric(kf_small[t_col_kf], errors="coerce")
+
+            # rename time column to match merged
+            if t_col_kf != t_col_merged:
+                kf_small = kf_small.rename(columns={t_col_kf: t_col_merged})
+
+            merged = pd.merge_asof(
+                merged,
+                kf_small,
+                on=t_col_merged,
+                direction="nearest",
+                tolerance=2e-2,  # 20 ms; tighten if possible
+            )
+
+            # used_n over time + KF rejected count (derived from kf_used_rate)
+            if ("qnp_used_n" in merged.columns) and ("kf_used_rate" in merged.columns):
+                plt.figure()
+
+                n_used = merged["qnp_used_n"].to_numpy(dtype=float)
+                kf_used_rate = merged["kf_used_rate"].to_numpy(dtype=float)
+
+                # rejected fraction in [0,1]
+                n_kf_rejected_eff = n_used * kf_used_rate
+
+                plt.plot(t, n_used, label="QnP used_n")
+                plt.plot(t, n_kf_rejected_eff, linestyle="--", label="QnP-KF used_n")
+
+                plt.xlabel("Time [s]")
+                plt.ylabel("N features")
+                plt.grid(True)
+                plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path("8_KF_Features_used.pdf"))
+                    if not show:
+                        plt.close()
 
         # per-parameter 1-sigma time series
         if have_qnp_sig or have_qnp_kf_sig:
@@ -467,6 +541,418 @@ class Plotter:
                         plt.savefig(dir_path / Path(f"15_NIS_Accepted_Histogram_vs_time.pdf"))
                         if not show:
                             plt.close()
+
+            # ============================================================
+            # NEW: "Brittleness / pollution" story plots
+            #   - Confidence gain (σ_unw / σ_kf)
+            #   - Link gain to KF rejection + innovation inconsistency
+            #   - Heatmap of per-feature NIS/sigma with gain overlay
+            # ============================================================
+
+            # Helper: ensure output dir exists if saving
+            def _ensure_dir():
+                if save:
+                    if not Path.is_dir(dir_path):
+                        Path.mkdir(dir_path, parents=True, exist_ok=True)
+
+            # We need QnP sigmas + QnP-KF sigmas to form confidence gain
+            have_rot_sig = all(c in merged_kf.columns for c in ["qnp_sig_rx", "qnp_sig_ry", "qnp_sig_rz"])
+            have_rot_sig_kf = all(c in merged_kf.columns for c in ["qnp_kf_sig_rx", "qnp_kf_sig_ry", "qnp_kf_sig_rz"])
+
+            # KF rejection + innovation inconsistency summaries (frame-level)
+            has_used_rate = "kf_used_rate" in merged_kf.columns
+            has_nis_p95 = "kf_nis_p95_used" in merged_kf.columns
+            has_nis_med = "kf_nis_med_used" in merged_kf.columns
+
+            if have_rot_sig and have_rot_sig_kf:
+                eps = 1e-12
+
+                # Choose which rotational sigma to tell the story with:
+                # - rz is often most interpretable
+                # - or max(rx,ry,rz) is a robust "worst-axis" indicator
+                sig_unw_rz = merged_kf["qnp_sig_rz"].to_numpy(dtype=float)
+                sig_kf_rz = merged_kf["qnp_kf_sig_rz"].to_numpy(dtype=float)
+
+                # Confidence gain: how much more "confident" the KF-weighted solve is
+                conf_gain_rz = (sig_unw_rz + eps) / (sig_kf_rz + eps)
+
+                # Also useful: a magnitude gain (optional)
+                sig_unw_rmag = np.sqrt(
+                    merged_kf["qnp_sig_rx"].to_numpy(dtype=float) ** 2 +
+                    merged_kf["qnp_sig_ry"].to_numpy(dtype=float) ** 2 +
+                    merged_kf["qnp_sig_rz"].to_numpy(dtype=float) ** 2
+                )
+                sig_kf_rmag = np.sqrt(
+                    merged_kf["qnp_kf_sig_rx"].to_numpy(dtype=float) ** 2 +
+                    merged_kf["qnp_kf_sig_ry"].to_numpy(dtype=float) ** 2 +
+                    merged_kf["qnp_kf_sig_rz"].to_numpy(dtype=float) ** 2
+                )
+                conf_gain_rmag = (sig_unw_rmag + eps) / (sig_kf_rmag + eps)
+
+                # KF rejected fraction (proxy for polluted measurement field)
+                if has_used_rate:
+                    used_rate = merged_kf["kf_used_rate"].to_numpy(dtype=float)
+                    rej_frac = 1.0 - used_rate
+                else:
+                    rej_frac = None
+
+                # ============================================================
+                # Fig A: Confidence gain vs time + overlays (rejection + NIS)
+                # ============================================================
+                plt.figure()
+                plt.plot(t, conf_gain_rz, label="Confidence gain (σ_unw_rz / σ_kf_rz)")
+                plt.plot(t, conf_gain_rmag, linestyle="--", label="Confidence gain (||σ_r|| unw / KF)")
+                plt.axhline(1.0, linestyle="--", label="= 1 (no advantage)")
+                plt.xlabel("Time [s]")
+                plt.ylabel("Confidence gain (ratio)")
+                plt.grid(True)
+
+                # Overlays on a right axis, if available
+                ax1 = plt.gca()
+                ax2 = ax1.twinx()
+
+                overlay_handles = []
+                overlay_labels = []
+
+                if rej_frac is not None:
+                    h = ax2.plot(t, rej_frac, linestyle=":", label="KF rejected fraction (1 - used_rate)")
+                    overlay_handles += h
+                    overlay_labels += ["KF rejected fraction (1 - used_rate)"]
+
+                if has_nis_p95:
+                    h = ax2.plot(t, merged_kf["kf_nis_p95_used"], linestyle="-.", label="KF NIS p95 (accepted)")
+                    overlay_handles += h
+                    overlay_labels += ["KF NIS p95 (accepted)"]
+                elif has_nis_med:
+                    h = ax2.plot(t, merged_kf["kf_nis_med_used"], linestyle="-.", label="KF NIS median (accepted)")
+                    overlay_handles += h
+                    overlay_labels += ["KF NIS median (accepted)"]
+
+                ax2.set_ylabel("KF diagnostics")
+
+                # Combine legends cleanly
+                h1, l1 = ax1.get_legend_handles_labels()
+                h2, l2 = ax2.get_legend_handles_labels()
+                ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+
+                if save:
+                    _ensure_dir()
+                    plt.savefig(dir_path / Path("16_ConfidenceGain_vs_Time_with_KF_Diagnostics.pdf"))
+                    if not show:
+                        plt.close()
+
+                # ============================================================
+                # Fig B: Confidence gain vs rejection fraction (scatter)
+                #   "When more measurements are rejected, KF-weighting helps more"
+                # ============================================================
+                if rej_frac is not None:
+                    x = rej_frac[1:]
+                    y = conf_gain_rz[1:]
+                    good = np.isfinite(x) & np.isfinite(y)
+                    if np.count_nonzero(good) > 3:
+                        corr = float(np.corrcoef(x[good], y[good])[0, 1])
+                    else:
+                        corr = float("nan")
+
+                    plt.figure()
+                    plt.scatter(x[good], y[good], s=18, alpha=0.8, label=f"frames (corr={corr:.3f})")
+                    plt.xlabel("KF rejected fraction (1 - used_rate)")
+                    plt.ylabel("Confidence gain (σ_unw_rz / σ_kf_rz)")
+                    plt.grid(True)
+                    plt.legend(loc="upper left")
+
+                    if save:
+                        _ensure_dir()
+                        plt.savefig(dir_path / Path("17_ConfidenceGain_vs_KF_RejectionScatter.pdf"))
+                        if not show:
+                            plt.close()
+
+                # ============================================================
+                # Fig C: Confidence gain vs innovation inconsistency (scatter)
+                #   "When accepted innovations are inconsistent, KF-weighting helps more"
+                # ============================================================
+                if has_nis_p95 or has_nis_med:
+                    nis_key = "kf_nis_p95_used" if has_nis_p95 else "kf_nis_med_used"
+                    x = merged_kf[nis_key].to_numpy(dtype=float)[1:]
+                    y = conf_gain_rz[1:]  #rejecting first one as KF's are unintialized
+                    good = np.isfinite(x) & np.isfinite(y)
+                    if np.count_nonzero(good) > 3:
+                        corr = float(np.corrcoef(x[good], y[good])[0, 1])
+                    else:
+                        corr = float("nan")
+
+                    plt.figure()
+                    plt.scatter(x[good], y[good], s=18, alpha=0.8, label=f"frames (corr={corr:.3f})")
+                    plt.xlabel(f"KF {nis_key}")
+                    plt.ylabel("Confidence gain (σ_unw_rz / σ_kf_rz)")
+                    plt.grid(True)
+                    plt.legend(loc="upper left")
+
+                    if save:
+                        _ensure_dir()
+                        plt.savefig(dir_path / Path("18_ConfidenceGain_vs_KF_InnovationScatter.pdf"))
+                        if not show:
+                            plt.close()
+
+                # ============================================================
+                # Fig D: Heatmap of per-feature instability + gain overlay
+                #
+                # Two options:
+                #   1) Use per-feature NIS (endswith '_kf_nis') — best "false positive / mismatch" proxy
+                #   2) Use per-feature sigma_px (endswith '_kf_sigma_px') — best "uncertainty field" view
+                #
+                # We'll prefer NIS heatmap if available; otherwise fall back to sigma_px.
+                # ============================================================
+
+                # Collect per-feature series columns
+                nis_cols = [c for c in merged_kf.columns if c.endswith("_kf_nis")]
+                sig_cols = [c for c in merged_kf.columns if c.endswith("_kf_sigma_px")]
+
+                # Sort feature columns by feature index if they are named like feat_0_..., feat_1_...
+                def _feat_sort_key(name: str):
+                    # Expected: "feat_{i}_kf_nis" or "feat_{i}_kf_sigma_px"
+                    try:
+                        # split on '_' and find first integer
+                        parts = name.split("_")
+                        for p in parts:
+                            if p.isdigit():
+                                return int(p)
+                        # if pattern is feat_{i}, parts[1] likely int
+                        if len(parts) > 1 and parts[1].isdigit():
+                            return int(parts[1])
+                    except Exception:
+                        pass
+                    return 10 ** 9
+
+                if len(nis_cols) > 0:
+                    cols = sorted(nis_cols, key=_feat_sort_key)
+                    data_kind = "NIS"
+                    # Mask invalid zeros/negatives as NaN
+                    M = merged_kf[cols].to_numpy(dtype=float)
+                    M[M <= 0.0] = np.nan
+                    # Optional: clip for readability (keep extreme spikes from dominating colormap)
+                    # (Use percentile clipping so it adapts to runs)
+                    vmin = np.nanpercentile(M, 5)
+                    vmax = np.nanpercentile(M, 95)
+
+                elif len(sig_cols) > 0:
+                    cols = sorted(sig_cols, key=_feat_sort_key)
+                    data_kind = "sigma_px"
+                    M = merged_kf[cols].to_numpy(dtype=float)
+                    M[~np.isfinite(M)] = np.nan
+                    vmin = np.nanpercentile(M, 5)
+                    vmax = np.nanpercentile(M, 95)
+
+                else:
+                    cols = []
+                    M = None
+                    data_kind = None
+
+                if M is not None and len(cols) > 0:
+                    plt.figure(figsize=(10, 6))
+                    ax = plt.gca()
+
+                    # Heatmap: time along x, feature index along y
+                    # We use imshow with extent so x-axis matches time
+                    im = ax.imshow(
+                        M.T,
+                        aspect="auto",
+                        origin="lower",
+                        extent=[float(t.iloc[0]), float(t.iloc[-1]), 0, M.shape[1]],
+                        vmin=vmin,
+                        vmax=vmax,
+                    )
+                    ax.set_xlabel("Time [s]")
+                    ax.set_ylabel("Feature index")
+                    cbar = plt.colorbar(im, ax=ax)
+                    cbar.set_label(data_kind)
+
+                    # Overlay confidence gain on a second axis (same x)
+                    ax2 = ax.twinx()
+                    ax2.plot(t, conf_gain_rz,
+                             linewidth=1.0, color='black')
+                    ax2.plot(t, conf_gain_rz, label="Confidence gain (σ_unw_rz / σ_kf_rz)",
+                             linewidth=0.5, color='white')
+                    ax2.axhline(1.0, linestyle="--")
+                    ax2.set_ylabel("Confidence gain")
+
+                    # Optional: mark top-K gain spikes with vertical lines
+                    # Helps visually align "pollution field" with "brittleness"
+                    cg = np.asarray(conf_gain_rz, dtype=float)
+                    good = np.isfinite(cg)
+                    if np.count_nonzero(good) > 10:
+                        # pick top 5 spikes
+                        idxs = np.array([49, 125, 200, 240, 375, 430])
+                        tg = np.asarray(t[good])
+                        for xv in tg[idxs]:
+                            ax.axvline(float(xv), linestyle=":", linewidth=1, color='red')
+
+                    # Legends
+                    h1, l1 = ax2.get_legend_handles_labels()
+                    ax2.legend(h1, l1, loc="upper right")
+
+                    plt.title(f"Per-feature {data_kind} heatmap with confidence gain overlay")
+
+                    if save:
+                        _ensure_dir()
+                        plt.savefig(dir_path / Path(f"19_Heatmap_{data_kind}_with_ConfidenceGainOverlay.pdf"))
+                        if not show:
+                            plt.close()
+
+            # ============================================================
+            # NEW FIGURES: Region-summary stats (NIS + Gain + Rejection)
+            # ============================================================
+
+            # ---- configure windows (seconds) ----
+            roi_windows = [
+                ("Early gain (1.5–3.0s)", 1.5, 3.0),
+                ("Moderate Spike (5–7.5s)", 5.0, 7.5),
+                ("Nominal (9–11s)", 9.0, 11.0),
+                ("Nominal (11–13s)", 11.0, 13.0),
+                ("Nominal (17.5–20s)", 17.5, 20.0),
+                ("Late gain (21–22s)", 21.0, 22.0),
+            ]
+
+            # ---- per-feature KF NIS + used masks ----
+            nis_cols = [c for c in merged_kf.columns if c.endswith("_kf_nis")]
+            used_cols = [c.replace("_kf_nis", "_kf_used") for c in nis_cols if
+                         c.replace("_kf_nis", "_kf_used") in merged_kf.columns]
+
+            # ---- confidence gain (rotation) ----
+            eps = 1e-12
+            have_gain = ("qnp_sig_rz" in merged_kf.columns) and ("qnp_kf_sig_rz" in merged_kf.columns)
+            if have_gain:
+                sig_unw = merged_kf["qnp_sig_rz"].to_numpy(dtype=float)
+                sig_kf = merged_kf["qnp_kf_sig_rz"].to_numpy(dtype=float)
+                conf_gain = (sig_unw + eps) / (sig_kf + eps)
+            else:
+                conf_gain = None
+
+            # ---- rejection fraction ----
+            rej_frac = None
+            if "kf_used_rate" in merged_kf.columns:
+                rej_frac = 1.0 - merged_kf["kf_used_rate"].to_numpy(dtype=float)
+
+            def _collect_used_nis(t0, t1):
+                m = (t >= t0) & (t <= t1)
+                if len(nis_cols) == 0 or len(used_cols) == 0:
+                    return np.array([], dtype=float), int(np.count_nonzero(m))
+                nisM = merged_kf.loc[m, nis_cols].to_numpy(dtype=float)
+                useM = merged_kf.loc[m, used_cols].to_numpy(dtype=float)
+                x = nisM[(useM > 0.5) & np.isfinite(nisM) & (nisM >= 0.0)]
+                return x, int(np.count_nonzero(m))
+
+            def _roi_stat(arr):
+                # robust summary (avoid being dominated by rare spikes)
+                if arr.size == 0:
+                    return dict(med=np.nan, p90=np.nan, p95=np.nan)
+                med, p90, p95 = np.percentile(arr, [50, 90, 95])
+                return dict(med=float(med), p90=float(p90), p95=float(p95))
+
+            def _roi_gain_stat(t0, t1):
+                if conf_gain is None:
+                    return dict(med=np.nan, p90=np.nan)
+                m = (t >= t0) & (t <= t1)
+                g = conf_gain[m]
+                g = g[np.isfinite(g)]
+                if g.size == 0:
+                    return dict(med=np.nan, p90=np.nan)
+                med, p90 = np.percentile(g, [50, 90])
+                return dict(med=float(med), p90=float(p90))
+
+            def _roi_rej_stat(t0, t1):
+                if rej_frac is None:
+                    return np.nan
+                m = (t >= t0) & (t <= t1)
+                r = rej_frac[m]
+                r = r[np.isfinite(r)]
+                return float(np.mean(r)) if r.size else np.nan
+
+            # ---- collect region datasets ----
+            labels = [w[0] for w in roi_windows]
+            nis_used_sets = []
+            nis_stats = []
+            gain_stats = []
+            rej_stats = []
+            frames_counts = []
+
+            for name, a, b in roi_windows:
+                x, nframes = _collect_used_nis(a, b)
+                nis_used_sets.append(x)
+                nis_stats.append(_roi_stat(x))
+                gain_stats.append(_roi_gain_stat(a, b))
+                rej_stats.append(_roi_rej_stat(a, b))
+                frames_counts.append(nframes)
+
+            # ============================================================
+            # FIG 1: Boxplot of used-feature NIS by window
+            # ============================================================
+            plt.figure(figsize=(8, 5))
+            plt.boxplot(nis_used_sets, labels=labels, showfliers=False)
+            plt.ylabel("Per-feature NIS (used measurements only)")
+            plt.xlabel("Time window")
+            plt.grid(True, axis="y")
+            plt.title("Per-feature NIS distribution by time window (accepted features)")
+            plt.xticks(rotation=15, ha="right")
+            plt.tight_layout()
+            if save:
+                plt.savefig(dir_path / Path("20_ROI_NIS_Boxplot.pdf"))
+                if not show:
+                    plt.close()
+
+            # ============================================================
+            # FIG 2: Robust NIS quantiles (Median / P90 / P95) by window
+            # ============================================================
+            xpos = np.arange(len(labels))
+            width = 0.22
+            meds = [s["med"] for s in nis_stats]
+            p90s = [s["p90"] for s in nis_stats]
+            p95s = [s["p95"] for s in nis_stats]
+
+            plt.figure(figsize=(8, 5))
+            plt.bar(xpos - width, meds, width, label="Median")
+            plt.bar(xpos, p90s, width, label="P90")
+            plt.bar(xpos + width, p95s, width, label="P95")
+            plt.xticks(xpos, labels, rotation=15, ha="right")
+            plt.ylabel("Per-feature NIS (used measurements only)")
+            plt.grid(True, axis="y")
+            plt.title("Robust NIS quantiles by time window (accepted features)")
+            plt.legend(loc="upper left")
+            plt.tight_layout()
+            if save:
+                plt.savefig(dir_path / Path("21_ROI_NIS_Quantiles.pdf"))
+                if not show:
+                    plt.close()
+
+            # ============================================================
+            # FIG 3: Confidence gain by window + mean rejection fraction overlay
+            # ============================================================
+            gain_med = [g["med"] for g in gain_stats]
+            gain_p90 = [g["p90"] for g in gain_stats]
+
+            plt.figure(figsize=(8, 5))
+            ax1 = plt.gca()
+            ax1.bar(xpos, gain_med, label="Gain median (σ_unw/σ_kf)")
+            ax1.plot(xpos, gain_p90, linestyle="--", marker="o", label="Gain P90")
+            ax1.set_xticks(xpos)
+            ax1.set_xticklabels(labels, rotation=15, ha="right")
+            ax1.set_ylabel("Confidence gain (σ_unweighted / σ_KF-weighted)")
+            ax1.grid(True, axis="y")
+
+            ax2 = ax1.twinx()
+            ax2.plot(xpos, rej_stats, linestyle=":", marker="s", label="Mean rejected fraction")
+            ax2.set_ylabel("Rejected fraction (1 - used_rate)")
+
+            h1, l1 = ax1.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
+            ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+
+            plt.title("Region summary: confidence gain vs measurement rejection")
+            plt.tight_layout()
+            if save:
+                plt.savefig(dir_path / Path("22_ROI_Gain_vs_Rejection.pdf"))
+                if not show:
+                    plt.close()
 
             # sigma_pxs_cols = list(filter(lambda x: x.endswith("sigma_px"), merged_kf.columns))
             # sigma_pys_cols = list(filter(lambda x: x.endswith("sigma_py"), merged_kf.columns))

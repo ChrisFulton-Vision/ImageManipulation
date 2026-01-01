@@ -52,7 +52,216 @@ class QnPStats:
     s2: float
     cov6: np.ndarray
 
+@njit(cache=True, fastmath=False)
+def _project_accum_irls_numba(object_pts, meas_2N,
+                              qw, qx, qy, qz, tx, ty, tz,
+                              fx, fy, cx, cy,
+                              kind_int, c,
+                              inv_sigma_2N,  # either None or (2N,) float64
+                              z_eps=1e-3):
+    N = object_pts.shape[0]
+    R = _quat_to_R_numba(qw, qx, qy, qz)
+
+    LtL = np.zeros((6, 6), dtype=np.float64)
+    Lty = np.zeros(6, dtype=np.float64)
+    y2  = 0.0
+
+    front = 0
+
+    eps = 1e-12
+    if c <= 0.0:
+        c = 1.0
+
+    for i in range(N):
+        X = object_pts[i, 0]
+        Y = object_pts[i, 1]
+        Z = object_pts[i, 2]
+
+        rx = R[0, 0]*X + R[0, 1]*Y + R[0, 2]*Z
+        ry = R[1, 0]*X + R[1, 1]*Y + R[1, 2]*Z
+        rz = R[2, 0]*X + R[2, 1]*Y + R[2, 2]*Z
+
+        x = rx + tx
+        y = ry + ty
+        z = rz + tz
+
+        if z > z_eps:
+            front += 1
+
+        invz = 1.0 / z
+        invz2 = invz * invz
+
+        u = fx * (x * invz) + cx
+        v = fy * (y * invz) + cy
+
+        r2 = 2 * i
+        du = meas_2N[r2 + 0] - u
+        dv = meas_2N[r2 + 1] - v
+
+        # base whitening from KF sigmas (2N)
+        if inv_sigma_2N is None:
+            iu = 1.0
+            iv = 1.0
+        else:
+            iu = inv_sigma_2N[r2 + 0]
+            iv = inv_sigma_2N[r2 + 1]
+
+        # robust sw per feature from whitened magnitude (same as your robust kernel)
+        if kind_int == 0:
+            sw = 1.0
+        else:
+            rwu = du * iu
+            rwv = dv * iv
+            rmag = np.sqrt(rwu*rwu + rwv*rwv)
+
+            if rmag < eps:
+                w = 1.0
+            elif kind_int == 1:  # huber
+                w = 1.0 if rmag <= c else (c / rmag)
+            elif kind_int == 2:  # cauchy
+                t = rmag / c
+                w = 1.0 / (1.0 + t*t)
+            else:  # tukey
+                t = rmag / c
+                if t >= 1.0:
+                    w = 0.0
+                else:
+                    a = 1.0 - t*t
+                    w = a*a
+
+            sw = np.sqrt(w)
+
+        # final sqrt-weights for each residual row
+        wu = iu * sw
+        wv = iv * sw
+
+        # weighted residuals
+        ru = wu * du
+        rv = wv * dv
+
+        y2 += ru*ru + rv*rv
+
+        # Jacobian row algebra (same as your _project_and_jacobian_numba)
+        uX = fx * invz
+        uZ = -fx * x * invz2
+        vY = fy * invz
+        vZ = -fy * y * invz2
+
+        a = rx
+        b = ry
+        cR = rz
+
+        # rot partials
+        Lurx = uZ * b
+        Lury = uX * cR - uZ * a
+        Lurz = -uX * b
+
+        Lvrx = -vY * cR + vZ * b
+        Lvry = -vZ * a
+        Lvrz = vY * a
+
+        # trans partials
+        Ju = (uX, 0.0, uZ)  # (tx,ty,tz) cols for u row
+        Jv = (0.0, vY, vZ)  # (tx,ty,tz) cols for v row
+
+        # build weighted Jacobian rows (6 elements each)
+        ju0 = wu * Lurx
+        ju1 = wu * Lury
+        ju2 = wu * Lurz
+        ju3 = wu * Ju[0]
+        ju4 = wu * Ju[1]
+        ju5 = wu * Ju[2]
+
+        jv0 = wv * Lvrx
+        jv1 = wv * Lvry
+        jv2 = wv * Lvrz
+        jv3 = wv * Jv[0]
+        jv4 = wv * Jv[1]
+        jv5 = wv * Jv[2]
+
+        # Accumulate Lty += J^T r
+        Lty[0] += ju0*ru + jv0*rv
+        Lty[1] += ju1*ru + jv1*rv
+        Lty[2] += ju2*ru + jv2*rv
+        Lty[3] += ju3*ru + jv3*rv
+        Lty[4] += ju4*ru + jv4*rv
+        Lty[5] += ju5*ru + jv5*rv
+
+        # Accumulate LtL += J^T J (two rows)
+        # (manual outer-products, still tiny and fast at N<=100)
+        # u-row
+        LtL[0,0] += ju0*ju0; LtL[0,1] += ju0*ju1; LtL[0,2] += ju0*ju2; LtL[0,3] += ju0*ju3; LtL[0,4] += ju0*ju4; LtL[0,5] += ju0*ju5
+        LtL[1,1] += ju1*ju1; LtL[1,2] += ju1*ju2; LtL[1,3] += ju1*ju3; LtL[1,4] += ju1*ju4; LtL[1,5] += ju1*ju5
+        LtL[2,2] += ju2*ju2; LtL[2,3] += ju2*ju3; LtL[2,4] += ju2*ju4; LtL[2,5] += ju2*ju5
+        LtL[3,3] += ju3*ju3; LtL[3,4] += ju3*ju4; LtL[3,5] += ju3*ju5
+        LtL[4,4] += ju4*ju4; LtL[4,5] += ju4*ju5
+        LtL[5,5] += ju5*ju5
+
+        # v-row
+        LtL[0,0] += jv0*jv0; LtL[0,1] += jv0*jv1; LtL[0,2] += jv0*jv2; LtL[0,3] += jv0*jv3; LtL[0,4] += jv0*jv4; LtL[0,5] += jv0*jv5
+        LtL[1,1] += jv1*jv1; LtL[1,2] += jv1*jv2; LtL[1,3] += jv1*jv3; LtL[1,4] += jv1*jv4; LtL[1,5] += jv1*jv5
+        LtL[2,2] += jv2*jv2; LtL[2,3] += jv2*jv3; LtL[2,4] += jv2*jv4; LtL[2,5] += jv2*jv5
+        LtL[3,3] += jv3*jv3; LtL[3,4] += jv3*jv4; LtL[3,5] += jv3*jv5
+        LtL[4,4] += jv4*jv4; LtL[4,5] += jv4*jv5
+        LtL[5,5] += jv5*jv5
+
+    # symmetrize LtL
+    LtL[1,0] = LtL[0,1]; LtL[2,0] = LtL[0,2]; LtL[3,0] = LtL[0,3]; LtL[4,0] = LtL[0,4]; LtL[5,0] = LtL[0,5]
+    LtL[2,1] = LtL[1,2]; LtL[3,1] = LtL[1,3]; LtL[4,1] = LtL[1,4]; LtL[5,1] = LtL[1,5]
+    LtL[3,2] = LtL[2,3]; LtL[4,2] = LtL[2,4]; LtL[5,2] = LtL[2,5]
+    LtL[4,3] = LtL[3,4]; LtL[5,3] = LtL[3,5]
+    LtL[5,4] = LtL[4,5]
+
+    front_frac = front / float(max(1, N))
+    return LtL, Lty, y2, front_frac
+
+
 # --- Small helpers --------------------------------------------------------------
+import numpy as np
+from numba import njit
+
+@njit(cache=True, fastmath=False)
+def _quat_mul(qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2):
+    # (q1 ⊗ q2)
+    return (
+        qw1*qw2 - qx1*qx2 - qy1*qy2 - qz1*qz2,
+        qw1*qx2 + qx1*qw2 + qy1*qz2 - qz1*qy2,
+        qw1*qy2 - qx1*qz2 + qy1*qw2 + qz1*qx2,
+        qw1*qz2 + qx1*qy2 - qy1*qx2 + qz1*qw2,
+    )
+
+@njit(cache=True, fastmath=False)
+def _quat_normalize_posw(qw, qx, qy, qz):
+    n2 = qw*qw + qx*qx + qy*qy + qz*qz
+    if n2 <= 0.0:
+        return 1.0, 0.0, 0.0, 0.0
+    invn = 1.0 / np.sqrt(n2)
+    qw *= invn; qx *= invn; qy *= invn; qz *= invn
+    # enforce positive scalar (your force_s_pos)
+    if qw < 0.0:
+        qw = -qw; qx = -qx; qy = -qy; qz = -qz
+    return qw, qx, qy, qz
+
+@njit(cache=True, fastmath=False)
+def _rotvec_to_quat(drx, dry, drz):
+    # Rodrigues/rotation-vector to quaternion
+    th2 = drx*drx + dry*dry + drz*drz
+    if th2 < 1e-24:
+        # small-angle: sin(th/2)/th ~ 0.5
+        return 1.0, 0.5*drx, 0.5*dry, 0.5*drz
+    th = np.sqrt(th2)
+    half = 0.5 * th
+    s = np.sin(half) / th
+    return np.cos(half), drx*s, dry*s, drz*s
+
+@njit(cache=True, fastmath=False)
+def _apply_delta_q(qw, qx, qy, qz, drx, dry, drz):
+    dqw, dqx, dqy, dqz = _rotvec_to_quat(drx, dry, drz)
+    # left-multiply: q_new = dq ⊗ q
+    nw, nx, ny, nz = _quat_mul(dqw, dqx, dqy, dqz, qw, qx, qy, qz)
+    return _quat_normalize_posw(nw, nx, ny, nz)
+
+
 @njit(parallel=True, fastmath=False, cache=True)
 def _deriv_kernel_numba(RX: np.ndarray, xyz_cam: np.ndarray, fx: float, fy: float) -> np.ndarray:
     """
@@ -478,7 +687,7 @@ def opt(
     sigma_2N=None,
     sigma_floor_px: float = 1.0):
     """
-    Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN.
+    Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN/LM.
     State: [δr, δt] (6 DOF), minimal tangent update.
     """
 
@@ -489,32 +698,20 @@ def opt(
         est_q = seed_q.copy()
         est_t = seed_t.copy()
 
-    meas_pix = img_pts.reshape(-1).astype(np.float64)
-    N = img_pts.shape[0]
-
-    # Work buffers (allocated once)
-    proj = np.empty(2 * N, dtype=np.float64)
-    y = np.empty(2 * N, dtype=np.float64)
-    RX = np.empty((N, 3), dtype=np.float64)
-    xyz = np.empty((N, 3), dtype=np.float64)
-    L = np.empty((2 * N, 6), dtype=np.float64)
-
+    # Ensure float64, contiguous
+    meas_pix = np.ascontiguousarray(img_pts.reshape(-1), dtype=np.float64)
+    N = int(img_pts.shape[0])
     object_pts64 = np.ascontiguousarray(object_pts, dtype=np.float64)
 
     # ----------- Sigma whitening (once) -----------
     inv_sigma_2N = _inv_sigma_2N_from_sigma(sigma_2N, N)
     if inv_sigma_2N is not None:
-        # Prevent absurdly tiny sigmas from dominating the solve.
-        # We cap inv_sigma <= 1/sigma_floor.
         sf = float(sigma_floor_px)
         if (not np.isfinite(sf)) or (sf <= 0.0):
             sf = 1.0
         inv_sigma_2N = np.minimum(inv_sigma_2N, 1.0 / sf)
 
-    sqrtw = np.empty(2 * N, dtype=np.float64)
-    rw = np.empty(2 * N, dtype=np.float64)
-
-    # Robust enum → int
+    # Robust enum → int (matches your existing mapping) :contentReference[oaicite:1]{index=1}
     kind_int = 0
     if robust_kind == robust_cost.huber:
         kind_int = 1
@@ -523,134 +720,107 @@ def opt(
     elif robust_kind == robust_cost.tukey:
         kind_int = 3
 
+    # Float-state (no quaternion objects in-loop)
+    qw, qx, qy, qz = float(est_q.s), float(est_q.vec[0]), float(est_q.vec[1]), float(est_q.vec[2])
+    tx, ty, tz = float(est_t[0]), float(est_t[1]), float(est_t[2])
+
     lam = 1e-1
-    keep_going = True
-    iter_num = 0
+    max_iters = 20
 
-    eye6 = np.eye(6, dtype=np.float64)
-
-
-    # ================= GN LOOP =================
-    while keep_going:
-        iter_num += 1
-
-        # ---- Projection + Jacobian ----
-        qw, qx, qy, qz = est_q.s, *est_q.vec
-        tx, ty, tz = est_t
-
-        _project_and_jacobian_numba(
-            object_pts64,
-            float(qw), float(qx), float(qy), float(qz),
-            float(tx), float(ty), float(tz),
+    # ================= GN/LM LOOP =================
+    for iter_num in range(1, max_iters + 1):
+        LtL, Lty, old_y2, front_frac = _project_accum_irls_numba(
+            object_pts64, meas_pix,
+            qw, qx, qy, qz, tx, ty, tz,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
-            proj, RX, xyz, L
+            int(kind_int), float(robust_param),
+            inv_sigma_2N
         )
 
-        y[:] = meas_pix - proj
-
-        # ---- Build sqrtw = R^{-1/2} * robust ----
-        if inv_sigma_2N is None:
-            sqrtw[:] = 1.0
-        else:
-            sqrtw[:] = inv_sigma_2N
-
-        if kind_int != 0:
-            _robust_sqrt_weights_inplace_numba(
-                y, N, kind_int, float(robust_param), inv_sigma_2N, rw
-            )
-            sqrtw *= rw
-
-        LtL, Lty, y2 = _accum_LtL_Lty_numba(L, y, sqrtw)
-        old_y_mag = np.sqrt(y2)
-
-        # ---- Damped solve ----
-        # Avoid allocating a new eye(6) every iteration
-        # (put `eye6 = np.eye(6, dtype=np.float64)` once above the GN loop)
-        A = LtL.copy()
-        A[0, 0] += lam;
-        A[1, 1] += lam;
-        A[2, 2] += lam
-        A[3, 3] += lam;
-        A[4, 4] += lam;
-        A[5, 5] += lam
-        delta_x = np.linalg.solve(A, Lty)
-
-        # ---- Single-shot LM step (no backtracking line search) ----
-        scale = 1.0
-        delta_r = delta_x[:3]
-        delta_t = delta_x[3:]
-
-        # One quaternion update per GN iter (not per scale attempt)
-        trial_q = q.from_rodrigues(delta_r) * est_q
-        trial_t = est_t + delta_t
-
-        qw, qx, qy, qz = trial_q.s, *trial_q.vec
-        tx, ty, tz = trial_t
-
-        _project_and_jacobian_numba(
-            object_pts64,
-            float(qw), float(qx), float(qy), float(qz),
-            float(tx), float(ty), float(tz),
-            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
-            proj, RX, xyz, L
-        )
-
-        # Chirality check using xyz from numba (no Python quat * points)
-        if np.mean(xyz[:, 2] > 1e-3) < 0.9:
+        # chirality check (same intent as before, but fused)
+        if front_frac < 0.9:
             lam *= 3.0
+            continue
+
+        # LM solve: (LtL + lam I) dx = Lty
+        A = LtL.copy()
+        A[0, 0] += lam; A[1, 1] += lam; A[2, 2] += lam
+        A[3, 3] += lam; A[4, 4] += lam; A[5, 5] += lam
+        dx = np.linalg.solve(A, Lty)
+
+        drx, dry, drz = float(dx[0]), float(dx[1]), float(dx[2])
+        dtx, dty, dtz = float(dx[3]), float(dx[4]), float(dx[5])
+
+        tqw, tqx, tqy, tqz = _apply_delta_q(qw, qx, qy, qz, drx, dry, drz)
+        ttx, tty, ttz = tx + dtx, ty + dty, tz + dtz
+
+        _LtL2, _Lty2, new_y2, front2 = _project_accum_irls_numba(
+            object_pts64, meas_pix,
+            tqw, tqx, tqy, tqz, ttx, tty, ttz,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            int(kind_int), float(robust_param),
+            inv_sigma_2N
+        )
+
+        if front2 < 0.9:
+            lam *= 3.0
+            continue
+
+        # Predicted reduction (standard LM; avoids needing L.dot(dx))
+        pred = 0.5 * float(dx.dot(lam * dx + Lty))
+        if pred <= 0.0 or (not np.isfinite(pred)):
+            lam *= 3.0
+            continue
+
+        rho = float((old_y2 - new_y2) / pred)
+
+        if rho > 0.25 and new_y2 < old_y2:
+            # accept
+            qw, qx, qy, qz = tqw, tqx, tqy, tqz
+            tx, ty, tz = ttx, tty, ttz
+            lam *= 0.3
         else:
-            y[:] = meas_pix - proj
+            lam *= 3.0
 
-            if inv_sigma_2N is None:
-                sqrtw[:] = 1.0
-            else:
-                sqrtw[:] = inv_sigma_2N
+        # stop: small step or small improvement
+        if np.linalg.norm(dx) < 1e-7:
+            break
+        if abs(old_y2 - new_y2) / max(1e-12, old_y2) < 1e-6:
+            break
 
-            if kind_int != 0:
-                _robust_sqrt_weights_inplace_numba(
-                    y, N, kind_int, float(robust_param), inv_sigma_2N, rw
-                )
-                sqrtw *= rw
+    # Wrap back into quaternion object ONCE
+    est_q = q(qw, np.array([qx, qy, qz], dtype=np.float64))
+    est_t = np.array([tx, ty, tz], dtype=np.float64)
+    est_q.force_s_pos()  # safe; should already be positive-w
 
-            new_y_mag = np.linalg.norm(sqrtw * y)
-
-            # GN ratio test (same logic, just no scaling loop)
-            y_pred = y - L.dot(delta_x)
-            y_pred_mag = np.linalg.norm(sqrtw * y_pred)
-
-            denom = old_y_mag - y_pred_mag
-            ratio = 0.0 if denom == 0 else (old_y_mag - new_y_mag) / denom
-
-            if 0.25 < ratio < 4.0:
-                lam *= 0.3
-                est_q = trial_q
-                est_t = trial_t
-            else:
-                lam *= 3.0
-
-        if np.linalg.norm(scale * delta_x) < 1e-7 or iter_num > 20:
-            keep_going = False
-
-    est_q.force_s_pos()
     if not return_stats:
         return est_q, est_t
 
-    LtL, _Lty, y2 = _accum_LtL_Lty_numba(L, y, sqrtw)
+    # Final stats at converged pose
+    LtL, _Lty, y2, _front = _project_accum_irls_numba(
+        object_pts64, meas_pix,
+        float(est_q.s), float(est_q.vec[0]), float(est_q.vec[1]), float(est_q.vec[2]),
+        float(est_t[0]), float(est_t[1]), float(est_t[2]),
+        float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+        int(kind_int), float(robust_param),
+        inv_sigma_2N
+    )
 
     dof = 2 * N - 6
     if dof < 1:
         dof = 1
     s2 = float(y2) / float(dof)
 
-    # Cov = s2 * inv(LtL)
     I = np.eye(6, dtype=np.float64)
     cov6 = s2 * np.linalg.solve(LtL, I)
 
-    return est_q, est_t, QnPStats(N=int(N),
-                                  dof=int(dof),
-                                  sse_w=float(y2),
-                                  s2=float(s2),
-                                  cov6=cov6)
+    return est_q, est_t, QnPStats(
+        N=int(N),
+        dof=int(dof),
+        sse_w=float(y2),
+        s2=float(s2),
+        cov6=cov6
+    )
 
 def enforce_chirality(q_est, t_est, object_pts):
     # Camera-frame points

@@ -28,6 +28,162 @@ METHOD_COLORS = {
     "fwd LUT bilinear (numba ss)":    "#c5b0d5",  # light purple
 }
 
+def prejit_undistort_kernels():
+    cal = Calibration().randomize(
+        rng=np.random.default_rng(0),
+        width=864, height=864,
+        keep_intrinsics=False,
+        profile="mixed",
+        strength="high",
+        ensure_invertible=True,
+    )
+    K, dist = make_opencv_mats(cal)
+
+    # representative points
+    pts_und = np.array([[100.0, 200.0],
+                        [400.0, 500.0],
+                        [800.0, 100.0]], dtype=np.float64)
+    pts_dist = opencv_distort_batch(K, dist, pts_und).astype(np.float64)
+
+    # Force-compile both code paths
+    _ = undistort_points_px(cal, pts_dist, mode="opencv")
+    _ = undistort_points_px(cal, pts_dist, mode="precise")
+
+
+def plot_tradeoff_pairs(
+    paired_rows,
+    *,
+    title="UNDISTORT: 5FP vs 2FP+N across calibrations",
+    connect_every=10,
+    sort_by="severity",          # "severity" or None
+    noise_floor=1e-13,           # equivalence floor for RMS
+    cmap_name="turbo",
+):
+    """
+    paired_rows: list of dicts, each corresponds to ONE calibration:
+      {
+        "cal_id": int,
+        "severity": float,        # e.g. max_corner_distortion_px
+        "run_id": str,            # optional
+        "m5": {"time_s":..., "rms":..., "method": "ours undistort vec (5fp)"},
+        "mH": {"time_s":..., "rms":..., "method": "ours undistort vec (2fp+N)"},
+      }
+
+    Produces:
+      - scatter of (time, RMS) for both methods, colored by severity
+      - connecting line between paired points every Nth calibration
+      - textbox: % faster, % more-precise-or-equivalent, % both
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib as mpl
+
+    m5_name = "ours undistort vec (5fp)"
+    mh_name = "ours undistort vec (2fp+N)"
+
+    rows = list(paired_rows)
+    if sort_by == "severity":
+        rows.sort(key=lambda r: r["severity"])
+
+    # ---- arrays ----
+    x5 = np.asarray([r["m5"]["time_s"] for r in rows], dtype=float)
+    y5 = np.asarray([r["m5"]["rms"]    for r in rows], dtype=float)
+
+    xh = np.asarray([r["mH"]["time_s"] for r in rows], dtype=float)
+    yh = np.asarray([r["mH"]["rms"]    for r in rows], dtype=float)
+
+    sev = np.asarray([r["severity"] for r in rows], dtype=float)
+
+    # ---- dominance / stats ----
+    faster = xh < x5
+
+    # "more precise OR essentially equivalent"
+    # - counts as better if yh <= y5
+    # - counts as equivalent if both are at/below noise floor
+    precise_or_eq = (yh <= y5) | ((y5 <= noise_floor) & (yh <= noise_floor))
+
+    both = faster & precise_or_eq
+
+    n = max(1, len(rows))
+    pct_faster = 100.0 * float(np.sum(faster)) / n
+    pct_prec   = 100.0 * float(np.sum(precise_or_eq)) / n
+    pct_both   = 100.0 * float(np.sum(both)) / n
+
+    # ---- severity colormap ----
+    # Robust norm so a few extremes don't blow out the scale
+    vmin = float(np.percentile(sev, 2.0))
+    vmax = float(np.percentile(sev, 98.0))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        vmin, vmax = float(np.min(sev)), float(np.max(sev))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = mpl.cm.get_cmap(cmap_name)
+
+    plt.figure(figsize=(14, 6))
+    ax = plt.gca()
+
+    # ---- scatters (same colors, different markers) ----
+    sc5 = ax.scatter(
+        x5, y5,
+        c=sev, cmap=cmap, norm=norm,
+        marker='o', alpha=0.70, s=60,
+        label=m5_name,
+        linewidths=0.0,
+    )
+    sch = ax.scatter(
+        xh, yh,
+        c=sev, cmap=cmap, norm=norm,
+        marker='s', alpha=0.70, s=60,
+        label=mh_name,
+        linewidths=0.0,
+    )
+
+    # ---- connecting lines every Nth calibration ----
+    step = max(1, int(connect_every))
+    for i in range(0, len(rows), step):
+        # use same severity color for the connector, very faint
+        col = cmap(norm(sev[i]))
+        ax.plot([x5[i], xh[i]], [y5[i], yh[i]], color=col, alpha=0.4, linewidth=1.0)
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Avg time per call (seconds)")
+    ax.set_ylabel("RMS px error")
+    ax.set_title(title)
+    xmax = np.percentile(np.r_[x5, xh], 99.5)
+    ax.set_xlim(left=None, right=xmax * 1.05)
+    ax.grid(True, which="both")
+
+    # Legend
+    leg = ax.legend(loc="upper right")
+    ax.add_artist(leg)
+
+    # Colorbar for severity
+    cbar = plt.colorbar(sc5, ax=ax, pad=0.02)
+    cbar.set_label("Distortion severity (max corner displacement, px)")
+
+    # ---- textbox under legend ----
+    stats_txt = (
+        f"2FP+N faster: {pct_faster:5.1f}%\n"
+        f"2FP+N ≥ precision (≤ {noise_floor:.0e} floor): {pct_prec:5.1f}%\n"
+        f"Both: {pct_both:5.1f}%"
+    )
+
+    # Place under legend in axes coords (top-right-ish)
+    ax.text(
+        0.985, 0.86, stats_txt,
+        transform=ax.transAxes,
+        ha="right", va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85, edgecolor="0.7"),
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
 def err_stats(est: np.ndarray, truth: np.ndarray, mask: np.ndarray | None = None):
     """
     Returns RMS, Max, p99, p99.9 of pointwise Euclidean error.
@@ -896,8 +1052,136 @@ def test_cal(cal: Calibration, run_id: str):
 
     return results
 
+def show_tradeoff_pairs_sweep(
+    *,
+    num_cals=150,
+    width=864,
+    height=864,
+    # sweep controls
+    strengths=("high","high"),
+    profiles=("radial_only", "tangential_only", "mixed"),
+    # evaluation sizes
+    N_err=50_000,        # precision evaluation set
+    N_time=20_000,       # timing evaluation set (keeps things fast)
+    # bench controls
+    iters=400,
+    warmup=30,
+    connect_every=10,
+    seed=123,
+):
+    """
+    Generates a paired speed-vs-precision plot comparing:
+      - ours undistort vec (5fp):   undistort_points_px(..., mode="opencv")
+      - ours undistort vec (2fp+N): undistort_points_px(..., mode="precise")
+
+    across randomized calibrations. Points are paired per calibration and
+    optionally connected every Nth calibration.
+    """
+
+    # Forces warm-up so first iteration isn't significantly slower unfairly
+    prejit_undistort_kernels()
+
+    paired_rows = []
+    rng = np.random.default_rng(seed)
+
+    # Pre-generate a single truth point set in-frame for repeatability across cals.
+    # (You *can* regenerate per-cal if you want; keeping it fixed reduces variance.)
+    pts_px_und_truth = np.column_stack([
+        rng.uniform(0.0, float(width),  size=N_err),
+        rng.uniform(0.0, float(height), size=N_err),
+    ]).astype(np.float64)
+
+    # Subset used for timing
+    pts_px_und_time_truth = pts_px_und_truth[:N_time].copy()
+
+    cal = Calibration()  # reuse object to reduce alloc noise
+
+    cal_id = 0
+    total = len(strengths) * len(profiles) * num_cals
+
+    for strength in strengths:
+        for profile in profiles:
+            for _ in range(num_cals):
+                # --- randomize calibration ---
+                cal.randomize(
+                    rng=rng,
+                    width=width,
+                    height=height,
+                    keep_intrinsics=False,
+                    profile=profile,
+                    strength=strength,
+                    ensure_invertible=True,
+                )
+                assert cal.validCal
+
+                # distortion severity: max corner displacement in pixels
+                severity, _ = cal.max_corner_distortion_px()
+
+                # OpenCV mats
+                K, dist = make_opencv_mats(cal)
+
+                # --- build distorted inputs from truth (OpenCV is "ground truth" forward) ---
+                pts_px_dist = opencv_distort_batch(K, dist, pts_px_und_truth)
+                pts_px_dist_time = np.ascontiguousarray(pts_px_dist[:N_time], dtype=np.float64)
+
+                # --- precision (full N_err set, not timed) ---
+                und5 = undistort_points_px(cal, pts_px_dist, mode="opencv")   # 5FP
+                undH = undistort_points_px(cal, pts_px_dist, mode="precise")  # 2FP+N
+
+                st5 = err_stats(und5, pts_px_und_truth)  # truth is in-frame by construction
+                stH = err_stats(undH, pts_px_und_truth)
+
+                # optional extra diagnostics (helps interpret convergence/stability)
+                oob5 = float(np.mean(~in_bounds_mask(und5, width, height)))
+                oobH = float(np.mean(~in_bounds_mask(undH, width, height)))
+
+                # --- timing (smaller N_time set) ---
+                run5 = (lambda: undistort_points_px(cal, pts_px_dist_time, mode="opencv"))
+                runH = (lambda: undistort_points_px(cal, pts_px_dist_time, mode="precise"))
+
+                t5 = bench(run5, iters=iters, warmup=warmup)
+                tH = bench(runH, iters=iters, warmup=warmup)
+
+                paired_rows.append({
+                    "cal_id": int(cal_id),
+                    "severity": float(severity),
+                    "run_id": f"{strength}|{profile}",
+                    "m5": {
+                        "time_s": float(t5),
+                        "rms": float(st5["rms"]),
+                        "method": "ours undistort vec (5fp)",
+                        "oob": oob5,
+                    },
+                    "mH": {
+                        "time_s": float(tH),
+                        "rms": float(stH["rms"]),
+                        "method": "ours undistort vec (2fp+N)",
+                        "oob": oobH,
+                    },
+                })
+
+                cal_id += 1
+                if cal_id % 10 == 0:
+                    print(f"[pairs sweep] {cal_id}/{total} done...")
+
+    plot_tradeoff_pairs(
+        paired_rows,
+        connect_every=connect_every,
+        sort_by="severity",
+        title="UNDISTORT: 5FP vs 2FP+N (paired per calibration; sorted by corner distortion)",
+    )
+
+    # If you also want the paired data for later analysis / saving:
+    return paired_rows
+
 
 def main():
+    show_tradeoff_pairs_sweep(
+        num_cals=20,          # per (strength,profile) bucket; start small
+        iters=10,
+        warmup=25,
+        connect_every=1,
+    )
 
     cv2.setUseOptimized(True)
     cv2.setNumThreads(os.cpu_count())  # or a fixed N for fairness

@@ -956,8 +956,8 @@ def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
     return t
 
 
-def solveQnP(object_pts: np.array,
-             img_pts: np.array,
+def solveQnP(object_pts: NDArray,
+             img_pts: NDArray,
              cal: Calibration,
              return_stats:bool = False,
              sigma_2N=None,

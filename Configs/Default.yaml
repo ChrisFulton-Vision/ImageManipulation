@@ -7,11 +7,12 @@ cubemap: false
 detectTags: true
 detect_corners: false
 detect_horizon: false
-dp_ckptN: 200
+dp_ckptN: '200'
 dp_conf_list: '0.80'
+dp_gpu: true
 dp_img_dir: ''
-dp_output_csv: ''
-dp_prefetch: 32
+dp_prefetch: '32'
+draw_chessboard: false
 end_export_idx: 1
 export_quality: Medium Quality
 factor_graph: false
@@ -29,6 +30,7 @@ pnpLidarPoints: false
 processingKernel: Unfiltered
 qnpLidarPoints: false
 rt_speed: 1.0
+saveFolder: C:/repos/aburn/usr/jarvis_submodules/camera_calibration_python/ProcessedImages/CalspanSubset/Conf0.4
 secondsBetweenImages: 1.0
 start_export_idx: 0
 target_fps: 20.0

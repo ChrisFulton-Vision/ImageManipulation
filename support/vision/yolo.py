@@ -4,6 +4,7 @@ import glob
 import os
 import re
 import numpy as np
+from numpy.typing import NDArray
 
 from support.io.my_logging import LOG
 
@@ -14,6 +15,7 @@ from support.vision.calibration import Calibration, undistort_points_px_numba
 from support.io.meta_yolo_reader import MetaYoloReader
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text, lrg_text
+from support.io.my_logging import LOG
 
 CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
 CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6"
@@ -139,10 +141,10 @@ class YOLO:
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
 
     def inferOnImage(self,
-                     image: np.array,
-                     markup_image: np.array,
+                     image: NDArray,
+                     markup_image: NDArray,
                      markup_is_undistorted: bool = False,
-                     bias_tracking: bool = False) -> (np.array, np.array):
+                     bias_tracking: bool = False) -> tuple[NDArray, NDArray]:
         '''
         Runs the sub-methods necessary to process an image with YOLO
         :param image: np.array from OpenCV
@@ -156,7 +158,7 @@ class YOLO:
     def set_calibration(self, calibration: Calibration) -> None:
         self.calibration = copy.deepcopy(calibration)
 
-    def preprocessImage(self, image: np.array) -> np.array:
+    def preprocessImage(self, image: NDArray) -> NDArray:
         '''
         This preprocessing:
             Fixes the image to the YOLO network's size
@@ -167,13 +169,14 @@ class YOLO:
         '''
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
-            image = cv2.resize(image, self.yoloSize)
+            height, width = self.yoloSize
+            image = cv2.resize(image, (width, height))
         image = image.transpose((2, 0, 1))
         image = np.expand_dims(image, axis=0)
         image = image.astype(np.float32) / 255.0
         return image
 
-    def processImage(self, yoloImage: np.array) -> np.array:
+    def processImage(self, yoloImage: NDArray) -> NDArray:
         '''
         Clears the 'cache' for previous YOLO solutions, then calls the yolo inference method
         :param yoloImage: np.array that has completed preprocessing
@@ -182,7 +185,7 @@ class YOLO:
         self.boxes, self.scores, self.class_ids = [], [], []
         return self.runOneSession(yoloImage)
 
-    def runOneSession(self, yoloImage: np.array) -> np.array:
+    def runOneSession(self, yoloImage: NDArray) -> NDArray:
         '''
         Records time before and after a yolo infernce for time differencing. Runs the YOLO session
         :param yoloImage: image that has been through preprocessImage
@@ -197,7 +200,7 @@ class YOLO:
         centers, boxes, scores, class_ids = self.interpretOutput(output)
         return centers, boxes, scores, class_ids, (endTime - startTime).total_seconds()
 
-    def interpretOutput(self, output: np.array) -> (list, list, list, list):
+    def interpretOutput(self, output: NDArray) -> (list, list, list, list):
         '''
         Takes outputs from onnxruntime and processes them
         Filters to retain only the highest-confidence detection for each class
@@ -258,9 +261,9 @@ class YOLO:
 
         return centers, boxes, scores, classes
 
-    def markUpImage(self, image: np.array,
+    def markUpImage(self, image: NDArray,
                     output: (list, list, list, list),
-                    markup_is_undistorted: bool) -> tuple[np.array, tuple[np.array, np.array]]:
+                    markup_is_undistorted: bool) -> tuple[NDArray, tuple[NDArray, NDArray]]:
         '''
         Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
         up the image with a PnP solution as well.
@@ -268,6 +271,7 @@ class YOLO:
         :param output: processed onnxruntime sessions
         :return: marked-up image
         '''
+        return image, (0.0, 0.0)
         h, w, _ = image.shape
 
         centers_dist, boxes, scores, class_ids, time = output
@@ -285,7 +289,6 @@ class YOLO:
             self.calibration.scaleCalibration(y_w)  # same logic you already use :contentReference[oaicite:2]{index=2}
 
             # Vectorized: distorted YOLO pixels -> undistorted YOLO pixels
-            # (Function name may be cal.undistort_points_px or module-level undistort_points_px depending on your Calibration.py)
             centers_und = undistort_points_px_numba(np.array(centers_dist, dtype=np.float64),
                                                     *self.calibration.iteratable_params,
                                                     self.calibration.has_tangential,
@@ -322,8 +325,8 @@ class YOLO:
 
         return image, None
 
-    def drawBoxes(self, image: np.array, newCenters: list, newBoxes: list,
-                  newClass_ids: list, newScores: list) -> np.array:
+    def drawBoxes(self, image: NDArray, newCenters: list, newBoxes: list,
+                  newClass_ids: list, newScores: list) -> NDArray:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -347,10 +350,13 @@ class YOLO:
             y1 = int(h / y_h * y1)
             y2 = int(h / y_h * y2)
 
-            label = f"{class_id}: {score:.2f}"
+            label = f"{class_id}"
             cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, small_text(w), clr.BLACK, 2)
-            cv2.putText(image, f"{class_id}", (x, y), cv2.FONT_HERSHEY_SIMPLEX, small_text(w), clr.LIGHTBLUE, 1)
+            (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+            lowerLeftCorner = (int(x-txt_w/2.0), int(y+txt_h/2.0))
+
+            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 6)
+            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 4)
 
         (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         txt_height_perRow = txt_height + 10
@@ -361,11 +367,24 @@ class YOLO:
 
         return image
 
+    def collect_objPts_and_imgPts(self, y_class_ids, y_centers):
+        object_points = []
+        image_points = []
+        for idx, y_class_id in enumerate(y_class_ids):
+            if y_class_id < len(self.reader.idsNamesLocs):
+                x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
+                object_points.append([x, y, z])
+                image_points.append(y_centers[idx])
+
+        object_points = np.array(object_points)
+        image_points = np.array(image_points)
+        return object_points, image_points
+
     def drawPnP(self,
-                image: np.array,
+                image: NDArray,
                 y_class_ids: list,
                 y_centers: list,
-                markup_is_undistorted: bool) -> tuple[np.array, np.array]:
+                markup_is_undistorted: bool) -> tuple[NDArray, NDArray] | None:
         '''
         If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
         onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
@@ -383,17 +402,7 @@ class YOLO:
 
         self.calibration.scaleCalibration(y_w)
 
-        object_points = []
-        image_points = []
-        badList = []
-        for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id not in badList and y_class_id < len(self.reader.idsNamesLocs):
-                x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
-                object_points.append([x, y, z])
-                image_points.append(y_centers[idx])
-
-        object_points = np.array(object_points)
-        image_points = np.array(image_points)
+        object_points, image_points = self.collect_objPts_and_imgPts(y_class_ids, y_centers)
 
         if len(object_points) < 6:
             return
@@ -428,12 +437,16 @@ class YOLO:
         cv2.putText(image, vec_str, (10, h - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.YELLOW, 2)
 
-        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, badList, rvec, tvec, markup_is_undistorted)
+        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, rvec, tvec, markup_is_undistorted)
 
         return (rvec, tvec)
 
-    def draw_PnP_proj(self, image: np.array, y_class_ids: list, y_centers: list, object_points: np.array, badList: list,
-                      rvec: np.array, tvec: np.array,
+    def draw_PnP_proj(self, image: NDArray,
+                      y_class_ids: list,
+                      y_centers: list,
+                      object_points: NDArray,
+                      rvec: NDArray,
+                      tvec: NDArray,
                       markup_is_undistorted: bool):
 
         h, w, _ = image.shape
@@ -455,7 +468,6 @@ class YOLO:
                                                       cameraMatrix=self.calibration.getCameraMatrix(),
                                                       distCoeffs=dist_coeffs)
 
-
                 x, y = np.squeeze(projectedPixel)
                 if np.isnan(x) or np.isnan(y):
                     return
@@ -475,19 +487,24 @@ class YOLO:
                     else:
                         self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
 
-                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, clr.BLACK, 3)
-                cv2.putText(image, str(id), (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, clr.YELLOW, 2)
+                (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 2)
+                lowerLeftCorner = (int(x-txt_w/2), int(y+txt_h/2))
+
+                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.BLACK, 4)
+                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(w), clr.YELLOW, 2)
 
                 if self.bias_tracking_active and y_class_id in self.biasTracker:
+                    lowerLeftCorner = (int(x_yolo + x_corr - txt_w / 2), int(y_yolo + y_corr + txt_h / 2))
+
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
                     cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
-                                small_text(w), clr.RED, 2)
+                                med_text(w), clr.RED, 2)
 
         bias_image_points = []
         for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id not in badList and y_class_id < len(self.reader.idsNamesLocs):
+            if y_class_id < len(self.reader.idsNamesLocs):
                 if y_class_id in self.biasTracker:
                     num, x_corr, y_corr = self.biasTracker[y_class_id]
                     x_yolo, y_yolo = y_centers[idx]

@@ -70,7 +70,10 @@ class CameraGui(CTkFrame):
             "detectTags", "undistort", "pnpLidarPoints", "qnpLidarPoints",
             "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
-            "cubemap", "hud", "hideAprilTags", "draw_chessboard"
+            "cubemap", "hud", "hideAprilTags", "draw_chessboard",
+            # --- Pose from YOLO detections (multi-feature) ---
+            # These are separate from the AprilTag/LiDAR toggles above.
+            "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints",
         ]
         self.recording = False
         self.yoloSession = None
@@ -128,6 +131,11 @@ class CameraGui(CTkFrame):
         self.lowPassFPS = 20.0
         self.pnpResult = None
         self.qnpResult = None
+        self.pnpDrawer = None
+        # --- Pose results from YOLO detections (multi-feature) ---
+        self.pnpYoloResult = None
+        self.qnpYoloResult = None
+        self.qnpKFYoloResult = None
         self.plotter = None
 
         # Checkerboard Handlers
@@ -341,7 +349,10 @@ class CameraGui(CTkFrame):
 
     def _init_flag_vars(self):
         for name in self._flags:
-            v = BooleanVar(value=bool(getattr(self.camConfig, name)))
+            if not hasattr(self.camConfig, name):
+                setattr(self.camConfig, name, False)
+            v = BooleanVar(value=bool(getattr(self.camConfig, name, False)))
+
             # when UI flips, write to model
             v.trace_add("write", lambda *_, n=name: self._on_flag_changed(n))
             self._flag_vars[name] = v
@@ -892,6 +903,23 @@ class CameraGui(CTkFrame):
         self.yoloBiasCheckbox.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
 
         rowID += 1
+        # --- Pose from YOLO centers (multi-feature) ---
+        # You can enable any combination (PnP / QnP / KF-weighted QnP).
+        pnpYoloPoints = CTkCheckBox(self.config_frame, text='SolvePnP from YOLO',
+                                    variable=self._flag_vars['pnpYoloPoints'])
+        pnpYoloPoints.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        qnpYoloPoints = CTkCheckBox(self.config_frame, text='SolveQnP from YOLO',
+                                    variable=self._flag_vars['qnpYoloPoints'])
+        qnpYoloPoints.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
+        qnpKFYoloPoints = CTkCheckBox(self.config_frame, text='SolveQnP (KF-weighted) from YOLO',
+                                      variable=self._flag_vars['qnpKFYoloPoints'])
+        qnpKFYoloPoints.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+
+        rowID += 1
+
         detectCornersCheckbox = CTkCheckBox(self.config_frame, text='Detect Corners',
                                             variable=self._flag_vars['detect_corners'])
         detectCornersCheckbox.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
@@ -2635,9 +2663,17 @@ class CameraGui(CTkFrame):
 
         if self.camConfig.yoloInference:
             self.run_yolo(frame)  # Takes original frame, not undistort. YOLO presumes original.
+            # Optional: pose estimation directly from YOLO centers (PnP / QnP / KF-weighted QnP)
+            try:
+                self.pose_from_yolo(img_time)
+            except Exception:
+                pass
         else:
             self.last_bounding_box_size = None
             self.last_yolo_center = None
+            self.pnpYoloResult = None
+            self.qnpYoloResult = None
+            self.qnpKFYoloResult = None
 
         if self.camConfig.factor_graph:
             self.factor_graph(img_time)
@@ -3322,9 +3358,31 @@ class CameraGui(CTkFrame):
             self.yoloSession.iou = self.camConfig.yolo_iou
             self.yoloSession.conf = self.camConfig.yolo_conf
 
+        import support.viz.draw_pnp_qnp as pnpDrw
+        if self.pnpDrawer is None:
+            self.pnpDrawer = pnpDrw.pnp_qnp_draw()
         (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
                                                                                self.camConfig.undistort,
                                                                                self.camConfig.yoloBiasTracking)
+
+        want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
+        want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
+        want_qnp_kf = bool(getattr(self.camConfig, "qnpKFYoloPoints", False))
+
+        algos = pnpDrw.twoToThreeSelectedAlgorithms()
+        algos.use_pnp = want_pnp
+        algos.use_qnp = want_qnp
+        algos.use_qnp_kf = want_qnp_kf
+
+        self.pnpDrawer.markUpImage(image=self.markup_frame,
+                output=output,
+                markup_is_undistorted=self.camConfig.undistort,
+                calibration=self.calibration,
+                conf=self.camConfig.yolo_conf,
+                iou=self.camConfig.yolo_iou,
+                yoloSize=self.yoloSession.yoloSize,
+                idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
+                usedAlgos=algos)
 
         centers, boxes, scores, class_ids, time = output
 
@@ -3340,10 +3398,9 @@ class CameraGui(CTkFrame):
                                            (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
             self.last_yolo_center = centers[best_idx]
 
-            self.last_yolo_center[0] = int(
-                self.last_yolo_center[0] * img_yolo_x_correction)
-            self.last_yolo_center[1] = int(
-                self.last_yolo_center[1] * img_yolo_y_correction)
+            self.last_yolo_center = (int(
+                self.last_yolo_center[0] * img_yolo_x_correction), int(
+                self.last_yolo_center[1] * img_yolo_y_correction))
 
             K = self.calibration.getCameraMatrix()
             # d = self.calibration.getDistortion()  # Presume undistorted image
@@ -3371,6 +3428,26 @@ class CameraGui(CTkFrame):
 
         self.last_bounding_box_size = None
         self.last_yolo_center = None
+
+    def pose_from_yolo(self, img_time=None):
+        """Compute (optional) PnP / QnP / KF-weighted QnP poses from YOLO detections."""
+        # Guard: must have calibration
+        if not getattr(self.calibration, "validCal", False):
+            self.pnpYoloResult = None
+            self.qnpYoloResult = None
+            self.qnpKFYoloResult = None
+            return
+
+        # Quick exit if nothing enabled
+        want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
+        want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
+        want_qnp_kf = bool(getattr(self.camConfig, "qnpKFYoloPoints", False))
+        if not (want_pnp or want_qnp or want_qnp_kf):
+            self.pnpYoloResult = None
+            self.qnpYoloResult = None
+            self.qnpKFYoloResult = None
+            return
+
 
     def factor_graph(self, time):
         from support.runtime.fg_drogue_only import FactorGraph

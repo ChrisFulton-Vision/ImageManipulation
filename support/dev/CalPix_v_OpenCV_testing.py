@@ -1062,7 +1062,7 @@ def show_tradeoff_pairs_sweep(
     profiles=("radial_only", "tangential_only", "mixed"),
     # evaluation sizes
     N_err=50_000,        # precision evaluation set
-    N_time=20_000,       # timing evaluation set (keeps things fast)
+    N_time=1_000,       # timing evaluation set (keeps things fast)
     # bench controls
     iters=400,
     warmup=30,

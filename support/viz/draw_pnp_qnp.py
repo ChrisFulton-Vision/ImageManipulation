@@ -48,6 +48,7 @@ class pnp_qnp_draw:
         cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
 
         centers_und = None
+        boxes_for_draw = boxes
         if calibration is not None and (markup_is_undistorted or len(set(class_ids)) > 5):
             # Ensure calibration matches YOLO coordinate system
             calibration.scaleCalibration(w)
@@ -65,6 +66,45 @@ class pnp_qnp_draw:
                                                     eps_px=1e-6)
                 centers_und = centers_und.tolist()
 
+            # ---- Undistort boxes too (undistort corners, then re-AABB) ----
+            if markup_is_undistorted and boxes is not None and len(boxes) > 0:
+                b = np.asarray(boxes, dtype=np.float64)  # (N,4) in YOLO pixel space: x1,y1,x2,y2
+
+                # Build corner list: (x1,y1), (x2,y1), (x2,y2), (x1,y2) for each box
+                x1 = b[:, 0]
+                y1 = b[:, 1]
+                x2 = b[:, 2]
+                y2 = b[:, 3]
+                corners = np.stack([
+                    np.stack([x1, y1], axis=1),
+                    np.stack([x2, y1], axis=1),
+                    np.stack([x2, y2], axis=1),
+                    np.stack([x1, y2], axis=1),
+                ], axis=1).reshape(-1, 2)  # (4N,2)
+
+                corners_und = undistort_points_px_numba(
+                    corners,
+                    *calibration.iteratable_params,
+                    calibration.has_tangential,
+                    mode_opencv_5fp=False,
+                    eps_px=1e-6
+                ).reshape(-1, 4, 2)  # (N,4,2)
+
+                # Rebuild axis-aligned boxes in undistorted YOLO pixel space
+                x_min = np.min(corners_und[:, :, 0], axis=1)
+                y_min = np.min(corners_und[:, :, 1], axis=1)
+                x_max = np.max(corners_und[:, :, 0], axis=1)
+                y_max = np.max(corners_und[:, :, 1], axis=1)
+
+                # Clamp to YOLO frame bounds (optional but helps avoid drawing weirdness)
+                y_h, y_w = yoloSize
+                x_min = np.clip(x_min, 0, y_w - 1)
+                x_max = np.clip(x_max, 0, y_w - 1)
+                y_min = np.clip(y_min, 0, y_h - 1)
+                y_max = np.clip(y_max, 0, y_h - 1)
+
+                boxes_for_draw = np.stack([x_min, y_min, x_max, y_max], axis=1).tolist()
+
         centers_for_draw = centers_dist
         if centers_und is not None:
             centers_for_pnp = centers_und
@@ -74,16 +114,17 @@ class pnp_qnp_draw:
             centers_for_pnp = centers_dist
 
         if len(class_ids) > 0:
-            indices = cv2.dnn.NMSBoxes(boxes, scores, conf, iou)
+            indices = cv2.dnn.NMSBoxes(boxes_for_draw,
+                                       scores, conf, iou)
             newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
             for i in indices:
-                # for i in range(len(centers)):
-                newCentersForDraw.append(centers_for_draw[i])
-                newCentersForPnP.append(centers_for_pnp[i])
-                newBoxes.append(boxes[i])
-                newClass_ids.append(class_ids[i])
-                newScores.append(scores[i])
+                ii = int(i[0]) if hasattr(i, "__len__") else int(i)
 
+                newCentersForDraw.append(centers_for_draw[ii])
+                newCentersForPnP.append(centers_for_pnp[ii])
+                newBoxes.append(boxes_for_draw[ii])
+                newClass_ids.append(class_ids[ii])
+                newScores.append(scores[ii])
             self._drawBoxes(image,
                                newCentersForDraw,
                                newBoxes,
@@ -138,6 +179,7 @@ class pnp_qnp_draw:
             x2 = int(w / y_w * x2)
             y1 = int(h / y_h * y1)
             y2 = int(h / y_h * y2)
+
 
             label = f"{class_id}"
             cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
@@ -195,6 +237,11 @@ class pnp_qnp_draw:
         if not ret:
             return
 
+        R, _ = cv2.Rodrigues(rvec)
+        P = np.hstack((R, tvec))
+        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(P)
+        rpy = np.array([euler_angles[0,0], euler_angles[1,0], euler_angles[2,0]])
+
         self.draw_proj(
             image=image,
             y_class_ids=y_class_ids,
@@ -206,7 +253,7 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}',
+            title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
             rowIDX=0
         )
 
@@ -241,6 +288,8 @@ class pnp_qnp_draw:
         )
         self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
 
+        rpy = q_rvec.eulerD()
+
         self.draw_proj(
             image=image,
             y_class_ids=y_class_ids,
@@ -252,7 +301,7 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}',
+            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
             rowIDX=index_for_display,
             txt_color = clr.ORANGE,
             txt_scale = 0.75
@@ -282,7 +331,7 @@ class pnp_qnp_draw:
         lower_left_corner = (int(0.01*w), int(h - (0.01 * h * (rowIDX + 1)) - height * rowIDX))
 
         cv2.putText(image, title, lower_left_corner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
-        cv2.putText(image, title, lower_left_corner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
+        cv2.putText(image, title, lower_left_corner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), txt_color, 2)
         for y_class_id, y_center in zip(y_class_ids, y_centers):
 
             # for idNameLoc in idsNamesLocs:

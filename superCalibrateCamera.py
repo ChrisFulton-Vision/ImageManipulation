@@ -4,6 +4,7 @@ import pickle
 import time
 import sys
 import threading
+from collections import deque
 
 # import vmbpy.c_binding
 # from vmbpy import *
@@ -54,10 +55,7 @@ CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 class CameraGui(CTkFrame):
     def __init__(self, master, *args, **kwargs):
 
-        self.profile_run_folder = False
-
         self.func_that_refits = None
-        self._checker_proc = None
 
         # Debounced cache writes
         self._save_debounce_id = None
@@ -87,7 +85,6 @@ class CameraGui(CTkFrame):
         self.calibration = Calibration()
         self.config_store = ConfigStore(CACHE_FILEPATH, configs_dir="Configs", scheduler=self)
         self.detectIDS = None
-        self.projectProbe = None
         self.centers = None
         self.indexDict = {}
         self.scanForCameras()
@@ -168,14 +165,20 @@ class CameraGui(CTkFrame):
         self.threadStopper = utils.ThreadStopper()
         self._thread = None
 
+        self._pb_cmds = deque()
+        self._pb_cmd_lock = threading.Lock()
+        self._pb_num_images = 0
+        self._pb_slider_dragging = False
+        self._pb_last_sent_idx = None
+        self._pb_slider_range_inited = False
+        self._pb_slider = None
+
         self.fps_time_log = time.time()
         self.curr_fps = 20.0
         self.pause = False
         self.last_nonzero_sign = 1
 
         self.imageProcessingKernelCombobox = None
-
-        self.bank_indicator_points = None
 
         self.last_image = None
 
@@ -291,7 +294,9 @@ class CameraGui(CTkFrame):
                                           text='Checkerboard',
                                           command=self.launch_checkerboard)
 
+        self.confSliderLabel.configure(text=f'Conf: {self.camConfig.yolo_conf:.2f}')
         self.confSliderBar.set(self.camConfig.yolo_conf)
+        self.iouSliderLabel.configure(text=f'IOU: {self.camConfig.yolo_iou:.2f}')
         self.iouSliderBar.set(self.camConfig.yolo_iou)
 
         self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
@@ -1074,10 +1079,6 @@ class CameraGui(CTkFrame):
             row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
         )
 
-        CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
-            row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
-        )
-
         # --- Select image folder ---
         # --- Select image folder ---
         img_dir_default = (
@@ -1170,14 +1171,6 @@ class CameraGui(CTkFrame):
         _bind_dp_str(self._dp_conf_list, "dp_conf_list")
         _bind_dp_str(self._dp_ckptN, "dp_ckptN")
         _bind_dp_str(self._dp_prefetch, "dp_prefetch")
-
-
-        def _cancel():
-            self._dp_runner.cancel_event.set()
-            if hasattr(self, "_dp_progress_label"):
-                self._dp_progress_label.configure(text="Canceling…")
-            if hasattr(self, "_dp_cancel_btn"):
-                self._dp_cancel_btn.configure(state="disabled")
 
         # --- Batch action buttons row ---
         # Left: YOLO batch
@@ -1551,38 +1544,293 @@ class CameraGui(CTkFrame):
     def launch_checkerboard(self):
         self.checkerboard_launcher.toggle()
 
-    def _poll_checkerboard_proc(self):
-        p = getattr(self, "_checker_proc", None)
-        if p is None:
-            self.btn_checkerboard.configure(state="normal", text="Checkerboard")
-            return
-
-        if p.poll() is None:
-            # still running
-            self.after(300, self._poll_checkerboard_proc)
-            return
-
-        # exited
-        self._checker_proc = None
-        self.btn_checkerboard.configure(state="normal", text="Checkerboard")
-
     def setup_playbackFrame(self):
+        f = self.playback_frame
+
+        for w in f.winfo_children():
+            w.destroy()
+
         rowID = 0
         self.update_playbackMenu()
-        playbackLabel = CTkLabel(self.playback_frame, textvariable=self.playbackModeText)
-        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=5, pady=5)
 
-    def safely_close_playwindow(self):
-        self.startStreamOffBool()
-        # Safely wait for window to be gone
-        while True:
-            try:
-                vis = cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
-                if vis <= 0:
-                    break
-            except Exception:
-                break
-            time.sleep(0.1)
+        playbackLabel = CTkLabel(f, textvariable=self.playbackModeText)
+        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=8, pady=(8, 4))
+        rowID += 1
+
+        # --- Frame slider ---
+        self._pb_frame_text = StringVar(value="Frame: — / —")
+        self._pb_slider_dragging = False
+
+        self._pb_frame_label = CTkLabel(f, textvariable=self._pb_frame_text)
+        self._pb_frame_label.grid(row=rowID, column=0, sticky="w", padx=8, pady=(4, 2))
+        rowID += 1
+
+        # Start with a safe dummy range; worker will update range once it knows num_images
+        self._pb_slider = CTkSlider(
+                        f,
+                        from_ = 0,
+                        to = 1,
+                        number_of_steps = 1,
+                        command = self._on_pb_slider_drag,  # live label only
+                        )
+        self._pb_slider.grid(row=rowID, column=0, sticky="ew", padx=8, pady=(0, 8))
+        rowID += 1
+
+        # Only seek on release (prevents seek spam while dragging)
+        self._pb_slider.bind("<ButtonPress-1>", lambda *_: self._set_pb_slider_dragging(True))
+        self._pb_slider.bind("<ButtonRelease-1>", self._on_pb_slider_release)
+
+        f.grid_columnconfigure(0, weight=1)
+
+        rowID += 1
+
+        # --- Primary playback controls (mirror hotkeys) ---
+        btn_frame = CTkFrame(self.playback_frame)
+        btn_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
+
+        def mk(text, action, *args, col=0):
+            b = CTkButton(
+                btn_frame,
+                text = text,
+                command = lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),)
+            b.grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+            return b
+
+        # Order roughly like a transport bar
+        mk("⟲ Rev (r)", "reverse", col=0)
+        mk("⟸ Back (z)", "step_back", col=1)
+        mk("⏯ Pause (space)", "toggle_pause", col=2)
+        mk("Fwd (c) ⟹", "step_forward", col=3)
+        mk("Mode (f)", "toggle_fps_mode", col=4)
+
+        rowID += 1
+        speed_frame = CTkFrame(self.playback_frame)
+        speed_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
+
+        mk2 = lambda text, action, *args, col=0: CTkButton(
+                speed_frame,
+                text = text,
+                command = lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
+                ).grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+
+        mk2("Slower (a)", "speed_down", col=0)
+        mk2("Faster (d)", "speed_up", col=1)
+        mk2("Overlays (w)", "toggle_overlays", col=2)
+        mk2("Mark Start (s)", "mark_start", col=3)
+        mk2("Mark End (e)", "mark_end", col=4)
+
+    # --- Playback slider helpers ---
+    def _set_pb_slider_dragging(self, dragging: bool):
+        self._pb_slider_dragging = bool(dragging)
+
+    def _on_pb_slider_drag(self, value):
+        """ UI thread: user is dragging slider.
+            We DO NOT seek here; we only update label."""
+        try:
+            v = int(round(float(value)))
+        except Exception:
+            return
+        n = int(getattr(self, "_pb_num_images", 0) or 0)
+
+        if n > 0:
+            v = max(0, min(v, n - 1))
+            self._pb_frame_text.set(f"Frame: {v} / {n - 1}")
+        else:
+            self._pb_frame_text.set(f"Frame: {v} / —")
+
+    def _on_pb_slider_release(self, _evt=None):
+        """ UI thread: mouse released -> enqueue ONE seek command. """
+
+        self._set_pb_slider_dragging(False)
+        try:
+            v = int(round(float(self._pb_slider.get())))
+        except Exception:
+            return
+        self._enqueue_playback_cmd("seek_idx", v)
+
+    def _pb_ui_set_slider_range(self, n: int):
+        """ UI thread: update slider bounds when worker learns the dataset length. """
+
+        n = int(n)
+
+        if n <= 1:
+            self._pb_slider.configure(from_=0, to=1, number_of_steps=1)
+            self._pb_frame_text.set("Frame: — / —")
+            return
+
+        self._pb_slider.configure(from_=0, to=n - 1, number_of_steps=n - 1)
+        self._pb_frame_text.set(f"Frame: 0 / {n - 1}")
+
+    def _pb_ui_set_slider_pos(self, idx: int, n: int):
+        """
+        UI thread: update slider position during playback.
+        Avoid fighting the user while dragging.
+        """
+
+        if getattr(self, "_pb_slider_dragging", False):
+            return
+
+        if not hasattr(self, "_pb_slider") or self._pb_slider is None:
+            return
+
+        idx = int(max(0, min(int(idx), int(n) - 1)))
+        self._pb_slider.set(idx)
+        self._pb_frame_text.set(f"Frame: {idx} / {int(n) - 1}")
+
+    # --- Playback command queue (UI thread safe) ---
+    def _enqueue_playback_cmd(self, action: str, *args):
+        """UI-thread safe: enqueue a playback action for the worker thread to apply."""
+        with self._pb_cmd_lock:
+            self._pb_cmds.append((action, args))
+
+    def _drain_playback_cmds(self):
+        """Worker-thread: pull all queued playback actions."""
+        out = []
+        with self._pb_cmd_lock:
+            while self._pb_cmds:
+                out.append(self._pb_cmds.popleft())
+        return out
+
+    # --- Single authoritative action dispatcher ---
+    def _apply_playback_action(self, action: str, args, *, loader, curr_idx: int, t, wall_start: float):
+        """
+        Apply ONE playback action. This is the only place that is allowed to mutate:
+           - curr_idx
+           - wall_start
+           - loader seek/stride
+           - pauseCache clear
+           - playback mode / speed changes
+         Returns (curr_idx, wall_start).
+         """
+
+        num_images = len(t)
+
+        if action == "toggle_fps_mode":
+            self.pause = False
+            self._on_toggle_fps_mode()
+            wall_start = self._reanchor_on_mode_change(self.camConfig.playback_mode, curr_idx, t)
+            self.update_playbackMenu()
+            self.saveToCache()
+
+        elif action == "step_forward":
+            curr_idx = self._on_step_forward(curr_idx, num_images)
+            self.pause = True
+            self.pauseCache.clear()
+            self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
+            loader.seek(curr_idx, clear_buffer=True)
+            self.update_playbackMenu()
+
+        elif action == "step_back":
+            curr_idx = self._on_step_back(curr_idx)
+            self.pause = True
+            self.pauseCache.clear()
+            self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
+            loader.seek(curr_idx, clear_buffer=True)
+            self.update_playbackMenu()
+
+        elif action == "toggle_pause":
+            wall_start = self._on_toggle_pause(curr_idx, t, wall_start)
+            self.update_playbackMenu()
+
+        elif action == "speed_up":
+            wall_start = self._on_speed_up(curr_idx=curr_idx, t=t)
+            self.update_playbackMenu()
+
+        elif action == "speed_down":
+            wall_start = self._on_speed_down(curr_idx=curr_idx, t=t)
+            self.update_playbackMenu()
+
+        elif action == "toggle_overlays":
+            self._on_toggle_overlays()
+
+        elif action == "mark_start":
+            self._on_mark_start(curr_idx)
+
+        elif action == "mark_end":
+            self._on_mark_end(curr_idx)
+
+        elif action == "reverse":
+            wall_start = self._on_reverse(loader=loader, curr_idx=curr_idx, t=t)
+            self.update_playbackMenu()
+
+        elif action == "seek_idx":
+            # args: (target_idx, )
+            (target_idx, ) = args
+            target_idx = int(max(0, min(int(target_idx), len(t) - 1)))
+
+            # Seek once, clear pause cache
+            curr_idx = target_idx
+            loader.seek(curr_idx, clear_buffer=True)
+            self.pauseCache.clear()
+
+            wall_start = self._reanchor_on_mode_change(self.camConfig.playback_mode, curr_idx, t)
+            self.update_playbackMenu()
+
+        # HUD bank offsets (optional buttons)
+        elif action == "bank_minus":
+            self.hud_marker.cam_bank_offset -= 0.1
+        elif action == "bank_plus":
+            self.hud_marker.cam_bank_offset += 0.1
+
+        # Time offset adjustments (optional buttons)
+        elif action == "offset":
+        # args: (delta,)
+            (delta,) = args
+            self._on_adjust_offset(float(delta))
+        elif action == "persist_offset":
+            self._on_persist_offset()
+
+        return curr_idx, wall_start
+
+    def _key_to_playback_action(self, key: int):
+        """Map a cv2.waitKey code to an action string + args."""
+
+        if key == ord('f'):
+            return ("toggle_fps_mode", ())
+        if key == ord('c'):
+            return ("step_forward", ())
+        if key == ord('z'):
+            return ("step_back", ())
+        if key == ord(' '):
+            return ("toggle_pause", ())
+        if key == ord('d'):
+            return ("speed_up", ())
+        if key == ord('a'):
+            return ("speed_down", ())
+        if key == ord('w'):
+            return ("toggle_overlays", ())
+        if key == ord('s'):
+            return ("mark_start", ())
+        if key == ord('e'):
+            return ("mark_end", ())
+        if key == ord('r'):
+            return ("reverse", ())
+        if key == ord('b'):
+            return ("bank_minus", ())
+        if key == ord('n'):
+            return ("bank_plus", ())
+
+        # offset hotkeys
+        if key == ord(";"):
+            return ("offset", (-0.01,))
+        if key == ord("'"):
+            return ("offset", (+0.01,))
+        if key == ord(':'):
+            return ("offset", (-0.10,))
+        if key == ord('"'):
+            return ("offset", (+0.10,))
+        if key == ord('['):
+            return ("offset", (-1.00,))
+        if key == ord(']'):
+            return ("offset", (+1.00,))
+
+        if key == ord('{'):
+            return ("offset", (-10.00,))
+        if key == ord('}'):
+            return ("offset", (+10.00,))
+        if key == ord('p'):
+            return ("persist_offset", ())
+        return (None, None)
 
     def setAprilTagSize(self):
 
@@ -1816,8 +2064,6 @@ class CameraGui(CTkFrame):
         if self.camConfig.imageSource == ImageSource.Camera_Stream:
             self.run_video_stream()
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            # self.profile_run_folder = True
-            # self.run_folder_reader_profiled()
             self.run_folder_reader()
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
@@ -2041,6 +2287,18 @@ class CameraGui(CTkFrame):
         last_speed = self.playback.speed
         curr_idx = 0
 
+        # ---- Playback slider: initialize range once we know dataset length ----
+        if not getattr(self, "_pb_slider_range_inited", False):
+            self._pb_slider_range_inited = True
+            self._pb_num_images = int(num_images)
+
+            # UI-thread update
+            try:
+                self.after(0, self._pb_ui_set_slider_range, int(num_images))
+                self.after(0, self._pb_ui_set_slider_pos, int(curr_idx), int(num_images))
+            except Exception:
+                pass
+
         # --- PAUSED CACHE: keep 1 frame while paused to avoid refetch spam ---
         self.pauseCache.clear()
 
@@ -2210,104 +2468,33 @@ class CameraGui(CTkFrame):
 
                 pending_keys.extend(self._poll_keys(1))
 
-                # --- Key handling: edge-triggered dispatcher ---
+                for (action, args) in self._drain_playback_cmds():
+                    curr_idx, wall_start = self._apply_playback_action(
+                        action, args, loader=loader, curr_idx=curr_idx, t=t, wall_start=wall_start
+                    )
                 while pending_keys:
                     key = pending_keys.pop(0)
-
-                    if key in (255, 0xFF, 0, -1):
-                        continue
-
-                    # Decide edge vs repeat behavior:
-                    if key in utils._EDGE_KEYS:
-                        if not utils._is_edge_allowed(key, last_edge_time):
-                            continue  # skip if within cooldown
-                    # if key in utils._REPEAT_KEYS: let every event through (no gating)
-
-                    # --- dispatch ---
-                    if key == ord('f'):
-                        self.pause = False
-                        self._on_toggle_fps_mode()
-                        wall_start = self._reanchor_on_mode_change(
-                            new_mode=self.camConfig.playback_mode,
-                            curr_idx=curr_idx,
-                            t=t
-                        )
-                        self.update_playbackMenu()
-                        self.saveToCache()
-
-                    elif key == ord('c'):
-                        curr_idx = self._on_step_forward(curr_idx, num_images)
-                        self.pause = True
-                        self.pauseCache.clear()
-                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                        loader.seek(curr_idx, clear_buffer=True)
-                        self.update_playbackMenu()
-
-                    elif key == ord('z'):
-                        curr_idx = self._on_step_back(curr_idx)
-                        self.pause = True
-                        self.pauseCache.clear()
-                        self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-                        loader.seek(curr_idx, clear_buffer=True)
-                        self.update_playbackMenu()
-
-                    elif key == ord(' '):
-                        wall_start = self._on_toggle_pause(curr_idx, t, wall_start)
-                        self.update_playbackMenu()
-
-                    elif key == ord('d'):
-                        wall_start = self._on_speed_up(curr_idx=curr_idx, t=t)
-                        self.update_playbackMenu()
-
-                    elif key == ord('a'):
-                        wall_start = self._on_speed_down(curr_idx=curr_idx, t=t)
-                        self.update_playbackMenu()
-
-                    elif key == ord('w'):
-                        self._on_toggle_overlays()
-
-                    elif key == ord('s'):
-                        self._on_mark_start(curr_idx)
-
-                    elif key == ord('e'):
-                        self._on_mark_end(curr_idx)
-
-                    elif key == ord('r'):
-                        wall_start = self._on_reverse(
-                            loader=loader, curr_idx=curr_idx, t=t
-                        )
-                        self.update_playbackMenu()
-
-                    elif key == ord('b'):
-                        self.hud_marker.cam_bank_offset -= 0.1
-                    elif key == ord('n'):
-                        self.hud_marker.cam_bank_offset += 0.1
-
-                    elif key == ord(";"):
-                        self._on_adjust_offset(-0.01)
-                    elif key == ord("'"):
-                        self._on_adjust_offset(+0.01)
-                    elif key == ord(':'):
-                        self._on_adjust_offset(-0.10)
-                    elif key == ord('"'):
-                        self._on_adjust_offset(+0.10)
-                    elif key == ord('['):
-                        self._on_adjust_offset(-1.00)
-                    elif key == ord(']'):
-                        self._on_adjust_offset(+1.00)
-                    elif key == ord('{'):
-                        self._on_adjust_offset(-10.00)
-                    elif key == ord('}'):
-                        self._on_adjust_offset(+10.00)
-                    elif key == ord('p'):
-                        self._on_persist_offset()
-
-                    elif key == 27:  # ESC
+                    if key == 27:  # ESC
                         self.threadStopper.set()
                         break
 
+                    action, args = self._key_to_playback_action(key)
+                    if action is not None:
+                        curr_idx, wall_start = self._apply_playback_action(
+                            action, args, loader=loader, curr_idx=curr_idx, t=t, wall_start=wall_start
+                        )
+
                     while self.making_gifOrVid:
                         time.sleep(0.1)
+
+                # ---- Playback slider: publish position when idx changes ----
+                if getattr(self, "_pb_num_images", 0):
+                    if getattr(self, "_pb_last_sent_idx", None) != curr_idx:
+                        self._pb_last_sent_idx = curr_idx
+                        try:
+                            self.after(0, self._pb_ui_set_slider_pos, int(curr_idx), int(num_images))
+                        except Exception:
+                            pass
 
                 pending_keys.extend(self._poll_keys(1))
                 if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
@@ -3361,8 +3548,7 @@ class CameraGui(CTkFrame):
         import support.viz.draw_pnp_qnp as pnpDrw
         if self.pnpDrawer is None:
             self.pnpDrawer = pnpDrw.pnp_qnp_draw()
-        (self.markup_frame, rvec_tvec), output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
-                                                                               self.camConfig.undistort,
+        self.markup_frame, output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
                                                                                self.camConfig.yoloBiasTracking)
 
         want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
@@ -3386,10 +3572,7 @@ class CameraGui(CTkFrame):
 
         centers, boxes, scores, class_ids, time = output
 
-        if rvec_tvec is not None:
-            self.last_yolo_3d_estimate = np.squeeze(rvec_tvec[1])
-
-        elif len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
+        if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
             img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
@@ -3405,10 +3588,6 @@ class CameraGui(CTkFrame):
             K = self.calibration.getCameraMatrix()
             # d = self.calibration.getDistortion()  # Presume undistorted image
             twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
-            # dist_est = 2.0 / (
-            #         self.last_bounding_box_size[0] / self.curr_frame.shape[0] + self.last_bounding_box_size[1] /
-            #         self.curr_frame.shape[1])
-            # dist_est = 2.0 / (self.last_bounding_box_size[0] + self.last_bounding_box_size[1])
             dist_est = self.calibration.fx * 4.07 / (self.last_bounding_box_size[0])
 
             if self.check_above_horizon(self.last_yolo_center):
@@ -3420,8 +3599,6 @@ class CameraGui(CTkFrame):
                             f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
                             (25, w - 50),
                             cv2.FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
-                # circle(self.markup_frame, (int(self.last_yolo_center[0]), int(self.last_yolo_center[1])),
-                #            3, (255, 0, 255), 3)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
                                            (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
                 return

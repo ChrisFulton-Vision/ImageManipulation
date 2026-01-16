@@ -2,19 +2,12 @@ import copy
 import datetime
 import glob
 import os
-import re
 import numpy as np
 from numpy.typing import NDArray
 
-from support.io.my_logging import LOG
-
 import cv2
-from cv2.dnn import NMSBoxes
-
-from support.vision.calibration import Calibration, undistort_points_px_numba
+from support.vision.calibration import Calibration
 from support.io.meta_yolo_reader import MetaYoloReader
-import support.viz.colors as clr
-from support.viz.CVFontScaling import small_text, med_text, lrg_text
 from support.io.my_logging import LOG
 
 CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
@@ -143,7 +136,6 @@ class YOLO:
     def inferOnImage(self,
                      image: NDArray,
                      markup_image: NDArray,
-                     markup_is_undistorted: bool = False,
                      bias_tracking: bool = False) -> tuple[NDArray, NDArray]:
         '''
         Runs the sub-methods necessary to process an image with YOLO
@@ -153,7 +145,7 @@ class YOLO:
         self.bias_tracking_active = bias_tracking
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
-        return self.markUpImage(markup_image, output, markup_is_undistorted), output
+        return markup_image, output
 
     def set_calibration(self, calibration: Calibration) -> None:
         self.calibration = copy.deepcopy(calibration)
@@ -261,298 +253,6 @@ class YOLO:
 
         return centers, boxes, scores, classes
 
-    def markUpImage(self, image: NDArray,
-                    output: (list, list, list, list),
-                    markup_is_undistorted: bool) -> tuple[NDArray, tuple[NDArray, NDArray]]:
-        '''
-        Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
-        up the image with a PnP solution as well.
-        :param image: Original OpenCV style np.array
-        :param output: processed onnxruntime sessions
-        :return: marked-up image
-        '''
-        return image, (0.0, 0.0)
-        h, w, _ = image.shape
-
-        centers_dist, boxes, scores, class_ids, time = output
-
-        text = f'Inference time: {time:.3f}s'
-        (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-        cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
-        cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
-
-        centers_und = None
-        if self.calibration is not None and (markup_is_undistorted or len(set(class_ids)) > 5):
-            # Ensure calibration matches YOLO coordinate system (you already do this in drawPnP)
-            # Better: do it here once, before both PnP and draw
-            y_h, y_w = self.yoloSize
-            self.calibration.scaleCalibration(y_w)  # same logic you already use :contentReference[oaicite:2]{index=2}
-
-            # Vectorized: distorted YOLO pixels -> undistorted YOLO pixels
-            centers_und = undistort_points_px_numba(np.array(centers_dist, dtype=np.float64),
-                                                    *self.calibration.iteratable_params,
-                                                    self.calibration.has_tangential,
-                                                    mode_opencv_5fp=False,
-                                                    eps_px=1e-6)
-            centers_und = centers_und.tolist()
-
-        centers_for_draw = centers_dist
-        if centers_und is not None:
-            centers_for_pnp = centers_und
-            if markup_is_undistorted:
-                centers_for_draw = centers_und
-        else:
-            centers_for_pnp = centers_dist
-
-        if len(class_ids) > 0:
-            indices = NMSBoxes(boxes, scores, self.conf, self.iou)
-            newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
-            for i in indices:
-                # for i in range(len(centers)):
-                newCentersForDraw.append(centers_for_draw[i])
-                newCentersForPnP.append(centers_for_pnp[i])
-                newBoxes.append(boxes[i])
-                newClass_ids.append(class_ids[i])
-                newScores.append(scores[i])
-
-            image = self.drawBoxes(image, newCentersForDraw, newBoxes, newClass_ids, newScores)
-            if len(set(indices)) > 5:
-                rvec_tvec = self.drawPnP(image,
-                                         newClass_ids,
-                                         newCentersForPnP,
-                                         markup_is_undistorted)
-                return image, rvec_tvec
-
-        return image, None
-
-    def drawBoxes(self, image: NDArray, newCenters: list, newBoxes: list,
-                  newClass_ids: list, newScores: list) -> NDArray:
-        '''
-        Draws yolo boxes
-        :param image: Original OpenCV image
-        :param newCenters: center of bounding box
-        :param newBoxes: onnxruntime box
-        :param newClass_ids: onnxruntime id
-        :param newScores: onnxruntime confidence
-        :param color: color of box
-        :return:
-        '''
-        h, w, _ = image.shape
-        y_h, y_w = self.yoloSize
-
-        for (centers, box, class_id, score) in zip(newCenters, newBoxes, newClass_ids, newScores):
-            x, y = centers
-            x = int(w / y_w * x)
-            y = int(h / y_h * y)
-            x1, y1, x2, y2 = box
-            x1 = int(w / y_w * x1)
-            x2 = int(w / y_w * x2)
-            y1 = int(h / y_h * y1)
-            y2 = int(h / y_h * y2)
-
-            label = f"{class_id}"
-            cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
-            (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-            lowerLeftCorner = (int(x-txt_w/2.0), int(y+txt_h/2.0))
-
-            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 6)
-            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 4)
-
-        (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-        txt_height_perRow = txt_height + 10
-        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                med_text(w), clr.BLACK, 4)
-        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                med_text(w), clr.LIGHTBLUE, 2)
-
-        return image
-
-    def collect_objPts_and_imgPts(self, y_class_ids, y_centers):
-        object_points = []
-        image_points = []
-        for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id < len(self.reader.idsNamesLocs):
-                x, y, z = self.reader.idsNamesLocs[y_class_id][2:]
-                object_points.append([x, y, z])
-                image_points.append(y_centers[idx])
-
-        object_points = np.array(object_points)
-        image_points = np.array(image_points)
-        return object_points, image_points
-
-    def drawPnP(self,
-                image: NDArray,
-                y_class_ids: list,
-                y_centers: list,
-                markup_is_undistorted: bool) -> tuple[NDArray, NDArray] | None:
-        '''
-        If enough features are detected, calculates the PnP solution for the image. Then, draws the reprojection
-        onto the image. Note that the image is received by reference, and the image isn't needed to be returned because
-        the original image is directly modified.
-        :param image: OpenCV marked-up image
-        :param y_class_ids: list of class ids for the solution
-        :param y_centers: list of center pixels for the solution
-        :return: Nothing
-        '''
-        h, w, _ = image.shape
-        y_h, y_w = self.yoloSize
-
-        if self.calibration is None:
-            return
-
-        self.calibration.scaleCalibration(y_w)
-
-        object_points, image_points = self.collect_objPts_and_imgPts(y_class_ids, y_centers)
-
-        if len(object_points) < 6:
-            return
-
-        ret, rvec, tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
-                                                      imagePoints=image_points,
-                                                      cameraMatrix=self.calibration.getCameraMatrix(),
-                                                      distCoeffs=np.zeros((5,)),
-                                                      confidence=0.99,
-                                                      flags=cv2.SOLVEPNP_ITERATIVE)
-
-        dcm, jacob = cv2.Rodrigues(rvec)
-        np.set_printoptions(suppress=True, precision=10)
-
-
-        if not ret:
-            return
-
-        self.orig_tvec.append(tvec)
-        vec_str = f'x:{tvec[0, 0]:+.3f}, y:{tvec[1, 0]:+.3f}, z:{tvec[2, 0]:+.3f}'
-        txt = 'SolvePnP Solution'
-        (vec_width, vec_height), base = cv2.getTextSize(vec_str, cv2.FONT_HERSHEY_SIMPLEX,
-                                                          med_text(w), 4)
-
-        cv2.putText(image, 'SolvePnP Solution', (10, h - vec_height - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                med_text(w), clr.BLACK, 4)
-        cv2.putText(image, 'SolvePnP Solution', (10, h - vec_height - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(w), clr.YELLOW, 2)
-
-        cv2.putText(image, vec_str, (10, h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
-        cv2.putText(image, vec_str, (10, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.YELLOW, 2)
-
-        self.draw_PnP_proj(image, y_class_ids, y_centers, object_points, rvec, tvec, markup_is_undistorted)
-
-        return (rvec, tvec)
-
-    def draw_PnP_proj(self, image: NDArray,
-                      y_class_ids: list,
-                      y_centers: list,
-                      object_points: NDArray,
-                      rvec: NDArray,
-                      tvec: NDArray,
-                      markup_is_undistorted: bool):
-
-        h, w, _ = image.shape
-        y_h, y_w = self.yoloSize
-
-        for y_class_id, y_center in zip(y_class_ids, y_centers):
-            if y_class_id <= len(self.reader.idsNamesLocs):
-
-                # for idNameLoc in reader.idsNamesLocs:
-                id = self.reader.idsNamesLocs[y_class_id][0]
-                xyz = np.array(self.reader.idsNamesLocs[y_class_id][2:])
-
-                if markup_is_undistorted:
-                    dist_coeffs = np.zeros((5,))
-                else:
-                    dist_coeffs = self.calibration.getDistortion()
-
-                projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
-                                                      cameraMatrix=self.calibration.getCameraMatrix(),
-                                                      distCoeffs=dist_coeffs)
-
-                x, y = np.squeeze(projectedPixel)
-                if np.isnan(x) or np.isnan(y):
-                    return
-                x = w / y_w * x
-                y = h / y_h * y
-
-                x_yolo, y_yolo = y_center
-
-                # This section establishes a threshold for error estimates that are not outlier rejected
-                if (x - x_yolo) ** 2.0 + (y - y_yolo) ** 2.0 < 40.0 ** 2:
-                    if y_class_id in self.biasTracker:
-                        num, x_bias, y_bias = self.biasTracker[y_class_id]
-                        if num > 9:
-                            num = 9
-                        self.biasTracker[y_class_id] = [num + 1, (x_bias * num + x - x_yolo) / (num + 1),
-                                                        (y_bias * num + y - y_yolo) / (num + 1)]
-                    else:
-                        self.biasTracker[y_class_id] = [1, x - x_yolo, y - y_yolo]
-
-                (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 2)
-                lowerLeftCorner = (int(x-txt_w/2), int(y+txt_h/2))
-
-                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.BLACK, 4)
-                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(w), clr.YELLOW, 2)
-
-                if self.bias_tracking_active and y_class_id in self.biasTracker:
-                    lowerLeftCorner = (int(x_yolo + x_corr - txt_w / 2), int(y_yolo + y_corr + txt_h / 2))
-
-                    num, x_corr, y_corr = self.biasTracker[y_class_id]
-                    cv2.putText(image, str(id), (int(x_yolo + x_corr), int(y_yolo + y_corr)), cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(w), clr.RED, 2)
-
-        bias_image_points = []
-        for idx, y_class_id in enumerate(y_class_ids):
-            if y_class_id < len(self.reader.idsNamesLocs):
-                if y_class_id in self.biasTracker:
-                    num, x_corr, y_corr = self.biasTracker[y_class_id]
-                    x_yolo, y_yolo = y_centers[idx]
-                    bias_image_points.append((x_yolo + x_corr, y_yolo + y_corr))
-                else:
-                    bias_image_points.append(y_centers[idx])
-        bias_image_points = np.array(bias_image_points)
-
-        ret, bias_rvec, bias_tvec, inliers = cv2.solvePnPRansac(objectPoints=object_points,
-                                                                imagePoints=bias_image_points,
-                                                                cameraMatrix=self.calibration.getCameraMatrix(),
-                                                                distCoeffs=np.zeros((5,)),
-                                                                flags=cv2.SOLVEPNP_ITERATIVE)
-        self.bias_tvec.append(bias_tvec)
-        self.plotCount += 1
-        # print(np.squeeze(np.array(self.orig_tvec)))
-        tvecs = np.squeeze(np.array(self.orig_tvec))
-        # print()
-        # print(np.squeeze(np.array(self.bias_tvec)))
-        bias_tvecs = np.squeeze(np.array(self.bias_tvec))
-        # print('\n\n')
-
-        # print(self.plotCount)
-        # if len(tvecs.shape) > 1 and self.plotCount > 200:
-        #     plt.title("Rigid vs. Semi-Rigid 3D Model Solve-PnP Solution")
-        #     plt.xlabel("Frame Number")
-        #     plt.ylabel("")
-        #     plt.plot(tvecs[:, 2], label='Rigid Model', linewidth=2.0)
-        #     plt.plot(bias_tvecs[:, 2], label='Semi-Rigid Model', linewidth=2.0)
-        #     plt.legend()
-        #     plt.tight_layout()
-        #     plt.show()
-        #     self.plotCount = 0
-        if self.bias_tracking_active:
-            (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-            txt_height_perRow = txt_height + 10
-            cv2.putText(image, f'x:{bias_tvec[0, 0]:+.3f}, y:{bias_tvec[1, 0]:+.3f}, z:{bias_tvec[2, 0]:+.3f}',
-                        (10, h - 3 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 2)
-            cv2.putText(image, f'x:{bias_tvec[0, 0]:+.3f}, y:{bias_tvec[1, 0]:+.3f}, z:{bias_tvec[2, 0]:+.3f}',
-                        (10, h - 3 * txt_height_perRow - 10), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.RED, 2)
-
-
-def natural_sort(l):
-    convert = lambda text: int(text) if text.isdigit() else text.lower()
-    alphanum_key = lambda key: [convert(c) for c in re.split('([0-9]+)', key)]
-    return sorted(l, key=alphanum_key)
-
-
 if __name__ == '__main__':
     from cv2 import imshow, imread, waitKey
 
@@ -568,6 +268,7 @@ if __name__ == '__main__':
     allImages = glob.glob(
         os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
 
+    from support.io.data_processing import natural_sort
     allImages = natural_sort(allImages)
 
     for imgFP in allImages:

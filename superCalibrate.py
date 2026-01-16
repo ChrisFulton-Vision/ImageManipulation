@@ -21,7 +21,7 @@ from cv2 import (CALIB_ZERO_TANGENT_DIST, CALIB_FIX_ASPECT_RATIO, CALIB_FIX_PRIN
                  EVENT_FLAG_LBUTTON, rectangle, EVENT_LBUTTONUP, ADAPTIVE_THRESH_GAUSSIAN_C,
                  findCirclesGrid, estimateChessboardSharpness, TERM_CRITERIA_MAX_ITER, TERM_CRITERIA_EPS, cornerSubPix,
                  drawChessboardCorners, fisheye, initCameraMatrix2D, CALIB_USE_INTRINSIC_GUESS, calibrateCameraROExtended,
-                 calibrationMatrixValues, findChessboardCornersSB)
+                 calibrationMatrixValues, findChessboardCornersSB, findChessboardCorners)
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
 
@@ -63,6 +63,7 @@ class ImageryCalibrationConfig:
         self.fixAspectRatio = True
         self.fixPrincipalPoint = True
         self.fisheye = False
+        self.screen_based_checkerboard = False
 
     @property
     def num_valid_imgs(self):
@@ -352,7 +353,7 @@ class CalibrateGui(CTkFrame):
 
     def createCalibrationWindowButton(self, rowID):
         self.displayCal = CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
-                                        command=self.updateCalWindow)
+                                        command=self.updateConfigWindow)
         self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         if self.imageConfig.camCal.validCal:
             self.displayCal.configure(state='normal')
@@ -502,7 +503,7 @@ class CalibrateGui(CTkFrame):
             self.calLabel.grid(row=1, column=0, padx=5, pady=5)
         else:
             self.calLabel = CTkLabel(f, text="No calibration calculated yet.", justify='center')
-            self.calLabel.grid(row=0, column=0, padx=5, pady=5)
+            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
             self.saveCalButton.configure(state='disabled')
             self.scale864Button.configure(state='disabled')
             self.scale2848Button.configure(state='disabled')
@@ -513,12 +514,12 @@ class CalibrateGui(CTkFrame):
     def scaleTo864(self):
         self.imageConfig.camCal.scaleCalibration(864)
         self.saveToCache()
-        self.updateCalWindow()
+        self.updateConfigWindow()
 
     def scaleTo2848(self):
         self.imageConfig.camCal.scaleCalibration(2848)
         self.saveToCache()
-        self.updateCalWindow()
+        self.updateConfigWindow()
 
     def scaleToInput(self):
         dialog = CTkInputDialog(
@@ -527,7 +528,7 @@ class CalibrateGui(CTkFrame):
         try:
             self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
             self.saveToCache()
-            self.updateCalWindow()
+            self.updateConfigWindow()
         except ValueError:
             print('Invalid input. Please input only an integer.')
 
@@ -580,6 +581,15 @@ class CalibrateGui(CTkFrame):
             zeroTangentDistCB.deselect()
         zeroTangentDistCB.configure(command=self.toggleZeroTangentDist)
         zeroTangentDistCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
+        rowID += 1
+
+        screen_based_checkerboardCB = CTkCheckBox(master=f, text="Screen Based Checkerboard", checkbox_height=20)
+        if self.imageConfig.screen_based_checkerboard:
+            screen_based_checkerboardCB.select()
+        else:
+            screen_based_checkerboardCB.deselect()
+        screen_based_checkerboardCB.configure(command=self.toggleScreenbasedCheckerboard)
+        screen_based_checkerboardCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
 
         return f
 
@@ -623,6 +633,9 @@ class CalibrateGui(CTkFrame):
 
     def toggleZeroTangentDist(self):
         self.imageConfig.zeroTangentDist = not self.imageConfig.zeroTangentDist
+
+    def toggleScreenbasedCheckerboard(self):
+        self.imageConfig.screen_based_checkerboard = not self.imageConfig.screen_based_checkerboard
 
     def toggleFixPrincipalPoint(self):
         self.imageConfig.fixPrincipalPoint = not self.imageConfig.fixPrincipalPoint
@@ -1215,9 +1228,7 @@ class CalibrateGui(CTkFrame):
 
         self.saveToCache()
         if not self.initImageFrame:
-            # self.setupImageFrame()
             self.initImageFrame = True
-        # self.updateImageFrame()
 
     def invertImageToggle(self):
         self.imageConfig.invert_image = not self.imageConfig.invert_image
@@ -1336,7 +1347,12 @@ class CalibrateGui(CTkFrame):
             return
 
         if self.imageConfig.calMode == CalibrationType.Chessboard:
-            ret, corners = findChessboardCornersSB(gray,
+            if self.imageConfig.screen_based_checkerboard:
+                ret, corners = findChessboardCornersSB(gray,
+                                                     (self.imageConfig.num_inner_corners_W,
+                                                      self.imageConfig.num_inner_corners_H))
+            else:
+                ret, corners = findChessboardCorners(gray,
                                                      (self.imageConfig.num_inner_corners_W,
                                                       self.imageConfig.num_inner_corners_H))
 

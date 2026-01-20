@@ -2,8 +2,9 @@ import os
 import pickle, copy
 
 import numpy as np
-
+from pathlib import Path
 from support.core.sensor_datum_mat4_bundle import parse_sensor_datum_mat4_bundle
+from support.io.my_logging import LOG
 
 class TruthPoints:
     def __init__(self):
@@ -111,6 +112,34 @@ class TruthPoints:
 
         for tag_id, tag_df in mat4_bundle.groupby('object_id'):
             self.truthPoints[tag_id] = tag_df[["x", "y", "z"]].mean().to_numpy()
+
+    def try_load(self, lidar_path : Path):
+        if not lidar_path.exists():
+            LOG.error(
+                f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}'
+            )
+            return
+
+        try:
+            with lidar_path.open('rb') as f:
+                obj = pickle.load(f)
+        except AttributeError as e:
+            # Old pickle referring to __main__.TruthPoints or otherwise broken:
+            LOG.warning("Failed to unpickle LiDAR truth points (%s). Using defaults instead.", e)
+            obj = TruthPoints()  # fall back to code-defined truth points
+        except Exception as e:
+            LOG.error("Error loading LiDAR truth points: %s", e)
+            return
+
+        # Accept either a TruthPoints instance or a raw dict
+        if isinstance(obj, TruthPoints):
+            self.copy(obj)
+        elif isinstance(obj, dict):
+            # Existing self.lidarTruthPoints is a TruthPoints()
+            self.truthPoints = copy.deepcopy(obj)
+        else:
+            LOG.error("Unexpected LiDAR truth data type: %r", type(obj))
+
 
 if __name__ == '__main__':
     TruthPoints()

@@ -40,9 +40,11 @@ from support.mathHelpers.include_numba import _njit as njit, prange
 from support.core.enums import robust_cost
 from numpy.typing import NDArray
 from dataclasses import dataclass
+from support.io.my_logging import LOG
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
+
 
 @dataclass
 class QnPStats:
@@ -51,6 +53,44 @@ class QnPStats:
     sse_w: float
     s2: float
     cov6: np.ndarray
+
+@dataclass
+class SeedConfig:
+    """
+    Controls robust unseeded initialization for solveQnP().
+
+    Goals:
+      - Keep per-frame cost ~baseline (opt called once)
+      - Improve robustness vs occasional DLT catastrophes
+      - Make tradeoff configurable for precision vs speed
+    """
+    enabled: bool = True
+
+    # Fast-path: try weighted DLT once (using sigma) and accept if "good enough".
+    try_weighted_dlt_first: bool = True
+    dlt_sigma_floor_px: float = 1.0
+    accept_median_err_px: float = 12.0      # accept seed if median reproj error <= this
+    accept_front_frac: float = 0.90        # accept seed if >= this fraction is in front
+
+    # If fast-path fails: multi-hypothesis DLT + cheap scoring (NO full opt in loop).
+    ransac_enabled: bool = True
+    ransac_iters: int = 12                 # good starting point for ~60 points and low outlier rate
+    subset_size: int = 6                   # 6 is fastest; bump to 8 if needed
+    early_exit_median_err_px: float = 10.0  # stop early if we find a great seed
+
+    # PROSAC-like sampling based on sigma (prefer most-certain points first)
+    prosac_enabled: bool = False
+    prosac_min_pool: int = 12              # initial pool size for PROSAC growth
+    rng_seed: int = 0
+
+    # Optional: do a tiny refine only on top-K seeds (still cheap)
+    refine_top_k: int = 1                  # 0 disables, 1 is usually enough
+    refine_max_iters: int = 4              # <=4 keeps it cheap
+
+    # Scoring: score on quick subset first (avoid full scoring every hypothesis)
+    score_quick_M: int = 6                # 0 => score all points always
+    z_eps: float = 1e-3
+
 
 @njit(cache=True, fastmath=False)
 def _project_accum_irls_numba(object_pts, meas_2N,
@@ -64,7 +104,7 @@ def _project_accum_irls_numba(object_pts, meas_2N,
 
     LtL = np.zeros((6, 6), dtype=np.float64)
     Lty = np.zeros(6, dtype=np.float64)
-    y2  = 0.0
+    y2 = 0.0
 
     front = 0
 
@@ -77,9 +117,9 @@ def _project_accum_irls_numba(object_pts, meas_2N,
         Y = object_pts[i, 1]
         Z = object_pts[i, 2]
 
-        rx = R[0, 0]*X + R[0, 1]*Y + R[0, 2]*Z
-        ry = R[1, 0]*X + R[1, 1]*Y + R[1, 2]*Z
-        rz = R[2, 0]*X + R[2, 1]*Y + R[2, 2]*Z
+        rx = R[0, 0] * X + R[0, 1] * Y + R[0, 2] * Z
+        ry = R[1, 0] * X + R[1, 1] * Y + R[1, 2] * Z
+        rz = R[2, 0] * X + R[2, 1] * Y + R[2, 2] * Z
 
         x = rx + tx
         y = ry + ty
@@ -112,7 +152,7 @@ def _project_accum_irls_numba(object_pts, meas_2N,
         else:
             rwu = du * iu
             rwv = dv * iv
-            rmag = np.sqrt(rwu*rwu + rwv*rwv)
+            rmag = np.sqrt(rwu * rwu + rwv * rwv)
 
             if rmag < eps:
                 w = 1.0
@@ -120,14 +160,14 @@ def _project_accum_irls_numba(object_pts, meas_2N,
                 w = 1.0 if rmag <= c else (c / rmag)
             elif kind_int == 2:  # cauchy
                 t = rmag / c
-                w = 1.0 / (1.0 + t*t)
+                w = 1.0 / (1.0 + t * t)
             else:  # tukey
                 t = rmag / c
                 if t >= 1.0:
                     w = 0.0
                 else:
-                    a = 1.0 - t*t
-                    w = a*a
+                    a = 1.0 - t * t
+                    w = a * a
 
             sw = np.sqrt(w)
 
@@ -139,7 +179,7 @@ def _project_accum_irls_numba(object_pts, meas_2N,
         ru = wu * du
         rv = wv * dv
 
-        y2 += ru*ru + rv*rv
+        y2 += ru * ru + rv * rv
 
         # Jacobian row algebra (same as your _project_and_jacobian_numba)
         uX = fx * invz
@@ -180,37 +220,77 @@ def _project_accum_irls_numba(object_pts, meas_2N,
         jv5 = wv * Jv[2]
 
         # Accumulate Lty += J^T r
-        Lty[0] += ju0*ru + jv0*rv
-        Lty[1] += ju1*ru + jv1*rv
-        Lty[2] += ju2*ru + jv2*rv
-        Lty[3] += ju3*ru + jv3*rv
-        Lty[4] += ju4*ru + jv4*rv
-        Lty[5] += ju5*ru + jv5*rv
+        Lty[0] += ju0 * ru + jv0 * rv
+        Lty[1] += ju1 * ru + jv1 * rv
+        Lty[2] += ju2 * ru + jv2 * rv
+        Lty[3] += ju3 * ru + jv3 * rv
+        Lty[4] += ju4 * ru + jv4 * rv
+        Lty[5] += ju5 * ru + jv5 * rv
 
         # Accumulate LtL += J^T J (two rows)
         # (manual outer-products, still tiny and fast at N<=100)
         # u-row
-        LtL[0,0] += ju0*ju0; LtL[0,1] += ju0*ju1; LtL[0,2] += ju0*ju2; LtL[0,3] += ju0*ju3; LtL[0,4] += ju0*ju4; LtL[0,5] += ju0*ju5
-        LtL[1,1] += ju1*ju1; LtL[1,2] += ju1*ju2; LtL[1,3] += ju1*ju3; LtL[1,4] += ju1*ju4; LtL[1,5] += ju1*ju5
-        LtL[2,2] += ju2*ju2; LtL[2,3] += ju2*ju3; LtL[2,4] += ju2*ju4; LtL[2,5] += ju2*ju5
-        LtL[3,3] += ju3*ju3; LtL[3,4] += ju3*ju4; LtL[3,5] += ju3*ju5
-        LtL[4,4] += ju4*ju4; LtL[4,5] += ju4*ju5
-        LtL[5,5] += ju5*ju5
+        LtL[0, 0] += ju0 * ju0
+        LtL[0, 1] += ju0 * ju1
+        LtL[0, 2] += ju0 * ju2
+        LtL[0, 3] += ju0 * ju3
+        LtL[0, 4] += ju0 * ju4
+        LtL[0, 5] += ju0 * ju5
+        LtL[1, 1] += ju1 * ju1
+        LtL[1, 2] += ju1 * ju2
+        LtL[1, 3] += ju1 * ju3
+        LtL[1, 4] += ju1 * ju4
+        LtL[1, 5] += ju1 * ju5
+        LtL[2, 2] += ju2 * ju2
+        LtL[2, 3] += ju2 * ju3
+        LtL[2, 4] += ju2 * ju4
+        LtL[2, 5] += ju2 * ju5
+        LtL[3, 3] += ju3 * ju3
+        LtL[3, 4] += ju3 * ju4
+        LtL[3, 5] += ju3 * ju5
+        LtL[4, 4] += ju4 * ju4
+        LtL[4, 5] += ju4 * ju5
+        LtL[5, 5] += ju5 * ju5
 
         # v-row
-        LtL[0,0] += jv0*jv0; LtL[0,1] += jv0*jv1; LtL[0,2] += jv0*jv2; LtL[0,3] += jv0*jv3; LtL[0,4] += jv0*jv4; LtL[0,5] += jv0*jv5
-        LtL[1,1] += jv1*jv1; LtL[1,2] += jv1*jv2; LtL[1,3] += jv1*jv3; LtL[1,4] += jv1*jv4; LtL[1,5] += jv1*jv5
-        LtL[2,2] += jv2*jv2; LtL[2,3] += jv2*jv3; LtL[2,4] += jv2*jv4; LtL[2,5] += jv2*jv5
-        LtL[3,3] += jv3*jv3; LtL[3,4] += jv3*jv4; LtL[3,5] += jv3*jv5
-        LtL[4,4] += jv4*jv4; LtL[4,5] += jv4*jv5
-        LtL[5,5] += jv5*jv5
+        LtL[0, 0] += jv0 * jv0
+        LtL[0, 1] += jv0 * jv1
+        LtL[0, 2] += jv0 * jv2
+        LtL[0, 3] += jv0 * jv3
+        LtL[0, 4] += jv0 * jv4
+        LtL[0, 5] += jv0 * jv5
+        LtL[1, 1] += jv1 * jv1
+        LtL[1, 2] += jv1 * jv2
+        LtL[1, 3] += jv1 * jv3
+        LtL[1, 4] += jv1 * jv4
+        LtL[1, 5] += jv1 * jv5
+        LtL[2, 2] += jv2 * jv2
+        LtL[2, 3] += jv2 * jv3
+        LtL[2, 4] += jv2 * jv4
+        LtL[2, 5] += jv2 * jv5
+        LtL[3, 3] += jv3 * jv3
+        LtL[3, 4] += jv3 * jv4
+        LtL[3, 5] += jv3 * jv5
+        LtL[4, 4] += jv4 * jv4
+        LtL[4, 5] += jv4 * jv5
+        LtL[5, 5] += jv5 * jv5
 
     # symmetrize LtL
-    LtL[1,0] = LtL[0,1]; LtL[2,0] = LtL[0,2]; LtL[3,0] = LtL[0,3]; LtL[4,0] = LtL[0,4]; LtL[5,0] = LtL[0,5]
-    LtL[2,1] = LtL[1,2]; LtL[3,1] = LtL[1,3]; LtL[4,1] = LtL[1,4]; LtL[5,1] = LtL[1,5]
-    LtL[3,2] = LtL[2,3]; LtL[4,2] = LtL[2,4]; LtL[5,2] = LtL[2,5]
-    LtL[4,3] = LtL[3,4]; LtL[5,3] = LtL[3,5]
-    LtL[5,4] = LtL[4,5]
+    LtL[1, 0] = LtL[0, 1]
+    LtL[2, 0] = LtL[0, 2]
+    LtL[3, 0] = LtL[0, 3]
+    LtL[4, 0] = LtL[0, 4]
+    LtL[5, 0] = LtL[0, 5]
+    LtL[2, 1] = LtL[1, 2]
+    LtL[3, 1] = LtL[1, 3]
+    LtL[4, 1] = LtL[1, 4]
+    LtL[5, 1] = LtL[1, 5]
+    LtL[3, 2] = LtL[2, 3]
+    LtL[4, 2] = LtL[2, 4]
+    LtL[5, 2] = LtL[2, 5]
+    LtL[4, 3] = LtL[3, 4]
+    LtL[5, 3] = LtL[3, 5]
+    LtL[5, 4] = LtL[4, 5]
 
     front_frac = front / float(max(1, N))
     return LtL, Lty, y2, front_frac
@@ -220,39 +300,49 @@ def _project_accum_irls_numba(object_pts, meas_2N,
 import numpy as np
 from numba import njit
 
+
 @njit(cache=True, fastmath=False)
 def _quat_mul(qw1, qx1, qy1, qz1, qw2, qx2, qy2, qz2):
     # (q1 ⊗ q2)
     return (
-        qw1*qw2 - qx1*qx2 - qy1*qy2 - qz1*qz2,
-        qw1*qx2 + qx1*qw2 + qy1*qz2 - qz1*qy2,
-        qw1*qy2 - qx1*qz2 + qy1*qw2 + qz1*qx2,
-        qw1*qz2 + qx1*qy2 - qy1*qx2 + qz1*qw2,
+        qw1 * qw2 - qx1 * qx2 - qy1 * qy2 - qz1 * qz2,
+        qw1 * qx2 + qx1 * qw2 + qy1 * qz2 - qz1 * qy2,
+        qw1 * qy2 - qx1 * qz2 + qy1 * qw2 + qz1 * qx2,
+        qw1 * qz2 + qx1 * qy2 - qy1 * qx2 + qz1 * qw2,
     )
+
 
 @njit(cache=True, fastmath=False)
 def _quat_normalize_posw(qw, qx, qy, qz):
-    n2 = qw*qw + qx*qx + qy*qy + qz*qz
+    n2 = qw * qw + qx * qx + qy * qy + qz * qz
     if n2 <= 0.0:
         return 1.0, 0.0, 0.0, 0.0
     invn = 1.0 / np.sqrt(n2)
-    qw *= invn; qx *= invn; qy *= invn; qz *= invn
+    qw *= invn
+    qx *= invn
+    qy *= invn
+    qz *= invn
     # enforce positive scalar (your force_s_pos)
     if qw < 0.0:
-        qw = -qw; qx = -qx; qy = -qy; qz = -qz
+        qw = -qw
+        qx = -qx
+        qy = -qy
+        qz = -qz
     return qw, qx, qy, qz
+
 
 @njit(cache=True, fastmath=False)
 def _rotvec_to_quat(drx, dry, drz):
     # Rodrigues/rotation-vector to quaternion
-    th2 = drx*drx + dry*dry + drz*drz
+    th2 = drx * drx + dry * dry + drz * drz
     if th2 < 1e-24:
         # small-angle: sin(th/2)/th ~ 0.5
-        return 1.0, 0.5*drx, 0.5*dry, 0.5*drz
+        return 1.0, 0.5 * drx, 0.5 * dry, 0.5 * drz
     th = np.sqrt(th2)
     half = 0.5 * th
     s = np.sin(half) / th
-    return np.cos(half), drx*s, dry*s, drz*s
+    return np.cos(half), drx * s, dry * s, drz * s
+
 
 @njit(cache=True, fastmath=False)
 def _apply_delta_q(qw, qx, qy, qz, drx, dry, drz):
@@ -321,32 +411,41 @@ def _deriv_kernel_numba(RX: np.ndarray, xyz_cam: np.ndarray, fx: float, fy: floa
         L[r + 1, 5] = vZ
 
     return L
+
+
 @njit(cache=True, fastmath=False)
 def _quat_to_R_numba(qw, qx, qy, qz):
     # Assumes q is unit-ish; still works if slightly off.
     # Returns 3x3 rotation matrix.
-    ww = qw*qw; xx = qx*qx; yy = qy*qy; zz = qz*qz
-    wx = qw*qx; wy = qw*qy; wz = qw*qz
-    xy = qx*qy; xz = qx*qz; yz = qy*qz
+    ww = qw * qw
+    xx = qx * qx
+    yy = qy * qy
+    zz = qz * qz
+    wx = qw * qx
+    wy = qw * qy
+    wz = qw * qz
+    xy = qx * qy
+    xz = qx * qz
+    yz = qy * qz
 
     R = np.empty((3, 3), dtype=np.float64)
     R[0, 0] = ww + xx - yy - zz
-    R[0, 1] = 2.0*(xy - wz)
-    R[0, 2] = 2.0*(xz + wy)
+    R[0, 1] = 2.0 * (xy - wz)
+    R[0, 2] = 2.0 * (xz + wy)
 
-    R[1, 0] = 2.0*(xy + wz)
+    R[1, 0] = 2.0 * (xy + wz)
     R[1, 1] = ww - xx + yy - zz
-    R[1, 2] = 2.0*(yz - wx)
+    R[1, 2] = 2.0 * (yz - wx)
 
-    R[2, 0] = 2.0*(xz - wy)
-    R[2, 1] = 2.0*(yz + wx)
+    R[2, 0] = 2.0 * (xz - wy)
+    R[2, 1] = 2.0 * (yz + wx)
     R[2, 2] = ww - xx - yy + zz
     return R
 
 
 @njit(parallel=True, cache=True, fastmath=False)
 def _project_and_jacobian_numba(object_pts, qw, qx, qy, qz, tx, ty, tz, fx, fy, cx, cy,
-                               proj_2N_out, RX_out, xyz_cam_out, L_out):
+                                proj_2N_out, RX_out, xyz_cam_out, L_out):
     """
     Fills:
       proj_2N_out: (2N,)
@@ -362,9 +461,9 @@ def _project_and_jacobian_numba(object_pts, qw, qx, qy, qz, tx, ty, tz, fx, fy, 
         Y = object_pts[i, 1]
         Z = object_pts[i, 2]
 
-        rx = R[0, 0]*X + R[0, 1]*Y + R[0, 2]*Z
-        ry = R[1, 0]*X + R[1, 1]*Y + R[1, 2]*Z
-        rz = R[2, 0]*X + R[2, 1]*Y + R[2, 2]*Z
+        rx = R[0, 0] * X + R[0, 1] * Y + R[0, 2] * Z
+        ry = R[1, 0] * X + R[1, 1] * Y + R[1, 2] * Z
+        rz = R[2, 0] * X + R[2, 1] * Y + R[2, 2] * Z
 
         RX_out[i, 0] = rx
         RX_out[i, 1] = ry
@@ -386,7 +485,7 @@ def _project_and_jacobian_numba(object_pts, qw, qx, qy, qz, tx, ty, tz, fx, fy, 
         v = fy * (y * invz) + cy
 
         r2 = 2 * i
-        proj_2N_out[r2]     = u
+        proj_2N_out[r2] = u
         proj_2N_out[r2 + 1] = v
 
         # Jacobian (same algebra as your _deriv_kernel_numba) :contentReference[oaicite:3]{index=3}
@@ -424,6 +523,7 @@ def _project_and_jacobian_numba(object_pts, qw, qx, qy, qz, tx, ty, tz, fx, fy, 
         L_out[r2 + 1, 4] = vY
         L_out[r2 + 1, 5] = vZ
 
+
 @njit(fastmath=False, cache=True)
 def _accum_LtL_Lty_numba(L: np.ndarray, y: np.ndarray, sqrtw: np.ndarray):
     """
@@ -447,7 +547,7 @@ def _accum_LtL_Lty_numba(L: np.ndarray, y: np.ndarray, sqrtw: np.ndarray):
 
     LtL = np.zeros((6, 6), dtype=np.float64)
     Lty = np.zeros(6, dtype=np.float64)
-    y2  = 0.0
+    y2 = 0.0
 
     M = L.shape[0]
 
@@ -521,11 +621,9 @@ def _row_normed(A, eps=1e-12):
     return A / np.clip(n, eps, None)
 
 
-
-
 # --- Camera projection ----------------------------------------------------------
 
-def h(est_q: q, est_t: np.array, feature_points, cal: Calibration):
+def h(est_q: q, est_t: NDArray, feature_points, cal: Calibration):
     """Project all `FEATURE_OFFSETS` into pixel coordinates given pose (q, t).
 
     The pose maps model points into the camera frame as:  X_cam = q.T * X + t
@@ -550,9 +648,9 @@ def _skew(v: np.ndarray) -> np.ndarray:
     """Return 3x3 skew-symmetric matrix [v]_x such that [v]_x w = v × w."""
     vx, vy, vz = v
     return np.array([
-        [0.0, -vz,  vy],
-        [vz,  0.0, -vx],
-        [-vy, vx,  0.0]
+        [0.0, -vz, vy],
+        [vz, 0.0, -vx],
+        [-vy, vx, 0.0]
     ], dtype=float)
 
 
@@ -569,7 +667,6 @@ def deriv(est_q: q, est_t: np.ndarray, feature_points: np.ndarray, cal: Calibrat
     xyz_cam = est_q * feature_points + est_t
     RX = xyz_cam - est_t
 
-
     # Ensure float64 + C-contiguous only if necessary (avoid unconditional copies)
     if xyz_cam.dtype != np.float64 or not xyz_cam.flags["C_CONTIGUOUS"]:
         xyz_cam = np.ascontiguousarray(xyz_cam, dtype=np.float64)
@@ -578,7 +675,8 @@ def deriv(est_q: q, est_t: np.ndarray, feature_points: np.ndarray, cal: Calibrat
 
     return _deriv_kernel_numba(RX, xyz_cam, float(cal.fx), float(cal.fy))
 
-def print_rayPts(ray_proj: np.array):
+
+def print_rayPts(ray_proj: NDArray):
     """Nicely print a flattened [u0, v0, u1, v1, ...] vector (debug helper)."""
     ray_proj = ray_proj.reshape(-1, 2)
     print(f"Norm: {np.linalg.norm(ray_proj)}")
@@ -595,9 +693,10 @@ def _expand_to_2N_weights(w, N):
         return w
     raise ValueError(f"weight length must be N or 2N; got {w.size}, N={N}")
 
+
 @njit(cache=True, fastmath=True)
 def _robust_sqrt_weights_inplace_numba(
-    y_2N, N, kind_int, c, inv_sigma_2N, out_sqrtw_2N
+        y_2N, N, kind_int, c, inv_sigma_2N, out_sqrtw_2N
 ):
     """
     Fill out_sqrtw_2N (2N,) with per-residual sqrt-weights for robust IRLS.
@@ -651,6 +750,7 @@ def _robust_sqrt_weights_inplace_numba(
         out_sqrtw_2N[2 * i + 0] = sw
         out_sqrtw_2N[2 * i + 1] = sw
 
+
 def _inv_sigma_2N_from_sigma(sigma_2N,
                              N: int,
                              eps: float = 1e-6,
@@ -676,16 +776,17 @@ def _inv_sigma_2N_from_sigma(sigma_2N,
 
 
 def opt(
-    img_pts: NDArray,
-    object_pts: NDArray,
-    cal: Calibration,
-    return_stats: bool,
-    seed_q: q = None,
-    seed_t: NDArray = None,
-    robust_kind: robust_cost = robust_cost.none,
-    robust_param: float = 2.0,
-    sigma_2N=None,
-    sigma_floor_px: float = 1.0):
+        img_pts: NDArray,
+        object_pts: NDArray,
+        cal: Calibration,
+        return_stats: bool,
+        seed_q: q = None,
+        seed_t: NDArray = None,
+        robust_kind: robust_cost = robust_cost.none,
+        robust_param: float = 2.0,
+        sigma_2N=None,
+        sigma_floor_px: float = 1.0,
+        max_iters: int = 20):
     """
     Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN/LM.
     State: [δr, δt] (6 DOF), minimal tangent update.
@@ -725,7 +826,6 @@ def opt(
     tx, ty, tz = float(est_t[0]), float(est_t[1]), float(est_t[2])
 
     lam = 1e-1
-    max_iters = 20
 
     # ================= GN/LM LOOP =================
     for iter_num in range(1, max_iters + 1):
@@ -744,8 +844,12 @@ def opt(
 
         # LM solve: (LtL + lam I) dx = Lty
         A = LtL.copy()
-        A[0, 0] += lam; A[1, 1] += lam; A[2, 2] += lam
-        A[3, 3] += lam; A[4, 4] += lam; A[5, 5] += lam
+        A[0, 0] += lam
+        A[1, 1] += lam
+        A[2, 2] += lam
+        A[3, 3] += lam
+        A[4, 4] += lam
+        A[5, 5] += lam
         dx = np.linalg.solve(A, Lty)
 
         drx, dry, drz = float(dx[0]), float(dx[1]), float(dx[2])
@@ -822,6 +926,7 @@ def opt(
         cov6=cov6
     )
 
+
 def enforce_chirality(q_est, t_est, object_pts):
     # Camera-frame points
     XYZ = q_est * object_pts + t_est
@@ -834,6 +939,95 @@ def enforce_chirality(q_est, t_est, object_pts):
         t_est = -t_est
         return True, q_est, t_est,
     return False, q_est, t_est
+
+
+def _score_pose(q_est, t_est, object_pts, img_pts, cal, sigma_2N=None):
+    """Robust score: median reprojection error in pixels (lower is better)."""
+    proj = h(q_est, t_est, object_pts, cal).reshape(-1, 2)
+    err = img_pts - proj
+    e = np.sqrt(np.sum(err ** 2, axis=1))
+
+    # Optional: whiten before scoring if you have sigmas
+    if sigma_2N is not None:
+        s = np.asarray(sigma_2N, dtype=float).ravel()
+        if s.size == 2 * img_pts.shape[0]:
+            sx = s[0::2]
+            sy = s[1::2]
+            # avoid divide-by-zero
+            e = np.sqrt((err[:, 0] / np.maximum(sx, 1e-6)) ** 2 + (err[:, 1] / np.maximum(sy, 1e-6)) ** 2)
+
+    return np.median(e)
+
+def robust_seed_ransac_dlt(
+    object_pts, img_pts, cal,
+    sigma_2N=None,
+    iters=64,
+    subset=8,
+    refine_iters=5,
+    robust_kind=robust_cost.huber,
+    robust_param=2.0,
+    rng_seed=0
+):
+    """
+    Multi-hypothesis initializer:
+      sample subset -> DLT -> chirality -> short refine -> robust score
+    Returns (best_q, best_t) or (None, None) if it fails.
+    """
+    N = img_pts.shape[0]
+    if N < 6:
+        return None, None
+
+    rng = np.random.default_rng(rng_seed)
+
+    best = None
+    best_score = np.inf
+
+    # Precompute per-point trust weights if you want (optional)
+    # Example: if sigma_2N provided, weight points by 1/sigma (roughly)
+    trust_w = None
+    if sigma_2N is not None:
+        s = np.asarray(sigma_2N, dtype=float).ravel()
+        if s.size == 2*N:
+            sx = s[0::2]; sy = s[1::2]
+            sp = np.sqrt(np.maximum(sx, 1e-6) * np.maximum(sy, 1e-6))
+            trust_w = 1.0 / np.maximum(sp, 1e-6)  # (N,)
+
+    for _ in range(iters):
+        idx = rng.choice(N, size=min(subset, N), replace=False)
+        obj_s = object_pts[idx]
+        img_s = img_pts[idx]
+
+        # Subset weights (optional)
+        tw_s = trust_w[idx] if trust_w is not None else None
+
+        try:
+            q0, t0 = DLT(obj_s, img_s, cal, trust_weighting=tw_s)
+        except Exception:
+            continue
+
+        _, q0, t0 = enforce_chirality(q0, t0, object_pts)
+
+        # quick local refine (few iterations) to stabilize basin selection
+        try:
+            q1, t1 = opt(
+                img_pts, object_pts, cal,
+                return_stats=False,
+                seed_q=q0, seed_t=t0,
+                sigma_2N=sigma_2N,
+                robust_kind=robust_kind,
+                robust_param=robust_param
+            )
+        except Exception:
+            continue
+
+        score = _score_pose(q1, t1, object_pts, img_pts, cal, sigma_2N=sigma_2N)
+        if np.isfinite(score) and score < best_score:
+            best_score = score
+            best = (q1, t1)
+
+    if best is None:
+        return None, None
+    return best
 
 def DLT(object_pts: NDArray,
         img_pts: NDArray,
@@ -853,7 +1047,7 @@ def DLT(object_pts: NDArray,
     """
 
     object_pts = np.asarray(object_pts, dtype=np.float64)
-    img_pts    = np.asarray(img_pts,    dtype=np.float64)
+    img_pts = np.asarray(img_pts, dtype=np.float64)
 
     num_points = img_pts.shape[0]
     if num_points < 6:
@@ -872,7 +1066,7 @@ def DLT(object_pts: NDArray,
         x = xtil[i]
         y = ytil[i]
 
-        A[2 * i]     = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
+        A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
         A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
 
     # --- apply trust weighting correctly ---
@@ -884,7 +1078,7 @@ def DLT(object_pts: NDArray,
             w = np.repeat(w, 2)
         elif w.size != 2 * num_points:
             raise ValueError(
-                f"trust_weighting must have length N={num_points} or 2N={2*num_points}, got {w.size}"
+                f"trust_weighting must have length N={num_points} or 2N={2 * num_points}, got {w.size}"
             )
 
         # Row-scale A by w (equivalent to diag(w) @ A, but faster/safer)
@@ -914,6 +1108,7 @@ def DLT(object_pts: NDArray,
     # --- return quaternion + translation ---
     q_init = mat2quat(R)
     return q_init, t
+
 
 def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
     """Solve translation t linearly given rotation R and image ratios (y/x, z/x).
@@ -955,48 +1150,296 @@ def _solve_t_given_R(Xw, x_tilde, y_tilde, R, w=None):
     t, *_ = np.linalg.lstsq(A, b, rcond=None)
     return t
 
-
-def solveQnP(object_pts: NDArray,
-             img_pts: NDArray,
-             cal: Calibration,
-             return_stats:bool = False,
-             sigma_2N=None,
-             user_seed_q=None,
-             user_seed_t=None,
-             robust_kind:robust_cost = robust_cost.huber,
-             robust_param:float = 2.0):
+def _sigma_to_point_sqrtw(sigma_2N, N: int, sigma_floor_px: float) -> np.ndarray | None:
     """
-    Quaternion-based PnP solver.
+    Convert (2N,) sigma (px) into per-point sqrt-weights (N,).
+    Weight model: w_i = 1 / max( sqrt(sx_i * sy_i), floor )
+    Returns None if sigma_2N is None or malformed.
+    """
+    if sigma_2N is None:
+        return None
+    s = np.asarray(sigma_2N, dtype=float).reshape(-1)
+    if s.size != 2 * N:
+        return None
+    sx = np.maximum(s[0::2], 1e-9)
+    sy = np.maximum(s[1::2], 1e-9)
+    sp = np.sqrt(sx * sy)
+    floor = float(sigma_floor_px) if (sigma_floor_px is not None and sigma_floor_px > 0) else 1.0
+    sp = np.maximum(sp, floor)
+    return 1.0 / sp
 
-    - If user_seed_q / user_seed_t are provided, they are used as the initial pose.
-    - Otherwise, we initialize with a DLT pose, then refine with Gauss–Newton (opt).
-    - Optional 'trust_weighting' (length 2N) down-weights residuals in pixel space
-      during the nonlinear refinement (but not in DLT).
+
+def _front_fraction(q_est: q, t_est: np.ndarray, object_pts: np.ndarray, z_eps: float = 1e-3) -> float:
+    """Fraction of points with z > z_eps in camera frame."""
+    XYZ = q_est * object_pts + t_est
+    return float(np.mean(XYZ[:, 2] > float(z_eps)))
+
+
+def _median_reproj_err_px(
+    q_est: q,
+    t_est: np.ndarray,
+    object_pts: np.ndarray,
+    img_pts: np.ndarray,
+    cal: Calibration,
+    idx: np.ndarray | None = None
+) -> float:
+    """Median L2 reprojection error in pixels (cheap; no Jacobians)."""
+    if idx is not None:
+        obj = object_pts[idx]
+        img = img_pts[idx]
+    else:
+        obj = object_pts
+        img = img_pts
+    proj = h(q_est, t_est, obj, cal).reshape(-1, 2)
+    e = img - proj
+    r = np.sqrt(np.sum(e * e, axis=1))
+    return float(np.median(r))
+
+
+def _choose_subset_indices_prosac(
+    rng: np.random.Generator,
+    order: np.ndarray,
+    it: int,
+    iters: int,
+    subset_size: int,
+    min_pool: int,
+    N: int
+) -> np.ndarray:
+    """
+    Simple PROSAC growth:
+      - Start sampling from top min_pool most-certain points
+      - Grow pool size towards N across iterations
+    """
+    if N <= subset_size:
+        return order.copy()
+
+    mp = max(int(min_pool), subset_size)
+    mp = min(mp, N)
+
+    if iters <= 1:
+        pool = mp
+    else:
+        pool = int(mp + (N - mp) * (it / float(iters - 1)))
+        pool = min(max(pool, mp), N)
+
+    pool_idx = order[:pool]
+    return rng.choice(pool_idx, size=subset_size, replace=False)
+
+
+def _robust_seed_fast(
+    object_pts: np.ndarray,
+    img_pts: np.ndarray,
+    cal: Calibration,
+    sigma_2N=None,
+    cfg: SeedConfig | None = None,
+    robust_kind_for_refine: robust_cost = robust_cost.huber,
+    robust_param_for_refine: float = 2.0,
+):
+    """
+    Returns (seed_q, seed_t, info_dict).
+
+    Key performance rule:
+      - NEVER calls full opt() inside the hypothesis loop
+      - Optional tiny refine only on top-K seeds (K small)
+    """
+    if cfg is None:
+        cfg = SeedConfig()
+
+    N = int(img_pts.shape[0])
+    info = {"path": "dlt", "accepted_fast": False, "ransac_used": False}
+
+    # ----------------------------
+    # Fast path: weighted DLT once
+    # ----------------------------
+    if cfg.try_weighted_dlt_first:
+        wN = _sigma_to_point_sqrtw(sigma_2N, N, cfg.dlt_sigma_floor_px)
+
+        try:
+            q0, t0 = DLT(object_pts, img_pts, cal, trust_weighting=wN)
+        except Exception:
+            q0, t0 = None, None
+
+        if q0 is not None:
+            _, q0, t0 = enforce_chirality(q0, t0, object_pts)
+            ff = _front_fraction(q0, t0, object_pts, z_eps=cfg.z_eps)
+
+            if cfg.score_quick_M and cfg.score_quick_M > 0:
+                quick_idx = np.arange(min(int(cfg.score_quick_M), N))
+                med = _median_reproj_err_px(q0, t0, object_pts, img_pts, cal, idx=quick_idx)
+            else:
+                med = _median_reproj_err_px(q0, t0, object_pts, img_pts, cal, idx=None)
+
+            if (ff >= cfg.accept_front_frac) and (med <= cfg.accept_median_err_px):
+                info["path"] = "weighted_dlt_fast_accept"
+                info["accepted_fast"] = True
+                return q0, t0, info
+
+    # ----------------------------
+    # Fallback: multi-hypothesis DLT + cheap scoring
+    # ----------------------------
+    if (not cfg.ransac_enabled) or (cfg.ransac_iters <= 0):
+        info["path"] = "plain_dlt_fallback"
+        q0, t0 = DLT(object_pts, img_pts, cal)
+        _, q0, t0 = enforce_chirality(q0, t0, object_pts)
+        return q0, t0, info
+
+    info["ransac_used"] = True
+    rng = np.random.default_rng(int(cfg.rng_seed))
+
+    # certainty ordering for PROSAC (lowest sigma => highest weight => earlier)
+    if cfg.prosac_enabled:
+        wN = _sigma_to_point_sqrtw(sigma_2N, N, cfg.dlt_sigma_floor_px)
+        if wN is None:
+            order = np.arange(N, dtype=int)
+        else:
+            order = np.argsort(-wN)  # descending weight => most certain first
+    else:
+        order = np.arange(N, dtype=int)
+
+    # quick scoring subset indices (fixed)
+    if cfg.score_quick_M and cfg.score_quick_M > 0:
+        M = min(int(cfg.score_quick_M), N)
+        quick_idx = order[:M].copy()
+    else:
+        quick_idx = None
+
+    best = None
+    best_med = np.inf
+
+    top = []  # (med, q, t)
+    K = max(int(cfg.refine_top_k), 0)
+
+    for it in range(int(cfg.ransac_iters)):
+        if cfg.prosac_enabled:
+            idx = _choose_subset_indices_prosac(
+                rng, order, it, int(cfg.ransac_iters),
+                subset_size=int(cfg.subset_size),
+                min_pool=int(cfg.prosac_min_pool),
+                N=N
+            )
+        else:
+            idx = rng.choice(N, size=min(int(cfg.subset_size), N), replace=False)
+
+        # optional weights for subset DLT
+        w_sub = None
+        if cfg.try_weighted_dlt_first:
+            wN = _sigma_to_point_sqrtw(sigma_2N, N, cfg.dlt_sigma_floor_px)
+            if wN is not None:
+                w_sub = wN[idx]
+
+        try:
+            qh, th = DLT(object_pts[idx], img_pts[idx], cal, trust_weighting=w_sub)
+        except Exception:
+            continue
+
+        _, qh, th = enforce_chirality(qh, th, object_pts)
+
+        ff = _front_fraction(qh, th, object_pts, z_eps=cfg.z_eps)
+        if ff < cfg.accept_front_frac:
+            continue
+
+        med = _median_reproj_err_px(qh, th, object_pts, img_pts, cal, idx=quick_idx)
+
+        if med < best_med:
+            best_med = med
+            best = (qh, th)
+
+        if K > 0:
+            top.append((med, qh, th))
+
+        if med <= float(cfg.early_exit_median_err_px):
+            break
+
+    if best is None:
+        info["path"] = "plain_dlt_after_ransac_fail"
+        q0, t0 = DLT(object_pts, img_pts, cal)
+        _, q0, t0 = enforce_chirality(q0, t0, object_pts)
+        return q0, t0, info
+
+    # Optional tiny refine on top-K (still cheap)
+    if K > 0 and len(top) > 0 and cfg.refine_max_iters > 0:
+        top.sort(key=lambda x: x[0])
+        top = top[:K]
+
+        best_ref = None
+        best_ref_med = np.inf
+
+        for (_med, qh, th) in top:
+            try:
+                qr, tr = opt(
+                    img_pts, object_pts, cal,
+                    return_stats=False,
+                    seed_q=qh, seed_t=th,
+                    sigma_2N=sigma_2N,
+                    robust_kind=robust_kind_for_refine,
+                    robust_param=robust_param_for_refine,
+                    sigma_floor_px=1.0,
+                    max_iters=int(cfg.refine_max_iters),
+                )
+            except Exception:
+                continue
+
+            med_full = _median_reproj_err_px(qr, tr, object_pts, img_pts, cal, idx=None)
+            if med_full < best_ref_med:
+                best_ref_med = med_full
+                best_ref = (qr, tr)
+
+        if best_ref is not None:
+            info["path"] = "ransac_topk_refined"
+            return best_ref[0], best_ref[1], info
+
+    info["path"] = "ransac_best_unrefined"
+    return best[0], best[1], info
+
+
+def solveQnP(
+    object_pts: NDArray,
+    img_pts: NDArray,
+    cal: Calibration,
+    return_stats: bool = False,
+    sigma_2N=None,
+    user_seed_q=None,
+    user_seed_t=None,
+    robust_kind: robust_cost = robust_cost.huber,
+    robust_param: float = 2.0,
+    seed_cfg: SeedConfig | None = None,
+):
+    """
+    QnP solver:
+      1) seed selection (user seed OR robust initializer)
+      2) enforce chirality
+      3) nonlinear refinement with opt()
     """
 
-    # ------------------------------------------------------------------
+    # ----------------------------
     # 1) Choose a good initial seed
-    # ------------------------------------------------------------------
+    # ----------------------------
     if (user_seed_q is not None) and (user_seed_t is not None):
-        # Use caller-provided seed (e.g., previous frame, or PnP pose)
         seed_q = user_seed_q.copy()
         seed_t = user_seed_t.copy()
     else:
-        # Use DLT initializer to mirror PnP-style behavior
-        seed_q, seed_t = DLT(object_pts, img_pts, cal)
+        if seed_cfg is None:
+            seed_cfg = SeedConfig()
 
-    flipped, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts)
-    # ------------------------------------------------------------------
-    # 2) Nonlinear refinement around the seed (Gauss–Newton / LM-like)
-    #    This is where trust_weighting gives us an advantage over PnP.
-    # ------------------------------------------------------------------
+        if seed_cfg.enabled:
+            seed_q, seed_t, _seed_info = _robust_seed_fast(
+                object_pts=np.asarray(object_pts, dtype=float),
+                img_pts=np.asarray(img_pts, dtype=float),
+                cal=cal,
+                sigma_2N=sigma_2N,
+                cfg=seed_cfg,
+                robust_kind_for_refine=robust_kind,
+                robust_param_for_refine=robust_param,
+            )
+        else:
+            seed_q, seed_t = DLT(object_pts, img_pts, cal)
 
-    # If caller provided sigma, use a robust loss by default (outlier safety).
-    if sigma_2N is not None and robust_kind == robust_cost.none:
-        robust_kind = robust_cost.huber
-        robust_param = 2.0  # 2-sigma in whitened units when sigma_2N is provided
+    _, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts)
 
-    return opt(
+    # ----------------------------
+    # 2) Full nonlinear refinement (called ONCE)
+    # ----------------------------
+    out = opt(
         img_pts,
         object_pts,
         cal,
@@ -1006,8 +1449,12 @@ def solveQnP(object_pts: NDArray,
         sigma_2N=sigma_2N,
         robust_kind=robust_kind,
         robust_param=robust_param,
-        sigma_floor_px=1.0
+        sigma_floor_px=1.0,
+        max_iters=20,
     )
+
+    return out
+
 
 if __name__ == '__main__':
     pass

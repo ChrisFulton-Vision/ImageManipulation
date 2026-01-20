@@ -1398,8 +1398,10 @@ class DataProcessorRunner:
                     calibration,
                     True,
                     None,
-                    user_seed_q=prev_qnp_q,
-                    user_seed_t=prev_qnp_t,
+                    # user_seed_q=prev_qnp_q,
+                    # user_seed_t=prev_qnp_t,
+                    user_seed_q=None,
+                    user_seed_t=None,
                 )
                 t_qnp += time.perf_counter() - t0
 
@@ -1416,8 +1418,10 @@ class DataProcessorRunner:
                             calibration,
                             True,
                             sigma_2N,
-                            user_seed_q=prev_qnp_kf_q,
-                            user_seed_t=prev_qnp_kf_t,
+                            # user_seed_q=prev_qnp_kf_q,
+                            # user_seed_t=prev_qnp_kf_t,
+                            user_seed_q=None,
+                            user_seed_t=None,
                         )
                         t_qnp_kf += time.perf_counter() - t0
                         prev_qnp_kf_q, prev_qnp_kf_t = quatQ_kf, vectQ_kf

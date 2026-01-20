@@ -7,13 +7,13 @@ from support.vision.calibration import Calibration, undistort_points_px_numba
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text
 from support.mathHelpers.twoD_to_threeD import solveQnP
-from support.io.my_logging import LOG
+
 
 class twoToThreeSelectedAlgorithms:
     def __init__(self):
         self.use_pnp = False
         self.use_qnp = False
-        self.use_kfqnp = False
+        self.use_wqnp = False
 
 
 class pnp_qnp_draw:

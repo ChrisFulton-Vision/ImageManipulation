@@ -4,11 +4,10 @@ from numpy import sin, cos, deg2rad
 from support.io.attitude_interpreter import AttitudeReader as AttRdr, ControlMode
 from support.viz.CVFontScaling import med_text
 from numpy.typing import NDArray
-from cv2 import putText, FONT_HERSHEY_SIMPLEX, polylines, fillPoly, line, circle, getTextSize
+import cv2
 from math import sin, cos, radians
-
-HUD_GREEN = (0, 255, 0)
-HUD_YELLOW = (0, 255, 255)
+import support.viz.colors as clr
+from support.core.enums import PlaybackSpeed
 
 
 class HUD_Marker:
@@ -84,8 +83,8 @@ class HUD_Marker:
         speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(img_time)  # + 173.11338 - 11.658461)
 
         # Speed
-        putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
-                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+        cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
 
         self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
 
@@ -102,10 +101,10 @@ class HUD_Marker:
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy
-        green = HUD_GREEN
+        green = clr.HUD_GREEN
 
         # --- Static bank indicator (prebuilt in self.bank_indicator_lines) ---
-        polylines(image, self.bank_indicator_lines, False, green, 2)
+        cv2.polylines(image, self.bank_indicator_lines, False, green, 2)
 
         # --- Precompute trig once ---
         # Bank for "response"
@@ -142,8 +141,8 @@ class HUD_Marker:
         cmd_lines = np.array([(int(px * x), int(py * y)) for (px, py) in cmd_bank_pts], dtype=np.int32)
 
         # --- Draw bank shapes ---
-        polylines(image, [lines], True, green, 2)  # "Bank Cmd" in your comment
-        fillPoly(image, [cmd_lines], green)  # "Bank Response" in your comment
+        cv2.polylines(image, [lines], True, green, 2)  # "Bank Cmd" in your comment
+        cv2.fillPoly(image, [cmd_lines], green)  # "Bank Response" in your comment
 
         # --- Pitch command triangles ---
         # Use cos(-θ)=cos θ and sin(-θ)=-sin θ
@@ -178,8 +177,8 @@ class HUD_Marker:
             hv(+0.03, -0.01 + delta),
         ], dtype=np.int32)
 
-        polylines(image, [left_tri], True, green, 2)
-        polylines(image, [right_tri], True, green, 2)
+        cv2.polylines(image, [left_tri], True, green, 2)
+        cv2.polylines(image, [right_tri], True, green, 2)
 
     def draw_pitchAngle(self, image, pitch_angle, bank_angle):
         x, y = self.last_xy
@@ -195,7 +194,7 @@ class HUD_Marker:
         c_b = cos(radians(bank_angle + self.cam_bank_offset))
 
         to_int = int  # local alias is slightly faster than global lookup
-        green = HUD_GREEN
+        green = clr.HUD_GREEN
         # Cache the scale once per call (your no-arg cached version)
         txt_scale = med_text()
 
@@ -223,7 +222,7 @@ class HUD_Marker:
             x2 = cx - inner * c_b - x_off
             y2 = cy + inner * s_b - y_off
 
-            line(image, (to_int(x1), to_int(y1)), (to_int(x2), to_int(y2)), green, 2)
+            cv2.line(image, (to_int(x1), to_int(y1)), (to_int(x2), to_int(y2)), green, 2)
 
             # right line: inner -> outer
             x3 = cx + inner * c_b - x_off
@@ -231,28 +230,29 @@ class HUD_Marker:
             x4 = cx + outer * c_b - x_off
             y4 = cy - outer * s_b - y_off
 
-            line(image, (to_int(x3), to_int(y3)), (to_int(x4), to_int(y4)), green, 2)
+            cv2.line(image, (to_int(x3), to_int(y3)), (to_int(x4), to_int(y4)), green, 2)
 
             # label; avoid f-string format cost by int()
-            putText(
+            cv2.putText(
                 image, str(int(i)),
                 (to_int(x4 + x * 0.02), to_int(y4)),
-                FONT_HERSHEY_SIMPLEX, txt_scale, green, 2
+                cv2.FONT_HERSHEY_SIMPLEX, txt_scale, green, 2
             )
 
-        circle(image, (int(cx), int(cy)), 5, green, 2)
+        cv2.circle(image, (int(cx), int(cy)), 5, green, 2)
 
     def draw_altitude(self, image, alt):
         x, y = self.last_xy
 
         alt_text = f'ALT: {alt:.0f}'
 
-        (width, height), baseline = getTextSize(alt_text, FONT_HERSHEY_SIMPLEX,
+        (width, height), baseline = cv2.getTextSize(alt_text,
+                                                    cv2.FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)
 
-        putText(image, alt_text,
+        cv2.putText(image, alt_text,
                     (int(0.775 * x - width / 2.0), int(0.4 * y - height / 2.0)),
-                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
 
         # cv2.rectangle(image,
         #               (int(0.773 * x - width / 2.0 ), int(0.4 * y - height * 2.0 )),
@@ -273,26 +273,63 @@ class HUD_Marker:
                         [self.throttle_loc[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r * 0.8)),
                          self.throttle_loc[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r * 0.6))]], np.int32)
 
-        polylines(image, self.throttle_circle_points, False, HUD_GREEN, 2)  # Arc
+        cv2.polylines(image, self.throttle_circle_points, False, clr.HUD_GREEN, 2)  # Arc
 
-        fillPoly(image, [tri], HUD_GREEN)  # Triangle Pointer
-        (width, height), baseline = getTextSize(f'{cmd_throttle:.1f}%', FONT_HERSHEY_SIMPLEX,
+        cv2.fillPoly(image, [tri], clr.HUD_GREEN)  # Triangle Pointer
+        (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%',
+                                                    cv2.FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)
-        putText(image, f'{cmd_throttle:.1f}%',
-                    (int(self.throttle_loc[0] - width / 2), int(self.throttle_loc[1] - height / 2)),
-                    FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+        cv2.putText(image, f'{cmd_throttle:.1f}%',
+                    (int(self.throttle_loc[0] - width / 2),
+                     int(self.throttle_loc[1] - height / 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
 
     def draw_controlMode(self, image, mode):
         match mode:
             case ControlMode.controller:
-                putText(image, "MODE: CNTL", self.controlMode_text_loc,
-                        FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
+                cv2.putText(image, "MODE: CNTL", self.controlMode_text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
             case ControlMode.manual:
-                putText(image, "MODE: MAN", self.controlMode_text_loc,
-                        FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
+                cv2.putText(image, "MODE: MAN", self.controlMode_text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
             case ControlMode.auto:
-                putText(image, "MODE: AUTO", self.controlMode_text_loc,
-                        FONT_HERSHEY_SIMPLEX, med_text(), HUD_GREEN, 2)
+                cv2.putText(image, "MODE: AUTO", self.controlMode_text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
             case _:
-                putText(image, "MODE: ERR", self.controlMode_text_loc,
-                        FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)
+                cv2.putText(image, "MODE: ERR", self.controlMode_text_loc,
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)
+
+    @staticmethod
+    def draw_playbackStats(image, lowPassFPS, target_fps, playback_mode, rt_speed, cam_to_log_time_offset):
+        (h, w) = image.shape[:2]
+
+        (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+        txt_pix_start_perRow = txt_height + 10
+        cv2.putText(image, f"Offset: {cam_to_log_time_offset:+.2f}s",
+                    (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.BLACK, 4)
+        cv2.putText(image, f"Offset: {cam_to_log_time_offset:+.2f}s",
+                    (10, txt_pix_start_perRow * 2), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.HUD_YELLOW, 2)
+        cv2.putText(image,
+                    f'Realtime: {rt_speed:.2f}' if playback_mode == PlaybackSpeed.Real_time else f'FPS: {lowPassFPS:.2f}/{target_fps:.2f}',
+                    (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.BLACK, 4)
+        cv2.putText(image,
+                    f'Realtime: {rt_speed:.2f}' if playback_mode == PlaybackSpeed.Real_time else f'FPS: {lowPassFPS:.2f}/{target_fps:.2f}',
+                    (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.HUD_YELLOW, 2)
+
+def draw_name_on_image(frame, name):
+    (width, height), base = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX,
+                                            med_text(frame.shape[0]), 4)
+    img_w, img_h, *_ = frame.shape
+    cv2.putText(frame, name, (img_w - width - 10, img_h - height),
+                cv2.FONT_HERSHEY_SIMPLEX, med_text(frame.shape[0]), clr.HUD_GREEN, 2)
+
+def draw_time_on_image(frame, time_str):
+    (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
+                                                      med_text(frame.shape[0]), 4)
+    img_w, img_h, *_ = frame.shape
+    cv2.putText(frame, time_str, (img_w - time_width - 10, img_h - time_height * 2 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, med_text(frame.shape[0]), clr.HUD_GREEN, 2)

@@ -6,6 +6,7 @@ from pathlib import Path
 from support.core.sensor_datum_mat4_bundle import parse_sensor_datum_mat4_bundle
 from support.io.my_logging import LOG
 
+
 class TruthPoints:
     def __init__(self):
         self.truthPoints = {}
@@ -34,8 +35,8 @@ class TruthPoints:
         # self.truthPoints['23'] = np.array([2.15135, 3.04855, -0.73227])
 
         # MOCAP 2025 Sept AprilTags
-        # self.truthPoints['3'] = np.array([-0.12710, -1.21415, -1.23755])  # True location
-        self.truthPoints['3'] = np.array([-0.12710, -1.21415, 3.0 - 1.23755])  # Modified location to test system
+        self.truthPoints['3'] = np.array([-0.12710, -1.21415, -1.23755])  # True location
+        # self.truthPoints['3'] = np.array([-0.12710, -1.21415, 3.0 - 1.23755])  # Modified location to test system
         self.truthPoints['5'] = np.array([0.70693, -1.90905, -0.70546])
         self.truthPoints['8'] = np.array([1.38641, 2.16063, -1.22338])
         self.truthPoints['9'] = np.array([5.35155, -1.39477, 0.29776])
@@ -72,7 +73,6 @@ class TruthPoints:
         # self.truthPoints['20'] = np.array([4.234251, -2.057815, 0.576980])
         # self.truthPoints['22'] = np.array([])
 
-
         # _FLU_TO_CV = np.array([
         #     [0., 1., 0.],
         #     [0., 0., -1.,],
@@ -81,7 +81,6 @@ class TruthPoints:
 
         # for key, val in self.truthPoints.items():
         #     self.truthPoints[key] = _FLU_TO_CV @ val
-
 
     def getTruthPointsDict(self):
         return self.truthPoints
@@ -99,7 +98,7 @@ class TruthPoints:
 
     def saveToCache(self):
         # Store only the data dict, not the whole class instance
-        with open('../../LIDAR_Truth_Points.pkl', 'wb') as f:
+        with open('../../ThreeD_Truth_Points.pkl', 'wb') as f:
             pickle.dump(self.truthPoints, f)
 
     def copy(self, classToCopy):
@@ -113,7 +112,7 @@ class TruthPoints:
         for tag_id, tag_df in mat4_bundle.groupby('object_id'):
             self.truthPoints[tag_id] = tag_df[["x", "y", "z"]].mean().to_numpy()
 
-    def try_load(self, lidar_path : Path):
+    def try_load(self, lidar_path: Path):
         if not lidar_path.exists():
             LOG.error(
                 f'Cached LiDAR file not found. Using defaults. Attempted filepath:\n{self.camConfig.lidarFilepath}'

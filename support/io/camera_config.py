@@ -15,8 +15,8 @@ class CameraConfig:
     detectTags: bool = False
     hideAprilTags: bool = True
     undistort: bool = False
-    pnpLidarPoints: bool = False
-    qnpLidarPoints: bool = False
+    pnpThreeDTruthPoints: bool = False
+    qnpThreeDTruthPoints: bool = False
     yoloInference: bool = False
     yoloBiasTracking: bool = False
     detect_corners: bool = False
@@ -40,7 +40,7 @@ class CameraConfig:
 
     # sources
     imageSource: enums.ImageSource = None  # set default below in __post_init__
-    lidarFilepath: str = None
+    ThreeDTruthFilepath: str = None
     yoloFilepath: str = ''
     hud_data_filepath: str = ''
 

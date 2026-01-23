@@ -24,9 +24,10 @@ from support.core.enums import ExportQuality, ImageKernel, ImageSource, Playback
 import support.gui.utils as utils
 import support.io.camera_config as camConfig
 from support.io.config_store import ConfigStore
-from support.vision.calibration import Calibration, undistort_points_px
 from support.io.image_time_reader import ImageTimeReader
 import support.io.data_processing as data
+from support.io.my_logging import LOG
+from support.vision.calibration import Calibration, undistort_points_px
 from support.viz.CVFontScaling import small_text, med_text
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
@@ -64,12 +65,12 @@ class CameraGui(CTkFrame):
         self._flag_vars: dict[str, BooleanVar] = {}
         self._checkboxes: dict[str, CTkCheckBox] = {}
         self._flags = [
-            "detectTags", "undistort", "pnpLidarPoints", "qnpLidarPoints",
+            "detectTags", "undistort", "pnp3DTruthPoints", "qnp3DTruthPoints",
             "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
             "cubemap", "hud", "hideAprilTags", "draw_chessboard",
             # --- Pose from YOLO detections (multi-feature) ---
-            # These are separate from the AprilTag/LiDAR toggles above.
+            # These are separate from the AprilTag/3DTruth toggles above.
             "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints",
         ]
         self.recording = False
@@ -117,7 +118,8 @@ class CameraGui(CTkFrame):
         self.current_var_y = 10.0
         self.current_var_z = 10.0
         self.shutting_down = False
-        self.printLidar = False
+        self.print3DTruthOnce = False
+        self.screenshot_impending = False
         self.face_size = None
         self.faces_dirs = None
         self.cubemap_faces = None
@@ -201,25 +203,27 @@ class CameraGui(CTkFrame):
 
         self.recordButton = CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
                                       hover_color='navy', command=self.recordOff)
-        self.printButton = CTkButton(master=self.export_frame, text='Print LiDAR', fg_color='green',
-                                     hover_color='navy', command=self.printLidarOnce)
+        self.printButton = CTkButton(master=self.export_frame, text='Print 3D Turth Correlation', fg_color='green',
+                                     hover_color='navy', command=self.print3DTruthPointsOnce)
+        self.screenshotButton = CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
+                                     hover_color='navy', command=self.screenshot)
         self.selectCameraCombo = CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
                                              command=self.selectCamera)
         self.selectFolderLabel = CTkLabel(self.cam_frame,
                                           text="../" + Path(
                                               self.default_filepath).name if self.default_filepath else "../")
-        self.selectTruthPointsButton = CTkButton(master=self.cam_frame, text='Select LIDAR Points',
-                                                 hover_color='blue', command=self.selectLidarFile)
+        self.selectTruthPointsButton = CTkButton(master=self.cam_frame, text='Select 3D Truth Points',
+                                                 hover_color='blue', command=self.select3DTruthFile)
         self.selectFlightLogButton = CTkButton(master=self.cam_frame, text='Select Flight Log File',
                                                hover_color='blue', command=self.selectLogFile)
 
         self.playbackModeText = StringVar(value='Playback Mode: FPS')
         self.update_playbackMenu()
 
-        if self.camConfig.lidarFilepath is not None:
+        if self.camConfig.ThreeDTruthFilepath is not None:
             self.selectTruthPointsLabel = CTkLabel(self.cam_frame,
                                                    text="../" + Path(
-                                                       self.camConfig.lidarFilepath).name if self.camConfig.lidarFilepath else "../")
+                                                       self.camConfig.ThreeDTruthFilepath).name if self.camConfig.ThreeDTruthFilepath else "../")
         else:
             self.selectTruthPointsLabel = CTkLabel(self.cam_frame, text='No Truth Loaded')
 
@@ -229,7 +233,7 @@ class CameraGui(CTkFrame):
         else:
             self.selectFlightLogLabel = CTkLabel(self.cam_frame, text='No Flight Log Loaded')
 
-        self.lidarTruthPoints = None
+        self.ThreeDTruthPoints = None
         self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=clr.CTK_GREEN,
                                                  command=self.selectYoloFolder)
         self.selectYOLO_folderLabel = CTkLabel(self.cam_frame,
@@ -449,8 +453,8 @@ class CameraGui(CTkFrame):
         self.updateLogFile()
         self.ingestCalibration()
         self.updateYOLOLabel()
-        self.updateLidarLabel()
-        if self.lidarTruthPoints is not None:
+        self.update3DTruthLabel()
+        if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
 
         # --- model -> UI resync on config load (batch DP + flags) ---
@@ -517,12 +521,12 @@ class CameraGui(CTkFrame):
             self.camConfig.calibFilepath = poss_filepath
             self.ingestCalibration()
 
-    def selectLidarFile(self):
-        init_dir = Path(self.camConfig.lidarFilepath or self.default_filepath or Path.cwd()).parent
-        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select LIDAR Truth Points')
+    def select3DTruthFile(self):
+        init_dir = Path(self.camConfig.ThreeDTruthFilepath or self.default_filepath or Path.cwd()).parent
+        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select 3D Truth Points')
         if poss_filepath:
-            self.camConfig.lidarFilepath = poss_filepath
-            self.updateLidarLabel()
+            self.camConfig.ThreeDTruthFilepath = poss_filepath
+            self.update3DTruthLabel()
             self.loadTruthPoints()
             self.saveToCache()
 
@@ -547,9 +551,9 @@ class CameraGui(CTkFrame):
             self.updateYOLOLabel()
             self.saveToCache()
 
-    def updateLidarLabel(self):
-        if self.camConfig.lidarFilepath:
-            self.selectTruthPointsLabel.configure(text=Path(self.camConfig.lidarFilepath).name)
+    def update3DTruthLabel(self):
+        if self.camConfig.ThreeDTruthFilepath:
+            self.selectTruthPointsLabel.configure(text=Path(self.camConfig.ThreeDTruthFilepath).name)
 
     def updateFlightLogLabel(self):
         if self.camConfig.hud_data_filepath:
@@ -562,14 +566,14 @@ class CameraGui(CTkFrame):
                 self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
     def loadTruthPoints(self):
-        if not self.camConfig.lidarFilepath:
+        if not self.camConfig.ThreeDTruthFilepath:
             return
 
-        lidar_path = Path(self.camConfig.lidarFilepath)
+        truth_path = Path(self.camConfig.ThreeDTruthFilepath)
 
-        from support.io.lidar_truth import TruthPoints
-        self.lidarTruthPoints = TruthPoints()
-        self.lidarTruthPoints.try_load(lidar_path)
+        from support.io.ThreeD_truth import TruthPoints
+        self.ThreeDTruthPoints = TruthPoints()
+        self.ThreeDTruthPoints.try_load(truth_path)
 
     def updateQuality(self, qualityValue: str):
         self.camConfig.export_quality = ExportQuality(qualityValue)
@@ -696,7 +700,9 @@ class CameraGui(CTkFrame):
 
         elif self.camConfig.imageSource == ImageSource.Static_Image:
 
-            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
+            fp = self.camConfig.imageFilepath if self.camConfig.imageFilepath is not None else self.default_filepath
+
+            self.singleImageTextButton.configure(text=Path(fp).name)
             if not self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.singleImageTextButton.grid_info():
@@ -704,7 +710,9 @@ class CameraGui(CTkFrame):
 
         elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
 
-            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
+            fp = self.camConfig.imageFilepath if self.camConfig.imageFilepath is not None else self.default_filepath
+
+            self.multiImageTextButton.configure(text=Path(fp).parent.name)
             if not self.multiImageFolderSelect.grid_info():
                 self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
             if not self.multiImageTextButton.grid_info():
@@ -831,11 +839,11 @@ class CameraGui(CTkFrame):
         self.grid_sideBySide(rowID, self.detectAprilTagsCheckbox, self.hideAprilTagsCheckbox)
         rowID += 1
 
-        pnpLidarPoints = CTkCheckBox(self.config_frame, text='SolvePnP LiDAR Into Image',
-                                     variable=self._flag_vars['pnpLidarPoints'])
-        qnpLidarPoints = CTkCheckBox(self.config_frame, text='SolveQnP LiDAR Into Image',
-                                     variable=self._flag_vars['qnpLidarPoints'])
-        self.grid_sideBySide(rowID, pnpLidarPoints, qnpLidarPoints)
+        pnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolvePnP 3D Truth Into Image',
+                                     variable=self._flag_vars['pnp3DTruthPoints'])
+        qnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolveQnP 3D Truth Into Image',
+                                     variable=self._flag_vars['qnp3DTruthPoints'])
+        self.grid_sideBySide(rowID, pnp3DTruthPoints, qnp3DTruthPoints)
         rowID += 1
 
         self.grid_sideBySide(rowID, self.yoloInferenceCheckbox, self.yoloBiasCheckbox)
@@ -905,6 +913,9 @@ class CameraGui(CTkFrame):
         rowID = 0
         self.recordOff()
         self.grid_sideBySide(rowID, self.recordButton, self.printButton)
+        rowID += 1
+
+        self.screenshotButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         rowID += 1
 
         activeEntryButton = CTkButton(self.export_frame, text="Time Between Saved Frames",
@@ -1948,6 +1959,11 @@ class CameraGui(CTkFrame):
         except cv2.error:
             pass  # window not yet open
 
+    def screenshot(self):
+        self.screenshot_impending = True
+        self.screenshotButton.configure(fg_color='black')
+        self.after(500, lambda: self.screenshotButton.configure(fg_color='green'))
+
     def recordOn(self):
         self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
         self.recording = True
@@ -1958,8 +1974,8 @@ class CameraGui(CTkFrame):
                                     command=self.recordOn)
         self.recording = False
 
-    def printLidarOnce(self):
-        self.printLidar = True
+    def print3DTruthPointsOnce(self):
+        self.print3DTruthOnce = True
 
     def createDetector(self):
         if self.detector is None:
@@ -2769,13 +2785,13 @@ class CameraGui(CTkFrame):
             if self.camConfig.hideAprilTags:
                 self.inpaint_apriltags()
 
-        if self.camConfig.pnpLidarPoints and self.detector is not None:
-            self.pnpLidarPoints()
+        if self.camConfig.pnp3DTruthPoints and self.detector is not None:
+            self.pnp3DTruthPoints()
         else:
             self.pnpResult = None
 
-        if self.camConfig.qnpLidarPoints and self.detector is not None:
-            self.qnpLidarPoints()
+        if self.camConfig.qnp3DTruthPoints and self.detector is not None:
+            self.qnp3DTruthPoints()
         else:
             self.qnpResult = None
 
@@ -2820,7 +2836,7 @@ class CameraGui(CTkFrame):
         if img_time is not None:
             self.draw_time(img_time)
 
-        if self.printLidar:
+        if self.print3DTruthOnce:
             self.print_pnp_results()
 
         if display_in_realtime:
@@ -2956,12 +2972,12 @@ class CameraGui(CTkFrame):
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
 
-        if self.lidarTruthPoints is None:
+        if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
 
         points = None
         if self.centers is not None and len(self.centers) >= 6:
-            truthPoints = copy.copy(self.lidarTruthPoints.truthPoints)
+            truthPoints = copy.copy(self.ThreeDTruthPoints.truthPoints)
             points = []
 
             removeIDs = []
@@ -2978,21 +2994,35 @@ class CameraGui(CTkFrame):
 
         probe_pose = np.array([4.89965725, .20014286, -1.55304432])
 
-        if points is not None and self.detector is not None:
-            print(f'Obj Points: \n{points}')
-        if self.centers is not None:
-            print(f'Img Points: \n{self.centers}')
-        print(f'Cam Matrix: \n{self.calibration.getCameraMatrix()}')
-        if self.pnpResult is not None:
-            print(f'PnP Result: \ncam_R_tgt:\n{self.pnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.pnpResult[1]}')
-        if self.qnpResult is not None:
-            print(f'QnP Result: \ncam_R_tgt:\n{self.qnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.qnpResult[1]}')
-        print()
-        print(f'Diff: {self.pnpResult[1]}')
-        print(f'Diff: {probe_pose}')
-        print(f'Diff: {self.pnpResult[1] - probe_pose}')
+        self.print3DTruthOnce = False
 
-        self.printLidar = False
+        if points is None or self.detector is None or self.centers is None:
+            return
+        if self.qnpResult is None and self.pnpResult is None:
+            return
+
+        try:
+            import logging
+            curr_level = LOG.level
+            LOG.setLevel(logging.INFO)
+            b1_lne = '\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~'
+            b2_lne = b1_lne + b1_lne + '\n'
+            LOG.info(b2_lne)
+            LOG.info(f'\nThreeD Correlation Output Requested: Current Time: {time.asctime()}')
+            if points is not None and self.detector is not None:
+                LOG.info(f'\nObj Points: \n{points}')
+            if self.centers is not None:
+                LOG.info(f'\nImg Points: \n{self.centers}')
+            LOG.info(f'\nCam Matrix: \n{self.calibration.getCameraMatrix()}')
+            if self.pnpResult is not None:
+                LOG.info(f'\nPnP Result: \ncam_R_tgt:\n{self.pnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.pnpResult[1]}')
+            if self.qnpResult is not None:
+                LOG.info(f'\nQnP Result: \ncam_R_tgt:\n{self.qnpResult[0].to_dcm()}\ncam_t_tgt:\n{self.qnpResult[1]}')
+
+            LOG.info(b1_lne)
+        finally:
+            LOG.setLevel(curr_level)
+
 
     def update_cube_map_vectors(self):
         """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -3252,13 +3282,13 @@ class CameraGui(CTkFrame):
             else:
                 self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
 
-    def pnpLidarPoints(self):
+    def pnp3DTruthPoints(self):
 
-        if self.lidarTruthPoints is None:
+        if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
 
         if self.centers is not None and len(self.centers) >= 6:
-            truthPoints = deepcopy(self.lidarTruthPoints.truthPoints)
+            truthPoints = deepcopy(self.ThreeDTruthPoints.truthPoints)
             points = []
             distParams = np.zeros((5,))  # use image undistort instead
 
@@ -3284,35 +3314,35 @@ class CameraGui(CTkFrame):
                                            flags=cv2.SOLVEPNP_ITERATIVE)
 
             if ret:
-                projectedPoints_orig, _ = cv2.projectPoints(self.lidarTruthPoints.getTruthPointsNumpy(),
+                projectedPoints_orig, _ = cv2.projectPoints(self.ThreeDTruthPoints.getTruthPointsNumpy(),
                                                             rvec=rvec,
                                                             tvec=tvec,
                                                             cameraMatrix=self.calibration.getCameraMatrix(),
                                                             distCoeffs=distParams)
 
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
-                               list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
+                               list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
                 self.pnpResult = (quatPnP, vectPnP)
 
-                cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quatPnP, 'ijk.6f'), (50, 75),
+                cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f'), (50, 75),
                             cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-                cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vectPnP),
+                cv2.putText(self.markup_frame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
                             (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
 
-    def qnpLidarPoints(self):
+    def qnp3DTruthPoints(self):
 
-        if self.lidarTruthPoints is None:
+        if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
 
         if self.centers is not None and len(self.centers) >= 6:
-            truthPoints = deepcopy(self.lidarTruthPoints.truthPoints)
+            truthPoints = deepcopy(self.ThreeDTruthPoints.truthPoints)
 
             points = []
             # distParams = np.zeros((5,))  # use image undistort instead
@@ -3333,7 +3363,7 @@ class CameraGui(CTkFrame):
                 return
 
             quat, vect, *_ = solveQnP(points, centers, self.calibration, None)
-            xyz_proj = quat * self.lidarTruthPoints.getTruthPointsNumpy() + vect
+            xyz_proj = quat * self.ThreeDTruthPoints.getTruthPointsNumpy() + vect
 
             q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
                                                 [-1., 0., 0.],
@@ -3348,14 +3378,14 @@ class CameraGui(CTkFrame):
             us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 1] / xyz_proj[:, 2] + self.calibration.cy
 
             self.plotOnImg(us_vs_s_proj.astype(int),
-                           list(self.lidarTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
+                           list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
             self.qnpResult = (quat, vect)
-            cv2.putText(self.markup_frame, 'Orientation (quat) From LiDAR: ' + format(quat, 'ijk.6f'), (50, 225),
+            cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quat, 'ijk.6f'), (50, 225),
                         cv2.FONT_HERSHEY_DUPLEX,
                         small_text(self.markup_frame.shape[0]),
                         (255, 255, 0), 3,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, 'Location From LiDAR: ' + np.array2string(vect), (50, 300),
+            cv2.putText(self.markup_frame, 'Location From Truth Frame: ' + np.array2string(vect), (50, 300),
                         cv2.FONT_HERSHEY_DUPLEX,
                         small_text(self.markup_frame.shape[0]),
                         (255, 255, 0), 3,
@@ -3651,11 +3681,13 @@ class CameraGui(CTkFrame):
 
         cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
 
-        if self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages:
-            cv2.imwrite(os.path.join(self.default_filepath, str(self.img_idx) + '.png'), self.markup_frame)
+        if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
+                self.screenshot_impending):
+            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), self.markup_frame)
             self.img_idx += 1
             self.lastImageTime = time.time()
             self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
+            self.screenshot_impending = False
 
     def plotOnImg(self, points, names, color):
         for idx, pxPt in enumerate(points):

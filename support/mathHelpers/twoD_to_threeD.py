@@ -74,12 +74,12 @@ class SeedConfig:
 
     # If fast-path fails: multi-hypothesis DLT + cheap scoring (NO full opt in loop).
     ransac_enabled: bool = True
-    ransac_iters: int = 12                 # good starting point for ~60 points and low outlier rate
+    ransac_iters: int = 32                 # good starting point for ~60 points and low outlier rate
     subset_size: int = 6                   # 6 is fastest; bump to 8 if needed
     early_exit_median_err_px: float = 10.0  # stop early if we find a great seed
 
     # PROSAC-like sampling based on sigma (prefer most-certain points first)
-    prosac_enabled: bool = False
+    prosac_enabled: bool = True
     prosac_min_pool: int = 12              # initial pool size for PROSAC growth
     rng_seed: int = 0
 
@@ -88,7 +88,7 @@ class SeedConfig:
     refine_max_iters: int = 4              # <=4 keeps it cheap
 
     # Scoring: score on quick subset first (avoid full scoring every hypothesis)
-    score_quick_M: int = 6                # 0 => score all points always
+    score_quick_M: int = 2                # 0 => score all points always
     z_eps: float = 1e-3
 
 

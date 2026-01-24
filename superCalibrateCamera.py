@@ -12,7 +12,6 @@ from collections import deque
 import numpy as np
 from pathlib import Path
 from tkinter import filedialog
-from yaml import safe_load, dump
 
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
                            StringVar, CTkProgressBar, END)
@@ -79,8 +78,7 @@ class CameraGui(CTkFrame):
         self.vc = None
         self._thread = None
         self.shutting_down = False
-
-
+        self.stream_running_var = BooleanVar(value=False)
 
         self.recording = False
         self.yoloSession = None
@@ -94,11 +92,8 @@ class CameraGui(CTkFrame):
         self.config_store = ConfigStore(CACHE_FILEPATH, configs_dir="Configs", scheduler=self)
         self.detectIDS = None
         self.centers = None
-        self.indexDict = {}
-        self.scanForCameras()
         self.default_filepath = ''
 
-        self.cam_frame = CTkFrame(master=master)
         self.config_frame = CTkFrame(master=master)
         self.export_frame = CTkFrame(master=master)
         self.playback_frame = CTkFrame(master=master)
@@ -261,18 +256,17 @@ class CameraGui(CTkFrame):
         self._last_ui_tick = 0.0
         self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
 
-        self.filepath_test = filepath_page.Filepath_page(master,
+        self.filepath_page = filepath_page.Filepath_page(master,
                                                          get_super_config=lambda: self.camConfig,
-                                                         start_stream_func=self.startStreamOn,
-                                                         stop_stream_func=self.startStreamOffBool,
+                                                         stream_toggle=self.startStreamToggle,
                                                          save_to_cache=self.saveToCache,
                                                          load_from_cache=self.loadFromCache,
                                                          update_post_newCamConfig=self.update_post_newCamConfig,
                                                          sync_flags_from_model=self._sync_flags_from_model,
                                                          ingestCalibration=self.ingestCalibration,
                                                          loadTruthPoints=self.loadTruthPoints,
-                                                         updateYOLOLabel=self.updateYOLOLabel,
-                                                         updateLogFile=self.updateLogFile)
+                                                         updateYOLOModel=self.updateYOLOModel,
+                                                         updateLogFile=self.updateLogFile,)
 
         self.setupFrame()
 
@@ -420,7 +414,7 @@ class CameraGui(CTkFrame):
         # self.updateSingleOrStream(rowID=1)
         self.updateLogFile()
         self.ingestCalibration()
-        self.updateYOLOLabel()
+        self.updateYOLOModel()
         if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
 
@@ -453,74 +447,17 @@ class CameraGui(CTkFrame):
         if self.func_that_refits is not None:
             self.func_that_refits()
 
-    def _flush_cache_now(self):
-        """Actually write current config to disk. Called by saveToCache()."""
-        cache_path = Path(CACHE_FILEPATH)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Pointer to the most recent config YAML
-        with cache_path.open('wb') as f:
-            pickle.dump(self.camConfig.configFilepath, f)
-
-        # Full YAML config
-        os.makedirs('Configs', exist_ok=True)
-        with open(self.camConfig.configFilepath, 'w') as f:
-            dump(self.camConfig.toDict, f)
-
     def saveToCache(self, immediate: bool = False, delay_ms: int = 500):
         self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
-
-    def selectFolder(self):
-        init_dir = Path(self.default_filepath).parent if self.default_filepath else Path.cwd()
-        fp = self.askFilepath(str(init_dir), "Select Imagery Folder")
-        if fp:
-            self.camConfig.saveFolder = fp
-            self.saveToCache(immediate=True)
-            self.loadFromCache()
-            self.selectFolderLabel.configure(text=os.path.basename(self.camConfig.saveFolder))
-
-    def loadCalibration(self):
-        init_dir = Path(self.camConfig.calibFilepath or self.default_filepath or Path.cwd()).parent
-        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select Calibration File')
-        if poss_filepath:
-            self.camConfig.calibFilepath = poss_filepath
-            self.ingestCalibration()
-
-    def select3DTruthFile(self):
-        init_dir = Path(self.camConfig.ThreeDTruthFilepath or self.default_filepath or Path.cwd()).parent
-        poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select 3D Truth Points')
-        if poss_filepath:
-            self.camConfig.ThreeDTruthFilepath = poss_filepath
-            # self.update3DTruthLabel()
-            self.loadTruthPoints()
-            self.saveToCache()
-
-    def selectLogFile(self):
-        init_dir = Path(self.camConfig.hud_data_filepath or self.default_filepath or Path.cwd())
-        poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select Flight Log Data')
-        if poss_dir:
-            self.camConfig.hud_data_filepath = poss_dir
-            self.updateLogFile()
 
     def updateLogFile(self):
         if self.hud_marker is not None:
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-        # self.updateFlightLogLabel()
         self.saveToCache()
 
-    def selectYoloFolder(self):
-        init_dir = Path(self.camConfig.yoloFilepath or Path.cwd())
-        poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select YOLO Folder')
-        if poss_dir:
-            self.camConfig.yoloFilepath = poss_dir
-            self.updateYOLOLabel()
-            self.saveToCache()
-
-    def updateYOLOLabel(self):
-        if self.camConfig.yoloFilepath:
-            # self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
-            if self.yoloSession is not None:
-                self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+    def updateYOLOModel(self):
+        if self.camConfig.yoloFilepath and self.yoloSession is not None:
+            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
     def loadTruthPoints(self):
         if not self.camConfig.ThreeDTruthFilepath:
@@ -566,10 +503,10 @@ class CameraGui(CTkFrame):
             self.selectCalibLabel.configure(
                 text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
                 bg_color=self.selectCalibLabel.cget("bg_color"))
-            self.cam_frame.update_idletasks()
+            self.filepath_page.update_idletasks()
             self.update_idletasks()
             self.selectCalibLabel.update_idletasks()
-            self.cam_frame.update_idletasks()
+            self.filepath_page.update_idletasks()
             self.update_idletasks()
 
         self.undistortCheckbox.configure(state='normal')
@@ -595,75 +532,6 @@ class CameraGui(CTkFrame):
         )
 
         self.saveToCache()
-
-    def scanForCameras(self):
-        self.indexDict = {}
-        from cv2_enumerate_cameras import enumerate_cameras
-        for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
-            self.indexDict[camera_info.name] = camera_info.index
-
-        # with VmbSystem.get_instance() as vmb:
-        #     cams = vmb.get_all_cameras()
-        #     if cams:
-        #         cam = cams[0]
-        #         try:
-        #             cam._open()
-        #         except vmbpy.c_binding.VmbError as e:
-        #             LOG.warning(f'Could not open camera: {e}')
-        #             return
-        #         try:
-        #             cam.start_streaming(
-        #                 lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
-        #             time.sleep(5)
-        #             cam.stop_streaming()
-        #         finally:
-        #             cam._close()
-
-    def selectCamera(self, key):
-        self.camConfig.cam_index = self.indexDict[key]
-
-    def sourceUpdate(self, source):
-        self.camConfig.imageSource = ImageSource(source)
-
-
-    def selectConfigFile(self):
-        initDir = str(Path.cwd() / 'Configs')
-
-        poss_file = filedialog.asksaveasfilename(
-            initialdir=initDir,
-            title="Select or create YAML config",
-            defaultextension=".yaml",
-            filetypes=[("YAML", "*.yaml"), ("All files", "*.*")],
-            confirmoverwrite=False,  # <-- key line
-        )
-        if not poss_file:
-            return
-
-        self.camConfig.configFilepath = poss_file
-        if os.path.exists(self.camConfig.configFilepath):
-            with open(self.camConfig.configFilepath, 'r') as f:
-                self.camConfig.fromDict(safe_load(f))
-                self.update_post_newCamConfig()
-        else:
-            with open(self.camConfig.configFilepath, 'w') as f:
-                dump(self.camConfig.toDict, f)
-
-        self.configSelectLabel.configure(text=os.path.basename(self.camConfig.configFilepath))
-        self._sync_flags_from_model()
-        self.saveToCache()
-
-    def selectImagesFilepath(self):
-        if self.camConfig.imageFilepath is None:
-            initDir = str(Path(self.default_filepath).parent)
-        else:
-            initDir = self.camConfig.imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
-
-        poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
-        if poss_file != '':
-            self.camConfig.imageFilepath = poss_file
-            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
-            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
-            self.saveToCache()
 
     def setupFrame(self):
         self.setup_configFrame()
@@ -1747,19 +1615,23 @@ class CameraGui(CTkFrame):
     def startStreamToggle(self):
         if self._thread is None or not self._thread.is_alive():  # thread not running
             self.startStreamOn()
+            self.stream_running_var.set(True)
             return True
 
         self.startStreamOffBool()
+        self.stream_running_var.set(False)
         return False
 
     def startStreamOn(self):
         self.showWindow = True
         self.threadStopper = utils.ThreadStopper()
+        self.stream_running_var.set(True)
         self._thread = threading.Thread(target=self.run, daemon=True)
         self._thread.start()
 
     def startStreamOffBool(self):
         self.showWindow = False
+        self.stream_running_var.set(False)
 
     def startStreamOff(self):
         cv2.waitKey(1)

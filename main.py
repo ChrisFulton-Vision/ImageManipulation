@@ -151,7 +151,7 @@ class CameraPage(ctk.CTkFrame):
         show_section(self, "Filepaths")
 
     def _make_setupPage(self):
-        return self.camGui.filepath_test
+        return self.camGui.filepath_page
     def _make_ImgProcPage(self):
         return self.camGui.config_frame
     def _make_exportPage(self):
@@ -171,7 +171,6 @@ class CameraPage(ctk.CTkFrame):
         self.camGui.shutting_down = True
         self.camGui.recordOff()
         self.camGui.startStreamOffBool()
-        self.camGui.safely_close_playwindow()
         if hasattr(self.camGui, "set_ui_active"):
             self.camGui.set_ui_active(False)
 
@@ -184,17 +183,26 @@ class CameraPage(ctk.CTkFrame):
             self.camGui.on_section_hide(name)
 
     def submenu_footer(self):
-        def on_toggle(btn: ctk.CTkButton):
-            # call your existing toggle
-            running = self.camGui.startStreamToggle()
-
-            # update UI to reflect state
+        def render(btn: ctk.CTkButton):
+            running = bool(self.camGui.stream_running_var.get())
             if running:
                 btn.configure(text="Stop Camera", fg_color="royalblue4", hover_color="blue")
             else:
                 btn.configure(text="Start Camera", fg_color=GREEN, hover_color=DEFAULT_HOVER)
 
-        return ("Start Camera", on_toggle)
+            self.camGui.filepath_page.update_buttonsForStream(running)
+
+        def on_toggle(btn: ctk.CTkButton):
+            self.camGui.startStreamToggle()
+            # no UI updates here; trace will do it
+
+        # IMPORTANT: this runs when the footer button gets created (it exists by then)
+        def bind_footer(btn: ctk.CTkButton):
+            render(btn)
+            self.camGui.stream_running_var.trace_add("write", lambda *_: render(btn))
+
+        # Return the handler *and* a binder
+        return ("Start Camera", on_toggle, bind_footer)
 
 # ------------ App / Router with two sidebars ------------
 
@@ -378,15 +386,19 @@ class App(ctk.CTk):
         # configure the persistent bottom button from the page (if provided)
         footer = getattr(page, "submenu_footer", None)
         if callable(footer):
-            text, cmd = footer()
-            # pass the button to the page's handler
+            out = footer()
+            if len(out) == 2:
+                text, cmd = out
+                binder = None
+            else:
+                text, cmd, binder = out
+
             self.subnav_footer_btn.configure(
                 text=text,
                 command=lambda fn=cmd, btn=self.subnav_footer_btn: fn(btn)
             )
-            self.subnav_bottom.grid()
-        else:
-            self.subnav_bottom.grid_remove()
+            if binder is not None:
+                binder(self.subnav_footer_btn)
 
         if has_sub:
             self.subnav.grid()

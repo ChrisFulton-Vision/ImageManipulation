@@ -21,6 +21,7 @@ import cv2
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
+import support.gui.CTKCamFilepathPage as filepath_page
 import support.gui.utils as utils
 import support.io.camera_config as camConfig
 from support.io.config_store import ConfigStore
@@ -70,12 +71,19 @@ class CameraGui(CTkFrame):
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
             "cubemap", "hud", "hideAprilTags", "draw_chessboard",
             # --- Pose from YOLO detections (multi-feature) ---
-            # These are separate from the AprilTag/3DTruth toggles above.
             "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints",
         ]
+        self.threadStopper = utils.ThreadStopper()
+        self.camConfig: camConfig.CameraConfig = camConfig.CameraConfig()
+        self.windowName = 'Processed Image'
+        self.vc = None
+        self._thread = None
+        self.shutting_down = False
+
+
+
         self.recording = False
         self.yoloSession = None
-        self.camConfig = camConfig.CameraConfig()
         self.detector = None
         self.arucoDict = None
         self.arucoParams = None
@@ -88,14 +96,15 @@ class CameraGui(CTkFrame):
         self.centers = None
         self.indexDict = {}
         self.scanForCameras()
-        self.windowName = 'Processed Image'
         self.default_filepath = ''
+
         self.cam_frame = CTkFrame(master=master)
         self.config_frame = CTkFrame(master=master)
         self.export_frame = CTkFrame(master=master)
         self.playback_frame = CTkFrame(master=master)
         self.data_frame = CTkFrame(master=master)
         self.hotkey_frame = CTkFrame(master=master)
+
         self.showWindow = False
         self.GaborGUI = None
         self.radius = 800
@@ -117,7 +126,6 @@ class CameraGui(CTkFrame):
         self.current_var_x = 10.0
         self.current_var_y = 10.0
         self.current_var_z = 10.0
-        self.shutting_down = False
         self.print3DTruthOnce = False
         self.screenshot_impending = False
         self.face_size = None
@@ -127,6 +135,8 @@ class CameraGui(CTkFrame):
         self.map_y = None
         self.hud_marker = None
         self.lowPassFPS = 20.0
+        self.ThreeDTruthPoints = None
+        self.selectCalibLabel = None
         self.pnpResult = None
         self.qnpResult = None
         self.pnpDrawer = None
@@ -155,16 +165,11 @@ class CameraGui(CTkFrame):
 
         self.gpu_monitor = None
 
-        self.vc = None
-
         self.pauseCache = utils.PausedCache()
         self.playback = utils.PlaybackState()
 
         # Optimization for undistort
         self.map1, self.map2 = None, None
-
-        self.threadStopper = utils.ThreadStopper()
-        self._thread = None
 
         self._pb_cmds = deque()
         self._pb_cmd_lock = threading.Lock()
@@ -185,62 +190,15 @@ class CameraGui(CTkFrame):
 
         self.available_sources = [source.value for source in ImageSource]
 
-        self.streamOrImgCombo = CTkComboBox(self.cam_frame, values=self.available_sources,
-                                            command=self.sourceUpdate)
-        self.startStreamButton = CTkButton(master=self.cam_frame, text='Start Stream', fg_color=clr.CTK_BUTTON_RED,
-                                           hover_color='blue')
-
-        self.configSelectButton = CTkButton(self.cam_frame, text='Select Config File',
-                                            command=self.selectConfigFile)
-        self.configSelectLabel = CTkLabel(self.cam_frame, text=os.path.basename(self.camConfig.configFilepath))
-
-        self.singleImageFolderSelect = CTkButton(self.cam_frame, text='Select Img',
-                                                 command=self.selectImagesFilepath)
-        self.singleImageTextButton = CTkButton(self.cam_frame, text='No Image Selected')
-        self.multiImageFolderSelect = CTkButton(self.cam_frame, text='Select Img Folder',
-                                                command=self.selectImagesFilepath)
-        self.multiImageTextButton = CTkButton(self.cam_frame, text='No Folder Selected', command=self.startStreamOn)
-
         self.recordButton = CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
                                       hover_color='navy', command=self.recordOff)
         self.printButton = CTkButton(master=self.export_frame, text='Print 3D Turth Correlation', fg_color='green',
                                      hover_color='navy', command=self.print3DTruthPointsOnce)
         self.screenshotButton = CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
-                                     hover_color='navy', command=self.screenshot)
-        self.selectCameraCombo = CTkComboBox(self.cam_frame, values=list(self.indexDict.keys()),
-                                             command=self.selectCamera)
-        self.selectFolderLabel = CTkLabel(self.cam_frame,
-                                          text="../" + Path(
-                                              self.default_filepath).name if self.default_filepath else "../")
-        self.selectTruthPointsButton = CTkButton(master=self.cam_frame, text='Select 3D Truth Points',
-                                                 hover_color='blue', command=self.select3DTruthFile)
-        self.selectFlightLogButton = CTkButton(master=self.cam_frame, text='Select Flight Log File',
-                                               hover_color='blue', command=self.selectLogFile)
+                                          hover_color='navy', command=self.screenshot)
 
         self.playbackModeText = StringVar(value='Playback Mode: FPS')
-        self.update_playbackMenu()
 
-        if self.camConfig.ThreeDTruthFilepath is not None:
-            self.selectTruthPointsLabel = CTkLabel(self.cam_frame,
-                                                   text="../" + Path(
-                                                       self.camConfig.ThreeDTruthFilepath).name if self.camConfig.ThreeDTruthFilepath else "../")
-        else:
-            self.selectTruthPointsLabel = CTkLabel(self.cam_frame, text='No Truth Loaded')
-
-        if self.camConfig.hud_data_filepath is not None:
-            self.selectFlightLogLabel = CTkLabel(self.cam_frame, text="../" + Path(
-                self.camConfig.hud_data_filepath).name if self.camConfig.hud_data_filepath else "../")
-        else:
-            self.selectFlightLogLabel = CTkLabel(self.cam_frame, text='No Flight Log Loaded')
-
-        self.ThreeDTruthPoints = None
-        self.selectYOLO_folderButton = CTkButton(self.cam_frame, text='Select YOLO Folder', fg_color=clr.CTK_GREEN,
-                                                 command=self.selectYoloFolder)
-        self.selectYOLO_folderLabel = CTkLabel(self.cam_frame,
-                                               text="../" + Path(
-                                                   self.camConfig.yoloFilepath).name if self.camConfig.yoloFilepath else "../"
-                                               )
-        self.selectCalibLabel = None
         self.drawChessboardButton = CTkCheckBox(self.config_frame, text='Draw Chessboard',
                                                 variable=self._flag_vars['draw_chessboard'])
         self.undistortCheckbox = CTkCheckBox(self.config_frame, text='Undistort',
@@ -291,13 +249,10 @@ class CameraGui(CTkFrame):
         self.iouSliderLabel.configure(text=f'IOU: {self.camConfig.yolo_iou:.2f}')
         self.iouSliderBar.set(self.camConfig.yolo_iou)
 
-        self.selectCameraCombo.set(list(self.indexDict.keys())[self.camConfig.cam_index])
-
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
-        self.cam_frame.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
-        self.cam_frame.grid_columnconfigure(list(range(3)), weight=1)
+
         self.lastWidth = 1
         self.lastHeight = 1
         self.saveToCache(immediate=True)
@@ -305,6 +260,19 @@ class CameraGui(CTkFrame):
         self._ui_active = True
         self._last_ui_tick = 0.0
         self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
+
+        self.filepath_test = filepath_page.Filepath_page(master,
+                                                         get_super_config=lambda: self.camConfig,
+                                                         start_stream_func=self.startStreamOn,
+                                                         stop_stream_func=self.startStreamOffBool,
+                                                         save_to_cache=self.saveToCache,
+                                                         load_from_cache=self.loadFromCache,
+                                                         update_post_newCamConfig=self.update_post_newCamConfig,
+                                                         sync_flags_from_model=self._sync_flags_from_model,
+                                                         ingestCalibration=self.ingestCalibration,
+                                                         loadTruthPoints=self.loadTruthPoints,
+                                                         updateYOLOLabel=self.updateYOLOLabel,
+                                                         updateLogFile=self.updateLogFile)
 
         self.setupFrame()
 
@@ -443,17 +411,16 @@ class CameraGui(CTkFrame):
 
     def loadFromCache(self):
         res = self.config_store.load_from_cache(self.camConfig)
-        if res.yaml_path:
-            self.configSelectLabel.configure(text=os.path.basename(res.yaml_path))
+        # if res.yaml_path:
+        #     self.configSelectLabel.configure(text=os.path.basename(res.yaml_path))
         if res.loaded_yaml:
             self.update_post_newCamConfig()
 
     def update_post_newCamConfig(self):
-        self.updateSingleOrStream(rowID=1)
+        # self.updateSingleOrStream(rowID=1)
         self.updateLogFile()
         self.ingestCalibration()
         self.updateYOLOLabel()
-        self.update3DTruthLabel()
         if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
 
@@ -482,8 +449,6 @@ class CameraGui(CTkFrame):
 
         except Exception:
             pass
-
-        self.selectFolderLabel.configure(text=os.path.basename(self.camConfig.saveFolder))
 
         if self.func_that_refits is not None:
             self.func_that_refits()
@@ -526,7 +491,7 @@ class CameraGui(CTkFrame):
         poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select 3D Truth Points')
         if poss_filepath:
             self.camConfig.ThreeDTruthFilepath = poss_filepath
-            self.update3DTruthLabel()
+            # self.update3DTruthLabel()
             self.loadTruthPoints()
             self.saveToCache()
 
@@ -540,7 +505,7 @@ class CameraGui(CTkFrame):
     def updateLogFile(self):
         if self.hud_marker is not None:
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-        self.updateFlightLogLabel()
+        # self.updateFlightLogLabel()
         self.saveToCache()
 
     def selectYoloFolder(self):
@@ -551,17 +516,9 @@ class CameraGui(CTkFrame):
             self.updateYOLOLabel()
             self.saveToCache()
 
-    def update3DTruthLabel(self):
-        if self.camConfig.ThreeDTruthFilepath:
-            self.selectTruthPointsLabel.configure(text=Path(self.camConfig.ThreeDTruthFilepath).name)
-
-    def updateFlightLogLabel(self):
-        if self.camConfig.hud_data_filepath:
-            self.selectFlightLogLabel.configure(text=Path(self.camConfig.hud_data_filepath).name)
-
     def updateYOLOLabel(self):
         if self.camConfig.yoloFilepath:
-            self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
+            # self.selectYOLO_folderLabel.configure(text=Path(self.camConfig.yoloFilepath).name)
             if self.yoloSession is not None:
                 self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
@@ -666,61 +623,8 @@ class CameraGui(CTkFrame):
         self.camConfig.cam_index = self.indexDict[key]
 
     def sourceUpdate(self, source):
-
         self.camConfig.imageSource = ImageSource(source)
 
-        self.updateSingleOrStream(rowID=1)
-
-    def updateSingleOrStream(self, rowID):
-        if not self.camConfig.imageSource == ImageSource.Camera_Stream:
-            if self.selectCameraCombo.grid_info():
-                self.selectCameraCombo.grid_forget()
-            if self.startStreamButton.grid_info():
-                self.startStreamButton.grid_forget()
-
-        if not self.camConfig.imageSource == ImageSource.Static_Image:
-            if self.singleImageFolderSelect.grid_info():
-                self.singleImageFolderSelect.grid_forget()
-            if self.singleImageTextButton.grid_info():
-                self.singleImageTextButton.grid_forget()
-
-        if not self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            if self.multiImageTextButton.grid_info():
-                self.multiImageTextButton.grid_forget()
-            if self.multiImageFolderSelect.grid_info():
-                self.multiImageFolderSelect.grid_forget()
-
-        if self.camConfig.imageSource == ImageSource.Camera_Stream:
-
-            self.startStreamOff()
-            if not self.startStreamButton.grid_info():
-                self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-            if not self.selectCameraCombo.grid_info():
-                self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
-
-        elif self.camConfig.imageSource == ImageSource.Static_Image:
-
-            fp = self.camConfig.imageFilepath if self.camConfig.imageFilepath is not None else self.default_filepath
-
-            self.singleImageTextButton.configure(text=Path(fp).name)
-            if not self.singleImageFolderSelect.grid_info():
-                self.singleImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
-            if not self.singleImageTextButton.grid_info():
-                self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
-
-        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-
-            fp = self.camConfig.imageFilepath if self.camConfig.imageFilepath is not None else self.default_filepath
-
-            self.multiImageTextButton.configure(text=Path(fp).parent.name)
-            if not self.multiImageFolderSelect.grid_info():
-                self.multiImageFolderSelect.grid(row=1, column=0, padx=5, pady=5, sticky='nsew')
-            if not self.multiImageTextButton.grid_info():
-                self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
-        else:
-            raise ValueError(f'Unknown Image selection mode: {self.camConfig.imageSource}')
-
-        self.saveToCache()
 
     def selectConfigFile(self):
         initDir = str(Path.cwd() / 'Configs')
@@ -762,65 +666,15 @@ class CameraGui(CTkFrame):
             self.saveToCache()
 
     def setupFrame(self):
-        self.setup_camFrame()
         self.setup_configFrame()
         self.setup_exportFrame()
         self.setup_dataFrame()
         self.setup_playbackFrame()
 
-    def grid_sideBySide(self, row, *args, col=0):
+    @staticmethod
+    def grid_sideBySide(row, *args, col=0):
         for idx, item in enumerate(args):
             item.grid(row=row, column=col + idx, padx=5, pady=5, sticky='nsew')
-
-    def setup_camFrame(self):
-        rowID = 0
-
-        self.streamOrImgCombo = CTkComboBox(self.cam_frame,
-                                            values=['Camera Stream', 'Static Image', 'Stream from Folder'],
-                                            command=self.sourceUpdate)
-        self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        rowID += 1
-
-        self.startStreamOff()
-
-        self.singleImageTextButton.configure(command=self.startStreamOn)
-        if self.camConfig.imageFilepath is not None:
-            self.singleImageTextButton.configure(text=Path(self.camConfig.imageFilepath).name)
-
-        self.multiImageTextButton.configure(command=self.startStreamOn)
-        if self.camConfig.imageFilepath is not None:
-            self.multiImageTextButton.configure(text=Path(self.camConfig.imageFilepath).parent.name)
-
-        self.streamOrImgCombo.set(self.camConfig.imageSource.value)
-        self.sourceUpdate(self.camConfig.imageSource.value)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.configSelectButton, self.configSelectLabel)
-        rowID += 1
-
-        selectFolderButton = CTkButton(self.cam_frame, text='Select Save Folder', command=self.selectFolder)
-        self.grid_sideBySide(rowID, selectFolderButton, self.selectFolderLabel)
-        rowID += 1
-
-        selectCalibButton = CTkButton(self.cam_frame, text='Select Calibration', command=self.loadCalibration)
-        self.selectCalibLabel = CTkLabel(self.cam_frame,
-                                         text="../" + os.path.basename(os.path.normpath(self.camConfig.calibFilepath)))
-        self.grid_sideBySide(rowID, selectCalibButton, self.selectCalibLabel)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.selectTruthPointsButton, self.selectTruthPointsLabel)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.selectYOLO_folderButton, self.selectYOLO_folderLabel)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.selectFlightLogButton, self.selectFlightLogLabel)
-        rowID += 1
-
-        aprilTagSizeEntryButton = CTkButton(self.cam_frame, text="Enter Size of April Tag (m)",
-                                            command=self.setAprilTagSize)
-        self.aprilTagSizeEntry = CTkEntry(self.cam_frame, placeholder_text=str(self.camConfig.aprilTagSize))
-        self.grid_sideBySide(rowID, aprilTagSizeEntryButton, self.aprilTagSizeEntry)
 
     def setup_configFrame(self):
         rowID = 0
@@ -840,9 +694,9 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         pnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolvePnP 3D Truth Into Image',
-                                     variable=self._flag_vars['pnp3DTruthPoints'])
+                                       variable=self._flag_vars['pnp3DTruthPoints'])
         qnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolveQnP 3D Truth Into Image',
-                                     variable=self._flag_vars['qnp3DTruthPoints'])
+                                       variable=self._flag_vars['qnp3DTruthPoints'])
         self.grid_sideBySide(rowID, pnp3DTruthPoints, qnp3DTruthPoints)
         rowID += 1
 
@@ -884,7 +738,7 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         hudCheckbox = CTkCheckBox(self.config_frame, text='HUD',
-                                       variable=self._flag_vars['hud'])
+                                  variable=self._flag_vars['hud'])
         self.grid_sideBySide(rowID, self.cubemapCheckbox, hudCheckbox)
         rowID += 1
 
@@ -1783,7 +1637,6 @@ class CameraGui(CTkFrame):
         return (None, None)
 
     def setAprilTagSize(self):
-
         try:
             self.camConfig.aprilTagSize = float(self.aprilTagSizeEntry.get())
         except ValueError:
@@ -1901,17 +1754,6 @@ class CameraGui(CTkFrame):
 
     def startStreamOn(self):
         self.showWindow = True
-        self.singleImageTextButton.configure(command=self.startStreamOffBool, text='Stop Displaying',
-                                             fg_color=clr.CTK_GREEN,
-                                             hover_color='navy')
-        self.startStreamButton.configure(command=self.startStreamOffBool, text='Stop Streaming', fg_color=clr.CTK_GREEN,
-                                         hover_color='navy')
-        self.multiImageTextButton.configure(command=self.startStreamOffBool, fg_color=clr.CTK_GREEN, hover_color='navy')
-
-        self.selectCameraCombo.configure(state='disabled')
-
-        self.streamOrImgCombo.configure(state='disabled')
-
         self.threadStopper = utils.ThreadStopper()
         self._thread = threading.Thread(target=self.run, daemon=True)
         self._thread.start()
@@ -1938,20 +1780,6 @@ class CameraGui(CTkFrame):
         self._thread = None
 
         if not self.shutting_down:
-            if self.camConfig.imageFilepath is not None:
-                self.singleImageTextButton.configure(
-                    command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
-                    text=os.path.basename(self.camConfig.imageFilepath)
-                )
-            self.startStreamButton.configure(command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED,
-                                             hover_color='blue')
-            self.multiImageTextButton.configure(command=self.startStreamOn, fg_color=clr.CTK_BUTTON_RED,
-                                                hover_color='blue')
-
-            self.selectCameraCombo.configure(state='normal')
-            self.startStreamButton.configure(text='Start Stream')
-            self.streamOrImgCombo.configure(state='normal')
-
             self.showWindow = False
 
         try:
@@ -2569,34 +2397,6 @@ class CameraGui(CTkFrame):
         self._thread = None
         self.showWindow = False
 
-        # Rewire buttons back to "start"
-        if self.camConfig.imageFilepath is not None:
-            self.singleImageTextButton.configure(
-                command=self.startStreamOn,
-                fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
-                text=os.path.basename(self.camConfig.imageFilepath)
-            )
-        else:
-            self.singleImageTextButton.configure(
-                command=self.startStreamOn,
-                fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
-                text='No Image Selected'
-            )
-
-        self.startStreamButton.configure(
-            command=self.startStreamOn,
-            fg_color=clr.CTK_BUTTON_RED, hover_color='blue',
-            text='Start Stream'
-        )
-        self.multiImageTextButton.configure(
-            command=self.startStreamOn,
-            fg_color=clr.CTK_BUTTON_RED, hover_color='blue'
-        )
-
-        # Re-enable selectors
-        self.selectCameraCombo.configure(state='normal')
-        self.streamOrImgCombo.configure(state='normal')
-
     # --- Key action helpers (CameraGui) ---
 
     def _on_toggle_fps_mode(self):
@@ -3001,9 +2801,9 @@ class CameraGui(CTkFrame):
         if self.qnpResult is None and self.pnpResult is None:
             return
 
+        curr_level = LOG.level
         try:
             import logging
-            curr_level = LOG.level
             LOG.setLevel(logging.INFO)
             b1_lne = '\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~'
             b2_lne = b1_lne + b1_lne + '\n'
@@ -3022,7 +2822,6 @@ class CameraGui(CTkFrame):
             LOG.info(b1_lne)
         finally:
             LOG.setLevel(curr_level)
-
 
     def update_cube_map_vectors(self):
         """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -3327,7 +3126,8 @@ class CameraGui(CTkFrame):
 
                 self.pnpResult = (quatPnP, vectPnP)
 
-                cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f'), (50, 75),
+                cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f'),
+                            (50, 75),
                             cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)

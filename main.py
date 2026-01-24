@@ -141,17 +141,17 @@ class CameraPage(ctk.CTkFrame):
         self.camGui = cam.CameraGui(self)
 
         self.sections = {
-            "Configuration": self._make_setupPage(),
+            "Filepaths": self._make_setupPage(),
             "Image Processing": self._make_ImgProcPage(),
             "Export": self._make_exportPage(),
             "Playback": self._make_playbackPage(),
             "Data Processing": self._make_dataPage(),
             "Hotkeys": self._make_hotkeyPage(),
         }
-        show_section(self, "Configuration")
+        show_section(self, "Filepaths")
 
     def _make_setupPage(self):
-        return self.camGui.cam_frame
+        return self.camGui.filepath_test
     def _make_ImgProcPage(self):
         return self.camGui.config_frame
     def _make_exportPage(self):

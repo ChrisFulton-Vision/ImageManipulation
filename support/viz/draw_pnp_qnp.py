@@ -352,13 +352,14 @@ class pnp_qnp_draw:
             if np.isnan(x) or np.isnan(y):
                 return
 
-            x = w / y_w * x
-            y = h / y_h * y
+            x = float(w / y_w * x)
+            y = float(h / y_h * y)
 
-            (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, txt_scale * med_text(w), 2)
-            lowerLeftCorner = (int(x-txt_w/2), int(y+txt_h/2))
+            if (0 < x < w and 0 < y < h):
+                (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, txt_scale * med_text(w), 2)
+                lowerLeftCorner = (int(x-txt_w/2), int(y+txt_h/2))
 
-            cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                        txt_scale * med_text(w), clr.BLACK, 4)
-            cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                        txt_scale * med_text(w), txt_color, 2)
+                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                            txt_scale * med_text(w), clr.BLACK, 4)
+                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                            txt_scale * med_text(w), txt_color, 2)

@@ -15,8 +15,8 @@ class CameraConfig:
     detectTags: bool = False
     hideAprilTags: bool = True
     undistort: bool = False
-    pnpThreeDTruthPoints: bool = False
-    qnpThreeDTruthPoints: bool = False
+    pnp3DTruthPoints: bool = False
+    qnp3DTruthPoints: bool = False
     yoloInference: bool = False
     yoloBiasTracking: bool = False
     detect_corners: bool = False

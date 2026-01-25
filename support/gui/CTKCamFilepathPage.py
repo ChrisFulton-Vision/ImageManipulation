@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol
 from support.io.camera_config import CameraConfig
 from support.core.enums import ImageSource
 import support.viz.colors as clr
@@ -11,40 +11,45 @@ import os
 import cv2
 
 
+# This protocol class enforces typesafe appropriate usage of super-class functions
+# This list of functions is for things this page GUI does not control, but does update
+# with interaction on these GUI buttons. Example, select new YOLO model forces the
+# super to reload its assigned YOLO model.
+class FilepathController(Protocol):
+    camConfig: CameraConfig
+
+    def saveToCache(self, immediate: bool = False) -> None: ...
+
+    def loadFromCache(self) -> None: ...
+
+    def update_post_newCamConfig(self) -> None: ...
+
+    def sync_flags_from_model(self) -> None: ...
+
+    def ingestCalibration(self) -> None: ...
+
+    def loadTruthPoints(self) -> None: ...
+
+    def updateYOLOModel(self) -> None: ...
+
+    def updateLogFile(self) -> None: ...
+
+    def startStreamToggle(self) -> bool: ...
+
+
 class Filepath_page(ctk.CTkFrame):
     def __init__(
             self,
             master,
             *args,
-            get_super_config: Callable[[], 'CameraConfig'],
-            stream_toggle: Callable,
-            save_to_cache: Callable,
-            load_from_cache: Callable,
-            update_post_newCamConfig: Callable,
-            sync_flags_from_model: Callable,
-            ingestCalibration: Callable,
-            loadTruthPoints: Callable,
-            updateYOLOModel: Callable,
-            updateLogFile: Callable,
-            default_filepath: str = '',
+            controller: FilepathController,
             **kwargs,
     ):
-        self.sup_toggle_stream = stream_toggle
-        self.saveToCache = save_to_cache
-        self.loadFromCache = load_from_cache
-        self.update_post_newCamConfig = update_post_newCamConfig
-        self._sync_flags_from_model = sync_flags_from_model
-        self.sup_ingestCalibration = ingestCalibration
-        self.default_filepath = default_filepath
-        self.loadTruthPoints = loadTruthPoints
-        self.sup_updateYOLOModel = updateYOLOModel
-        self.sup_updateLogFile = updateLogFile
+        self.ctrl = controller
+        self.default_filepath = '/..'
 
         self.indexDict = {}
         self.scanForCameras()
-
-        # remove your custom arg from anything CTk sees
-        self._get_super_config = get_super_config
 
         super().__init__(master, *args, **kwargs)
         self.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
@@ -65,8 +70,8 @@ class Filepath_page(ctk.CTkFrame):
                                                      command=self.selectImagesFilepath)
         self.singleImageTextButton = ctk.CTkButton(self, text='No Image Selected',
                                                    command=self.toggle_stream)
-        if self._get_super_config().imageFilepath is not None:
-            self.singleImageTextButton.configure(text=Path(self._get_super_config().imageFilepath).name)
+        if self.ctrl.camConfig.imageFilepath is not None:
+            self.singleImageTextButton.configure(text=Path(self.ctrl.camConfig.imageFilepath).name)
 
         self.multiImageFolderSelect = ctk.CTkButton(self, text='Select Img Folder',
                                                     command=self.selectImagesFilepath)
@@ -75,7 +80,7 @@ class Filepath_page(ctk.CTkFrame):
 
         self.configSelectButton = ctk.CTkButton(self, text='Select Config File',
                                                 command=self.selectConfigFile)
-        self.configSelectText = ctk.StringVar(value=os.path.basename(self._get_super_config().configFilepath))
+        self.configSelectText = ctk.StringVar(value=os.path.basename(self.ctrl.camConfig.configFilepath))
         configSelectLabel = ctk.CTkLabel(self, textvariable=self.configSelectText)
 
         selectSaveFolderButton = ctk.CTkButton(self, text='Select Save Folder', command=self.selectSaveFolder)
@@ -84,26 +89,26 @@ class Filepath_page(ctk.CTkFrame):
         selectSaveFolderLabel = ctk.CTkLabel(self,
                                              textvariable=self.saveFolderText)
 
-        if self._get_super_config().imageFilepath is not None:
-            self.multiImageTextButton.configure(text=Path(self._get_super_config().imageFilepath).parent.name)
+        if self.ctrl.camConfig.imageFilepath is not None:
+            self.multiImageTextButton.configure(text=Path(self.ctrl.camConfig.imageFilepath).parent.name)
 
-        self.streamOrImgCombo.set(self._get_super_config().imageSource.value)
-        self.sourceUpdate(self._get_super_config().imageSource.value)
+        self.streamOrImgCombo.set(self.ctrl.camConfig.imageSource.value)
+        self.sourceUpdate(self.ctrl.camConfig.imageSource.value)
 
         # Calibration Selector
         selectCalibButton = ctk.CTkButton(self, text='Select Calibration', command=self.loadCalibration)
         self.selectCalibLabelText = ctk.StringVar(value="../" + os.path.basename(
-            os.path.normpath(self._get_super_config().calibFilepath)))
+            os.path.normpath(self.ctrl.camConfig.calibFilepath)))
         selectCalibLabel = ctk.CTkLabel(self, textvariable=self.selectCalibLabelText)
 
         # 3D Truth Points Selector
         selectTruthPointsButton = ctk.CTkButton(master=self, text='Select 3D Truth Points',
                                                 hover_color='blue', command=self.select3DTruthFile)
-        if self._get_super_config().ThreeDTruthFilepath is None:
+        if self.ctrl.camConfig.ThreeDTruthFilepath is None:
             self.selectTruthPointsLabelText = ctk.StringVar(value='No Truth Loaded')
-        elif self._get_super_config().ThreeDTruthFilepath:
+        elif self.ctrl.camConfig.ThreeDTruthFilepath:
             self.selectTruthPointsLabelText = ctk.StringVar(value="../" + Path(
-                self._get_super_config().ThreeDTruthFilepath).name)
+                self.ctrl.camConfig.ThreeDTruthFilepath).name)
         else:
             self.selectTruthPointsLabelText = ctk.StringVar(value="../")
         selectTruthPointsLabel = ctk.CTkLabel(self, textvariable=self.selectTruthPointsLabelText)
@@ -112,22 +117,22 @@ class Filepath_page(ctk.CTkFrame):
         selectYOLO_folderButton = ctk.CTkButton(self, text='Select YOLO Folder', fg_color=clr.CTK_GREEN,
                                                 command=self.selectYoloFolder)
         self.yoloFolderText = ctk.StringVar(value="../" + Path(
-            self._get_super_config().yoloFilepath).name if self._get_super_config().yoloFilepath else "../")
+            self.ctrl.camConfig.yoloFilepath).name if self.ctrl.camConfig.yoloFilepath else "../")
         selectYOLO_folderLabel = ctk.CTkLabel(self,
                                               textvariable=self.yoloFolderText)
 
         # Flight Log Loader
         selectFlightLogButton = ctk.CTkButton(master=self, text='Select Flight Log File',
                                               hover_color='blue', command=self.selectLogFile)
-        if self._get_super_config().hud_data_filepath is None:
+        if self.ctrl.camConfig.hud_data_filepath is None:
             self.FlightLogLabelText = ctk.StringVar(value='No Flight Log Loaded')
         else:
             self.FlightLogLabelText = ctk.StringVar(value="../" + Path(
-                self._get_super_config().hud_data_filepath).name if self._get_super_config().hud_data_filepath else "../")
+                self.ctrl.camConfig.hud_data_filepath).name if self.ctrl.camConfig.hud_data_filepath else "../")
         selectFlightLogLabel = ctk.CTkLabel(self, textvariable=self.FlightLogLabelText)
 
         # April Tag Size Entry
-        aprilTagSizeEntry = ctk.CTkEntry(self, placeholder_text=str(self._get_super_config().aprilTagSize))
+        aprilTagSizeEntry = ctk.CTkEntry(self, placeholder_text=str(self.ctrl.camConfig.aprilTagSize))
         aprilTagSizeEntryButton = ctk.CTkButton(self, text="Enter Size of April Tag (m)",
                                                 command=lambda entry=aprilTagSizeEntry: self.setAprilTagSize(entry))
 
@@ -159,67 +164,69 @@ class Filepath_page(ctk.CTkFrame):
         self.sync_labels()
 
     def toggle_stream(self):
-        running = self.sup_toggle_stream()
+        running = self.ctrl.startStreamToggle()
         self.update_buttonsForStream(running)
 
     def update_buttonsForStream(self, running: bool):
         if running:
-            self.startStreamButton.configure(text='Stop Stream')
+            self.multiImageTextButton.configure(fg_color="royalblue4")
+            self.startStreamButton.configure(text='Stop Stream', fg_color="royalblue4")
             self.selectCameraCombo.configure(state='disabled')
             self.streamOrImgCombo.configure(state='disabled')
         else:
-            self.startStreamButton.configure(text='Start Stream')
+            self.multiImageTextButton.configure(fg_color=clr.CTK_BUTTON_RED)
+            self.startStreamButton.configure(text='Start Stream', fg_color=clr.CTK_BUTTON_RED)
             self.selectCameraCombo.configure(state='normal')
             self.streamOrImgCombo.configure(state='normal')
 
     def selectSaveFolder(self):
-        init_dir = Path(self._get_super_config().saveFolder or Path(self.default_filepath) or Path.cwd())
+        init_dir = Path(self.ctrl.camConfig.saveFolder or Path(self.default_filepath) or Path.cwd())
         fp = self.askFilepath(str(init_dir), "Select Folder For Saving")
         if fp:
-            self._get_super_config().saveFolder = fp
-            self.saveToCache(immediate=True)
-            self.loadFromCache()
+            self.ctrl.camConfig.saveFolder = fp
+            self.ctrl.saveToCache(immediate=True)
+            self.ctrl.loadFromCache()
             self.updateSaveFolderLabel()
 
     def updateSaveFolderLabel(self):
-        self.saveFolderText.set(Path(self._get_super_config().saveFolder).name)
+        self.saveFolderText.set(Path(self.ctrl.camConfig.saveFolder).name)
 
     def sourceUpdate(self, source):
-        self._get_super_config().imageSource = ImageSource(source)
+        self.ctrl.camConfig.imageSource = ImageSource(source)
         self.updateSingleOrStream(rowID=1)
 
     def updateSingleOrStream(self, rowID):
-        if not self._get_super_config().imageSource == ImageSource.Camera_Stream:
+        if not self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream:
             if self.selectCameraCombo.grid_info():
                 self.selectCameraCombo.grid_forget()
             if self.startStreamButton.grid_info():
                 self.startStreamButton.grid_forget()
 
-        if not self._get_super_config().imageSource == ImageSource.Static_Image:
+        if not self.ctrl.camConfig.imageSource == ImageSource.Static_Image:
             if self.singleImageFolderSelect.grid_info():
                 self.singleImageFolderSelect.grid_forget()
             if self.singleImageTextButton.grid_info():
                 self.singleImageTextButton.grid_forget()
 
-        if not self._get_super_config().imageSource == ImageSource.Stream_from_Folder:
+        if not self.ctrl.camConfig.imageSource == ImageSource.Stream_from_Folder:
             if self.multiImageTextButton.grid_info():
                 self.multiImageTextButton.grid_forget()
             if self.multiImageFolderSelect.grid_info():
                 self.multiImageFolderSelect.grid_forget()
 
-        if self._get_super_config().imageSource == ImageSource.Camera_Stream:
+        if self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream:
 
             if not self.startStreamButton.grid_info():
                 self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
             if not self.selectCameraCombo.grid_info():
                 self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
 
-        elif self._get_super_config().imageSource == ImageSource.Static_Image:
+        elif self.ctrl.camConfig.imageSource == ImageSource.Static_Image:
 
-            if self._get_super_config().imageFilepath is None:
+            if self.ctrl.camConfig.imageFilepath is None:
                 fp = self.default_filepath
             else:
-                fp = self._get_super_config().imageFilepath
+                fp = self.ctrl.camConfig.imageFilepath
 
             self.singleImageTextButton.configure(text=Path(fp).name)
             if not self.singleImageFolderSelect.grid_info():
@@ -227,10 +234,10 @@ class Filepath_page(ctk.CTkFrame):
             if not self.singleImageTextButton.grid_info():
                 self.singleImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
 
-        elif self._get_super_config().imageSource == ImageSource.Stream_from_Folder:
+        elif self.ctrl.camConfig.imageSource == ImageSource.Stream_from_Folder:
 
-            if self._get_super_config().imageFilepath is not None:
-                fp = self._get_super_config().imageFilepath
+            if self.ctrl.camConfig.imageFilepath is not None:
+                fp = self.ctrl.camConfig.imageFilepath
             else:
                 fp = self.default_filepath
 
@@ -240,9 +247,9 @@ class Filepath_page(ctk.CTkFrame):
             if not self.multiImageTextButton.grid_info():
                 self.multiImageTextButton.grid(row=1, column=1, padx=5, pady=5, sticky='nsew')
         else:
-            raise ValueError(f'Unknown Image selection mode: {self._get_super_config().imageSource}')
+            raise ValueError(f'Unknown Image selection mode: {self.ctrl.camConfig.imageSource}')
 
-        self.saveToCache()
+        self.ctrl.saveToCache()
 
     ### HELPERS ########################
 
@@ -283,20 +290,20 @@ class Filepath_page(ctk.CTkFrame):
 
     ### BUTTON ACTIONS #################
     def selectCamera(self, key):
-        self._get_super_config().cam_index = self.indexDict[key]
+        self.ctrl.camConfig.cam_index = self.indexDict[key]
 
     def selectImagesFilepath(self):
-        if self._get_super_config().imageFilepath is None:
+        if self.ctrl.camConfig.imageFilepath is None:
             initDir = str(Path(self.default_filepath).parent)
         else:
-            initDir = self._get_super_config().imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
+            initDir = self.ctrl.camConfig.imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':
-            self._get_super_config().imageFilepath = poss_file
-            self.singleImageTextButton.configure(text=Path(self._get_super_config().imageFilepath).name)
-            self.multiImageTextButton.configure(text=Path(self._get_super_config().imageFilepath).parent.name)
-            self.saveToCache()
+            self.ctrl.camConfig.imageFilepath = poss_file
+            self.singleImageTextButton.configure(text=Path(self.ctrl.camConfig.imageFilepath).name)
+            self.multiImageTextButton.configure(text=Path(self.ctrl.camConfig.imageFilepath).parent.name)
+            self.ctrl.saveToCache()
 
     def selectConfigFile(self):
         initDir = str(Path.cwd() / 'Configs')
@@ -311,21 +318,21 @@ class Filepath_page(ctk.CTkFrame):
         if not poss_file:
             return
 
-        self._get_super_config().configFilepath = poss_file
-        if os.path.exists(self._get_super_config().configFilepath):
-            with open(self._get_super_config().configFilepath, 'r') as f:
-                self._get_super_config().fromDict(safe_load(f))
-                self.update_post_newCamConfig()
+        self.ctrl.camConfig.configFilepath = poss_file
+        if os.path.exists(self.ctrl.camConfig.configFilepath):
+            with open(self.ctrl.camConfig.configFilepath, 'r') as f:
+                self.ctrl.camConfig.fromDict(safe_load(f))
+                self.ctrl.update_post_newCamConfig()
         else:
-            with open(self._get_super_config().configFilepath, 'w') as f:
-                dump(self._get_super_config().toDict, f)
+            with open(self.ctrl.camConfig.configFilepath, 'w') as f:
+                dump(self.ctrl.camConfig.toDict, f)
 
-        self._sync_flags_from_model()
-        self.saveToCache()
+        self.ctrl.sync_flags_from_model()
+        self.ctrl.saveToCache()
         self.sync_labels()
 
     def updateConfigLabel(self):
-        self.configSelectText.set(Path(self._get_super_config().configFilepath).name)
+        self.configSelectText.set(Path(self.ctrl.camConfig.configFilepath).name)
 
     def sync_labels(self):
         self.updateSingleOrStream(rowID=1)
@@ -338,57 +345,57 @@ class Filepath_page(ctk.CTkFrame):
 
     def setAprilTagSize(self, aprilTagSizeEntry):
         try:
-            self._get_super_config().aprilTagSize = float(aprilTagSizeEntry.get())
+            self.ctrl.camConfig.aprilTagSize = float(aprilTagSizeEntry.get())
         except ValueError:
             aprilTagSizeEntry.delete(0, ctk.END)
-            aprilTagSizeEntry.configure(placeholder_text=str(self._get_super_config().aprilTagSize), )
-        self.saveToCache()
+            aprilTagSizeEntry.configure(placeholder_text=str(self.ctrl.camConfig.aprilTagSize), )
+        self.ctrl.saveToCache()
 
     def loadCalibration(self):
-        init_dir = Path(self._get_super_config().calibFilepath or self.default_filepath or Path.cwd())
+        init_dir = Path(self.ctrl.camConfig.calibFilepath or self.default_filepath or Path.cwd())
         poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select Calibration File')
         if poss_filepath:
-            self._get_super_config().calibFilepath = poss_filepath
-            self.sup_ingestCalibration()
+            self.ctrl.camConfig.calibFilepath = poss_filepath
+            self.ctrl.ingestCalibration()
             self.updateCalLabel()
         else:
             self.selectCalibLabelText.set("No Calibration Loaded")
 
     def updateCalLabel(self):
-        name = Path(self._get_super_config().calibFilepath).name
+        name = Path(self.ctrl.camConfig.calibFilepath).name
         self.selectCalibLabelText.set(name)
 
     def select3DTruthFile(self):
-        init_dir = Path(self._get_super_config().ThreeDTruthFilepath or self.default_filepath or Path.cwd())
+        init_dir = Path(self.ctrl.camConfig.ThreeDTruthFilepath or self.default_filepath or Path.cwd())
         poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select 3D Truth Points')
         if poss_filepath:
-            self._get_super_config().ThreeDTruthFilepath = poss_filepath
+            self.ctrl.camConfig.ThreeDTruthFilepath = poss_filepath
             self.update3DTruthLabel()
-            self.loadTruthPoints()
-            self.saveToCache()
+            self.ctrl.loadTruthPoints()
+            self.ctrl.saveToCache()
 
     def update3DTruthLabel(self):
-        if self._get_super_config().ThreeDTruthFilepath:
-            self.selectTruthPointsLabelText.set(Path(self._get_super_config().ThreeDTruthFilepath).name)
+        if self.ctrl.camConfig.ThreeDTruthFilepath:
+            self.selectTruthPointsLabelText.set(Path(self.ctrl.camConfig.ThreeDTruthFilepath).name)
 
     def selectYoloFolder(self):
-        init_dir = Path(self._get_super_config().yoloFilepath or Path.cwd())
+        init_dir = Path(self.ctrl.camConfig.yoloFilepath or Path.cwd())
         poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select YOLO Folder')
         if poss_dir:
-            self._get_super_config().yoloFilepath = poss_dir
-            self.sup_updateYOLOModel()
+            self.ctrl.camConfig.yoloFilepath = poss_dir
+            self.ctrl.updateYOLOModel()
             self.updateYoloLabel()
-            self.saveToCache()
+            self.ctrl.saveToCache()
 
     def updateYoloLabel(self):
-        self.yoloFolderText.set(Path(self._get_super_config().yoloFilepath).name)
+        self.yoloFolderText.set(Path(self.ctrl.camConfig.yoloFilepath).name)
 
     def selectLogFile(self):
-        init_dir = Path(self._get_super_config().hud_data_filepath or self.default_filepath or Path.cwd())
+        init_dir = Path(self.ctrl.camConfig.hud_data_filepath or self.default_filepath or Path.cwd())
         poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select Flight Log Data')
         if poss_dir:
-            self._get_super_config().hud_data_filepath = poss_dir
-            self.sup_updateLogFile()
+            self.ctrl.camConfig.hud_data_filepath = poss_dir
+            self.ctrl.updateLogFile()
 
     def updateLogLabel(self):
-        self.FlightLogLabelText.set(Path(self._get_super_config().hud_data_filepath).name)
+        self.FlightLogLabelText.set(Path(self.ctrl.camConfig.hud_data_filepath).name)

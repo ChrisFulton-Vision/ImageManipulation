@@ -1,6 +1,5 @@
 import copy
 import os
-import pickle
 import time
 import sys
 import threading
@@ -11,7 +10,7 @@ from collections import deque
 
 import numpy as np
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, TclError
 
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
                            StringVar, CTkProgressBar, END)
@@ -229,7 +228,7 @@ class CameraGui(CTkFrame):
 
         self.loadFromCache()
 
-        self._sync_flags_from_model()
+        self.sync_flags_from_model()
 
         self.exportStartFrame = CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
@@ -257,16 +256,7 @@ class CameraGui(CTkFrame):
         self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
 
         self.filepath_page = filepath_page.Filepath_page(master,
-                                                         get_super_config=lambda: self.camConfig,
-                                                         stream_toggle=self.startStreamToggle,
-                                                         save_to_cache=self.saveToCache,
-                                                         load_from_cache=self.loadFromCache,
-                                                         update_post_newCamConfig=self.update_post_newCamConfig,
-                                                         sync_flags_from_model=self._sync_flags_from_model,
-                                                         ingestCalibration=self.ingestCalibration,
-                                                         loadTruthPoints=self.loadTruthPoints,
-                                                         updateYOLOModel=self.updateYOLOModel,
-                                                         updateLogFile=self.updateLogFile,)
+                                                         controller=self)
 
         self.setupFrame()
 
@@ -333,7 +323,7 @@ class CameraGui(CTkFrame):
         self.saveToCache()
 
     # keep model -> UI sync helper (if you ever load cache, etc.)
-    def _sync_flags_from_model(self):
+    def sync_flags_from_model(self):
         for n in self._flags:
             self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
         if self.camConfig.detectTags:
@@ -384,7 +374,7 @@ class CameraGui(CTkFrame):
             try:
                 if not widget.winfo_viewable():
                     return False
-            except Exception:
+            except TclError:
                 return False
         now = time.monotonic()
         if (now - self._last_ui_tick) >= self._ui_throttle_sec:
@@ -411,7 +401,7 @@ class CameraGui(CTkFrame):
             self.update_post_newCamConfig()
 
     def update_post_newCamConfig(self):
-        # self.updateSingleOrStream(rowID=1)
+
         self.updateLogFile()
         self.ingestCalibration()
         self.updateYOLOModel()
@@ -419,17 +409,8 @@ class CameraGui(CTkFrame):
             self.loadTruthPoints()
 
         # --- model -> UI resync on config load (batch DP + flags) ---
-        try:
-            if hasattr(self, "_sync_flags_from_model"):
-                self._sync_flags_from_model()
-        except Exception:
-            pass
-
-        try:
-            if hasattr(self, "_sync_dp_from_model"):
-                self._sync_dp_from_model()
-        except Exception:
-            pass
+        self.sync_flags_from_model()
+        self._sync_dp_from_model()
 
         # Ensure GPU UI matches dp_gpu setting (avoid cached desync)
         try:

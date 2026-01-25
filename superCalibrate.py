@@ -234,21 +234,6 @@ class CalibrateGui(CTkFrame):
         # Stop/avoid background refreshers when hidden (threads/after loops).
         # If you have repeating after() callbacks, guard their reschedule on this flag.
 
-    def _ui_should_paint(self, widget=None) -> bool:
-        if not self._ui_active:
-            return False
-        if widget is not None:
-            try:
-                if not widget.winfo_viewable():
-                    return False
-            except Exception:
-                return False
-        now = time.monotonic()
-        if (now - self._last_ui_tick) >= self._ui_throttle_sec:
-            self._last_ui_tick = now
-            return True
-        return False
-
     def setup_configFrame(self, master_frame):
         f = CTkFrame(master_frame)
         rowID = 0

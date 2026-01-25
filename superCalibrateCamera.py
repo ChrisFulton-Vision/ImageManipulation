@@ -10,27 +10,34 @@ from collections import deque
 
 import numpy as np
 from pathlib import Path
-from tkinter import filedialog, TclError
+from tkinter import filedialog
 
 from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
-                           StringVar, CTkProgressBar, END)
+                           DoubleVar, StringVar, CTkProgressBar, END)
 import cv2
 
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
+
 from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
+
 import support.gui.CTKCamFilepathPage as filepath_page
+import support.gui.CTKCamImageProcessingPage as image_processing_page
+import support.gui.CTKHotkeyPage as hotkey_page
 import support.gui.utils as utils
+from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
+from support.gui.gpu_monitor import GpuMonitor, GpuSample
+
 import support.io.camera_config as camConfig
 from support.io.config_store import ConfigStore
 from support.io.image_time_reader import ImageTimeReader
 import support.io.data_processing as data
 from support.io.my_logging import LOG
+
 from support.vision.calibration import Calibration, undistort_points_px
-from support.viz.CVFontScaling import small_text, med_text
-from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
-from support.gui.gpu_monitor import GpuMonitor, GpuSample
 from support.vision.draw_circle_and_mask import dim_except_circle
+
+from support.viz.CVFontScaling import small_text, med_text
 from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
 import support.viz.colors as clr
 
@@ -53,6 +60,7 @@ CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 class CameraGui(CTkFrame):
     def __init__(self, master, *args, **kwargs):
+        self._loading_config = True
 
         self.func_that_refits = None
 
@@ -61,7 +69,7 @@ class CameraGui(CTkFrame):
 
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
-        self._flag_vars: dict[str, BooleanVar] = {}
+        self._flag_vars: dict[str, BooleanVar | DoubleVar] = {}
         self._checkboxes: dict[str, CTkCheckBox] = {}
         self._flags = [
             "detectTags", "undistort", "pnp3DTruthPoints", "qnp3DTruthPoints",
@@ -70,6 +78,7 @@ class CameraGui(CTkFrame):
             "cubemap", "hud", "hideAprilTags", "draw_chessboard",
             # --- Pose from YOLO detections (multi-feature) ---
             "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints",
+            'yolo_conf', 'yolo_iou'
         ]
         self.threadStopper = utils.ThreadStopper()
         self.camConfig: camConfig.CameraConfig = camConfig.CameraConfig()
@@ -93,7 +102,9 @@ class CameraGui(CTkFrame):
         self.centers = None
         self.default_filepath = ''
 
-        self.config_frame = CTkFrame(master=master)
+        self.image_processing_page = image_processing_page.ImageProcessing_page(master, controller=self)
+        self.hotkey_page = hotkey_page.Hotkey_page(master)
+
         self.export_frame = CTkFrame(master=master)
         self.playback_frame = CTkFrame(master=master)
         self.data_frame = CTkFrame(master=master)
@@ -193,34 +204,6 @@ class CameraGui(CTkFrame):
 
         self.playbackModeText = StringVar(value='Playback Mode: FPS')
 
-        self.drawChessboardButton = CTkCheckBox(self.config_frame, text='Draw Chessboard',
-                                                variable=self._flag_vars['draw_chessboard'])
-        self.undistortCheckbox = CTkCheckBox(self.config_frame, text='Undistort',
-                                             variable=self._flag_vars['undistort'])
-        self.detectAprilTagsCheckbox = CTkCheckBox(
-            self.config_frame, text="Detect April Tags",
-            variable=self._flag_vars["detectTags"]
-        )
-        self.hideAprilTagsCheckbox = CTkCheckBox(
-            self.config_frame, text="Hide April Tags",
-            variable=self._flag_vars['hideAprilTags']
-        )
-        self.detectHorizonCheckbox = CTkCheckBox(self.config_frame, text='Detect Horizon',
-                                                 variable=self._flag_vars['detect_horizon'])
-
-        self.yoloInferenceCheckbox = CTkCheckBox(self.config_frame, text='Run YOLO on image',
-                                                 variable=self._flag_vars['yoloInference'])
-
-        self.yoloBiasCheckbox = CTkCheckBox(self.config_frame, text='Run YOLO Bias Tracking',
-                                            variable=self._flag_vars['yoloBiasTracking'])
-        self.cubemapCheckbox = CTkCheckBox(self.config_frame, text='Cubemap',
-                                           variable=self._flag_vars['cubemap'])
-        self.confSliderLabel = CTkLabel(self.config_frame, text='Conf: 0.75')
-        self.confSliderBar = CTkSlider(self.config_frame, command=self.confSlider,
-                                       from_=0.15)  # type: ignore[arg-type]  # safe to ignore, ctk accepts float
-        self.iouSliderLabel = CTkLabel(self.config_frame, text='IOU: 1.00')
-        self.iouSliderBar = CTkSlider(self.config_frame, command=self.iouSlider)
-
         self.exportQualityCombo = CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
                                               command=self.updateQuality)
 
@@ -238,11 +221,6 @@ class CameraGui(CTkFrame):
                                           text='Checkerboard',
                                           command=self.launch_checkerboard)
 
-        self.confSliderLabel.configure(text=f'Conf: {self.camConfig.yolo_conf:.2f}')
-        self.confSliderBar.set(self.camConfig.yolo_conf)
-        self.iouSliderLabel.configure(text=f'IOU: {self.camConfig.yolo_iou:.2f}')
-        self.iouSliderBar.set(self.camConfig.yolo_iou)
-
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
         self.lastImageTime = 0
@@ -259,6 +237,8 @@ class CameraGui(CTkFrame):
                                                          controller=self)
 
         self.setupFrame()
+
+        self._loading_config = False
 
     def on_app_close(self):
 
@@ -296,20 +276,29 @@ class CameraGui(CTkFrame):
         self.func_that_refits = func
 
     def _init_flag_vars(self):
+        double_vars = ['yolo_conf', 'yolo_iou']
         for name in self._flags:
             if not hasattr(self.camConfig, name):
-                setattr(self.camConfig, name, False)
-            v = BooleanVar(value=bool(getattr(self.camConfig, name, False)))
+                setattr(self.camConfig, name, 1.0 if name in double_vars else False)
+
+            if name in double_vars:
+                v = DoubleVar(value=getattr(self.camConfig, name, 1.0))
+            else:
+                v = BooleanVar(value=bool(getattr(self.camConfig, name, False)))
 
             # when UI flips, write to model
             v.trace_add("write", lambda *_, n=name: self._on_flag_changed(n))
             self._flag_vars[name] = v
 
     def _on_flag_changed(self, name: str):
-        val = bool(self._flag_vars[name].get())
+        # DoubleVars must stay float; everything else is bool
+        if name in ("yolo_conf", "yolo_iou"):
+            val = float(self._flag_vars[name].get())
+        else:
+            val = bool(self._flag_vars[name].get())
+
         # guard rails / side-effects
         if name == "undistort" and not self.calibration.validCal:
-            # can't enable; snap back off
             self._flag_vars[name].set(False)
             return
 
@@ -322,10 +311,13 @@ class CameraGui(CTkFrame):
         setattr(self.camConfig, name, val)
         self.saveToCache()
 
-    # keep model -> UI sync helper (if you ever load cache, etc.)
     def sync_flags_from_model(self):
         for n in self._flags:
-            self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
+            if n in ("yolo_conf", "yolo_iou"):
+                self._flag_vars[n].set(float(getattr(self.camConfig, n, 1.0)))
+            else:
+                self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
+
         if self.camConfig.detectTags:
             self.createDetector()
 
@@ -366,22 +358,6 @@ class CameraGui(CTkFrame):
             # Optionally auto-resume prior state; or keep manual
             pass
 
-    def _ui_should_paint(self, widget=None) -> bool:
-        # Throttle + only if page/target is visible
-        if not self._ui_active:
-            return False
-        if widget is not None:
-            try:
-                if not widget.winfo_viewable():
-                    return False
-            except TclError:
-                return False
-        now = time.monotonic()
-        if (now - self._last_ui_tick) >= self._ui_throttle_sec:
-            self._last_ui_tick = now
-            return True
-        return False
-
     # Optional: react to section changes if you want different behavior
     def on_section_show(self, name: str):
         # Example: only allow OpenCV windows / key polling while in Playback
@@ -394,11 +370,12 @@ class CameraGui(CTkFrame):
     # except Exception: pass
 
     def loadFromCache(self):
+        self._loading_config = True
         res = self.config_store.load_from_cache(self.camConfig)
-        # if res.yaml_path:
-        #     self.configSelectLabel.configure(text=os.path.basename(res.yaml_path))
         if res.loaded_yaml:
             self.update_post_newCamConfig()
+        else:
+            self._loading_config = False
 
     def update_post_newCamConfig(self):
 
@@ -425,10 +402,19 @@ class CameraGui(CTkFrame):
         except Exception:
             pass
 
+        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
+        self._flag_vars["yolo_iou"].set(float(self.camConfig.yolo_iou))
+
         if self.func_that_refits is not None:
             self.func_that_refits()
 
     def saveToCache(self, immediate: bool = False, delay_ms: int = 500):
+        if getattr(self, "_loading_config", False):
+            return
+
+        self.camConfig.yolo_conf = float(self._flag_vars["yolo_conf"].get())
+        self.camConfig.yolo_iou = float(self._flag_vars["yolo_iou"].get())
+
         self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
 
     def updateLogFile(self):
@@ -454,20 +440,6 @@ class CameraGui(CTkFrame):
         self.camConfig.export_quality = ExportQuality(qualityValue)
         self.saveToCache()
 
-    def confSlider(self, confValue):
-        self.camConfig.yolo_conf = confValue
-        if self.yoloSession is not None:
-            self.yoloSession.conf = confValue
-        self.confSliderLabel.configure(text='Conf: ' + f'{confValue:.2f}')
-        self.saveToCache()
-
-    def iouSlider(self, iouValue):
-        self.camConfig.yolo_iou = iouValue
-        if self.yoloSession is not None:
-            self.yoloSession.iou = iouValue
-        self.iouSliderLabel.configure(text='IOU: ' + f'{iouValue:.2f}')
-        self.saveToCache()
-
     def ingestCalibration(self):
 
         if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(
@@ -490,14 +462,14 @@ class CameraGui(CTkFrame):
             self.filepath_page.update_idletasks()
             self.update_idletasks()
 
-        self.undistortCheckbox.configure(state='normal')
+        self.image_processing_page.undistortCheckbox.configure(state='normal')
         if self.calibration.fisheye:
             cube_state = 'normal'
         else:
             cube_state = 'disabled'
             self.camConfig.cubemap = False
-            self.cubemapCheckbox.deselect()
-        self.cubemapCheckbox.configure(state=cube_state)
+            self.image_processing_page.cubemapCheckbox.deselect()
+        self.image_processing_page.cubemapCheckbox.configure(state=cube_state)
 
         if self.yoloSession is not None:
             self.yoloSession.set_calibration(self.calibration)
@@ -509,13 +481,12 @@ class CameraGui(CTkFrame):
         newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
 
         self.map1, self.map2 = cv2.initUndistortRectifyMap(
-            K, D, R=None, newCameraMatrix=newK, size=(w, h), m1type=cv2.CV_16SC2
+            K, D, None, newK, (w, h), cv2.CV_16SC2
         )
 
         self.saveToCache()
 
     def setupFrame(self):
-        self.setup_configFrame()
         self.setup_exportFrame()
         self.setup_dataFrame()
         self.setup_playbackFrame()
@@ -524,93 +495,6 @@ class CameraGui(CTkFrame):
     def grid_sideBySide(row, *args, col=0):
         for idx, item in enumerate(args):
             item.grid(row=row, column=col + idx, padx=5, pady=5, sticky='nsew')
-
-    def setup_configFrame(self):
-        rowID = 0
-        self.grid_sideBySide(rowID, self.confSliderLabel, self.confSliderBar)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.iouSliderLabel, self.iouSliderBar)
-        rowID += 1
-
-        if not self.calibration.validCal:
-            self.undistortCheckbox.configure(state='disabled')
-
-        self.grid_sideBySide(rowID, self.drawChessboardButton, self.undistortCheckbox)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.detectAprilTagsCheckbox, self.hideAprilTagsCheckbox)
-        rowID += 1
-
-        pnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolvePnP 3D Truth Into Image',
-                                       variable=self._flag_vars['pnp3DTruthPoints'])
-        qnp3DTruthPoints = CTkCheckBox(self.config_frame, text='SolveQnP 3D Truth Into Image',
-                                       variable=self._flag_vars['qnp3DTruthPoints'])
-        self.grid_sideBySide(rowID, pnp3DTruthPoints, qnp3DTruthPoints)
-        rowID += 1
-
-        self.grid_sideBySide(rowID, self.yoloInferenceCheckbox, self.yoloBiasCheckbox)
-        rowID += 1
-
-        # --- Pose from YOLO centers (multi-feature) ---
-        # You can enable any combination (PnP / QnP / KF-weighted QnP).
-        pnpYoloPoints = CTkCheckBox(self.config_frame, text='SolvePnP from YOLO',
-                                    variable=self._flag_vars['pnpYoloPoints'])
-        qnpYoloPoints = CTkCheckBox(self.config_frame, text='SolveQnP from YOLO',
-                                    variable=self._flag_vars['qnpYoloPoints'])
-        self.grid_sideBySide(rowID, pnpYoloPoints, qnpYoloPoints)
-        rowID += 1
-
-        qnpKFYoloPoints = CTkCheckBox(self.config_frame, text='SolveWQnP from YOLO',
-                                      variable=self._flag_vars['qnpKFYoloPoints'])
-        qnpKFYoloPoints.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
-
-        rowID += 1
-
-        detectCornersCheckbox = CTkCheckBox(self.config_frame, text='Detect Corners',
-                                            variable=self._flag_vars['detect_corners'])
-        self.grid_sideBySide(rowID, detectCornersCheckbox, self.detectHorizonCheckbox)
-        rowID += 1
-
-        factorgraphCheckbox = CTkCheckBox(self.config_frame, text='Factor Graph',
-                                          variable=self._flag_vars['factor_graph'])
-        hyperfocusCheckbox = CTkCheckBox(self.config_frame, text='Hyper Focus',
-                                         variable=self._flag_vars['hyper_focus'])
-        self.grid_sideBySide(rowID, factorgraphCheckbox, hyperfocusCheckbox)
-        rowID += 1
-
-        phaseCorrelationCheckbox = CTkCheckBox(self.config_frame, text='PhaseCorrelation',
-                                               variable=self._flag_vars['phase_correlation'])
-        crosshairsCheckbox = CTkCheckBox(self.config_frame, text='Crosshairs',
-                                         variable=self._flag_vars['crosshairs'])
-        self.grid_sideBySide(rowID, phaseCorrelationCheckbox, crosshairsCheckbox)
-        rowID += 1
-
-        hudCheckbox = CTkCheckBox(self.config_frame, text='HUD',
-                                  variable=self._flag_vars['hud'])
-        self.grid_sideBySide(rowID, self.cubemapCheckbox, hudCheckbox)
-        rowID += 1
-
-        imageProcessingKernelLabel = CTkLabel(self.config_frame, text='Image Filter: ')
-
-        self.imageProcessingKernelCombobox = CTkComboBox(self.config_frame,
-                                                         values=list(ImageKernel.__members__.keys()),
-                                                         command=self.updateImageProcessingKernel)
-        self.imageProcessingKernelCombobox.set(self.camConfig.processingKernel.name)
-        self.updateImageProcessingKernel(self.camConfig.processingKernel.name)
-        self.grid_sideBySide(rowID, imageProcessingKernelLabel, self.imageProcessingKernelCombobox)
-        rowID += 1
-
-    def updateImageProcessingKernel(self, newValue):
-        if self.camConfig.processingKernel == ImageKernel.Gabor and self.GaborGUI is not None:
-            self.GaborGUI.close()
-        self.camConfig.processingKernel = ImageKernel(newValue)
-        if self.camConfig.processingKernel == ImageKernel.Unfiltered:
-            self.imageProcessingKernelCombobox.configure(fg_color='#343638', text_color='#DCE4EE')
-        else:
-            self.imageProcessingKernelCombobox.configure(fg_color='yellow', text_color='black')
-
-        self.saveToCache()
 
     def setup_exportFrame(self):
         rowID = 0
@@ -647,44 +531,6 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         self.btn_checkerboard.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
-
-        title = 'Folder Replay Hotkeys'
-        items = [
-            ("Space", "Pause / resume"),
-            ("f", "Toggle Fixed-FPS ↔ Real-time"),
-            ("c / z", "Step forward / backward one frame"),
-            ("d / a", "Speed up / slow down playback"),
-            ("r", "Reverse direction"),
-            ("w", "Toggle overlays"),
-            ("s / e", "Mark export start / end"),
-            ("[ / ] , { / }", "Adjust time offset (small / large)"),
-            ("; / ' , : / \"", "Adjust time offset (fine)"),
-            ("p", "Persist time offset"),
-            ("Esc", "Exit player"),
-        ]
-
-        CTkLabel(self.hotkey_frame, text=title, font=("Segoe UI", 16, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 8)
-        )
-
-        # headings
-        CTkLabel(self.hotkey_frame, text="Key", font=("Segoe UI", 13, "bold")).grid(
-            row=1, column=0, sticky="w", padx=12, pady=(6, 2)
-        )
-        CTkLabel(self.hotkey_frame, text="Action", font=("Segoe UI", 13, "bold")).grid(
-            row=1, column=1, sticky="w", padx=12, pady=(6, 2)
-        )
-
-        # rows
-        for i, (key, desc) in enumerate(items, start=2):
-            CTkLabel(self.hotkey_frame, text=key).grid(row=i, column=0, sticky="w", padx=12, pady=2)
-            CTkLabel(self.hotkey_frame, text=desc, justify="left", wraplength=520).grid(
-                row=i, column=1, sticky="w", padx=12, pady=2
-            )
-
-        # let text column expand
-        self.hotkey_frame.grid_columnconfigure(0, weight=0)
-        self.hotkey_frame.grid_columnconfigure(1, weight=1)
 
     def _on_checker_status(self, btn_state: str, btn_text: str) -> None:
         self.btn_checkerboard.configure(state=btn_state, text=btn_text)
@@ -917,20 +763,20 @@ class CameraGui(CTkFrame):
         conf_list_var = getattr(self, "_dp_conf_list", None)
 
         def post_status(text: str):
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def post_progress(frac: float, text: str):
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress"):
                     self._dp_progress.set(float(frac))
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def _worker():
             try:
@@ -972,23 +818,23 @@ class CameraGui(CTkFrame):
         )
 
         def progress_cb(frac: float, text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress"):
                     self._dp_progress.set(float(frac))
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def status_cb(text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def _finish(text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
                 if hasattr(self, "_dp_run_btn"):
@@ -996,7 +842,7 @@ class CameraGui(CTkFrame):
                 if hasattr(self, "_dp_cancel_btn"):
                     self._dp_cancel_btn.configure(state="normal")
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def _worker():
             try:
@@ -1072,23 +918,23 @@ class CameraGui(CTkFrame):
 
         # callbacks (UI thread)
         def post_progress(frac: float, text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress"):
                     self._dp_progress.set(float(frac))
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def post_status(text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         def post_finish(text: str) -> None:
-            def _ui():
+            def _ui(*_):
                 if hasattr(self, "_dp_progress_label"):
                     self._dp_progress_label.configure(text=text)
                 if hasattr(self, "_dp_run_btn"):
@@ -1096,7 +942,7 @@ class CameraGui(CTkFrame):
                 if hasattr(self, "_dp_cancel_btn"):
                     self._dp_cancel_btn.configure(state="normal")
 
-            self.after(0, _ui)
+            self.after(0, _ui, ())
 
         # run worker
         def _worker():
@@ -1393,9 +1239,6 @@ class CameraGui(CTkFrame):
             wall_start = self._on_speed_down(curr_idx=curr_idx, t=t)
             self.update_playbackMenu()
 
-        elif action == "toggle_overlays":
-            self._on_toggle_overlays()
-
         elif action == "mark_start":
             self._on_mark_start(curr_idx)
 
@@ -1435,62 +1278,54 @@ class CameraGui(CTkFrame):
 
         return curr_idx, wall_start
 
-    def _key_to_playback_action(self, key: int):
+    @staticmethod
+    def _key_to_playback_action(key: int):
         """Map a cv2.waitKey code to an action string + args."""
 
         if key == ord('f'):
-            return ("toggle_fps_mode", ())
+            return "toggle_fps_mode", ()
         if key == ord('c'):
-            return ("step_forward", ())
+            return "step_forward", ()
         if key == ord('z'):
-            return ("step_back", ())
+            return "step_back", ()
         if key == ord(' '):
-            return ("toggle_pause", ())
+            return "toggle_pause", ()
         if key == ord('d'):
-            return ("speed_up", ())
+            return "speed_up", ()
         if key == ord('a'):
-            return ("speed_down", ())
-        if key == ord('w'):
-            return ("toggle_overlays", ())
+            return "speed_down", ()
         if key == ord('s'):
-            return ("mark_start", ())
+            return "mark_start", ()
         if key == ord('e'):
-            return ("mark_end", ())
+            return "mark_end", ()
         if key == ord('r'):
-            return ("reverse", ())
+            return "reverse", ()
         if key == ord('b'):
-            return ("bank_minus", ())
+            return "bank_minus", ()
         if key == ord('n'):
-            return ("bank_plus", ())
+            return "bank_plus", ()
 
         # offset hotkeys
         if key == ord(";"):
-            return ("offset", (-0.01,))
+            return "offset", (-0.01,)
         if key == ord("'"):
-            return ("offset", (+0.01,))
+            return "offset", (+0.01,)
         if key == ord(':'):
-            return ("offset", (-0.10,))
+            return "offset", (-0.10,)
         if key == ord('"'):
-            return ("offset", (+0.10,))
+            return "offset", (+0.10,)
         if key == ord('['):
-            return ("offset", (-1.00,))
+            return "offset", (-1.00,)
         if key == ord(']'):
-            return ("offset", (+1.00,))
+            return "offset", (+1.00,)
 
         if key == ord('{'):
-            return ("offset", (-10.00,))
+            return "offset", (-10.00,)
         if key == ord('}'):
-            return ("offset", (+10.00,))
+            return "offset", (+10.00,)
         if key == ord('p'):
-            return ("persist_offset", ())
-        return (None, None)
-
-    def setAprilTagSize(self):
-        try:
-            self.camConfig.aprilTagSize = float(self.aprilTagSizeEntry.get())
-        except ValueError:
-            self.aprilTagSizeEntry.delete(0, END)
-            self.aprilTagSizeEntry.configure(placeholder_text=str(self.camConfig.aprilTagSize), )
+            return "persist_offset", ()
+        return None, None
 
     def getEntryValue(self):
         try:
@@ -2356,14 +2191,6 @@ class CameraGui(CTkFrame):
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    def _on_toggle_overlays(self):
-        self._toggle('undistort')
-        self._toggle('yoloInference')
-        self._toggle('yoloInference')
-        self._toggle('detect_horizon')
-        self._toggle('hyper_focus')
-        self._toggle('factor_graph')
-
     def _toggle(self, attribute: str):
         self._flag_vars[attribute].set(not self._flag_vars[attribute].get())
         self.saveToCache()
@@ -3015,7 +2842,7 @@ class CameraGui(CTkFrame):
             if len(points) < 6:
                 return
 
-            quat, vect, *_ = solveQnP(points, centers, self.calibration, None)
+            quat, vect, *_ = solveQnP(points, centers, self.calibration, True)
             xyz_proj = quat * self.ThreeDTruthPoints.getTruthPointsNumpy() + vect
 
             q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],

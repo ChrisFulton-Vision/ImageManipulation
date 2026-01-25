@@ -153,7 +153,7 @@ class CameraPage(ctk.CTkFrame):
     def _make_setupPage(self):
         return self.camGui.filepath_page
     def _make_ImgProcPage(self):
-        return self.camGui.config_frame
+        return self.camGui.image_processing_page
     def _make_exportPage(self):
         return self.camGui.export_frame
     def _make_playbackPage(self):
@@ -161,7 +161,7 @@ class CameraPage(ctk.CTkFrame):
     def _make_dataPage(self):
         return self.camGui.data_frame
     def _make_hotkeyPage(self):
-        return self.camGui.hotkey_frame
+        return self.camGui.hotkey_page
 
     def on_show(self):
         if hasattr(self.camGui, "set_ui_active"):

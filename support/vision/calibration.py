@@ -55,6 +55,8 @@ class Calibration:
     def iteratable_params(self):
         if not self.fisheye:
             return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2, self.k3
+        else:
+            return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.k3, self.k4
 
     def randomize(
             self,

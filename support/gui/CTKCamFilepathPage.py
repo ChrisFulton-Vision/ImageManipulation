@@ -327,8 +327,6 @@ class Filepath_page(ctk.CTkFrame):
             with open(self.ctrl.camConfig.configFilepath, 'w') as f:
                 dump(self.ctrl.camConfig.toDict, f)
 
-        self.ctrl.sync_flags_from_model()
-        self.ctrl.saveToCache()
         self.sync_labels()
 
     def updateConfigLabel(self):

@@ -379,11 +379,18 @@ class CameraGui(CTkFrame):
 
     def update_post_newCamConfig(self):
 
+        # Setting flag vars directly calls SaveToCache, overriding camConfig with current flag vars.
+        # Copy-store temp iou overrides this behavior.
+        iou = copy.deepcopy(self.camConfig.yolo_iou)
+        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
+        self._flag_vars["yolo_iou"].set(float(iou))
+
         self.updateLogFile()
         self.ingestCalibration()
         self.updateYOLOModel()
         if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
+
 
         # --- model -> UI resync on config load (batch DP + flags) ---
         self.sync_flags_from_model()
@@ -402,8 +409,7 @@ class CameraGui(CTkFrame):
         except Exception:
             pass
 
-        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
-        self._flag_vars["yolo_iou"].set(float(self.camConfig.yolo_iou))
+        self.saveToCache()
 
         if self.func_that_refits is not None:
             self.func_that_refits()
@@ -1556,7 +1562,6 @@ class CameraGui(CTkFrame):
         stop_display_time = None
 
         while (rval and not self.threadStopper.is_set() and
-               cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0 and
                self.showWindow and not self.making_gifOrVid):
             rval, frame = self.vc.read()
 
@@ -1567,6 +1572,7 @@ class CameraGui(CTkFrame):
             key = cv2.waitKey(1)
 
             if key == 27:  # exit on ESC
+                self.after(0, self.filepath_page.toggle_stream)
                 self.threadStopper.set()
                 break
 
@@ -1578,6 +1584,11 @@ class CameraGui(CTkFrame):
             if stop_display_time is not None and time.monotonic() > stop_display_time:
                 stop_display_time = None
                 print('Time out')
+
+            if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) < 1:
+                self.after(0, self.filepath_page.toggle_stream)
+                self.threadStopper.set()
+                break
 
         # Minimal teardown in the worker; the UI thread will handle buttons/state.
         if self.vc is not None and self.vc.isOpened():
@@ -1807,7 +1818,6 @@ class CameraGui(CTkFrame):
 
         try:
             while (not self.threadStopper.is_set()
-                   and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE)
                    and self.showWindow
                    and not self.making_gifOrVid):
 
@@ -1947,6 +1957,7 @@ class CameraGui(CTkFrame):
                 while pending_keys:
                     key = pending_keys.pop(0)
                     if key == 27:  # ESC
+                        self.after(0, self.filepath_page.toggle_stream)
                         self.threadStopper.set()
                         break
 
@@ -1970,6 +1981,7 @@ class CameraGui(CTkFrame):
 
                 pending_keys.extend(self._poll_keys(1))
                 if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
+                    self.after(0, self.filepath_page.toggle_stream)
                     self.threadStopper.set()
                     break
 
@@ -2191,9 +2203,9 @@ class CameraGui(CTkFrame):
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    def _toggle(self, attribute: str):
-        self._flag_vars[attribute].set(not self._flag_vars[attribute].get())
-        self.saveToCache()
+    # def _toggle(self, attribute: str):
+    #     self._flag_vars[attribute].set(not self._flag_vars[attribute].get())
+    #     self.saveToCache()
 
     def _on_mark_start(self, curr_idx: int):
         self.camConfig.start_export_idx = curr_idx

@@ -868,6 +868,26 @@ def distort_points_px_numba(pts_px_und,
     return out
 
 def distort_points_px(cal, pts_px_und):
+    """
+    Fisheye doctest: forward then inverse round-trip.
+
+    >>> cal = default_fisheye_cam()
+    >>> assert cal.validCal
+    >>> pts = np.array([[100.0, 100.0],
+    ...                 [432.0, 432.0],
+    ...                 [800.0, 200.0]], dtype=np.float64)
+    >>> d = distort_points_px(cal, pts)
+    >>> u = undistort_points_px(cal, d)
+    >>> float(np.max(np.sqrt(np.sum((u - pts)**2, axis=1)))) < 1e-9
+    True
+
+    Scalar input returns a 2-vector:
+
+    >>> p = np.array([123.0, 456.0], dtype=np.float64)
+    >>> q = distort_points_px(cal, p)
+    >>> q.shape
+    (2,)
+    """
     pts = np.asarray(pts_px_und, dtype=np.float64)
     scalar = (pts.ndim == 1)
     if scalar:
@@ -949,6 +969,36 @@ def _newton_update_in_place(
     y[do] -= del_y
 
 def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
+    """
+    Fisheye doctest: inverse then forward round-trip.
+
+    >>> cal = default_fisheye_cam()
+    >>> assert cal.validCal
+    >>> pts = np.array([[120.0, 140.0],
+    ...                 [432.0, 432.0],
+    ...                 [700.0, 820.0]], dtype=np.float64)
+    >>> u = undistort_points_px(cal, pts)
+    >>> d = distort_points_px(cal, u)
+    >>> float(np.max(np.sqrt(np.sum((d - pts)**2, axis=1)))) < 1e-9
+    True
+
+    Optional: compare to OpenCV if installed.
+
+    >>> try:
+    ...     import cv2
+    ... except Exception:
+    ...     cv2 = None
+    >>> if cv2 is not None:
+    ...     K = np.array([[cal.fx, 0.0, cal.cx],
+    ...                   [0.0, cal.fy, cal.cy],
+    ...                   [0.0, 0.0, 1.0]], dtype=np.float64)
+    ...     D = np.array([cal.k1, cal.k2, cal.k3, cal.k4], dtype=np.float64)
+    ...     pts_cv = pts.reshape(-1, 1, 2)
+    ...     ocv = cv2.fisheye.undistortPoints(pts_cv, K, D, R=None, P=K).reshape(-1, 2)
+    ...     ours = undistort_points_px(cal, pts)
+    ...     float(np.max(np.sqrt(np.sum((ours - ocv)**2, axis=1)))) < 1e-9
+    True
+    """
     pts = np.asarray(pts_px_dist, dtype=np.float64)
     scalar = (pts.ndim == 1)
     if scalar:
@@ -1477,10 +1527,10 @@ def default_864_cam():
     cal.p1 = -0.000232
     cal.p2 = 0.000432
     cal.k3 = -0.0137
-    cal.calTime = 200.0
-    cal.numCBUsed = 50
-    cal.rmsError = 0.10
-    cal.hfov = 49.28
+    cal.calTime = 0.0
+    cal.numCBUsed = 0
+    cal.rmsError = 0.0
+    cal.hfov = 0.0
     cal.width = 864
     cal.height = 864
     return cal
@@ -1494,6 +1544,10 @@ def default_fisheye_cam():
     cal.k2 = 0.0015
     cal.k3 = -0.0002
     cal.k4 = 0.00002
+    cal.calTime = 0.0
+    cal.numCBUsed = 0
+    cal.rmsError = 0.0
+    cal.hfov = 0.0
     cal.width = 864
     cal.height = 864
     return cal
@@ -1507,10 +1561,10 @@ def default_2848_cam():
     cal.p1 = -0.000232
     cal.p2 = 0.000432
     cal.k3 = -0.000269
-    cal.calTime = 200.0
-    cal.numCBUsed = 50
-    cal.rmsError = 0.10
-    cal.hfov = 49.28
+    cal.calTime = 0.0
+    cal.numCBUsed = 0
+    cal.rmsError = 0.0
+    cal.hfov = 0.0
     cal.width = 2848
     cal.height = 2848
     return cal
@@ -1597,7 +1651,7 @@ if __name__ == "__main__":
                 pts_in_cv = pts_in.reshape(-1, 1, 2)
                 out = cv2.fisheye.undistortPoints(pts_in_cv, K, D, R=None, P=K)
                 return out.reshape(-1, 2)
-            _bench("OpenCV fisheye.undistortPoints", ocv, pts)
+            _bench("CV fisheye.undistortPoints  ", ocv, pts)
 
         else:
             def ocv(pts_in):

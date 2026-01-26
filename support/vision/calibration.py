@@ -873,12 +873,20 @@ def distort_points_px(cal, pts_px_und):
     if scalar:
         pts = pts.reshape(1, 2)
 
-    out = distort_points_px_numba(
-        pts,
-        float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
-        float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
-        bool(cal.has_tangential)
-    )
+    if bool(getattr(cal, "fisheye", False)):
+        out = distort_points_px_fisheye_numba(
+            pts,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            float(cal.k1), float(cal.k2), float(cal.k3), float(cal.k4),
+        )
+    else:
+        out = distort_points_px_numba(
+            pts,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
+            bool(cal.has_tangential)
+        )
+
     return out[0] if scalar else out
 
 def _radial_terms(x, y, k1, k2, k3):
@@ -946,14 +954,22 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
     if scalar:
         pts = pts.reshape(1, 2)
 
-    out = undistort_points_px_numba_dispatch(
-        pts,
-        float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
-        float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
-        bool(cal.has_tangential),
-        mode_opencv_5fp=(mode == "opencv"),
-        eps_px=float(eps_px),
-    )
+    if bool(getattr(cal, "fisheye", False)):
+        out = undistort_points_px_fisheye_numba(
+            pts,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            float(cal.k1), float(cal.k2), float(cal.k3), float(cal.k4),
+        )
+    else:
+        out = undistort_points_px_numba_dispatch(
+            pts,
+            float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
+            float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
+            bool(cal.has_tangential),
+            mode_opencv_5fp=(mode == "opencv"),
+            eps_px=float(eps_px),
+        )
+
     return out[0] if scalar else out
 
 @njit(parallel=True, fastmath=True)
@@ -1300,7 +1316,133 @@ def undistort_2fp_newton_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, p1, p2, k3, ep
 
     return out
 
+@njit(cache=True, fastmath=True)
+def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4):
+    """
+    Solve theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = theta_d
+    via Newton iterations.
+    """
+    if theta_d <= 1e-24:
+        return 0.0
 
+    # Good initial guess: theta ~= theta_d
+    theta = theta_d
+
+    # Newton iterations (OpenCV does something similar internally)
+    for _ in range(8):
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+
+        poly = 1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8
+        f = theta * poly - theta_d
+
+        # derivative:
+        # d/dtheta [theta*poly] = poly + theta * dpoly/dtheta
+        # dpoly/dtheta = 2*k1*theta + 4*k2*theta^3 + 6*k3*theta^5 + 8*k4*theta^7
+        dpoly = (2.0 * k1 * theta
+                 + 4.0 * k2 * theta * t2
+                 + 6.0 * k3 * theta * t4
+                 + 8.0 * k4 * theta * t6)
+        fp = poly + theta * dpoly
+
+        if abs(fp) < 1e-24:
+            break
+
+        step = f / fp
+        theta -= step
+
+        if abs(step) < 1e-14:
+            break
+
+    return theta
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def undistort_points_px_fisheye_numba(pts_px_dist, fx, fy, cx, cy, k1, k2, k3, k4):
+    """
+    Inverse of OpenCV fisheye distortion model.
+    Input: distorted pixel points (N,2)
+    Output: undistorted pixel points (N,2)
+    """
+    N = pts_px_dist.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    for i in prange(N):
+        u = pts_px_dist[i, 0]
+        v = pts_px_dist[i, 1]
+
+        # pixels -> distorted normalized
+        xd = (u - cx) * inv_fx
+        yd = (v - cy) * inv_fy
+
+        rd = np.sqrt(xd * xd + yd * yd)
+
+        if rd <= 1e-24:
+            # center stays center
+            x = xd
+            y = yd
+        else:
+            theta_d = rd
+            theta = _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4)
+            r = np.tan(theta)
+
+            scale = r / rd
+            x = xd * scale
+            y = yd * scale
+
+        out[i, 0] = x * fx + cx
+        out[i, 1] = y * fy + cy
+
+    return out
+
+
+@njit(parallel=True, cache=True, fastmath=True)
+def distort_points_px_fisheye_numba(pts_px_und, fx, fy, cx, cy, k1, k2, k3, k4):
+    """
+    Forward OpenCV fisheye distortion model.
+    Input: undistorted pixel points (N,2)
+    Output: distorted pixel points (N,2)
+    """
+    N = pts_px_und.shape[0]
+    out = np.empty((N, 2), dtype=np.float64)
+
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    for i in prange(N):
+        u = pts_px_und[i, 0]
+        v = pts_px_und[i, 1]
+
+        # pixels -> undistorted normalized
+        x = (u - cx) * inv_fx
+        y = (v - cy) * inv_fy
+
+        r = np.sqrt(x * x + y * y)
+        if r <= 1e-24:
+            xd = x
+            yd = y
+        else:
+            theta = np.arctan(r)
+            t2 = theta * theta
+            t4 = t2 * t2
+            t6 = t4 * t2
+            t8 = t4 * t4
+
+            theta_d = theta * (1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8)
+            scale = theta_d / r
+
+            xd = x * scale
+            yd = y * scale
+
+        out[i, 0] = xd * fx + cx
+        out[i, 1] = yd * fy + cy
+
+    return out
 # -------------------------- dispatcher (Python) -------------------------------
 
 def undistort_points_px_numba_dispatch(
@@ -1343,6 +1485,18 @@ def default_864_cam():
     cal.height = 864
     return cal
 
+def default_fisheye_cam():
+    cal = Calibration()
+    cal.fisheye = True
+    cal.fx = cal.fy = 450.0
+    cal.cx = cal.cy = 432.0
+    cal.k1 = -0.010
+    cal.k2 = 0.0015
+    cal.k3 = -0.0002
+    cal.k4 = 0.00002
+    cal.width = 864
+    cal.height = 864
+    return cal
 
 def default_2848_cam():
     cal = Calibration()
@@ -1363,13 +1517,110 @@ def default_2848_cam():
 
 
 if __name__ == "__main__":
-    cal = default_864_cam()
+    import time
+    import numpy as np
 
-    p0 = pxl(pix_coords=list(864.0 * np.random.rand(2)))
-    start_px = copy.deepcopy(p0.pix_coords)
-    print(p0)
-    cal.undistort_point(p0)
-    print(p0)
-    cal.distort_point(p0)
-    print(p0)
-    print(f'Error: {np.array(p0.pix_coords) - np.array(start_px)}')
+    try:
+        import cv2
+        _HAS_CV2 = True
+        cv2.setUseOptimized(True)
+    except Exception:
+        _HAS_CV2 = False
+
+    def _K_D_from_cal(cal):
+        K = np.array([[cal.fx, 0.0, cal.cx],
+                      [0.0, cal.fy, cal.cy],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        if bool(getattr(cal, "fisheye", False)):
+            D = np.array([cal.k1, cal.k2, cal.k3, cal.k4], dtype=np.float64)
+        else:
+            # OpenCV undistortPoints expects up to 8; you probably only use k1,k2,p1,p2,k3
+            # If you don’t have tangential, p1/p2 should be 0 already.
+            k1 = float(getattr(cal, "k1", 0.0))
+            k2 = float(getattr(cal, "k2", 0.0))
+            p1 = float(getattr(cal, "p1", 0.0))
+            p2 = float(getattr(cal, "p2", 0.0))
+            k3 = float(getattr(cal, "k3", 0.0))
+            D = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
+        return K, D
+
+    def _make_points(cal, N=200_000, seed=0):
+        rng = np.random.default_rng(seed)
+        pts = np.empty((N, 2), dtype=np.float64)
+        pts[:, 0] = rng.random(N) * (float(cal.width) - 1.0)
+        pts[:, 1] = rng.random(N) * (float(cal.height) - 1.0)
+        return pts
+
+    def _bench(label, fn, pts, warmup=2, reps=10):
+        # Warmup (important for numba + caches)
+        for _ in range(warmup):
+            _ = fn(pts)
+
+        times = np.empty(reps, dtype=np.float64)
+        for i in range(reps):
+            t0 = time.perf_counter()
+            _ = fn(pts)
+            t1 = time.perf_counter()
+            times[i] = t1 - t0
+
+        med = float(np.median(times))
+        p10 = float(np.percentile(times, 10))
+        p90 = float(np.percentile(times, 90))
+        N = pts.shape[0]
+        print(f"{label:28s}  med={med*1000:7.3f} ms  p10={p10*1000:7.3f} ms  p90={p90*1000:7.3f} ms  ({N/med:,.1f} pts/s)")
+
+    def benchmark_undistort(cal, N=200_000, seed=0):
+        print("\n==============================")
+        print(f"Benchmark undistortPoints | fisheye={bool(getattr(cal,'fisheye',False))} | N={N}")
+        print("==============================")
+
+        pts = _make_points(cal, N=N, seed=seed)
+
+        # Your Numba-routed implementation
+        def ours(pts_in):
+            return undistort_points_px(cal, pts_in)
+
+        _bench("OURS (numba) undistort", ours, pts)
+
+        if not _HAS_CV2:
+            print("OpenCV not available; skipping cv2 benchmark.")
+            return
+
+        K, D = _K_D_from_cal(cal)
+
+        # OpenCV expects Nx1x2
+        pts_cv = pts.reshape(-1, 1, 2).astype(np.float64, copy=False)
+
+        if bool(getattr(cal, "fisheye", False)):
+            def ocv(pts_in):
+                pts_in_cv = pts_in.reshape(-1, 1, 2)
+                out = cv2.fisheye.undistortPoints(pts_in_cv, K, D, R=None, P=K)
+                return out.reshape(-1, 2)
+            _bench("OpenCV fisheye.undistortPoints", ocv, pts)
+
+        else:
+            def ocv(pts_in):
+                pts_in_cv = pts_in.reshape(-1, 1, 2)
+                out = cv2.undistortPoints(pts_in_cv, K, D, R=None, P=K)
+                return out.reshape(-1, 2)
+            _bench("OpenCV undistortPoints", ocv, pts)
+
+    # --- Run benchmarks on both your standard + fisheye cal ---
+    cal_std = default_864_cam()
+    cal_std.fisheye = False
+
+    cal_fish = Calibration()
+    cal_fish.fisheye = True
+    cal_fish.fx = cal_fish.fy = 450.0
+    cal_fish.cx = cal_fish.cy = 432.0
+    cal_fish.k1 = -0.010
+    cal_fish.k2 = 0.0015
+    cal_fish.k3 = -0.0002
+    cal_fish.k4 = 0.00002
+    cal_fish.width = 864
+    cal_fish.height = 864
+
+    benchmark_undistort(cal_std,  N=200_000, seed=1)
+    benchmark_undistort(cal_fish, N=200_000, seed=2)
+

@@ -3,7 +3,7 @@
 import numpy as np
 from numpy.typing import NDArray
 import cv2
-from support.vision.calibration import Calibration, undistort_points_px_numba
+from support.vision.calibration import Calibration, undistort_points_px
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text
 from support.mathHelpers.twoD_to_threeD import solveQnP
@@ -59,18 +59,8 @@ class pnp_qnp_draw:
             numpy_centers = np.array(centers_dist, dtype=np.float64)
 
             if len(set(class_ids)) > 0:
-                if not calibration.fisheye:
-                    centers_und = undistort_points_px_numba(numpy_centers,
-                                                    *calibration.iteratable_params,
-                                                    calibration.has_tangential,
-                                                    mode_opencv_5fp=False,
-                                                    eps_px=1e-6)
-                else:
-                    numpy_centers = numpy_centers.reshape(-1, 1, 2)
-                    centers_und = cv2.fisheye.undistortPoints(numpy_centers,
-                                                              calibration.getCameraMatrix(),
-                                                              calibration.getDistortion(),
-                                                              P=calibration.getCameraMatrix()).reshape(-1,2)
+                centers_und = undistort_points_px(calibration, numpy_centers,
+                                                  eps_px=1e-6)
                 centers_und = centers_und.tolist()
 
             # ---- Undistort boxes too (undistort corners, then re-AABB) ----
@@ -89,22 +79,10 @@ class pnp_qnp_draw:
                     np.stack([x1, y2], axis=1),
                 ], axis=1).reshape(-1, 2)  # (4N,2)
 
-                if not calibration.fisheye:
-                    corners_und = undistort_points_px_numba(
-                        corners,
-                        *calibration.iteratable_params,
-                        calibration.has_tangential,
-                        mode_opencv_5fp=False,
-                        eps_px=1e-6
-                    ).reshape(-1, 4, 2)  # (N,4,2)
-                else:
-                    corners = corners.reshape(-1, 1, 2)
-                    corners_und = cv2.fisheye.undistortPoints(
-                        corners,
-                        calibration.getCameraMatrix(),
-                        calibration.getDistortion(),
-                        P=calibration.getCameraMatrix()
-                        ).reshape(-1, 4, 2)
+                corners_und = undistort_points_px(calibration,
+                                                  corners,
+                                                  eps_px=1e-6
+                                                  ).reshape(-1, 4, 2)  # (N,4,2)
 
                 # Rebuild axis-aligned boxes in undistorted YOLO pixel space
                 x_min = np.min(corners_und[:, :, 0], axis=1)

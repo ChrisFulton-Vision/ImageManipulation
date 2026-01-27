@@ -21,25 +21,25 @@ from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 
 from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
 
-import support.gui.CTKCamFilepathPage as filepath_page
-import support.gui.CTKCamImageProcessingPage as image_processing_page
-import support.gui.CTKHotkeyPage as hotkey_page
+import support.gui.CTKCamFilepathPage as Filepath_page
+import support.gui.CTKCamImageProcessingPage as Image_processing_page
+import support.gui.CTKHotkeyPage as Hotkey_page
 import support.gui.utils as utils
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
 
-import support.io.camera_config as camConfig
+import support.io.data_processing as data
+from support.io.camera_config import CameraConfig as CamConfig
 from support.io.config_store import ConfigStore
 from support.io.image_time_reader import ImageTimeReader
-import support.io.data_processing as data
 from support.io.my_logging import LOG
 
 from support.vision.calibration import Calibration, undistort_points_px
 from support.vision.draw_circle_and_mask import dim_except_circle
 
+import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text
 from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
-import support.viz.colors as clr
 
 from copy import deepcopy
 from math import pow
@@ -81,7 +81,7 @@ class CameraGui(CTkFrame):
             'yolo_conf', 'yolo_iou'
         ]
         self.threadStopper = utils.ThreadStopper()
-        self.camConfig: camConfig.CameraConfig = camConfig.CameraConfig()
+        self.camConfig: CamConfig = CamConfig()
         self.windowName = 'Processed Image'
         self.vc = None
         self._thread = None
@@ -102,8 +102,8 @@ class CameraGui(CTkFrame):
         self.centers = None
         self.default_filepath = ''
 
-        self.image_processing_page = image_processing_page.ImageProcessing_page(master, controller=self)
-        self.hotkey_page = hotkey_page.Hotkey_page(master)
+        self.image_processing_page = Image_processing_page.ImageProcessing_page(master, controller=self)
+        self.hotkey_page = Hotkey_page.Hotkey_page(master)
 
         self.export_frame = CTkFrame(master=master)
         self.playback_frame = CTkFrame(master=master)
@@ -197,7 +197,7 @@ class CameraGui(CTkFrame):
 
         self.recordButton = CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
                                       hover_color='navy', command=self.recordOff)
-        self.printButton = CTkButton(master=self.export_frame, text='Print 3D Turth Correlation', fg_color='green',
+        self.printButton = CTkButton(master=self.export_frame, text='Print 3D Truth Correlation', fg_color='green',
                                      hover_color='navy', command=self.print3DTruthPointsOnce)
         self.screenshotButton = CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
                                           hover_color='navy', command=self.screenshot)
@@ -233,7 +233,7 @@ class CameraGui(CTkFrame):
         self._last_ui_tick = 0.0
         self._ui_throttle_sec = 0.10  # refresh UI at most every 100 ms
 
-        self.filepath_page = filepath_page.Filepath_page(master,
+        self.filepath_page = Filepath_page.Filepath_page(master,
                                                          controller=self)
 
         self.setupFrame()
@@ -241,35 +241,27 @@ class CameraGui(CTkFrame):
         self._loading_config = False
 
     def on_app_close(self):
-
+        import tkinter as tk
         root = self.winfo_toplevel()
 
-        try:
-            if self.gpu_monitor is not None:
-                self.gpu_monitor.stop()
-        except Exception as e:
-            pass
+        if self.gpu_monitor is not None:
+            self.gpu_monitor.stop()
 
         try:
-            # returns a list of after handler IDs
-            after_ids = root.tk.call("after", "info")
-            for aid in after_ids:
-                try:
-                    root.after_cancel(aid)
-                except Exception:
-                    pass
-        except Exception:
+            root.after_cancel("all")
+        except tk.TclError:
+            # root already destroyed / interpreter gone
             pass
 
         self._plotter_close_plot_alias()
 
         try:
             root.quit()
-        except Exception:
+        except tk.TclError:
             pass
         try:
             root.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
     def func_to_refit(self, func):
@@ -287,7 +279,7 @@ class CameraGui(CTkFrame):
                 v = BooleanVar(value=bool(getattr(self.camConfig, name, False)))
 
             # when UI flips, write to model
-            v.trace_add("write", lambda *_, n=name: self._on_flag_changed(n))
+            v.trace_add("write", lambda var_name, index, op, n=name: self._on_flag_changed(n))
             self._flag_vars[name] = v
 
     def _on_flag_changed(self, name: str):
@@ -297,7 +289,7 @@ class CameraGui(CTkFrame):
         else:
             val = bool(self._flag_vars[name].get())
 
-        # guard rails / side-effects
+        # guard rails / side effects
         if name == "undistort" and not self.calibration.validCal:
             self._flag_vars[name].set(False)
             return
@@ -347,16 +339,16 @@ class CameraGui(CTkFrame):
             self._dp_gpu_var.set(bool(getattr(self.camConfig, "dp_gpu", False)))
 
     def set_ui_active(self, active: bool):
+        import tkinter as tk
         self._ui_active = bool(active)
         # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
         if not self._ui_active:
+            if not self.winfo_exists():
+                return
             try:
-                self.after(100, self.startStreamOff)
-            except Exception:
+                self.after(100, self.startStreamOff)  # type: ignore[call-arg]
+            except tk.TclError:
                 pass
-        else:
-            # Optionally auto-resume prior state; or keep manual
-            pass
 
     # Optional: react to section changes if you want different behavior
     def on_section_show(self, name: str):
@@ -390,7 +382,6 @@ class CameraGui(CTkFrame):
         self.updateYOLOModel()
         if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
-
 
         # --- model -> UI resync on config load (batch DP + flags) ---
         self.sync_flags_from_model()
@@ -452,7 +443,7 @@ class CameraGui(CTkFrame):
                 self.camConfig.calibFilepath):
             if self.selectCalibLabel is not None:
                 self.selectCalibLabel.configure(text='No Calibration Found')
-                self.after(10, self.update_idletasks)
+                self.after(10, self.update_idletasks)  # type: ignore[call-arg]
             return
 
         if not self.calibration.validCal:
@@ -584,7 +575,6 @@ class CameraGui(CTkFrame):
         )
 
         # --- Select image folder ---
-        # --- Select image folder ---
         img_dir_default = (
                 getattr(self.camConfig, "dp_img_dir", None)
                 or self.camConfig.imageFilepath
@@ -656,7 +646,7 @@ class CameraGui(CTkFrame):
         self.gpu_slider.configure(state='disabled')
         self.gpu_slider.set(0)
 
-        # Cleanly intializes GPU monitor, resets to user position
+        # Cleanly initializes GPU monitor, resets to user position
         self._on_toggle_show_gpu()
         self._on_toggle_show_gpu()
 
@@ -669,7 +659,7 @@ class CameraGui(CTkFrame):
                     setattr(self.camConfig, attr_name, var.get())
                     self.saveToCache()
                 except Exception:
-                    # On parse error etc, just keep the text; _get_dp_conf_values()
+                    # On parse error etc., just keep the text; _get_dp_conf_values()
                     # will fall back to [0.80] when it’s actually used.
                     pass
 
@@ -685,7 +675,7 @@ class CameraGui(CTkFrame):
         self._dp_run_btn = CTkButton(
             f,
             text="Run YOLO Batch",
-            fg_color="#2FA572",
+            fg_color=clr.CTK_BUTTON_GREEN,
             command=self._run_yolo_batch_start,
         )
         self._dp_run_btn.grid(row=10, column=0, padx=12, pady=(16, 12), sticky="ew")
@@ -719,9 +709,9 @@ class CameraGui(CTkFrame):
             from support.viz.Plotting import Plotter
             if self.plotter is None:
                 self.plotter = Plotter()
-            vars = data.parse_conf_list(getattr(self, "_dp_conf_list", None))
+            parse_vars = data.parse_conf_list(getattr(self, "_dp_conf_list", None))
             img_dir = Path(str(os.path.dirname(getattr(self.camConfig, "imageFilepath", "")) or "")) / "_ProcessedData"
-            for var in vars:
+            for var in parse_vars:
                 self.plotter.plot(var, img_dir, False, True)
                 try:
                     self.winfo_exists()
@@ -1382,8 +1372,8 @@ class CameraGui(CTkFrame):
         if self.making_gifOrVid:
             return
 
-        exportToGifButton.configure(text="Making gif...", state='disabled', fg_color="blue")
-        exportToVidButton.configure(text="Making gif...", state='disabled', fg_color="blue")
+        exportToGifButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
+        exportToVidButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToGif_worker,
@@ -1395,8 +1385,8 @@ class CameraGui(CTkFrame):
         if self.making_gifOrVid:
             return
 
-        exportToGifButton.configure(text="Making vid...", state='disabled', fg_color="blue")
-        exportToVidButton.configure(text="Making vid...", state='disabled', fg_color="blue")
+        exportToGifButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
+        exportToVidButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToVid_worker,
@@ -1430,8 +1420,8 @@ class CameraGui(CTkFrame):
 
     def _exportToGifOrVid_done(self,
                                exportToGifButton, exportToVidButton):
-        exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_GREEN)
-        exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_GREEN)
+        exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
         self.making_gifOrVid = False
 
     def startStreamToggle(self):
@@ -1461,7 +1451,7 @@ class CameraGui(CTkFrame):
         self.threadStopper.set()
         try:
             cv2.destroyWindow(self.windowName)
-        except cv2.error as e:
+        except cv2.error:
             pass  # Window not yet open
 
         if self.vc is not None and self.vc.isOpened():
@@ -1476,23 +1466,20 @@ class CameraGui(CTkFrame):
         if not self.shutting_down:
             self.showWindow = False
 
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass  # window not yet open
 
     def screenshot(self):
         self.screenshot_impending = True
-        self.screenshotButton.configure(fg_color='black')
-        self.after(500, lambda: self.screenshotButton.configure(fg_color='green'))
+        self.screenshotButton.configure(fg_color=clr.CTK_BLACK)
+        self.after(500, lambda: self.screenshotButton.configure(fg_color=clr.CTK_GREEN))  # type: ignore[call-arg]
 
     def recordOn(self):
-        self.recordButton.configure(fg_color='green', text='Saving Imagery', hover_color='navy', command=self.recordOff)
+        self.recordButton.configure(fg_color=clr.CTK_GREEN, text='Saving Imagery', hover_color=clr.CTK_NAVY,
+                                    command=self.recordOff)
         self.recording = True
 
     def recordOff(self):
         self.recordButton.configure(fg_color=clr.CTK_BUTTON_RED, text=f'Saved Imagery: #{self.img_idx}',
-                                    hover_color='blue',
+                                    hover_color=clr.CTK_BLUE,
                                     command=self.recordOn)
         self.recording = False
 
@@ -1528,9 +1515,9 @@ class CameraGui(CTkFrame):
 
         try:
             cv2.destroyWindow(self.windowName)
-        except cv2.error as e:
+        except cv2.error:
             pass
-        self.after(0, self._on_worker_exit)
+        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
 
     @staticmethod
     def convert_cv_to_pil(img):
@@ -1572,7 +1559,7 @@ class CameraGui(CTkFrame):
             key = cv2.waitKey(1)
 
             if key == 27:  # exit on ESC
-                self.after(0, self.filepath_page.toggle_stream)
+                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                 self.threadStopper.set()
                 break
 
@@ -1586,7 +1573,7 @@ class CameraGui(CTkFrame):
                 print('Time out')
 
             if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) < 1:
-                self.after(0, self.filepath_page.toggle_stream)
+                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                 self.threadStopper.set()
                 break
 
@@ -1600,7 +1587,7 @@ class CameraGui(CTkFrame):
         except cv2.error:
             pass
 
-        self.after(0, self._on_worker_exit)
+        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
         return
 
     def _draw_chessboard_state(self, frame):
@@ -1658,13 +1645,13 @@ class CameraGui(CTkFrame):
         return None
 
     @staticmethod
-    def _stride_for_speed(speed_abs: int) -> int:
+    def _stride_for_speed(speed_abs: float) -> float:
         s = max(0, int(speed_abs))
         if s == 0:
             return 0
         if s == 1:
             return 1
-        return min(8, s)
+        return min(8.0, s)
 
     def populate_idsTimes(self, directory):
         d = Path(directory)
@@ -1715,10 +1702,6 @@ class CameraGui(CTkFrame):
         import cProfile
         import pstats
 
-        if not self.profile_run_folder:
-            # Normal behavior
-            return self.run_folder_reader()
-
         prof = cProfile.Profile()
         try:
             prof.enable()
@@ -1768,7 +1751,11 @@ class CameraGui(CTkFrame):
         self.pause = False
         self.last_nonzero_sign = 1
         last_speed = self.playback.speed
-        curr_idx = 0
+
+        if num_images > 0:
+            self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
+        else:
+            self.playback.curr_idx = 0
 
         # ---- Playback slider: initialize range once we know dataset length ----
         if not getattr(self, "_pb_slider_range_inited", False):
@@ -1778,7 +1765,7 @@ class CameraGui(CTkFrame):
             # UI-thread update
             try:
                 self.after(0, self._pb_ui_set_slider_range, int(num_images))
-                self.after(0, self._pb_ui_set_slider_pos, int(curr_idx), int(num_images))
+                self.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
             except Exception:
                 pass
 
@@ -1795,16 +1782,29 @@ class CameraGui(CTkFrame):
             filepaths=[str(p) for p in paths],
             max_buffer=96,
             preprocess=None,
-            start_index=0,
+            start_index=self.playback.curr_idx,
             loop=True,
             read_flags=cv2.IMREAD_COLOR,
         ).start()
 
         # one-shot key handling
         pending_keys = []
-        last_edge_time: dict[int, float] = {}
 
         wall_start = time.monotonic()
+
+        # If resuming mid-sequence in Real_time mode, align wall_start so elapsed maps to curr_idx
+        if self.camConfig.playback_mode == PlaybackSpeed.Real_time and num_images > 0 and len(t) > 0:
+            rs = float(self.camConfig.rt_speed) or 1e-6
+            # Make elapsed_ref ~= t[curr_idx] at start (for forward play)
+            wall_start = time.monotonic() - (t[self.playback.curr_idx] / rs)
+
+        # Align wall_start so Fixed_fps starts immediately when resuming mid-sequence
+        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and num_images > 0:
+            period = 1.0 / max(0.001, float(self.camConfig.target_fps))
+            # Forward play: make target_time for curr_idx approximately "now"
+            wall_start = time.monotonic() - period * float(self.playback.curr_idx)
+
+        self.update_playbackMenu()
 
         def sleep_until(deadline) -> list[int]:
             keys = []
@@ -1842,10 +1842,10 @@ class CameraGui(CTkFrame):
                         signed_stride = self.last_nonzero_sign * s_abs
                         if signed_stride != self.playback.stride:
                             loader.set_stride(signed_stride)
-                            self.playback.stride = signed_stride
+                            self.playback.stride = int(signed_stride)
 
-                        curr_idx = max(0, min(curr_idx, num_images - 1))
-                        loader.seek(curr_idx, clear_buffer=True)
+                        self.playback.curr_idx = max(0, min(self.playback.curr_idx, num_images - 1))
+                        loader.seek(self.playback.curr_idx, clear_buffer=True)
                         self.pauseCache.clear()
 
                     last_speed = self.playback.speed
@@ -1868,14 +1868,14 @@ class CameraGui(CTkFrame):
                     frame = None
                     if got is not None:
                         got_idx, frame = got
-                        curr_idx = got_idx
+                        self.playback.curr_idx = got_idx
 
                     # leaving pause → invalidate paused cache
                     self.pauseCache.clear()
 
                 else:
                     # ===== PAUSED MODE with CACHE =====
-                    target_idx = max(0, min(curr_idx, num_images - 1))
+                    target_idx = max(0, min(self.playback.curr_idx, num_images - 1))
 
                     # If cache is invalid or user moved (z/c), fetch once; otherwise reuse cached frame
                     if self.pauseCache.frame is None or self.pauseCache.idx != target_idx:
@@ -1886,7 +1886,7 @@ class CameraGui(CTkFrame):
                         if got is not None:
                             got_idx, frame = got
                             self.pauseCache.set(got_idx, frame)
-                            curr_idx = got_idx
+                            self.playback.curr_idx = got_idx
                         else:
                             # If file truly missing, print once; otherwise keep last cached frame (if any)
                             p = paths[target_idx]
@@ -1896,15 +1896,15 @@ class CameraGui(CTkFrame):
                     frame = self.pauseCache.frame
 
                 # ===== display / HUD =====
-                if frame is not None and Path(paths[curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
+                if frame is not None and Path(paths[self.playback.curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
 
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not self.pause:
                         period = 1.0 / self.camConfig.target_fps
                         target_time = wall_start + period * (
-                            curr_idx if not self.last_nonzero_sign < 0 else num_images - curr_idx)
+                            self.playback.curr_idx if not self.last_nonzero_sign < 0 else num_images - self.playback.curr_idx)
                         if target_time < time.monotonic():
                             wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                curr_idx if not self.last_nonzero_sign < 0 else num_images - curr_idx)
+                                self.playback.curr_idx if not self.last_nonzero_sign < 0 else num_images - self.playback.curr_idx)
                         pending_keys.extend(sleep_until(target_time))
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not self.pause:
@@ -1926,24 +1926,24 @@ class CameraGui(CTkFrame):
                             idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
 
                         idx_target = max(0, min(idx_target, num_images - 1))
-                        if idx_target != curr_idx:
+                        if idx_target != self.playback.curr_idx:
                             loader.seek(idx_target, clear_buffer=True)
                             got = loader.get_next(timeout=0.02)
                             if got is not None:
-                                curr_idx, frame = got
+                                self.playback.curr_idx, frame = got
 
                         pending_keys.extend(self._poll_keys(1))
 
-                    ts = self.ImageTimeReader.idsTimes[curr_idx][1]
+                    ts = self.ImageTimeReader.idsTimes[self.playback.curr_idx][1]
                     boxAround = False
-                    if self.camConfig.start_export_idx <= curr_idx <= self.camConfig.end_export_idx:
+                    if self.camConfig.start_export_idx <= self.playback.curr_idx <= self.camConfig.end_export_idx:
                         boxAround = True
                     if ts is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[curr_idx][0],
+                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[self.playback.curr_idx][0],
                                            box_around=boxAround)
                     else:
                         self.analyze_image(frame, ts + self.camConfig.cam_to_log_time_offset,
-                                           self.ImageTimeReader.idsTimes[curr_idx][0], box_around=boxAround)
+                                           self.ImageTimeReader.idsTimes[self.playback.curr_idx][0], box_around=boxAround)
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
@@ -1951,20 +1951,20 @@ class CameraGui(CTkFrame):
                 pending_keys.extend(self._poll_keys(1))
 
                 for (action, args) in self._drain_playback_cmds():
-                    curr_idx, wall_start = self._apply_playback_action(
-                        action, args, loader=loader, curr_idx=curr_idx, t=t, wall_start=wall_start
+                    self.playback.curr_idx, wall_start = self._apply_playback_action(
+                        action, args, loader=loader, curr_idx=self.playback.curr_idx, t=t, wall_start=wall_start
                     )
                 while pending_keys:
                     key = pending_keys.pop(0)
                     if key == 27:  # ESC
-                        self.after(0, self.filepath_page.toggle_stream)
+                        self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                         self.threadStopper.set()
                         break
 
                     action, args = self._key_to_playback_action(key)
                     if action is not None:
-                        curr_idx, wall_start = self._apply_playback_action(
-                            action, args, loader=loader, curr_idx=curr_idx, t=t, wall_start=wall_start
+                        self.playback.curr_idx, wall_start = self._apply_playback_action(
+                            action, args, loader=loader, curr_idx=self.playback.curr_idx, t=t, wall_start=wall_start
                         )
 
                     while self.making_gifOrVid:
@@ -1972,16 +1972,16 @@ class CameraGui(CTkFrame):
 
                 # ---- Playback slider: publish position when idx changes ----
                 if getattr(self, "_pb_num_images", 0):
-                    if getattr(self, "_pb_last_sent_idx", None) != curr_idx:
-                        self._pb_last_sent_idx = curr_idx
+                    if getattr(self, "_pb_last_sent_idx", None) != self.playback.curr_idx:
+                        self._pb_last_sent_idx = self.playback.curr_idx
                         try:
-                            self.after(0, self._pb_ui_set_slider_pos, int(curr_idx), int(num_images))
+                            self.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
                         except Exception:
                             pass
 
                 pending_keys.extend(self._poll_keys(1))
                 if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
-                    self.after(0, self.filepath_page.toggle_stream)
+                    self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                     self.threadStopper.set()
                     break
 
@@ -1990,7 +1990,7 @@ class CameraGui(CTkFrame):
                 cv2.destroyWindow(self.windowName)
             except cv2.error:
                 pass
-            self.after(0, self._on_worker_exit)
+            self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
             loader.stop()
 
     def update_playbackMenu(self):
@@ -2476,15 +2476,15 @@ class CameraGui(CTkFrame):
             for idx, detectID in enumerate(self.detectIDS):
                 try:
                     points.append(truthPoints[str(detectID[0])])
-                except KeyError as e:
+                except KeyError:
                     removeIDs.append(idx)
 
             centers = self.centers.copy()
-            for id in reversed(removeIDs):
-                centers = np.delete(centers, id, axis=0)
+            for idx in reversed(removeIDs):
+                centers = np.delete(centers, idx, axis=0)
             points = np.array(points)
 
-        probe_pose = np.array([4.89965725, .20014286, -1.55304432])
+        # probe_pose = np.array([4.89965725, .20014286, -1.55304432])
 
         self.print3DTruthOnce = False
 
@@ -2575,8 +2575,6 @@ class CameraGui(CTkFrame):
         self.fisheye_to_cubemap_vectorized()
 
     def fisheye_to_cubemap_vectorized(self):
-
-        cube_faces = {}
 
         self.map_x = {}
         self.map_y = {}
@@ -2787,12 +2785,12 @@ class CameraGui(CTkFrame):
             for idx, detectID in enumerate(self.detectIDS):
                 try:
                     points.append(truthPoints[str(detectID[0])])
-                except KeyError as e:
+                except KeyError:
                     removeIDs.append(idx)
 
             centers = deepcopy(self.centers)
-            for id in reversed(removeIDs):
-                centers = np.delete(centers, id, axis=0)
+            for idx in reversed(removeIDs):
+                centers = np.delete(centers, idx, axis=0)
             points = np.array(points)
 
             if len(points) < 6:
@@ -2843,7 +2841,7 @@ class CameraGui(CTkFrame):
             for idx, detectID in enumerate(self.detectIDS):
                 try:
                     points.append(truthPoints[str(detectID[0])])
-                except KeyError as e:
+                except KeyError:
                     removeIDs.append(idx)
 
             centers = deepcopy(self.centers)
@@ -2906,7 +2904,7 @@ class CameraGui(CTkFrame):
                                 minLineLength=np.sum(self.curr_frame.shape) / 10.0,
                                 maxLineGap=20)
 
-        color = (0, 0, 255)
+        color = clr.RED
 
         # Find the most horizontal line
         if lines is not None:
@@ -2925,7 +2923,7 @@ class CameraGui(CTkFrame):
                     x2 = self.curr_frame.shape[1]
                     self.hor_last_midpoint = ((y1 + m * x2 / 2.0) + self.hor_last_midpoint) / 2.0
                     self.hor_last_slope = (m + self.hor_last_slope) / 2.0
-                    color = (20, 150, 20)
+                    color = clr.YELLOWGREEN
 
         x1 = 0
         x2 = int(self.curr_frame.shape[1])
@@ -2949,8 +2947,6 @@ class CameraGui(CTkFrame):
             if self.last_bounding_box_size is not None:
                 self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
                     1] + self.radius * 4.0) / 5.0
-            else:
-                self.confSlider(self.camConfig.yolo_conf)
 
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
             self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.50)
@@ -2958,7 +2954,6 @@ class CameraGui(CTkFrame):
             self.radius = min(800.0, self.radius + 12.0)
             if self.yoloSession is not None:
                 self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
-                self.confSliderBar.set(self.yoloSession.conf)
         else:
             if self.last_bounding_box_size is not None:
                 # 1.0 for single feature, 1.5 for drogue
@@ -2979,11 +2974,11 @@ class CameraGui(CTkFrame):
                                                   y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
     def run_yolo(self, orig_image):
-        '''
+        """
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
-        '''
+        """
         from support.vision import yolo
         if self.yoloSession is None:
             self.yoloSession = yolo.YOLO()
@@ -3017,7 +3012,7 @@ class CameraGui(CTkFrame):
                                    idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
                                    usedAlgos=algos)
 
-        centers, boxes, scores, class_ids, time = output
+        centers, boxes, scores, class_ids, img_time = output
 
         if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
@@ -3072,29 +3067,28 @@ class CameraGui(CTkFrame):
             self.qnpKFYoloResult = None
             return
 
-    def factor_graph(self, time):
+    def factor_graph(self, img_time):
         from support.runtime.fg_drogue_only import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
-        color = (120, 255, 120)
+        color = clr.YELLOWGREEN
 
         if self.last_yolo_3d_estimate is not None:
-            if time < self.last_time_update:
+            if img_time < self.last_time_update:
                 self.FG.reset()
-            elif time > self.last_time_update:
-                self.FG.newRecvMeas(self.last_yolo_3d_estimate, time)
-                self.last_time_update = time
+            elif img_time > self.last_time_update:
+                self.FG.newRecvMeas(self.last_yolo_3d_estimate, img_time)
+                self.last_time_update = img_time
             if self.FG.numMeas > 20:
                 self.FG.popOldestMeas()
             if self.FG.numMeas > 2:
                 self.FG.opt()
         else:
-            color = (0, 0, 255)
+            color = clr.RED
 
-        if time is not None and self.FG.numMeas > 2:
+        if img_time is not None and self.FG.numMeas > 2:
             K = self.calibration.getCameraMatrix()
-            d = self.calibration.getDistortion()
-            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (time - self.last_time_update) * self.FG.r_V_d[-1])
+            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (img_time - self.last_time_update) * self.FG.r_V_d[-1])
             self.curr_FG_pixel = (self.curr_FG_pixel / self.curr_FG_pixel[2])[:2]
 
             h, w, _ = self.markup_frame.shape
@@ -3123,9 +3117,9 @@ class CameraGui(CTkFrame):
 
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
 
-            self.current_var_x = var_x + var_vx * (time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
-            self.current_var_y = var_y + var_vy * (time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
-            self.current_var_z = var_z + var_vz * (time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
+            self.current_var_x = var_x + var_vx * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
+            self.current_var_y = var_y + var_vy * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
+            self.current_var_z = var_z + var_vz * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
 
         self.last_yolo_3d_estimate = None
 

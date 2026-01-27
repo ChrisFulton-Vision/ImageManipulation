@@ -114,7 +114,7 @@ class Filepath_page(ctk.CTkFrame):
         selectTruthPointsLabel = ctk.CTkLabel(self, textvariable=self.selectTruthPointsLabelText)
 
         # YOLO Selector
-        selectYOLO_folderButton = ctk.CTkButton(self, text='Select YOLO Folder', fg_color=clr.CTK_GREEN,
+        selectYOLO_folderButton = ctk.CTkButton(self, text='Select YOLO Folder',
                                                 command=self.selectYoloFolder)
         self.yoloFolderText = ctk.StringVar(value="../" + Path(
             self.ctrl.camConfig.yoloFilepath).name if self.ctrl.camConfig.yoloFilepath else "../")

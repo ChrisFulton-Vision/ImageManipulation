@@ -88,16 +88,35 @@ class BufferedImageLoader:
     def get_next(self, timeout: Optional[float] = 0.2) -> Optional[Tuple[int, np.ndarray]]:
         """
         Pop the next (index, frame) from buffer.
-        Returns None if stopped or timed out (so your UI loop can keep pumping).
+        Returns None if stopped or timed out.
+        Drops stale frames produced before the most recent seek/stride change.
         """
-        try:
-            idx, img, gen = self._q.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        # sentinel or shutdown
-        if idx < 0 or img is None:
-            return None
-        return idx, img
+        deadline = None if timeout is None else (time.monotonic() + timeout)
+
+        while True:
+            # time budget handling
+            if deadline is None:
+                remaining = None
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+
+            try:
+                idx, img, gen = self._q.get(timeout=remaining)
+            except queue.Empty:
+                return None
+
+            # sentinel/shutdown
+            if idx < 0 or img is None:
+                return None
+
+            # drop stale frames
+            with self._lock:
+                if gen != self._generation:
+                    continue
+
+            return idx, img
 
     # ----------------- worker logic -----------------
     def _worker(self):

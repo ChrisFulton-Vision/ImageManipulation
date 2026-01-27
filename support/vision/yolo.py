@@ -2,15 +2,16 @@ import copy
 import datetime
 import glob
 import os
+
+import cv2
 import numpy as np
 from numpy.typing import NDArray
 
-import cv2
-from support.vision.calibration import Calibration
 from support.io.meta_yolo_reader import MetaYoloReader
 from support.io.my_logging import LOG
+from support.vision.calibration import Calibration
 
-CUDA_BIN  = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
+CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6\bin"
 CUDNN_BIN = r"C:\Program Files\NVIDIA\CUDNN\v9.4\bin\12.6"
 
 if os.path.isdir(CUDA_BIN):
@@ -37,9 +38,9 @@ ort.preload_dlls(cuda=True, cudnn=True, msvc=True, directory=None)
 
 
 class YOLO:
-    '''
+    """
     This class will perform a YOLO inference on a provided image.
-    '''
+    """
 
     def __init__(self, conf: float = 0.75, iou: float = 0.99, yoloSize=(864, 864),
                  model_path="YOLOModels/GIII_01172025_10_100M_MoreFeatures/",
@@ -74,13 +75,13 @@ class YOLO:
         return len(self.class_names)
 
     def setNewFolder(self, directory: str) -> None:
-        '''
+        """
         This function changes all the necessary settings for selecting a new YOLO folder. The folder should have
         ONE .onnx file and ONE .csv file. The onnx file should be the yolo model. The csv file should be the
         yolo meta_data.
         :param directory: As a string, the location of the intended directory.
         :return: Nothing
-        '''
+        """
         if len(glob.glob(os.path.join(directory, f'*.onnx'))) > 0 and len(
                 glob.glob(os.path.join(directory, f'*.csv'))) > 0:
             self.modelPath = glob.glob(os.path.join(directory, f'*.onnx'))[0]
@@ -90,12 +91,13 @@ class YOLO:
             else:
                 self.yoloSize = self.reader.imageSize
 
-            import ast, onnx
+            import ast
+            import onnx
 
             self.class_names = range(self.reader.numClasses)
 
             model_proto = onnx.load(self.modelPath)
-            meta = {p.key.lower(): p.value for p in model_proto.metadata_props}
+            meta = {prop.key.lower(): prop.value for prop in model_proto.metadata_props}
 
             if "names" in meta:
                 raw = meta["names"]
@@ -120,11 +122,11 @@ class YOLO:
             self.reinitSession()
 
     def reinitSession(self) -> None:
-        '''
+        """
         When yolo parameters change, this creates a new session with those parameters. Must be called when
         something changes.
         :return nothing:
-        '''
+        """
         sess_options = ort.SessionOptions()
         # sess_options.intra_op_num_threads = 1
         # sess_options.inter_op_num_threads = 1
@@ -136,12 +138,14 @@ class YOLO:
     def inferOnImage(self,
                      image: NDArray,
                      markup_image: NDArray,
-                     bias_tracking: bool = False) -> tuple[NDArray, NDArray]:
-        '''
+                     bias_tracking: bool = False) -> tuple[NDArray, tuple[list, list, list, list, float]]:
+        """
         Runs the sub-methods necessary to process an image with YOLO
+        :param bias_tracking:
+        :param markup_image:
         :param image: np.array from OpenCV
         :return: Marked-up image post-yolo inference
-        '''
+        """
         self.bias_tracking_active = bias_tracking
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
@@ -151,14 +155,14 @@ class YOLO:
         self.calibration = copy.deepcopy(calibration)
 
     def preprocessImage(self, image: NDArray) -> NDArray:
-        '''
+        """
         This preprocessing:
             Fixes the image to the YOLO network's size
             Transposes the image so that it matches onnxruntime's input format
             Adds a dimension to match onnxruntime's input format
         :param image: np.array from OpenCV
         :return: preprocessed image
-        '''
+        """
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
             height, width = self.yoloSize
@@ -168,21 +172,21 @@ class YOLO:
         image = image.astype(np.float32) / 255.0
         return image
 
-    def processImage(self, yoloImage: NDArray) -> NDArray:
-        '''
+    def processImage(self, yoloImage: NDArray) -> tuple[list, list, list, list, float]:
+        """
         Clears the 'cache' for previous YOLO solutions, then calls the yolo inference method
         :param yoloImage: np.array that has completed preprocessing
         :return: onnxruntime output
-        '''
+        """
         self.boxes, self.scores, self.class_ids = [], [], []
         return self.runOneSession(yoloImage)
 
-    def runOneSession(self, yoloImage: NDArray) -> NDArray:
-        '''
-        Records time before and after a yolo infernce for time differencing. Runs the YOLO session
+    def runOneSession(self, yoloImage: NDArray) -> tuple[list, list, list, list, float]:
+        """
+        Records time before and after a yolo inference for time differencing. Runs the YOLO session
         :param yoloImage: image that has been through preprocessImage
         :return: outputs from onnxruntime session. Labeled output for clarity.
-        '''
+        """
         startTime = datetime.datetime.now()
         if self.session is not None:
             output = self.session.run(None, {self.session.get_inputs()[0].name: yoloImage})
@@ -192,14 +196,13 @@ class YOLO:
         centers, boxes, scores, class_ids = self.interpretOutput(output)
         return centers, boxes, scores, class_ids, (endTime - startTime).total_seconds()
 
-    def interpretOutput(self, output: NDArray) -> (list, list, list, list):
-        '''
+    def interpretOutput(self, output: NDArray):
+        """
         Takes outputs from onnxruntime and processes them
         Filters to retain only the highest-confidence detection for each class
         :param output:  onnxruntime session outputs
         :return: cleaner outputs for interpretation
-        '''
-        best_detections = {}
+        """
 
         if output is None:
             return [], [], [], []
@@ -253,8 +256,8 @@ class YOLO:
 
         return centers, boxes, scores, classes
 
+
 if __name__ == '__main__':
-    from cv2 import imshow, imread, waitKey
 
     yolo = YOLO(conf=0.75, iou=0.99, yoloSize=(864, 864),
                 model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
@@ -269,13 +272,15 @@ if __name__ == '__main__':
         os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
 
     from support.io.data_processing import natural_sort
+
     allImages = natural_sort(allImages)
 
     for imgFP in allImages:
-        (newImg, rvec_tvec), sol = yolo.inferOnImage(imread(imgFP))
-        imshow('YOLO', newImg)
+        img = cv2.imread(imgFP)
+        (newImg, rvec_tvec), sol = yolo.inferOnImage(img, img)
+        cv2.imshow('YOLO', newImg)
         # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
-        key = waitKey(0)
+        key = cv2.waitKey(0)
         if key == 121:
             print('you hit yes')
             with open("test.txt", "w") as f:

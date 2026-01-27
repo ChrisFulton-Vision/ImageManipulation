@@ -1662,18 +1662,8 @@ if __name__ == "__main__":
 
     # --- Run benchmarks on both your standard + fisheye cal ---
     cal_std = default_864_cam()
-    cal_std.fisheye = False
 
-    cal_fish = Calibration()
-    cal_fish.fisheye = True
-    cal_fish.fx = cal_fish.fy = 450.0
-    cal_fish.cx = cal_fish.cy = 432.0
-    cal_fish.k1 = -0.010
-    cal_fish.k2 = 0.0015
-    cal_fish.k3 = -0.0002
-    cal_fish.k4 = 0.00002
-    cal_fish.width = 864
-    cal_fish.height = 864
+    cal_fish = default_fisheye_cam()
 
     benchmark_undistort(cal_std,  N=200_000, seed=1)
     benchmark_undistort(cal_fish, N=200_000, seed=2)

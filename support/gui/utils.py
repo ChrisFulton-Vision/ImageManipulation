@@ -62,6 +62,7 @@ class PlaybackState:
     speed: float = 1.0  # signed: <0 reverse, 0 paused, >0 forward
     last_nonzero_sign: int = 1  # +1 or -1, used when resuming from pause
     stride: int = 1  # cached stride we last told the loader
+    curr_idx: int = 0
 
 class ThreadStopper:
     def __init__(self):

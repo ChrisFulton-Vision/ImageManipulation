@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable, Optional, Protocol
 from support.io.camera_config import CameraConfig
+from support.viz.draw_pnp_qnp import pnp_qnp_draw
 from support.core.enums import ImageSource
 import support.viz.colors as clr
 import customtkinter as ctk
@@ -17,6 +18,7 @@ import cv2
 # super to reload its assigned YOLO model.
 class FilepathController(Protocol):
     camConfig: CameraConfig
+    pnpDrawer: pnp_qnp_draw
 
     def saveToCache(self, immediate: bool = False) -> None: ...
 
@@ -379,6 +381,12 @@ class Filepath_page(ctk.CTkFrame):
     def selectYoloFolder(self):
         init_dir = Path(self.ctrl.camConfig.yoloFilepath or Path.cwd())
         poss_dir = filedialog.askdirectory(initialdir=str(init_dir), title='Select YOLO Folder')
+
+        # If have an old solution, destroy when changing objects
+        if self.ctrl.pnpDrawer is not None:
+            self.ctrl.pnpDrawer.last_q_vec = None
+            self.ctrl.pnpDrawer.last_t_vec = None
+
         if poss_dir:
             self.ctrl.camConfig.yoloFilepath = poss_dir
             self.ctrl.updateYOLOModel()

@@ -166,6 +166,11 @@ class ImageProcessing_page(CTkFrame):
             self, text="SolveWQnP from YOLO", variable=self.ctrl._flag_vars["qnpKFYoloPoints"]
         )
         qnpKFYoloPoints.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+        circleNotFeatureDraw = CTkCheckBox(
+            self, text="Circles", variable=self.ctrl._flag_vars["circles_not_features"]
+        )
+        circleNotFeatureDraw.grid(row=rowID, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
         rowID += 1
 
         detectCornersCheckbox = CTkCheckBox(

@@ -30,7 +30,8 @@ class pnp_qnp_draw:
                     iou: float,
                     yoloSize: tuple[int, int],
                     idsNamesLocs,
-                    usedAlgos:twoToThreeSelectedAlgorithms) -> None:
+                    usedAlgos:twoToThreeSelectedAlgorithms,
+                    circles_not_features: bool = False) -> None:
         '''
         Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
         up the image with a PnP solution as well.
@@ -124,19 +125,12 @@ class pnp_qnp_draw:
                                newBoxes,
                                newClass_ids,
                                newScores,
-                               yoloSize)
+                               yoloSize,
+                               draw_as_circles=circles_not_features)
 
             if len(set(indices)) > 5:
                 idx = 0
-                if usedAlgos.use_pnp:
-                    self._drawPnP(image,
-                             newClass_ids,
-                             newCentersForPnP,
-                             markup_is_undistorted,
-                             calibration,
-                             yoloSize,
-                             idsNamesLocs)
-                    idx += 1
+
                 if usedAlgos.use_qnp:
                     self._drawQnP(image,
                              newClass_ids,
@@ -145,12 +139,27 @@ class pnp_qnp_draw:
                              calibration,
                              yoloSize,
                              idsNamesLocs,
-                             idx)
+                             idx,
+                             draw_as_circles=circles_not_features)
+                    idx += 1
+                if usedAlgos.use_pnp:
+                    self._drawPnP(image,
+                             newClass_ids,
+                             newCentersForPnP,
+                             markup_is_undistorted,
+                             calibration,
+                             yoloSize,
+                             idsNamesLocs,
+                             idx,
+                             draw_as_circles=circles_not_features)
+                    idx += 1
 
     @staticmethod
     def _drawBoxes(image: NDArray, newCenters: list, newBoxes: list,
                   newClass_ids: list, newScores: list,
-                  yoloSize: tuple[float, float]) -> NDArray:
+                  yoloSize: tuple[float, float],
+                   draw_as_circles: bool = True,
+                   circle_radius_px: int | None = None) -> NDArray:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -174,14 +183,19 @@ class pnp_qnp_draw:
             y1 = int(h / y_h * y1)
             y2 = int(h / y_h * y2)
 
+            if draw_as_circles:
+                r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.002 * w)))
+                cv2.circle(image, (x, y), r + 2, clr.BLACK, -1)
+                cv2.circle(image, (x, y), r, clr.LIGHTBLUE, -1)
+            else:
+                label = f"{class_id}"
+                cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
 
-            label = f"{class_id}"
-            cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
-            (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-            lowerLeftCorner = (int(x-txt_w/2.0), int(y+txt_h/2.0))
+                (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+                lowerLeftCorner = (int(x-txt_w/2.0), int(y+txt_h/2.0))
 
-            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 6)
-            cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 4)
+                cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 6)
+                cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 4)
 
         (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         txt_height_perRow = txt_height + 15
@@ -208,7 +222,9 @@ class pnp_qnp_draw:
                  markup_is_undistorted,
                  calibration,
                  yoloSize,
-                 idsNamesLocs):
+                 idsNamesLocs,
+                 idx =0,
+                 draw_as_circles=False):
         h, w, _ = image.shape
 
         if calibration is None:
@@ -231,10 +247,16 @@ class pnp_qnp_draw:
         if not ret:
             return
 
-        R, _ = cv2.Rodrigues(rvec)
-        P = np.hstack((R, tvec))
-        _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(P)
-        rpy = np.array([euler_angles[0,0], euler_angles[1,0], euler_angles[2,0]])
+        # R, _ = cv2.Rodrigues(rvec)
+        # P = np.hstack((R, tvec))
+        # _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(P)
+
+        if idx == 0:
+            scale = 0.006
+        elif idx == 1:
+            scale = 0.010
+        else:
+            scale = 0.014
 
         self.draw_proj(
             image=image,
@@ -248,7 +270,10 @@ class pnp_qnp_draw:
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
             title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
-            rowIDX=0
+            rowIDX=idx,
+            txt_scale = 0.75,
+            draw_as_circles = draw_as_circles,
+            circle_radius_px = int(round(scale * w))
         )
 
         return (rvec, tvec)
@@ -261,7 +286,8 @@ class pnp_qnp_draw:
                  calibration,
                  yoloSize,
                  idsNamesLocs,
-                 index_for_display):
+                 index_for_display,
+                 draw_as_circles: bool = False):
         h, w, _ = image.shape
 
         if calibration is None:
@@ -277,12 +303,18 @@ class pnp_qnp_draw:
             object_pts=object_points,
             img_pts=image_points,
             cal=calibration,
-            user_seed_q=self.last_q_vec,
-            user_seed_t=self.last_t_vec
+            # user_seed_q=self.last_q_vec,
+            # user_seed_t=self.last_t_vec,
+            # use_solvePnP_as_seed=True
         )
         self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
 
-        rpy = q_rvec.eulerD()
+        if index_for_display == 0:
+            scale = 0.006
+        elif index_for_display == 1:
+            scale = 0.010
+        else:
+            scale = 0.014
 
         self.draw_proj(
             image=image,
@@ -298,7 +330,8 @@ class pnp_qnp_draw:
             title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
             rowIDX=index_for_display,
             txt_color = clr.ORANGE,
-            txt_scale = 0.75
+            draw_as_circles = draw_as_circles,
+            circle_radius_px = int(round(scale * w))
         )
         return (q_rvec, q_tvec)
 
@@ -316,7 +349,9 @@ class pnp_qnp_draw:
                       title: str,
                       rowIDX: int,
                       txt_color = clr.YELLOW,
-                      txt_scale = 1.0):
+                      txt_scale = 1.0,
+                      draw_as_circles: bool = True,
+                      circle_radius_px: int | None = None):
 
         h, w, _ = image.shape
         y_h, y_w = yoloSize
@@ -350,10 +385,19 @@ class pnp_qnp_draw:
             y = float(h / y_h * y)
 
             if (0 < x < w and 0 < y < h):
-                (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, txt_scale * med_text(w), 2)
-                lowerLeftCorner = (int(x-txt_w/2), int(y+txt_h/2))
+                if draw_as_circles:
+                    # radius scales gently with image size unless overridden
+                    r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.006 * w)))
+                    cx, cy = int(round(x)), int(round(y))
+                    # outline + fill for contrast
+                    cv2.circle(image, (cx, cy), r + 3, clr.BLACK, 1)
+                    cv2.circle(image, (cx, cy), r, txt_color, 2)
+                else:
+                    (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, txt_scale * med_text(w),
+                                                           2)
+                    lowerLeftCorner = (int(x - txt_w / 2), int(y + txt_h / 2))
 
-                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                            txt_scale * med_text(w), clr.BLACK, 4)
-                cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
-                            txt_scale * med_text(w), txt_color, 2)
+                    cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                                txt_scale * med_text(w), clr.BLACK, 4)
+                    cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
+                                txt_scale * med_text(w), txt_color, 2)

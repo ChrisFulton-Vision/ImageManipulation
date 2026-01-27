@@ -617,7 +617,7 @@ def main():
     if sigma_squared is not None:
         # Add Gaussian pixel noise based on covariances created per pixel
         for idx, (m_pix, std_sq) in enumerate(zip(orig_meas_pix, sigma_squared)):
-            meas_pix[idx] = np.random.normal(m_pix, sqrt(std_sq))
+            meas_pix[idx] = np.random.normal(m_pix, np.sqrt(std_sq))
     else:
         # Add i.i.d. Gaussian pixel noise (sigma=5 px) to simulate detections
         meas_pix = orig_meas_pix + np.random.normal(0.0, 2.0, orig_meas_pix.shape)

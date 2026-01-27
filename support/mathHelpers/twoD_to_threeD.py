@@ -40,7 +40,6 @@ from support.mathHelpers.include_numba import _njit as njit, prange
 from support.core.enums import robust_cost
 from numpy.typing import NDArray
 from dataclasses import dataclass
-from support.io.my_logging import LOG
 
 # Pretty-printing controls for numpy (purely cosmetic; does not affect math)
 np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
@@ -1403,6 +1402,7 @@ def solveQnP(
     robust_kind: robust_cost = robust_cost.huber,
     robust_param: float = 2.0,
     seed_cfg: SeedConfig | None = None,
+    use_solvePnP_as_seed: bool = False,
 ):
     """
     QnP solver:
@@ -1417,6 +1417,17 @@ def solveQnP(
     if (user_seed_q is not None) and (user_seed_t is not None):
         seed_q = user_seed_q.copy()
         seed_t = user_seed_t.copy()
+    elif use_solvePnP_as_seed:
+        import cv2
+        ret, rvec, tvec, inliers = cv2.solvePnPRansac(
+            objectPoints=object_pts,
+            imagePoints=img_pts,
+            cameraMatrix=cal.getCameraMatrix(),
+            distCoeffs=np.zeros((5,)),
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        seed_q, seed_t = q().fromOpenCV_toAftr_rvec(rvec, tvec)
     else:
         if seed_cfg is None:
             seed_cfg = SeedConfig()
@@ -1433,6 +1444,7 @@ def solveQnP(
             )
         else:
             seed_q, seed_t = DLT(object_pts, img_pts, cal)
+
 
     _, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts)
 

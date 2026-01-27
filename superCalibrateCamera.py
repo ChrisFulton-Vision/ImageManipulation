@@ -77,7 +77,7 @@ class CameraGui(CTkFrame):
             "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
             "cubemap", "hud", "hideAprilTags", "draw_chessboard",
             # --- Pose from YOLO detections (multi-feature) ---
-            "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints",
+            "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints", "circles_not_features",
             'yolo_conf', 'yolo_iou'
         ]
         self.threadStopper = utils.ThreadStopper()
@@ -405,7 +405,9 @@ class CameraGui(CTkFrame):
         if self.func_that_refits is not None:
             self.func_that_refits()
 
-    def saveToCache(self, immediate: bool = False, delay_ms: int = 500):
+    def saveToCache(self,
+                    immediate: bool = False,
+                    delay_ms: int = 500):
         if getattr(self, "_loading_config", False):
             return
 
@@ -1187,7 +1189,13 @@ class CameraGui(CTkFrame):
         return out
 
     # --- Single authoritative action dispatcher ---
-    def _apply_playback_action(self, action: str, args, *, loader, curr_idx: int, t, wall_start: float):
+    def _apply_playback_action(self,
+                               action: str,
+                               args, *,
+                               loader,
+                               curr_idx: int,
+                               t,
+                               wall_start: float):
         """
         Apply ONE playback action. This is the only place that is allowed to mutate:
            - curr_idx
@@ -1518,11 +1526,6 @@ class CameraGui(CTkFrame):
         except cv2.error:
             pass
         self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-
-    @staticmethod
-    def convert_cv_to_pil(img):
-        from PIL.Image import fromarray
-        return fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
     def run(self):
 
@@ -3010,7 +3013,8 @@ class CameraGui(CTkFrame):
                                    iou=self.camConfig.yolo_iou,
                                    yoloSize=self.yoloSession.yoloSize,
                                    idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
-                                   usedAlgos=algos)
+                                   usedAlgos=algos,
+                                   circles_not_features=self._flag_vars["circles_not_features"].get())
 
         centers, boxes, scores, class_ids, img_time = output
 
@@ -3204,9 +3208,9 @@ class CameraGui(CTkFrame):
             self.lastWidth = width
             self.lastHeight = int(width / aspectRatio)
 
-    @staticmethod
-    def askFilepath(initDir, text):
-        poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True, title=text)
-        if poss_filepath == '':
-            return None
-        return poss_filepath
+    # @staticmethod
+    # def askFilepath(initDir, text):
+    #     poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True, title=text)
+    #     if poss_filepath == '':
+    #         return None
+    #     return poss_filepath

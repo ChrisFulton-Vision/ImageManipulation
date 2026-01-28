@@ -1414,6 +1414,7 @@ def solveQnP(
     # ----------------------------
     # 1) Choose a good initial seed
     # ----------------------------
+
     if (user_seed_q is not None) and (user_seed_t is not None):
         seed_q = user_seed_q.copy()
         seed_t = user_seed_t.copy()
@@ -1427,7 +1428,8 @@ def solveQnP(
             confidence=0.99,
             flags=cv2.SOLVEPNP_ITERATIVE
         )
-        seed_q, seed_t = q().fromOpenCV_toAftr_rvec(rvec, tvec)
+        seed_q = q().from_rodrigues(rvec)
+        seed_t = np.squeeze(tvec)
     else:
         if seed_cfg is None:
             seed_cfg = SeedConfig()
@@ -1464,7 +1466,6 @@ def solveQnP(
         sigma_floor_px=1.0,
         max_iters=20,
     )
-
     return out
 
 

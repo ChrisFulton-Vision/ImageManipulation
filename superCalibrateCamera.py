@@ -3007,7 +3007,7 @@ class CameraGui(CTkFrame):
 
         self.pnpDrawer.markUpImage(image=self.markup_frame,
                                    output=output,
-                                   markup_is_undistorted=self.camConfig.undistort,
+                                   markup_is_undistorted=not self.camConfig.undistort,
                                    calibration=self.calibration,
                                    conf=self.camConfig.yolo_conf,
                                    iou=self.camConfig.yolo_iou,

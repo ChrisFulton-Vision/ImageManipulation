@@ -7,7 +7,7 @@ from support.vision.calibration import Calibration, undistort_points_px
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text
 from support.mathHelpers.twoD_to_threeD import solveQnP
-
+from support.mathHelpers.quaternions import Quaternion as q
 
 class twoToThreeSelectedAlgorithms:
     def __init__(self):
@@ -21,6 +21,82 @@ class pnp_qnp_draw:
         self.last_q_vec = None
         self.last_t_vec = None
 
+        # -----------------------------
+        # NEW: estimation-only helpers
+        # -----------------------------
+    @staticmethod
+    def _estimate_pnp(object_points: NDArray,
+                      image_points: NDArray,
+                      calibration: Calibration):
+        """
+        Returns (rvec, tvec) from solvePnPRansac, or None if it fails.
+        """
+        if calibration is None:
+            return None
+        if object_points is None or image_points is None:
+            return None
+        if len(object_points) < 6:
+            return None
+
+        ret, rvec, tvec, inliers = cv2.solvePnPRansac(
+            objectPoints=object_points,
+            imagePoints=image_points,
+            cameraMatrix=calibration.getCameraMatrix(),
+            distCoeffs=np.zeros((5,)),
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        if not ret:
+            return None
+        return rvec, tvec
+
+    def _estimate_qnp(self,
+                      object_points: NDArray,
+                      image_points: NDArray,
+                      calibration: Calibration,
+                      seed_rvec=None,
+                      seed_tvec=None):
+        """
+        Returns (q_rvec, q_tvec) from solveQnP, or None if it fails.
+
+        seed_rvec/seed_tvec are intended to come from solvePnP.
+        If your solveQnP expects quaternion seed instead of Rodrigues,
+        convert seed_rvec -> quat before passing.
+        """
+        if calibration is None:
+            return None
+        if object_points is None or image_points is None:
+            return None
+        if len(object_points) < 6:
+            return None
+
+        # Prefer explicit seed (PnP), else fall back to last good QnP
+        user_seed_q = None
+        user_seed_t = None
+
+        if seed_rvec is not None and seed_tvec is not None:
+            # If solveQnP can take Rodrigues directly as its q seed, pass it through.
+            # Otherwise, convert Rodrigues -> quat here and pass that.
+            user_seed_q = q().from_rodrigues(seed_rvec)
+            user_seed_t = np.squeeze(seed_tvec)
+        elif self.last_q_vec is not None and self.last_t_vec is not None:
+            user_seed_q = self.last_q_vec
+            user_seed_t = self.last_t_vec
+
+        q_rvec, q_tvec = solveQnP(
+            object_pts=object_points,
+            img_pts=image_points,
+            cal=calibration,
+            user_seed_q=user_seed_q,
+            user_seed_t=user_seed_t,
+            # Turn this off because we are explicitly controlling the seed now.
+            use_solvePnP_as_seed=False
+        )
+
+        # Persist last good solution
+        self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
+        return q_rvec, q_tvec
+
     def markUpImage(self,
                     image: NDArray,
                     output: tuple[list, list, list, list, float],
@@ -30,129 +106,158 @@ class pnp_qnp_draw:
                     iou: float,
                     yoloSize: tuple[int, int],
                     idsNamesLocs,
-                    usedAlgos:twoToThreeSelectedAlgorithms,
+                    usedAlgos: twoToThreeSelectedAlgorithms,
                     circles_not_features: bool = False) -> None:
-        '''
-        Takes image and places bounding boxes on them. If there's more than 5 features, attempts to solvePnP and mark
-        up the image with a PnP solution as well.
-        :param image: Original OpenCV style np.array
-        :param output: processed onnxruntime sessions
-        :return: marked-up image
-        '''
-        h, w, _ = image.shape
 
+        h, w, _ = image.shape
         centers_dist, boxes, scores, class_ids, time = output
+
+        y_h, y_w = yoloSize
+        sx = w / float(y_w)
+        sy = h / float(y_h)
+
+        centers_px = np.asarray(centers_dist, dtype=np.float64)
+        centers_px[:, 0] *= sx
+        centers_px[:, 1] *= sy
+
+        boxes_px = None
+        if boxes is not None and len(boxes) > 0:
+            b = np.asarray(boxes, dtype=np.float64)
+            b[:, 0] *= sx
+            b[:, 2] *= sx
+            b[:, 1] *= sy
+            b[:, 3] *= sy
+            boxes_px = b
+
 
         text = f'Inference time: {time:.3f}s'
         (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
         cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
 
-        centers_und = None
-        boxes_for_draw = boxes
-        if calibration is not None and (markup_is_undistorted or len(set(class_ids)) > 5):
-            # Ensure calibration matches YOLO coordinate system
-            calibration.scaleCalibration(w)
+        centers_und_px = None
+        boxes_for_draw_px = boxes_px
 
+        if calibration is not None:
+            calibration.scaleCalibration(w)  # K now matches 'image' pixel space
 
-            # Vectorized: distorted YOLO pixels -> undistorted YOLO pixels
-            # (Function name may be cal.undistort_points_px or module-level undistort_points_px depending on your Calibration.py)
-            numpy_centers = np.array(centers_dist, dtype=np.float64)
+            if centers_px is not None and len(centers_px) > 0:
+                centers_und_px = undistort_points_px(calibration, centers_px, eps_px=1e-6)
 
-            if len(set(class_ids)) > 0:
-                centers_und = undistort_points_px(calibration, numpy_centers,
-                                                  eps_px=1e-6)
-                centers_und = centers_und.tolist()
-
-            # ---- Undistort boxes too (undistort corners, then re-AABB) ----
-            if markup_is_undistorted and boxes is not None and len(boxes) > 0:
-                b = np.asarray(boxes, dtype=np.float64)  # (N,4) in YOLO pixel space: x1,y1,x2,y2
-
-                # Build corner list: (x1,y1), (x2,y1), (x2,y2), (x1,y2) for each box
-                x1 = b[:, 0]
-                y1 = b[:, 1]
-                x2 = b[:, 2]
-                y2 = b[:, 3]
-                corners = np.stack([
+            if markup_is_undistorted and boxes_px is not None and len(boxes_px) > 0:
+                x1, y1, x2, y2 = boxes_px[:, 0], boxes_px[:, 1], boxes_px[:, 2], boxes_px[:, 3]
+                corners_px = np.stack([
                     np.stack([x1, y1], axis=1),
                     np.stack([x2, y1], axis=1),
                     np.stack([x2, y2], axis=1),
                     np.stack([x1, y2], axis=1),
-                ], axis=1).reshape(-1, 2)  # (4N,2)
+                ], axis=1).reshape(-1, 2)
 
-                corners_und = undistort_points_px(calibration,
-                                                  corners,
-                                                  eps_px=1e-6
-                                                  ).reshape(-1, 4, 2)  # (N,4,2)
+                corners_und_px = undistort_points_px(calibration, corners_px, eps_px=1e-6).reshape(-1, 4, 2)
 
-                # Rebuild axis-aligned boxes in undistorted YOLO pixel space
-                x_min = np.min(corners_und[:, :, 0], axis=1)
-                y_min = np.min(corners_und[:, :, 1], axis=1)
-                x_max = np.max(corners_und[:, :, 0], axis=1)
-                y_max = np.max(corners_und[:, :, 1], axis=1)
+                x_min = np.min(corners_und_px[:, :, 0], axis=1)
+                y_min = np.min(corners_und_px[:, :, 1], axis=1)
+                x_max = np.max(corners_und_px[:, :, 0], axis=1)
+                y_max = np.max(corners_und_px[:, :, 1], axis=1)
 
-                # Clamp to YOLO frame bounds (optional but helps avoid drawing weirdness)
-                y_h, y_w = yoloSize
-                x_min = np.clip(x_min, 0, y_w - 1)
-                x_max = np.clip(x_max, 0, y_w - 1)
-                y_min = np.clip(y_min, 0, y_h - 1)
-                y_max = np.clip(y_max, 0, y_h - 1)
+                x_min = np.clip(x_min, 0, w - 1)
+                x_max = np.clip(x_max, 0, w - 1)
+                y_min = np.clip(y_min, 0, h - 1)
+                y_max = np.clip(y_max, 0, h - 1)
 
-                boxes_for_draw = np.stack([x_min, y_min, x_max, y_max], axis=1).tolist()
+                boxes_for_draw_px = np.stack([x_min, y_min, x_max, y_max], axis=1)
 
-        centers_for_draw = centers_dist
-        if centers_und is not None:
-            centers_for_pnp = centers_und
+        centers_for_draw = centers_px
+        centers_for_pnp = centers_px
+
+        if centers_und_px is not None:
+            centers_for_pnp = centers_und_px
             if markup_is_undistorted:
-                centers_for_draw = centers_und
-        else:
-            centers_for_pnp = centers_dist
+                centers_for_draw = centers_und_px
 
-        if len(class_ids) > 0:
-            indices = cv2.dnn.NMSBoxes(boxes_for_draw,
-                                       scores, conf, iou)
-            newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
-            for i in indices:
-                ii = int(i[0]) if hasattr(i, "__len__") else int(i)
+        boxes_for_draw = boxes_for_draw_px.tolist() if boxes_for_draw_px is not None else boxes
 
-                newCentersForDraw.append(centers_for_draw[ii])
-                newCentersForPnP.append(centers_for_pnp[ii])
-                newBoxes.append(boxes_for_draw[ii])
-                newClass_ids.append(class_ids[ii])
-                newScores.append(scores[ii])
-            self._drawBoxes(image,
-                               newCentersForDraw,
-                               newBoxes,
-                               newClass_ids,
-                               newScores,
-                               yoloSize,
-                               draw_as_circles=circles_not_features)
+        if len(class_ids) == 0:
+            return
 
-            if len(set(indices)) > 5:
-                idx = 0
+        indices = cv2.dnn.NMSBoxes(boxes_for_draw, scores, conf, iou)
+        newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
+        for i in indices:
+            ii = int(i[0]) if hasattr(i, "__len__") else int(i)
+            newCentersForDraw.append(centers_for_draw[ii])
+            newCentersForPnP.append(centers_for_pnp[ii])
+            newBoxes.append(boxes_for_draw[ii])
+            newClass_ids.append(class_ids[ii])
+            newScores.append(scores[ii])
 
-                if usedAlgos.use_qnp:
-                    self._drawQnP(image,
-                             newClass_ids,
-                             newCentersForPnP,
-                             markup_is_undistorted,
-                             calibration,
-                             yoloSize,
-                             idsNamesLocs,
-                             idx,
-                             draw_as_circles=circles_not_features)
-                    idx += 1
-                if usedAlgos.use_pnp:
-                    self._drawPnP(image,
-                             newClass_ids,
-                             newCentersForPnP,
-                             markup_is_undistorted,
-                             calibration,
-                             yoloSize,
-                             idsNamesLocs,
-                             idx,
-                             draw_as_circles=circles_not_features)
-                    idx += 1
+        self._drawBoxes(
+            image,
+            newCentersForDraw,
+            newBoxes,
+            newClass_ids,
+            newScores,
+            yoloSize,
+            draw_as_circles=circles_not_features
+        )
+
+        if len(set(indices)) <= 5:
+            return
+
+        object_points, image_points = self._collect_objPts_and_imgPts(newClass_ids, newCentersForPnP, idsNamesLocs)
+        if len(object_points) < 6:
+            return
+
+        # 1) Estimate PnP (optional)
+        pnp_pose = None
+        if usedAlgos.use_pnp:
+            pnp_pose = self._estimate_pnp(object_points, image_points, calibration)
+
+        # 2) Estimate QnP (optional) seeded by PnP if available
+        qnp_pose = None
+        if usedAlgos.use_qnp:
+            if pnp_pose is not None:
+                seed_rvec, seed_tvec = pnp_pose
+            else:
+                seed_rvec, seed_tvec = None, None
+            qnp_pose = self._estimate_qnp(object_points, image_points, calibration, seed_rvec, seed_tvec)
+
+        # 3) Draw in desired order (match your idx stacking)
+        idx = 0
+        if usedAlgos.use_qnp and qnp_pose is not None:
+            q_rvec, q_tvec = qnp_pose
+            self._drawQnP_from_pose(
+                image=image,
+                y_class_ids=newClass_ids,
+                y_centers=newCentersForPnP,
+                object_points=object_points,
+                q_rvec=q_rvec,
+                q_tvec=q_tvec,
+                markup_is_undistorted=markup_is_undistorted,
+                calibration=calibration,
+                yoloSize=yoloSize,
+                idsNamesLocs=idsNamesLocs,
+                idx=idx,
+                draw_as_circles=circles_not_features
+            )
+            idx += 1
+
+        if usedAlgos.use_pnp and pnp_pose is not None:
+            rvec, tvec = pnp_pose
+            self._drawPnP_from_pose(
+                image=image,
+                y_class_ids=newClass_ids,
+                y_centers=newCentersForPnP,
+                object_points=object_points,
+                rvec=rvec,
+                tvec=tvec,
+                markup_is_undistorted=markup_is_undistorted,
+                calibration=calibration,
+                yoloSize=yoloSize,
+                idsNamesLocs=idsNamesLocs,
+                idx=idx,
+                draw_as_circles=circles_not_features
+            )
+            idx += 1
 
     @staticmethod
     def _drawBoxes(image: NDArray, newCenters: list, newBoxes: list,
@@ -175,13 +280,13 @@ class pnp_qnp_draw:
 
         for (centers, box, class_id, score) in zip(newCenters, newBoxes, newClass_ids, newScores):
             x, y = centers
-            x = int(w / y_w * x)
-            y = int(h / y_h * y)
             x1, y1, x2, y2 = box
-            x1 = int(w / y_w * x1)
-            x2 = int(w / y_w * x2)
-            y1 = int(h / y_h * y1)
-            y2 = int(h / y_h * y2)
+            x = int(round(x))
+            y = int(round(y))
+            x1 = int(round(x1))
+            y1 = int(round(y1))
+            x2 = int(round(x2))
+            y2 = int(round(y2))
 
             if draw_as_circles:
                 r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.002 * w)))
@@ -205,51 +310,30 @@ class pnp_qnp_draw:
                 med_text(w), clr.LIGHTBLUE, 2)
 
     @staticmethod
-    def _collect_objPts_and_imgPts( y_class_ids, y_centers, idsNamesLocs):
+    def _collect_objPts_and_imgPts(y_class_ids, y_centers, idsNamesLocs):
         object_points = []
         image_points = []
         for idx, cid in enumerate(y_class_ids):
             if cid < len(idsNamesLocs):
                 x, y, z = idsNamesLocs[cid][2:]
                 object_points.append([x, y, z])
-                image_points.append(y_centers[idx])  # <-- MUST be in same pixel space as scaled K
+                image_points.append(y_centers[idx])  # <-- must match scaled K pixel space
         return np.asarray(object_points, dtype=np.float64), np.asarray(image_points, dtype=np.float64)
 
-    def _drawPnP(self,
-                 image,
-                 y_class_ids,
-                 y_centers,
-                 markup_is_undistorted,
-                 calibration,
-                 yoloSize,
-                 idsNamesLocs,
-                 idx =0,
-                 draw_as_circles=False):
+    def _drawPnP_from_pose(self,
+                          image,
+                          y_class_ids,
+                          y_centers,
+                          object_points,
+                          rvec,
+                          tvec,
+                          markup_is_undistorted,
+                          calibration,
+                          yoloSize,
+                          idsNamesLocs,
+                          idx=0,
+                          draw_as_circles=False):
         h, w, _ = image.shape
-
-        if calibration is None:
-            return
-
-        # calibration.scaleCalibration(y_w)
-
-        object_points, image_points = self._collect_objPts_and_imgPts(y_class_ids, y_centers, idsNamesLocs)
-        if len(object_points) < 6:
-            return
-
-        ret, rvec, tvec, inliers = cv2.solvePnPRansac(
-            objectPoints=object_points,
-            imagePoints=image_points,
-            cameraMatrix=calibration.getCameraMatrix(),
-            distCoeffs=np.zeros((5,)),
-            confidence=0.99,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if not ret:
-            return
-
-        # R, _ = cv2.Rodrigues(rvec)
-        # P = np.hstack((R, tvec))
-        # _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(P)
 
         if idx == 0:
             scale = 0.006
@@ -269,49 +353,31 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
+            title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}',
             rowIDX=idx,
-            txt_scale = 0.75,
-            draw_as_circles = draw_as_circles,
-            circle_radius_px = int(round(scale * w))
+            txt_scale=0.75,
+            draw_as_circles=draw_as_circles,
+            circle_radius_px=int(round(scale * w))
         )
 
-        return (rvec, tvec)
-
-    def _drawQnP(self,
-                 image,
-                 y_class_ids,
-                 y_centers,
-                 markup_is_undistorted,
-                 calibration,
-                 yoloSize,
-                 idsNamesLocs,
-                 index_for_display,
-                 draw_as_circles: bool = False):
+    def _drawQnP_from_pose(self,
+                          image,
+                          y_class_ids,
+                          y_centers,
+                          object_points,
+                          q_rvec,
+                          q_tvec,
+                          markup_is_undistorted,
+                          calibration,
+                          yoloSize,
+                          idsNamesLocs,
+                          idx=0,
+                          draw_as_circles=False):
         h, w, _ = image.shape
 
-        if calibration is None:
-            return
-
-        # calibration.scaleCalibration(y_w)
-
-        object_points, image_points = self._collect_objPts_and_imgPts(y_class_ids, y_centers, idsNamesLocs)
-        if len(object_points) < 6:
-            return
-
-        q_rvec, q_tvec = solveQnP(
-            object_pts=object_points,
-            img_pts=image_points,
-            cal=calibration,
-            # user_seed_q=self.last_q_vec,
-            # user_seed_t=self.last_t_vec,
-            # use_solvePnP_as_seed=True
-        )
-        self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
-
-        if index_for_display == 0:
+        if idx == 0:
             scale = 0.006
-        elif index_for_display == 1:
+        elif idx == 1:
             scale = 0.010
         else:
             scale = 0.014
@@ -327,13 +393,12 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}', #, {rpy[0]:+4.1f}, {rpy[1]:+4.1f}, {rpy[2]:+4.1f}',
-            rowIDX=index_for_display,
-            txt_color = clr.ORANGE,
-            draw_as_circles = draw_as_circles,
-            circle_radius_px = int(round(scale * w))
+            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}',
+            rowIDX=idx,
+            txt_color=clr.ORANGE,
+            draw_as_circles=draw_as_circles,
+            circle_radius_px=int(round(scale * w))
         )
-        return (q_rvec, q_tvec)
 
     @staticmethod
     def draw_proj(image: NDArray,
@@ -381,8 +446,8 @@ class pnp_qnp_draw:
             if np.isnan(x) or np.isnan(y):
                 return
 
-            x = float(w / y_w * x)
-            y = float(h / y_h * y)
+            # x = float(w / y_w * x)
+            # y = float(h / y_h * y)
 
             if (0 < x < w and 0 < y < h):
                 if draw_as_circles:

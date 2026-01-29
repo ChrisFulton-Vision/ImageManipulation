@@ -298,7 +298,7 @@ class Filepath_page(ctk.CTkFrame):
         if self.ctrl.camConfig.imageFilepath is None:
             initDir = str(Path(self.default_filepath).parent)
         else:
-            initDir = self.ctrl.camConfig.imageFilepath  #os.path.normpath(self.camConfig.imageFilepath)
+            initDir = str(Path(self.ctrl.camConfig.imageFilepath).parent)  #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':
@@ -352,14 +352,15 @@ class Filepath_page(ctk.CTkFrame):
         self.ctrl.saveToCache()
 
     def loadCalibration(self):
-        init_dir = Path(self.ctrl.camConfig.calibFilepath or self.default_filepath or Path.cwd())
+        if self.ctrl.camConfig.calibFilepath is not None:
+            init_dir = Path(self.ctrl.camConfig.calibFilepath).parent
+        else:
+            init_dir = Path(self.default_filepath or Path.cwd())
         poss_filepath = filedialog.askopenfilename(initialdir=str(init_dir), title='Select Calibration File')
-        if poss_filepath:
+        if poss_filepath != '':
             self.ctrl.camConfig.calibFilepath = poss_filepath
             self.ctrl.ingestCalibration()
             self.updateCalLabel()
-        else:
-            self.selectCalibLabelText.set("No Calibration Loaded")
 
     def updateCalLabel(self):
         name = Path(self.ctrl.camConfig.calibFilepath).name

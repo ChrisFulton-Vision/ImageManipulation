@@ -109,9 +109,11 @@ class pnp_qnp_draw:
                     usedAlgos: twoToThreeSelectedAlgorithms,
                     circles_not_features: bool = False) -> None:
 
+
         h, w, _ = image.shape
         centers_dist, boxes, scores, class_ids, time = output
-
+        if len(centers_dist) < 1:
+            return
         y_h, y_w = yoloSize
         sx = w / float(y_w)
         sy = h / float(y_h)

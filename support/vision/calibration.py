@@ -1005,10 +1005,17 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
         pts = pts.reshape(1, 2)
 
     if bool(getattr(cal, "fisheye", False)):
+        # For fisheye we expose multiple internal theta inversion strategies.
+        # - "newton"   : pure Newton iterations (existing behavior)
+        # - "precise"  : fixed-point warm start + Newton refinement
+        # (You can add more strings later without touching the callers.)
+        mode_l = str(mode).lower()
+        use_precise = (mode_l in ("precise", "fisheye_precise", "fp_newton", "hybrid"))
         out = undistort_points_px_fisheye_numba(
             pts,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
             float(cal.k1), float(cal.k2), float(cal.k3), float(cal.k4),
+            bool(use_precise),
         )
     else:
         out = undistort_points_px_numba_dispatch(
@@ -1408,9 +1415,74 @@ def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4):
 
     return theta
 
+@njit(cache=True, fastmath=True)
+def _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4):
+    """
+    Solve theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = theta_d
+
+    Uses:
+      - Fixed-point iterations for a safe warm start
+      - Newton iterations for fast convergence
+    """
+    if theta_d <= 1e-24:
+        return 0.0
+
+    # ------------------------------------------------------------
+    # Fixed-point warm start
+    # ------------------------------------------------------------
+    theta = theta_d  # good initial guess for small angles
+
+    for _ in range(2):  # hard-coded FP iters (tune later)
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+
+        denom = 1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8
+
+        # Prevent division blow-up
+        if abs(denom) < 1e-24:
+            break
+
+        theta = theta_d / denom
+
+    # ------------------------------------------------------------
+    # Newton refinement (as you already had)
+    # ------------------------------------------------------------
+    for _ in range(8):
+        t2 = theta * theta
+        t4 = t2 * t2
+        t6 = t4 * t2
+        t8 = t4 * t4
+
+        poly = 1.0 + k1 * t2 + k2 * t4 + k3 * t6 + k4 * t8
+        f = theta * poly - theta_d
+
+        dpoly = (2.0 * k1 * theta
+                 + 4.0 * k2 * theta * t2
+                 + 6.0 * k3 * theta * t4
+                 + 8.0 * k4 * theta * t6)
+        fp = poly + theta * dpoly
+
+        if abs(fp) < 1e-24:
+            break
+
+        step = f / fp
+        theta -= step
+
+        if abs(step) < 1e-14:
+            break
+
+    return theta
+
 
 @njit(parallel=True, cache=True, fastmath=True)
-def undistort_points_px_fisheye_numba(pts_px_dist, fx, fy, cx, cy, k1, k2, k3, k4):
+def undistort_points_px_fisheye_numba(
+    pts_px_dist,
+    fx, fy, cx, cy,
+    k1, k2, k3, k4,
+    use_precise: bool,
+):
     """
     Inverse of OpenCV fisheye distortion model.
     Input: distorted pixel points (N,2)
@@ -1438,7 +1510,10 @@ def undistort_points_px_fisheye_numba(pts_px_dist, fx, fy, cx, cy, k1, k2, k3, k
             y = yd
         else:
             theta_d = rd
-            theta = _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4)
+            if use_precise:
+                theta = _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4)
+            else:
+                theta = _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4)
             r = np.tan(theta)
 
             scale = r / rd

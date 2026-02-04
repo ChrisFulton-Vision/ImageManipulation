@@ -129,12 +129,20 @@ def run_fisheye_point_tests(
     n_pts: int = 200_000,
     seed: int = 0,
     iters: int = 50,
+    undistort_modes: tuple[str, ...] = ("newton", "precise"),
 ):
     """
     Compare OpenCV fisheye vs our fisheye calibration.
     """
     if cal is None:
         cal = default_fisheye_cam()
+        cal.fx = cal.fy = 250.0
+        cal.cx = 960
+        cal.cy = 540
+        cal.k1 = -.35
+        cal.k2 = 0.11
+        cal.k3 = -0.04
+        cal.k4 = 0.008
 
     assert cal.validCal and cal.fisheye
 
@@ -154,12 +162,18 @@ def run_fisheye_point_tests(
 
     # ---------- UNDISTORT ----------
     cv_und = opencv_fisheye_undistort_batch(K, D, pts_dist)
-    ours_und = undistort_points_px(cal, pts_dist)
-
-    und_stats = err_stats(cv_und, ours_und, mask_dist)
-
     t_cv_und = bench(lambda: opencv_fisheye_undistort_batch(K, D, pts_dist), iters)
-    t_ours_und = bench(lambda: undistort_points_px(cal, pts_dist), iters)
+
+    und_results = {}
+    for mode in undistort_modes:
+        ours_und = undistort_points_px(cal, pts_dist, mode=mode)
+        und_stats = err_stats(cv_und, ours_und, mask_dist)
+        t_ours_und = bench(lambda m=mode: undistort_points_px(cal, pts_dist, mode=m), iters)
+        und_results[str(mode)] = {
+            "opencv_time": t_cv_und,
+            "ours_time": t_ours_und,
+            **und_stats,
+        }
 
     # ---------- DISTORT ----------
     cv_dist = opencv_fisheye_distort_batch(K, D, pts_und)
@@ -172,11 +186,7 @@ def run_fisheye_point_tests(
     t_ours_dist = bench(lambda: distort_points_px(cal, pts_und), iters)
 
     return {
-        "UNDISTORT": {
-            "opencv_time": t_cv_und,
-            "ours_time": t_ours_und,
-            **und_stats,
-        },
+        "UNDISTORT": und_results,
         "DISTORT": {
             "opencv_time": t_cv_dist,
             "ours_time": t_ours_dist,
@@ -193,5 +203,11 @@ if __name__ == "__main__":
     results = run_fisheye_point_tests()
     for task, stats in results.items():
         print(f"\n[{task}]")
-        for k, v in stats.items():
-            print(f"  {k:>12s}: {v}")
+        if task == "UNDISTORT":
+            for mode, mstats in stats.items():
+                print(f"  (mode={mode})")
+                for k, v in mstats.items():
+                    print(f"    {k:>12s}: {v}")
+        else:
+            for k, v in stats.items():
+                print(f"  {k:>12s}: {v}")

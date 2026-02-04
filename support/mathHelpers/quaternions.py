@@ -16,6 +16,7 @@ Terms used in function names:
 
 import numpy as np
 from numpy import cos, arccos, sin, arcsin, arctan2, rad2deg, deg2rad, sqrt, abs
+from numpy.typing import NDArray
 from typing_extensions import Self, Union
 
 # Import overwritten Numba decorator
@@ -551,10 +552,11 @@ class Quaternion:
     def yawD(self):
         return rad2deg(self.yawR)
 
-    def from_eulerD_rpy(self, rpy: np.array) -> None:
+    def from_eulerD_rpy(self, rpy: NDArray) -> "Quaternion":
         self.from_eulerR_rpy(deg2rad(rpy))
+        return self
 
-    def from_eulerR_rpy(self, rpy: np.array) -> None:
+    def from_eulerR_rpy(self, rpy: NDArray) -> None:
         # half angles
         rol = rpy[0] / 2.0
         ptc = rpy[1] / 2.0
@@ -564,7 +566,7 @@ class Quaternion:
         self.vec[1] = cos(rol) * sin(ptc) * cos(yaw) + sin(rol) * cos(ptc) * sin(yaw)
         self.vec[2] = cos(rol) * cos(ptc) * sin(yaw) - sin(rol) * sin(ptc) * cos(yaw)
 
-    def eulerR(self, order: str = 'rpy') -> np.array:
+    def eulerR(self, order: str = 'rpy') -> NDArray:
         going_out = []
         for char in order:
             match char:
@@ -679,6 +681,19 @@ class Quaternion:
         P[1:] = -P[1:]
         return P
 
+    def to_SE3_given_position(self, position: NDArray) -> NDArray:
+        going_out = np.eye(4)
+        going_out[:3, :3] = self.to_dcm()
+        going_out[:3, 3] = position
+        return going_out
+
+    def perturb_from_rodrigues_std(self, std: NDArray) -> "Quaternion":
+        dtheta = std * np.random.randn(3)
+        perturb_q = Quaternion().from_rodrigues(dtheta)
+        return perturb_q * self
+
+    def perturb_from_rodrigues_var(self, var: NDArray) -> "Quaternion":
+        return self.perturb_from_rodrigues_std(np.sqrt(var))
 
 pure_qs = Quaternion(s=1.0, vec=np.zeros((3,)))
 pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
@@ -727,6 +742,22 @@ def randomQuat():
     ]))
     return q
 
+def random_quat_within_deg(theta_max_deg: float):
+    theta_max = np.deg2rad(theta_max_deg)
+
+    # random axis uniformly on S^2
+    v = np.random.normal(size=3)
+    v /= np.linalg.norm(v)
+
+    # angle distributed for uniform measure in SO(3) restricted to theta <= theta_max
+    r = np.random.rand()
+    theta = 2.0 * np.arcsin((r ** (1.0 / 3.0)) * np.sin(theta_max / 2.0))
+
+    s = np.sin(theta / 2.0)
+    c = np.cos(theta / 2.0)
+
+    # Your class appears to be (x, y, z, w) from the code shown
+    return Quaternion(quat=np.array([c, v[0] * s, v[1] * s, v[2] * s]))
 
 def left_quat_productDeriv(quatL, quatR, isTargetConjugated):
     """

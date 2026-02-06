@@ -64,6 +64,9 @@ class ThreeD_to_ThreeD:
         seed = self.init_pose(self.points1, self.points2)
         if seed is None:
             raise ValueError("Degenerate seed from Gram–Schmidt (collinear or duplicate points).")
+        self.q: Quat = Quat()
+        self.t: NDArray = np.zeros(1)
+
         self.q, self.t = seed
 
         self.opt()
@@ -198,15 +201,18 @@ def print_3dPts(threeD_proj: NDArray[np.floating]) -> None:
 def main() -> None:
     test1: NDArray[np.floating] = np.random.normal(0.0, 1.0, (10, 3))
     noise: NDArray[np.floating] = np.random.normal(0.0, 0.1, test1.shape)
+    print(test1)
     q_true: Quat = randomQuat()
     t_true: NDArray[np.floating] = np.array([10.0, 0.0, 0.0]) + np.random.normal(1.0, 1.0, (3,))
     test2: NDArray[np.floating] = (q_true * test1 + t_true) + noise
 
     print(f"Targets: \n{q_true}\n{t_true}\n")
+    print(f"Targets: \n{q_true.to_SE3_given_position(t_true)}")
 
     optClass = ThreeD_to_ThreeD(test1, test2)
 
     print(f'Estimates: \n{optClass.q}\n{optClass.t}\n')
+    print(f'Estimates(SE3):\n{optClass.q.to_SE3_given_position(optClass.t)}\n')
 
     print(f"Resolved Residual: {norm(optClass.create_y())}\n{optClass.create_y()}")
     print(f"True Residual: {norm(optClass.create_y(q_true, t_true))}\n{optClass.create_y(q_true, t_true)}")

@@ -114,7 +114,7 @@ class ThreeD_to_ThreeD:
 
     def create_y(self, new_q: Optional[Quat] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
         if new_q is None:
-            new_q = self.q.copy
+            new_q = self.q.copy()
         if new_t is None:
             new_t = self.t.copy()
 

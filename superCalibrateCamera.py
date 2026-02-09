@@ -60,6 +60,25 @@ CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 class CameraGui(CTkFrame):
     def __init__(self, master, *args, **kwargs):
+        self._playback_allowed = None
+        self.curr_r_V_d = None
+        self.curr_r_T_d = None
+        self._pb_frame_label = None
+        self._pb_frame_text = None
+        self._dp_runner = None
+        self._dp_cancel_btn = None
+        self._dp_pnp_btn = None
+        self._dp_kalman_btn = None
+        self._dp_run_btn = None
+        self.gpu_slider = None
+        self._dp_progress = None
+        self._dp_gpu_var = None
+        self._dp_gpu_var = None
+        self._dp_progress_label = None
+        self._dp_prefetch = None
+        self._dp_ckptN = None
+        self._dp_conf_list = None
+        self._dp_img_dir_var = None
         self._loading_config = True
 
         self.func_that_refits = None
@@ -724,14 +743,14 @@ class CameraGui(CTkFrame):
         dp_plotter_btn = CTkButton(
             f,
             text="Plot",
-            command=plot_sequential,
-        ).grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+            command=plot_sequential, )
+        dp_plotter_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
         dp_close_plot_btn = CTkButton(
             f,
             text="Close Plots",
-            command=self._plotter_close_plot_alias,
-        ).grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+            command=self._plotter_close_plot_alias, )
+        dp_close_plot_btn.grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
     def _plotter_close_plot_alias(self):
         if self.plotter is None:
@@ -785,7 +804,7 @@ class CameraGui(CTkFrame):
                     post_progress=post_progress,
                     post_status=post_status,
                     sweep_timer=utils.SweepTimer(),
-                    fmt_mmss=utils._fmt_mmss,
+                    fmt_mmss=utils.fmt_mmss,
                 )
             except Exception as e:
                 post_status(f"SolvePnP/QnP failed: {e}")
@@ -961,7 +980,7 @@ class CameraGui(CTkFrame):
                     ids_times_pairs=pairs,
                     params=params,
                     sweep_timer=utils.SweepTimer(),
-                    fmt_mmss=utils._fmt_mmss,
+                    fmt_mmss=utils.fmt_mmss,
                     post_progress=post_progress,
                     post_status=post_status,
                     post_finish=post_finish,
@@ -1474,7 +1493,6 @@ class CameraGui(CTkFrame):
         if not self.shutting_down:
             self.showWindow = False
 
-
     def screenshot(self):
         self.screenshot_impending = True
         self.screenshotButton.configure(fg_color=clr.CTK_BLACK)
@@ -1899,15 +1917,20 @@ class CameraGui(CTkFrame):
                     frame = self.pauseCache.frame
 
                 # ===== display / HUD =====
-                if frame is not None and Path(paths[self.playback.curr_idx]).exists() and len(self.ImageTimeReader.idsTimes) > 0:
+                if (frame is not None and Path(paths[self.playback.curr_idx]).exists() and
+                        len(self.ImageTimeReader.idsTimes) > 0):
 
                     if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not self.pause:
                         period = 1.0 / self.camConfig.target_fps
-                        target_time = wall_start + period * (
-                            self.playback.curr_idx if not self.last_nonzero_sign < 0 else num_images - self.playback.curr_idx)
+
+                        if not self.last_nonzero_sign < 0:
+                            img_idx = self.playback.curr_idx
+                        else:
+                            img_idx = num_images - self.playback.curr_idx
+                        target_time = wall_start + period * img_idx
+
                         if target_time < time.monotonic():
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * (
-                                self.playback.curr_idx if not self.last_nonzero_sign < 0 else num_images - self.playback.curr_idx)
+                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * img_idx
                         pending_keys.extend(sleep_until(target_time))
 
                     elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not self.pause:
@@ -1946,7 +1969,8 @@ class CameraGui(CTkFrame):
                                            box_around=boxAround)
                     else:
                         self.analyze_image(frame, ts + self.camConfig.cam_to_log_time_offset,
-                                           self.ImageTimeReader.idsTimes[self.playback.curr_idx][0], box_around=boxAround)
+                                           self.ImageTimeReader.idsTimes[self.playback.curr_idx][0],
+                                           box_around=boxAround)
                 elif frame is None:
                     # Nothing to draw this iteration; just keep window responsive
                     pass
@@ -1998,8 +2022,16 @@ class CameraGui(CTkFrame):
 
     def update_playbackMenu(self):
         if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+            def mode(pauseStatus, playbackSpeed):
+                if pauseStatus:
+                    return 'Pause'
+                if playbackSpeed < 0:
+                    return "Rewind"
+                return "Play"
+
             self.playbackModeText.set(
-                value=f"Playback Mode: FPS\nTarget FPS: {self.camConfig.target_fps:.2f}\n{'Pause' if self.pause else 'Rewind' if self.playback.speed < 0 else 'Play'}")
+                value=f"Playback Mode: FPS\n \
+                    Target FPS: {self.camConfig.target_fps:.2f}\n{mode(self.pause, self.playback.speed)}")
         else:
             self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
 
@@ -2819,8 +2851,8 @@ class CameraGui(CTkFrame):
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
-                quatCV = q.from_rodrigues(rvec)
-                tCV = np.squeeze(tvec)
+                # quatCV = q.from_rodrigues(rvec)
+                # tCV = np.squeeze(tvec)
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
                 self.pnpResult = (quatPnP, vectPnP)
@@ -2834,7 +2866,7 @@ class CameraGui(CTkFrame):
                             (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
-                LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
+                # LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
 
     def qnp3DTruthPoints(self):
 
@@ -3049,7 +3081,8 @@ class CameraGui(CTkFrame):
                 cv2.putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                             med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
                 cv2.putText(self.markup_frame,
-                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, z:{self.last_yolo_3d_estimate[2]:.3f}',
+                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, \
+                                            z:{self.last_yolo_3d_estimate[2]:.3f}',
                             (25, w - 50),
                             cv2.FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,

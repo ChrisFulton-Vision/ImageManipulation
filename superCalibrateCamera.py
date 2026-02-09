@@ -2255,6 +2255,10 @@ class CameraGui(CTkFrame):
         self.curr_frame_gray = None
 
         # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
+        calSize = (self.calibration.width, self.calibration.height)
+        frameSize = frame.shape[:2]
+        if self.calibration.validCal and frameSize != calSize:
+            LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
         if self.calibration.validCal and self.camConfig.undistort:
             self.undistort(frame)
         else:
@@ -2335,7 +2339,7 @@ class CameraGui(CTkFrame):
             self.print_pnp_results()
 
         if display_in_realtime:
-            if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+            if self.camConfig.imageSource == ImageSource.Stream_from_Folder and not self.screenshot_impending:
                 self.draw_playbackStats()
             self.cleanup()
 
@@ -2815,6 +2819,8 @@ class CameraGui(CTkFrame):
                 self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
                                list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
 
+                quatCV = q.from_rodrigues(rvec)
+                tCV = np.squeeze(tvec)
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
                 self.pnpResult = (quatPnP, vectPnP)
@@ -2828,6 +2834,7 @@ class CameraGui(CTkFrame):
                             (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
                             (255, 255, 0), 3,
                             cv2.LINE_AA)
+                LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
 
     def qnp3DTruthPoints(self):
 

@@ -200,6 +200,7 @@ class CalibrateGui(CTkFrame):
         self.scale864Button = None
         self.scale2848Button = None
         self.scaleAnyButton = None
+        self.calLabel = None
 
         ##########################################################################
         # Now Initialize the buttons on the main frame
@@ -338,7 +339,7 @@ class CalibrateGui(CTkFrame):
 
     def createCalibrationWindowButton(self, rowID):
         self.displayCal = CTkButton(self.mainFrame, text='Display Calibration', state='disabled',
-                                        command=self.updateConfigWindow)
+                                        command=lambda: self.updateConfigWindow(self))
         self.displayCal.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         if self.imageConfig.camCal.validCal:
             self.displayCal.configure(state='normal')
@@ -474,21 +475,26 @@ class CalibrateGui(CTkFrame):
         self.saveCalButton.configure(command=lambda btn=self.saveCalButton: self.saveCal(btn))
         self.saveCalButton.grid(row=0, column=0, padx=5, pady=5)
 
-        self.scale864Button = CTkButton(master=f, text='Scale to 864x864', command=self.scaleTo864)
+        self.scale864Button = CTkButton(master=f, text='Scale to 864x864', command=lambda: self.scaleTo864(f))
         self.scale864Button.grid(row=3, column=0, padx=5, pady=5)
-        self.scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=self.scaleTo2848)
+        self.scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=lambda: self.scaleTo2848(f))
         self.scale2848Button.grid(row=4, column=0, padx=5, pady=5)
-        self.scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=self.scaleToInput)
+        self.scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=lambda: self.scaleToInput(f))
         self.scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
 
         if self.imageConfig.camCal.validCal:
             # Then display the calibration
-
-            self.calLabel = CTkLabel(master=f, text=self.imageConfig.camCal.calStr, justify='center', anchor='w')
-            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+            if self.calLabel is None:
+                self.calLabel = CTkLabel(master=f, text=self.imageConfig.camCal.calStr, justify='center', anchor='w')
+                self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+            else:
+                self.calLabel.configure(text=self.imageConfig.camCal.calStr)
         else:
-            self.calLabel = CTkLabel(f, text="No calibration calculated yet.", justify='center')
-            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+            if self.calLabel is None:
+                self.calLabel = CTkLabel(f, text="No calibration calculated yet.", justify='center')
+                self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+            else:
+                self.calLabel.configure(text="No calibration available.")
             self.saveCalButton.configure(state='disabled')
             self.scale864Button.configure(state='disabled')
             self.scale2848Button.configure(state='disabled')
@@ -496,26 +502,30 @@ class CalibrateGui(CTkFrame):
 
         return f
 
-    def scaleTo864(self):
+    def scaleTo864(self, master_frame):
         self.imageConfig.camCal.scaleCalibration(864)
         self.saveToCache()
-        self.updateConfigWindow()
+        self.updateConfigWindow(master_frame)
+        self.setup_CalFrame(master_frame)
 
-    def scaleTo2848(self):
+    def scaleTo2848(self, master_frame):
         self.imageConfig.camCal.scaleCalibration(2848)
         self.saveToCache()
-        self.updateConfigWindow()
+        self.updateConfigWindow(master_frame)
+        self.setup_CalFrame(master_frame)
 
-    def scaleToInput(self):
+    def scaleToInput(self, master_frame):
         dialog = CTkInputDialog(
             text='Input an integer value. The updated calibration width will be this value.',
             title='Calibration Scale Selection')
         try:
             self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
             self.saveToCache()
-            self.updateConfigWindow()
+            self.updateConfigWindow(master_frame)
+            self.setup_CalFrame(master_frame)
         except ValueError:
-            print('Invalid input. Please input only an integer.')
+            from support.io.my_logging import LOG
+            LOG.warning('Invalid input. Please input only an integer.')
 
     def updateConfigWindow(self, master_frame):
         rowID = 0

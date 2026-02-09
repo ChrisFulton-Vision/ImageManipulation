@@ -51,15 +51,15 @@ class TruthPoints:
         # self.truthPoints['23'] = np.array([2.16908, -1.33895, -0.46741])
 
         # MOCAP LIDAR AprilTags
-        self.truthPoints['0'] = np.array([5.999722958, 0.210682318, 0.569373071])
-        self.truthPoints['3'] = np.array([4.268728733, -6.744913101, 0.986035943])
-        self.truthPoints['5'] = np.array([6.382734299, 0.639621198, 1.011341929])
-        self.truthPoints['8'] = np.array([6.157489300, 3.442303658, 0.590105295])
-        self.truthPoints['10'] = np.array([7.166899204, 0.034531891, 0.964832246])
-        self.truthPoints['11'] = np.array([5.398657322, -0.701054692, 1.037473083])
-        self.truthPoints['12'] = np.array([2.359554768, 3.344508171, 1.080431104])
-        self.truthPoints['18'] = np.array([4.460691452, 3.925699234, 0.932579398])
-        self.truthPoints['20'] = np.array([3.291348934, 3.324561834, 0.576795220])
+        # self.truthPoints['0'] = np.array([5.999722958, 0.210682318, 0.569373071])
+        # self.truthPoints['3'] = np.array([4.268728733, -6.744913101, 0.986035943])
+        # self.truthPoints['5'] = np.array([6.382734299, 0.639621198, 1.011341929])
+        # self.truthPoints['8'] = np.array([6.157489300, 3.442303658, 0.590105295])
+        # self.truthPoints['10'] = np.array([7.166899204, 0.034531891, 0.964832246])
+        # self.truthPoints['11'] = np.array([5.398657322, -0.701054692, 1.037473083])
+        # self.truthPoints['12'] = np.array([2.359554768, 3.344508171, 1.080431104])
+        # self.truthPoints['18'] = np.array([4.460691452, 3.925699234, 0.932579398])
+        # self.truthPoints['20'] = np.array([3.291348934, 3.324561834, 0.576795220])
 
         # MOCAP 2025 Nov AprilTags
         # self.truthPoints['0'] = np.array([7.333877, -4.724778, 0.563943])
@@ -83,6 +83,30 @@ class TruthPoints:
         # self.truthPoints['19'] = np.array([7.138083, -5.202418, 1.440090])
         # self.truthPoints['20'] = np.array([4.234251, -2.057815, 0.576980])
         # self.truthPoints['22'] = np.array([])
+
+        # Seery MOCAP Data
+        self.truthPoints['0'] = np.array([2.213529348, -6.921269417, 0.581792355])
+        self.truthPoints['1'] = np.array([-0.067431509, -7.154722214, 1.101872683])
+        self.truthPoints['2'] = np.array([3.184869766, -7.632071495, 0.568810046])
+        self.truthPoints['3'] = np.array([4.279306412, -6.735857964, 0.996919036])
+        self.truthPoints['4'] = np.array([-1.547529221, -2.297834635, 0.637015581])
+        self.truthPoints['6'] = np.array([5.042785168, -5.044515610, 0.582720816])
+        self.truthPoints['7'] = np.array([1.149369478, -5.938117981, 0.583432853])
+        self.truthPoints['8'] = np.array([-0.394698590, -6.333474159, 0.609945714])
+        self.truthPoints['9'] = np.array([-1.033937335, -6.080481529, 0.602701604])
+        self.truthPoints['10'] = np.array([1.423779011, -7.666602612, 0.993166387])
+        self.truthPoints['11'] = np.array([4.289189816, -5.560795784, 1.043918014])
+        self.truthPoints['12'] = np.array([2.024945736, -8.406939507, 1.078723192])
+        self.truthPoints['13'] = np.array([5.471141338, -5.686547756, 0.831703246])
+        self.truthPoints['14'] = np.array([6.128262997, -4.250380039, 0.939006746])
+        self.truthPoints['15'] = np.array([6.322391510, -4.727521896, 0.614175320])
+        self.truthPoints['16'] = np.array([5.656450272, -3.245581150, 0.839761913])
+        self.truthPoints['17'] = np.array([5.444821835, -6.409629345, 0.993954897])
+        self.truthPoints['18'] = np.array([0.887455463, -8.438985825, 0.944647372])
+        self.truthPoints['19'] = np.array([4.030318260, -7.956672192, 0.939799428])
+        self.truthPoints['20'] = np.array([0.458850652, -7.742451191, 0.588691354])
+        self.truthPoints['23'] = np.array([6.223794937, -3.777098656, 0.596049547])
+
 
         # _FLU_TO_CV = np.array([
         #     [0., 1., 0.],

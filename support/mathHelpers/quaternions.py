@@ -26,11 +26,13 @@ from support.mathHelpers.include_numba import _njit as njit, prange
 
 _FLOAT_EPS = np.finfo(np.float64).eps
 
+
 @njit(cache=True, fastmath=False)
 def _cross3(a0, a1, a2, b0, b1, b2):
     return (a1 * b2 - a2 * b1,
             a2 * b0 - a0 * b2,
             a0 * b1 - a1 * b0)
+
 
 @njit(parallel=True, cache=True, fastmath=False)
 def rotate_vecs_quat_numba(w: float, x: float, y: float, z: float, vecs: np.ndarray) -> np.ndarray:
@@ -61,17 +63,19 @@ def rotate_vecs_quat_numba(w: float, x: float, y: float, z: float, vecs: np.ndar
 
     return out
 
+
 @njit(cache=True, fastmath=False)
 def qmul_numba(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     # a,b are shape (4,) = [w,x,y,z]
     aw, ax, ay, az = a[0], a[1], a[2], a[3]
     bw, bx, by, bz = b[0], b[1], b[2], b[3]
     out = np.empty(4, dtype=np.float64)
-    out[0] = aw*bw - ax*bx - ay*by - az*bz
-    out[1] = aw*bx + ax*bw + ay*bz - az*by
-    out[2] = aw*by - ax*bz + ay*bw + az*bx
-    out[3] = aw*bz + ax*by - ay*bx + az*bw
+    out[0] = aw * bw - ax * bx - ay * by - az * bz
+    out[1] = aw * bx + ax * bw + ay * bz - az * by
+    out[2] = aw * by - ax * bz + ay * bw + az * bx
+    out[3] = aw * bz + ax * by - ay * bx + az * bw
     return out
+
 
 @njit(parallel=True, cache=True, fastmath=False)
 def qmul_batch_left_numba(a: np.ndarray, Bs: np.ndarray) -> np.ndarray:
@@ -81,11 +85,12 @@ def qmul_batch_left_numba(a: np.ndarray, Bs: np.ndarray) -> np.ndarray:
     aw, ax, ay, az = a[0], a[1], a[2], a[3]
     for i in prange(N):
         bw, bx, by, bz = Bs[i, 0], Bs[i, 1], Bs[i, 2], Bs[i, 3]
-        out[i, 0] = aw*bw - ax*bx - ay*by - az*bz
-        out[i, 1] = aw*bx + ax*bw + ay*bz - az*by
-        out[i, 2] = aw*by - ax*bz + ay*bw + az*bx
-        out[i, 3] = aw*bz + ax*by - ay*bx + az*bw
+        out[i, 0] = aw * bw - ax * bx - ay * by - az * bz
+        out[i, 1] = aw * bx + ax * bw + ay * bz - az * by
+        out[i, 2] = aw * by - ax * bz + ay * bw + az * bx
+        out[i, 3] = aw * bz + ax * by - ay * bx + az * bw
     return out
+
 
 class Quaternion:
     __slots__ = ("s", "vec", "_cache4")
@@ -681,14 +686,6 @@ class Quaternion:
         P[1:] = -P[1:]
         return P
 
-    @staticmethod
-    def from_SE3(Mat4: NDArray):
-        if Mat4.shape != (4,4):
-            raise ValueError(f"Mat4 must be of shape (4,4), but is {Mat4.shape}")
-        dcm = Mat4[:3, :3]
-        pos = Mat4[:3, 3]
-        return mat2quat(dcm), pos
-
     def to_SE3_given_position(self, position: NDArray) -> NDArray:
         going_out = np.eye(4)
         going_out[:3, :3] = self.to_dcm()
@@ -703,18 +700,29 @@ class Quaternion:
     def perturb_from_rodrigues_var(self, var: NDArray) -> "Quaternion":
         return self.perturb_from_rodrigues_std(np.sqrt(var))
 
+
 pure_qs = Quaternion(s=1.0, vec=np.zeros((3,)))
 pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
 pure_qy = Quaternion(s=0.0, vec=np.array([0.0, 1.0, 0.0]))
 pure_qz = Quaternion(s=0.0, vec=np.array([0.0, 0.0, 1.0]))
 
+
+def from_SE3(Mat4: NDArray):
+    if Mat4.shape != (4, 4):
+        raise ValueError(f"Mat4 must be of shape (4,4), but is {Mat4.shape}")
+    dcm = Mat4[:3, :3]
+    pos = Mat4[:3, 3]
+    return mat2quat(dcm), pos
+
+
 def skew(v: np.ndarray) -> np.ndarray:
     """Return [v]_x such that [v]_x @ a = v x a."""
     v = np.asarray(v, dtype=float).reshape(3)
     x, y, z = v
-    return np.array([[0.0, -z,  y],
-                     [z,  0.0, -x],
-                     [-y, x,  0.0]], dtype=float)
+    return np.array([[0.0, -z, y],
+                     [z, 0.0, -x],
+                     [-y, x, 0.0]], dtype=float)
+
 
 def so3_left_jacobian(phi: np.ndarray) -> np.ndarray:
     """
@@ -735,6 +743,7 @@ def so3_left_jacobian(phi: np.ndarray) -> np.ndarray:
     b = (theta - np.sin(theta)) / (theta * theta * theta)
     return I - a * Phi + b * (Phi @ Phi)
 
+
 def interpolate(q1: Quaternion, q2: Quaternion, t: float):
     interp: Quaternion = q1 * (q1.inv * q2).power(t)
     return interp
@@ -749,6 +758,7 @@ def randomQuat():
         np.sqrt(u1) * np.cos(2 * np.pi * u3),
     ]))
     return q
+
 
 def random_quat_within_deg(theta_max_deg: float):
     theta_max = np.deg2rad(theta_max_deg)
@@ -766,6 +776,7 @@ def random_quat_within_deg(theta_max_deg: float):
 
     # Your class appears to be (x, y, z, w) from the code shown
     return Quaternion(quat=np.array([c, v[0] * s, v[1] * s, v[2] * s]))
+
 
 def left_quat_productDeriv(quatL, quatR, isTargetConjugated):
     """

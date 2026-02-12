@@ -380,7 +380,7 @@ class CalibrateGui(CTkFrame):
             if imgClass.include:
                 self.findChessboardCorners(master_frame, imgClass, showImage=False)
 
-        self.sortBySharpness()
+        self.sortForCuration()
         # Create a blank, black image with 3 color channels (BGR)
         blank_image = np.zeros((height, width, 3), np.uint8)
 
@@ -1009,7 +1009,7 @@ class CalibrateGui(CTkFrame):
         clearCacheButton = CTkButton(master=master_frame, text='Really Clear Cache', fg_color='green',
                                      command=lambda f=master_frame: self.clearCache(f, rowID))
         clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        self.after(2000, lambda f=master_frame, rid=rowID: self.protectClearCache(f, rid))
+        self.after(2000, self.protectClearCache, master_frame, rowID)
         self.after(2000, clearCacheButton.grid_forget)
 
     def protectClearCache(self, master_frame, rowID):
@@ -1171,6 +1171,33 @@ class CalibrateGui(CTkFrame):
         self.loadFromCache(False)
         self.saveToCache()
         self.updateImageFrame()
+
+    def sortForCuration(self):
+        """
+        Sort priority:
+          1) residual (if any exist)
+          2) sharpness (if any exist)
+          3) imageName (fallback)
+        """
+        imgs = self.imageConfig.img_collection
+
+        has_residual = any((img.include and img.residual is not None) for img in imgs)
+        has_sharpness = any((img.include and img.sharpness is not None) for img in imgs)
+
+        if has_residual:
+            # smaller residuals first; None goes to the bottom via sharpnessTest(None)->50.0
+            self.imageConfig.img_collection = sorted(
+                imgs,
+                key=lambda img: (self.sharpnessTest(img.residual), img.imageName.lower())
+            )
+        elif has_sharpness:
+            # keep your existing behavior (whatever “sharpness” direction you intended)
+            self.imageConfig.img_collection = sorted(
+                imgs,
+                key=lambda img: (self.sharpnessTest(img.sharpness), img.imageName.lower())
+            )
+        else:
+            self.imageConfig.img_collection = sorted(imgs, key=lambda img: img.imageName.lower())
 
     def sortBySharpness(self):
         self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,
@@ -1373,36 +1400,198 @@ class CalibrateGui(CTkFrame):
             self.drawImagePoints(imgClass, img, gray)
 
     def drawImagePoints(self, imgClass, img, gray):
-        if imgClass.imgPts is not None:
-            # Draw and display the corners
-            img = cv2.drawChessboardCorners(img,
-                                            (
-                                                self.imageConfig.num_inner_corners_W,
-                                                self.imageConfig.num_inner_corners_H),
-                                            imgClass.imgPts, True)
-
-            min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
-            max_X = min(int(np.max(imgClass.imgPts[:, 0, 0] + 100)), img.shape[1])
-            min_Y = max(int(np.min(imgClass.imgPts[:, :, 1] - 100)), 0)
-            max_Y = min(int(np.max(imgClass.imgPts[:, :, 1] + 100)), img.shape[0])
-
-            roi = img[min_Y:max_Y, min_X:max_X, :]
-            roi = cv2.resize(roi, (img.shape[0], img.shape[1]))
-            cv2.imshow('Chessboard Corners Detected', roi)
-            cv2.waitKey(0)
-        else:
-            imgClass.imgPts = None
-            imgClass.objPts = None
+        if imgClass.imgPts is None:
             imgClass.include = False
-
             h, w = gray.shape
-            # if h > 1080 or w > 1080:
-            #     scale = max(h / 1080, w / 1080) * 1.1
-            #     gray = cv2.resize(gray, (int(w / scale), int(h / scale)))
             dispImg = cv2.resize(gray, (int(w * self.scale), int(h * self.scale)))
             cv2.imshow('NO CHESSBOARD CORNERS FOUND', dispImg)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
+            return
+
+        # Compute ROI in original image coordinates
+        min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
+        max_X = min(int(np.max(imgClass.imgPts[:, 0, 0]) + 100), img.shape[1])
+        min_Y = max(int(np.min(imgClass.imgPts[:, 0, 1]) - 100), 0)
+        max_Y = min(int(np.max(imgClass.imgPts[:, 0, 1]) + 100), img.shape[0])
+
+        roi_base = img[min_Y:max_Y, min_X:max_X].copy()
+
+        # Shift points into ROI coordinates
+        pts_roi = imgClass.imgPts.copy()
+        pts_roi[:, 0, 0] -= min_X
+        pts_roi[:, 0, 1] -= min_Y
+
+        pattern_size = (self.imageConfig.num_inner_corners_W,
+                        self.imageConfig.num_inner_corners_H)
+
+        resid_roi, proj_roi, Hmat = self.chessboard_point_residuals_homography(pts_roi, pattern_size)
+
+        self.show_with_locked_aspect_redraw(
+            'Chessboard Corners Detected',
+            roi_base,
+            pts_roi,
+            pattern_size,
+            resid_roi=resid_roi,  # <-- new
+            proj_roi=proj_roi  # <-- optional (can draw predicted too)
+        )
+
+    @staticmethod
+    def show_with_locked_aspect_redraw(name, base_img, pts_roi, pattern_size, *, resid_roi=None, proj_roi=None):
+        if base_img.ndim == 2:
+            base_img = cv2.cvtColor(base_img, cv2.COLOR_GRAY2BGR)
+
+        cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        last_w_win, last_h_win = None, None
+
+        # Precompute some stats for coloring/thresholding
+        if resid_roi is not None and len(resid_roi) > 0:
+            resid_roi = np.asarray(resid_roi, dtype=np.float32).reshape(-1)
+            # Use a robust max so 1 crazy point doesn't wash out the colormap
+            r_med = float(np.median(resid_roi))
+            r_mad = float(np.median(np.abs(resid_roi - r_med)) + 1e-12)
+            r_lo = 0.0
+            r_hi = max(float(np.percentile(resid_roi, 95)), r_med + 6.0 * 1.4826 * r_mad)
+        else:
+            r_lo, r_hi = 0.0, 1.0
+
+        while True:
+            if cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1:
+                return
+
+            try:
+                x, y, w_win, h_win = cv2.getWindowImageRect(name)
+            except cv2.error:
+                break
+
+            if w_win <= 0 or h_win <= 0:
+                key = cv2.waitKey(30)
+                if key == 27:
+                    break
+                continue
+
+            if last_w_win == w_win and last_h_win == h_win:
+                key = cv2.waitKey(30)
+                if key == 27:
+                    break
+                continue
+            last_w_win, last_h_win = w_win, h_win
+
+            h_img, w_img = base_img.shape[:2]
+            s = min(w_win / w_img, h_win / h_img)
+            new_w = max(1, int(round(w_img * s)))
+            new_h = max(1, int(round(h_img * s)))
+
+            resized = cv2.resize(base_img, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+            # Scale observed points
+            pts_scaled = pts_roi.copy().astype(np.float32)
+            pts_scaled[:, 0, 0] *= s
+            pts_scaled[:, 0, 1] *= s
+            pts2 = pts_scaled.reshape(-1, 2)
+
+            # Optionally scale projected points too (for debug)
+            if proj_roi is not None:
+                proj2 = (np.asarray(proj_roi, dtype=np.float32) * s).reshape(-1, 2)
+            else:
+                proj2 = None
+
+            # Draw points colored by residual
+            if resid_roi is None:
+                # fallback: just draw green points
+                for (u, v) in pts2:
+                    cv2.circle(resized, (int(round(u)), int(round(v))), 3, (0, 255, 0), 2)
+            else:
+                # Identify worst K
+                K = min(10, len(resid_roi))
+                worst_idx = np.argsort(-resid_roi)[:K]
+
+                for k, (u, v) in enumerate(pts2):
+                    e = float(resid_roi[k])
+                    t = (e - r_lo) / (r_hi - r_lo + 1e-12)
+                    t = float(np.clip(t, 0.0, 1.0))
+
+                    # Hue: green -> red (0.33 -> 0.0)
+                    r, g, b = colorsys.hsv_to_rgb(0.33 * (1.0 - t), 1.0, 1.0)
+                    color = (int(255 * b), int(255 * g), int(255 * r))
+
+                    # Slightly bigger marker for bad points
+                    rad = 3 + int(round(4 * t))
+                    thick = 2 + int(round(2 * t))
+                    cv2.circle(resized, (int(round(u)), int(round(v))), rad, color, thick)
+
+                # Annotate worst points with index + error
+                for k in worst_idx:
+                    u, v = pts2[k]
+                    txt = f"{k}:{resid_roi[k]:.1f}px"
+                    cv2.putText(resized, txt, (int(round(u)) + 6, int(round(v)) - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(resized, txt, (int(round(u)) + 6, int(round(v)) - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+                # Optional: draw predicted points as tiny crosses
+                if proj2 is not None:
+                    for (u, v) in proj2:
+                        u = int(round(u));
+                        v = int(round(v))
+                        cv2.line(resized, (u - 3, v), (u + 3, v), (255, 255, 255), 1)
+                        cv2.line(resized, (u, v - 3), (u, v + 3), (255, 255, 255), 1)
+
+                # Summary text
+                mean_e = float(np.mean(resid_roi))
+                max_e = float(np.max(resid_roi))
+                cv2.putText(resized, f"per-point residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(resized, f"per-point residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
+                            (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+            # Letterbox canvas
+            canvas = np.zeros((h_win, w_win, 3), dtype=np.uint8)
+            x_off = (w_win - new_w) // 2
+            y_off = (h_win - new_h) // 2
+            canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+
+            cv2.imshow(name, canvas)
+
+            key = cv2.waitKey(30)
+            if key == 27:
+                break
+
+        if cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1:
+            return
+        cv2.destroyWindow(name)
+
+    @staticmethod
+    def chessboard_point_residuals_homography(imgPts, pattern_size):
+        """
+        imgPts: (N,1,2) float32/64 in ROI coordinates
+        pattern_size: (W, H) inner corners
+        Returns:
+            resid_px: (N,) reprojection residual in pixels
+            proj: (N,2) predicted points from homography
+            H: 3x3 homography
+        """
+        W, H = pattern_size
+        N = W * H
+        pts = np.asarray(imgPts, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] != N:
+            return None, None, None
+
+        # Ideal grid coordinates in chessboard index space
+        # (0..W-1, 0..H-1)
+        obj2d = np.array([(i, j) for j in range(H) for i in range(W)], dtype=np.float32)
+
+        # Robust homography (helps if a few corners are bad)
+        Hmat, inliers = cv2.findHomography(obj2d, pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        if Hmat is None:
+            # fall back to least squares
+            Hmat, _ = cv2.findHomography(obj2d, pts, method=0)
+
+        # Project ideal grid through H -> predicted pixel locations
+        proj = cv2.perspectiveTransform(obj2d.reshape(-1, 1, 2), Hmat).reshape(-1, 2)
+
+        resid = np.linalg.norm(pts - proj, axis=1)  # pixels
+        return resid, proj, Hmat
 
     def findIndexGivenImageName(self, name):
         sol_idx = None

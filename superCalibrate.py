@@ -826,8 +826,12 @@ class CalibrateGui(CTkFrame):
             self.updateImageFrame()
 
     def _last_page(self):
-        _, _, total = self._page_bounds()
-        self._page_start = total
+        total = len(self.imageConfig.img_collection)
+        if total <= 0:
+            self._page_start = 0
+        else:
+            pages = max(1, (total + self._page_size - 1) // self._page_size)
+            self._page_start = (pages - 1) * self._page_size  # start index of the last page
         self.updateImageFrame()
 
     def updateImageFrame(self, f=None):

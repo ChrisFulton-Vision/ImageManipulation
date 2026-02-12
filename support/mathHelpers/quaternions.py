@@ -681,6 +681,14 @@ class Quaternion:
         P[1:] = -P[1:]
         return P
 
+    @staticmethod
+    def from_SE3(Mat4: NDArray):
+        if Mat4.shape != (4,4):
+            raise ValueError(f"Mat4 must be of shape (4,4), but is {Mat4.shape}")
+        dcm = Mat4[:3, :3]
+        pos = Mat4[:3, 3]
+        return mat2quat(dcm), pos
+
     def to_SE3_given_position(self, position: NDArray) -> NDArray:
         going_out = np.eye(4)
         going_out[:3, :3] = self.to_dcm()

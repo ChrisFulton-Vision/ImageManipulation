@@ -1168,7 +1168,11 @@ def mat2quat(M):
     return Quaternion(s=float(q[0]), vec=q[1:])
 
 
-def mats2quats(mats: np.ndarray) -> np.ndarray:
+def se3s2quats(SE3s: NDArray) -> np.ndarray:
+    return np.array([mat2quat(M[:3, :3]).ndarray for M in SE3s])
+
+
+def mats2quats(mats: NDArray) -> np.ndarray:
     """Convert array of Nx3x3 matrices to Nx4 quaternions."""
     return np.array([mat2quat(M).ndarray for M in mats])
 

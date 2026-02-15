@@ -806,16 +806,22 @@ class CalibrateGui(CTkFrame):
             self._page_label.configure(text=f"{curr}/{pages}")
 
         # enable/disable pager buttons safely
-        self.firstPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
-        self.prevPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
-        self.nextPageBtn.configure(state=("normal" if curr < pages else "disabled"))
-        self.lastPageBtn.configure(state=("normal" if curr < pages else "disabled"))
+        # self.firstPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
+        # self.prevPageBtn.configure(state=("normal" if curr > 1 else "disabled"))
+        # self.nextPageBtn.configure(state=("normal" if curr < pages else "disabled"))
+        # self.lastPageBtn.configure(state=("normal" if curr < pages else "disabled"))
 
     def _first_page(self):
+        if self._page_start == 0:
+            self._last_page()
+            return
         self._page_start = 0
         self.updateImageFrame()
 
     def _page_prev(self):
+        if self._page_start == 0:
+            self._last_page()
+            return
         self._page_start = max(0, self._page_start - self._page_size)
         self.updateImageFrame()
 
@@ -823,15 +829,25 @@ class CalibrateGui(CTkFrame):
         _, end, total = self._page_bounds()
         if end < total:
             self._page_start += self._page_size
-            self.updateImageFrame()
+        else:
+            self._page_start = 0
+        self.updateImageFrame()
 
     def _last_page(self):
         total = len(self.imageConfig.img_collection)
         if total <= 0:
             self._page_start = 0
+            self.updateImageFrame()
+            return
+
+        pages = max(1, (total + self._page_size - 1) // self._page_size)
+        last_start = (pages - 1) * self._page_size  # start index of the last page
+
+        if self._page_start == last_start:
+            self._page_start = 0
         else:
-            pages = max(1, (total + self._page_size - 1) // self._page_size)
-            self._page_start = (pages - 1) * self._page_size  # start index of the last page
+            self._page_start = last_start
+
         self.updateImageFrame()
 
     def updateImageFrame(self, f=None):

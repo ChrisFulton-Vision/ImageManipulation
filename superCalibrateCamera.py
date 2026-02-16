@@ -9,6 +9,9 @@ from collections import deque
 # from vmbpy import *
 
 import numpy as np
+from dataclasses import dataclass
+from numpy.typing import NDArray
+from typing import Callable, List, Tuple, Any, Iterable, Optional
 from pathlib import Path
 from tkinter import filedialog
 
@@ -58,6 +61,18 @@ cv2.setUseOptimized(True)
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 
+@dataclass(slots=True)
+class FrameCtx:
+    img_time: Optional[float] = None
+    name: Optional[str] = None
+    display_in_realtime: bool = True
+
+
+Args = Tuple[Any, ...]
+StepFn = Callable[[NDArray, NDArray, FrameCtx, Args], None]
+StepSpec = Tuple[StepFn, Args]
+
+
 class CameraGui(CTkFrame):
     def __init__(self, master, *args, **kwargs):
         self._playback_allowed = None
@@ -82,6 +97,7 @@ class CameraGui(CTkFrame):
         self._loading_config = True
 
         self.func_that_refits = None
+        self.list_of_image_process_functors: List[StepSpec] = []
 
         # Debounced cache writes
         self._save_debounce_id = None
@@ -1362,7 +1378,7 @@ class CameraGui(CTkFrame):
             self.timeBetweenImgsEntry.configure(placeholder_text='1')
             self.camConfig.secondsBetweenImages = 1.0
 
-    def _gather_annotated_frames(self) -> list[np.ndarray]:
+    def _gather_annotated_frames(self) -> list[NDArray]:
         directory = Path(self.camConfig.imageFilepath).parent
         self.populate_idsTimes(str(directory))
 
@@ -1516,13 +1532,13 @@ class CameraGui(CTkFrame):
         if self.detector is None:
             self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
             self.arucoParams = cv2.aruco.DetectorParameters()
-            # self.arucoParams.adaptiveThreshWinSizeMin = 5
-            # self.arucoParams.adaptiveThreshWinSizeMax = 35
-            # self.arucoParams.adaptiveThreshWinSizeStep = 5
-            # self.arucoParams.minMarkerPerimeterRate = 0.02  # or higher if tags are big
-            # self.arucoParams.maxMarkerPerimeterRate = 1.0
-            # self.arucoParams.cornerRefinementMinAccuracy = 0.1  # or 0.2
-            # self.arucoParams.cornerRefinementMaxIterations = 20
+            self.arucoParams.adaptiveThreshWinSizeMin = 5
+            self.arucoParams.adaptiveThreshWinSizeMax = 35
+            self.arucoParams.adaptiveThreshWinSizeStep = 5
+            self.arucoParams.minMarkerPerimeterRate = 0.02  # or higher if tags are big
+            self.arucoParams.maxMarkerPerimeterRate = 1.0
+            self.arucoParams.cornerRefinementMinAccuracy = 0.1  # or 0.2
+            self.arucoParams.cornerRefinementMaxIterations = 20
         self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
     def run_detectSingleImage(self):
@@ -1778,10 +1794,19 @@ class CameraGui(CTkFrame):
         else:
             self.playback.curr_idx = 0
 
-        # ---- Playback slider: initialize range once we know dataset length ----
-        if not getattr(self, "_pb_slider_range_inited", False):
+        # ---- Playback slider: update range when dataset length changes ----
+        prev_n = int(getattr(self, "_pb_num_images", 0) or 0)
+        need_range_update = (not getattr(self, "_pb_slider_range_inited", False)) or (prev_n != int(num_images))
+
+        if need_range_update:
             self._pb_slider_range_inited = True
             self._pb_num_images = int(num_images)
+
+            # Clamp curr_idx to new bounds
+            if num_images > 0:
+                self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
+            else:
+                self.playback.curr_idx = 0
 
             # UI-thread update
             try:
@@ -2284,7 +2309,24 @@ class CameraGui(CTkFrame):
         if frame is None:
             return
 
+        ctx = FrameCtx(img_time=img_time, name=name, display_in_realtime=display_in_realtime)
+
+        self.pnpResult = None
+        self.qnpResult = None
         self.curr_frame_gray = None
+
+        self.list_of_image_process_functors: List[StepSpec] = [
+            (self.undistort, ()),
+            (self.detectAprilTags, (True,)),
+            (self.applyKernel, (ImageKernel.Invert,)),
+            (self.corner_detection, ()),
+        ]
+        markup_frame = self.markup_frame
+        # np.copyto is faster (doesn't reallocate), but requires destination to match shape
+        if markup_frame is None or markup_frame.shape != frame.shape:
+            markup_frame = frame.copy()
+        else:
+            np.copyto(markup_frame, frame)
 
         # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
         calSize = (self.calibration.width, self.calibration.height)
@@ -2292,51 +2334,81 @@ class CameraGui(CTkFrame):
         if self.calibration.validCal and frameSize != calSize:
             LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
         if self.calibration.validCal and self.camConfig.undistort:
-            self.undistort(frame)
+            self.undistort(frame,
+                           markup_frame,
+                           ctx,
+                           ())
         else:
-            self.curr_frame = frame  # explicit reference passed, saves copy if not undistorting
+            markup_frame: NDArray = frame  # explicit reference passed, saves copy if not undistorting
 
-        # np.copyto is faster (doesn't reallocate), but requires destination to match shape
-        if self.markup_frame is None or self.markup_frame.shape != self.curr_frame.shape:
-            self.markup_frame = self.curr_frame.copy()
-        else:
-            np.copyto(self.markup_frame, self.curr_frame)
+        # test_markup_frame: NDArray = np.copy(frame)
+        # cv2.imshow("Test", test_markup_frame)
+        # cv2.waitKey(0)
+        # for func, args in self.list_of_image_process_functors:
+        #     func(frame, test_markup_frame, ctx, args)
+        # cv2.resize(test_markup_frame, (864, 864), test_markup_frame)
+        # cv2.imshow("Test", test_markup_frame)
+        # cv2.waitKey(1)
 
         if self.camConfig.draw_chessboard:
-            self.draw_chessboard()
+            self.draw_chessboard(self.curr_frame,
+                                 markup_frame,
+                                 ctx,
+                                 ())
 
         if self.camConfig.processingKernel != ImageKernel.Unfiltered:
-            self.applyKernel()
+            self.applyKernel(frame,
+                             markup_frame,
+                             ctx,
+                             [self.camConfig.processingKernel])
 
         if self.camConfig.detect_corners:
-            self.corner_detection()
+            self.corner_detection(frame,
+                                  markup_frame,
+                                  ctx,
+                                  ())
 
         if self.camConfig.detectTags and self.detector is not None:
-            self.detectAprilTags()
-            if self.camConfig.hideAprilTags:
-                self.inpaint_apriltags()
+            self.detectAprilTags(frame,
+                                 markup_frame,
+                                 ctx,
+                                 [self.camConfig.hideAprilTags])
 
         if self.camConfig.pnp3DTruthPoints and self.detector is not None:
-            self.pnp3DTruthPoints()
-        else:
-            self.pnpResult = None
+            markup_frame = self.pnp3DTruthPoints(frame,
+                                                 markup_frame,
+                                                 ctx,
+                                                 ())
 
         if self.camConfig.qnp3DTruthPoints and self.detector is not None:
-            self.qnp3DTruthPoints()
-        else:
-            self.qnpResult = None
+            markup_frame = self.qnp3DTruthPoints(frame,
+                                                 markup_frame,
+                                                 ctx,
+                                                 ())
 
         if self.camConfig.detect_horizon:
-            self.detectHorizon()
+            markup_frame = self.detectHorizon(frame,
+                                              markup_frame,
+                                              ctx,
+                                              ())
 
         if self.camConfig.hyper_focus:
-            self.hyper_focus()
+            markup_frame = self.hyper_focus(frame,
+                                            markup_frame,
+                                            ctx,
+                                            ())
 
         if self.camConfig.phase_correlation:
-            self.phase_correlation()
+            self.phase_correlation(frame,
+                                   markup_frame,
+                                   ctx,
+                                   ())
 
         if self.camConfig.yoloInference:
-            self.run_yolo(frame)  # Takes original frame, not undistort. YOLO presumes original.
+            self.run_yolo(frame,
+                          markup_frame,
+                          ctx,
+                          ())  # Takes original frame, not undistort. YOLO presumes original.
             # Optional: pose estimation directly from YOLO centers (PnP / QnP / KF-weighted QnP)
             try:
                 self.pose_from_yolo()
@@ -2350,155 +2422,74 @@ class CameraGui(CTkFrame):
             self.qnpKFYoloResult = None
 
         if self.camConfig.factor_graph:
-            self.factor_graph(img_time)
+            self.factor_graph(frame, markup_frame, ctx, ())
         else:
             self.last_yolo_3d_estimate = None
 
-        if self.camConfig.hud and img_time is not None:
-            self.draw_HUD(img_time)
+        if self.camConfig.hud:
+            self.draw_HUD(frame, markup_frame, ctx, ())
 
         if box_around:
-            x, y, _ = self.markup_frame.shape
-            cv2.rectangle(self.markup_frame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
+            self.draw_boxAround(frame, markup_frame, ctx, ())
 
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.draw_name(name)
+            self.draw_name(frame, markup_frame, ctx, ())
 
-        if img_time is not None:
-            self.draw_time(img_time)
+        self.draw_time(frame, markup_frame, ctx, ())
 
         if self.print3DTruthOnce:
             self.print_pnp_results()
 
         if display_in_realtime:
             if self.camConfig.imageSource == ImageSource.Stream_from_Folder and not self.screenshot_impending:
-                self.draw_playbackStats()
-            self.cleanup()
+                self.draw_playbackStats(frame, markup_frame, ctx, ())
+            self.cleanup(markup_frame)
 
-        if not display_in_realtime:
-            return np.ascontiguousarray(self.markup_frame).copy()
+        else:
+            return np.ascontiguousarray(markup_frame).copy()
 
-    def draw_playbackStats(self):
+    def draw_playbackStats(self, frame, markupFrame, ctx: FrameCtx, args):
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
             self.hud_marker = HUD_Marker()
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
         self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
-        self.hud_marker.draw_playbackStats(self.markup_frame,
+        self.hud_marker.draw_playbackStats(markupFrame,
                                            self.lowPassFPS,
                                            self.camConfig.target_fps,
                                            self.camConfig.playback_mode,
                                            self.camConfig.rt_speed,
                                            self.camConfig.cam_to_log_time_offset)
 
-    def draw_time(self, img_time):
-        time_str = f"Flight Time: {img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
+    def draw_time(self, frame, markupFrame, ctx: FrameCtx, args):
+        if ctx.img_time is None:
+            return
+        time_str = f"Flight Time: {ctx.img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
         from support.viz.HUD_draw import draw_time_on_image
-        draw_time_on_image(self.markup_frame, time_str)
+        draw_time_on_image(markupFrame, time_str)
 
-    def draw_name(self, name):
+    def draw_name(self, frame, markupFrame, ctx: FrameCtx, args):
         from support.viz.HUD_draw import draw_name_on_image
-        draw_name_on_image(self.markup_frame, os.path.basename(name))
+        draw_name_on_image(os.path.basename(ctx.name), markupFrame)
 
-    def draw_HUD(self, img_time):
+    def draw_HUD(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+        if ctx.img_time is None:
+            return
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
             self.hud_marker = HUD_Marker()
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-        self.hud_marker.draw_HUD(self.markup_frame, img_time)
+        self.hud_marker.draw_HUD(markupFrame, ctx.img_time)
 
-    def draw_chessboard(self):
+    def draw_boxAround(self, frame, markupFrame, ctx: FrameCtx, args):
+        x, y, _ = markupFrame.shape
+        cv2.rectangle(markupFrame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
+
+    def draw_chessboard(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> None:
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cv2.cvtColor(self.markup_frame, cv2.COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
 
-        self._checker_residual.draw_chessboard(self.markup_frame, self.curr_frame_gray, self._cb_pattern)
-
-    def inpaint_apriltags(self,
-                          radius_px: int = 3,
-                          dilate_px: int = 2,
-                          method: int = cv2.INPAINT_TELEA,
-                          feather: bool = True):
-        if self.curr_frame_gray is None or self.markup_frame is None:
-            return
-        if self.detector is None:
-            return
-
-        corners, ids, rejected = self.detector.detectMarkers(self.curr_frame_gray)
-        if corners is None or len(corners) == 0:
-            return
-
-        mh, mw = self.markup_frame.shape[:2]
-        gh, gw = self.curr_frame_gray.shape[:2]
-
-        # scale factors from detection image to markup image
-        sx = mw / float(gw)
-        sy = mh / float(gh)
-
-        # how much to pad each ROI beyond the exact tag corners
-        pad = dilate_px + radius_px + 3
-
-        for c in corners:
-            # c shape ~ (1, 4, 2) -> (4, 2)
-            pts = np.asarray(c).squeeze().reshape(-1, 2).astype(np.float32)
-
-            # scale to markup_frame coords
-            pts_scaled = np.empty_like(pts, dtype=np.float32)
-            pts_scaled[:, 0] = pts[:, 0] * sx
-            pts_scaled[:, 1] = pts[:, 1] * sy
-
-            # tight bounding box around the tag
-            x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
-            x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
-            y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
-            y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
-
-            # clamp to image
-            x_min = max(x_min, 0)
-            y_min = max(y_min, 0)
-            x_max = min(x_max, mw - 1)
-            y_max = min(y_max, mh - 1)
-            if x_max <= x_min or y_max <= y_min:
-                continue  # degenerate ROI
-
-            roi_w = x_max - x_min + 1
-            roi_h = y_max - y_min + 1
-
-            # build local mask for this tag only
-            mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
-
-            # shift tag points into ROI coordinates
-            pts_roi = pts_scaled.copy()
-            pts_roi[:, 0] -= x_min
-            pts_roi[:, 1] -= y_min
-            pts_int = pts_roi.astype(np.int32)
-
-            cv2.fillConvexPoly(mask_roi, pts_int, 255)
-
-            # optional dilation to cover borders
-            if dilate_px > 0:
-                k = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
-                )
-                mask_roi = cv2.dilate(mask_roi, k)
-
-            # slice out the ROI from the big frame
-            frame_roi = self.markup_frame[y_min:y_max + 1, x_min:x_max + 1]
-
-            # inpaint only this small region
-            inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
-
-            if feather:
-                blur_ks = max(3, 2 * radius_px + 1)
-                soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
-                soft = soft[..., None]  # (H,W,1)
-
-                base = frame_roi.astype(np.float32)
-                inp = inpainted_roi.astype(np.float32)
-                blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
-
-                self.markup_frame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
-            else:
-                self.markup_frame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
+        self._checker_residual.draw_chessboard(markupFrame, self.curr_frame_gray, self._cb_pattern)
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
@@ -2675,7 +2666,7 @@ class CameraGui(CTkFrame):
 
         return stitched
 
-    def undistort(self, frame):
+    def undistort(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
 
         if self.calibration.fisheye:
             if self.camConfig.cubemap:
@@ -2683,7 +2674,7 @@ class CameraGui(CTkFrame):
                     self.face_size = 600
                     self.update_cube_map_vectors()
 
-                self.apply_fisheye_faces(frame)
+                self.apply_fisheye_faces(markupFrame)
                 layout = {
                     'bottom': (2, 1),
                     'left': (1, 0),
@@ -2691,76 +2682,113 @@ class CameraGui(CTkFrame):
                     'right': (1, 2),
                     # 'back': (1, 0),
                     'top': (0, 1)}
-                self.curr_frame = self.stitch_cubemap_faces(layout, cells=3)
+                markupFrame = self.stitch_cubemap_faces(layout, cells=3)
 
             else:
-                if self.face_size is None or self.face_size != min(frame.shape[:2]):
-                    self.face_size = min(frame.shape[:2])
+                if self.face_size is None or self.face_size != min(markupFrame.shape[:2]):
+                    self.face_size = min(markupFrame.shape[:2])
                     self.update_frontFace_vector()
 
-                self.apply_fisheye_faces(frame)
+                self.apply_fisheye_faces(markupFrame)
 
                 # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
-                self.curr_frame = self.cubemap_faces['front']
+                markupFrame = self.cubemap_faces['front']
         else:
-            self.curr_frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
-                                        borderMode=cv2.BORDER_CONSTANT)
+            if self.map1 is None or self.map2 is None:
+                raise ValueError("No calibration loaded!")
+            markupFrame = cv2.remap(markupFrame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT)
 
-    def applyKernel(self):
-        if self.camConfig.processingKernel != ImageKernel.Gabor and self.GaborGUI is not None:
+    def applyKernel(self, frame: NDArray,
+                    markupFrame: NDArray, ctx: FrameCtx,
+                    args) -> None:
+
+        if args == () or args is None:
+            raise ValueError("Image Kernel requires 1 ImageKernel enum object as argument")
+        process_kernel = args[0]
+        if len(args) > 1 or not isinstance(process_kernel, ImageKernel):
+            raise ValueError("Apply Kernel Argument should be 1 ImageKernel enum object.")
+
+        #  TODO Move ownership of whether GaborGui is open to owning function queue
+        if process_kernel != ImageKernel.Gabor and self.GaborGUI is not None:
             self.GaborGUI.close()
             self.GaborGUI = None
 
         from support.vision.filter_image import applyConvolutionFilter
 
-        if self.camConfig.processingKernel == ImageKernel.Gabor:
+        if process_kernel == ImageKernel.Invert:
+            markupFrame = cv2.bitwise_not(markupFrame)
+            return
+
+        if process_kernel == ImageKernel.Gabor:
             from support.vision.filter_image import GaborGUI
             if self.GaborGUI is None:
                 self.GaborGUI = GaborGUI()
-            self.markup_frame = applyConvolutionFilter(self.markup_frame,
-                                                       self.camConfig.processingKernel,
-                                                       self.GaborGUI.gaborFilter)
+            markupFrame = applyConvolutionFilter(markupFrame,
+                                                 process_kernel,
+                                                 self.GaborGUI.gaborFilter)
             return
 
-        self.markup_frame = applyConvolutionFilter(self.markup_frame,
-                                                   self.camConfig.processingKernel)
+        markupFrame = applyConvolutionFilter(markupFrame,
+                                             process_kernel)
 
-    def corner_detection(self):
+    def corner_detection(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
         harris_corners = cv2.cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
 
-        self.markup_frame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
+        markupFrame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
+        return markupFrame
 
-    def detectAprilTags(self, scale: float = 0.6):
+    def detectAprilTags(self,
+                        frame: NDArray,
+                        markupFrame: NDArray, ctx: FrameCtx,
+                        args) -> NDArray:
         """
         Faster AprilTag detection:
           - detect on downscaled image
           - upscale corners
           - refine on full-res gray image with cornerSubPix
         """
-        if self.curr_frame_gray is None:
-            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
-        if self.detector is None:
-            return
 
-        gray_full = self.curr_frame_gray
+        def process_single_arg(arg, scale, inpaint):
+            if isinstance(arg, float):
+                scale = arg
+            elif isinstance(arg, bool):
+                inpaint = arg
+            else:
+                raise AttributeError("Argument should be float or bool")
+
+        scale = 1.0
+        inpaint = False
+        if isinstance(args, Iterable):
+            for arg in args:
+                process_single_arg(arg, scale, inpaint)
+        else:
+            process_single_arg(args, scale, inpaint)
+
+        if self.detector is None:
+            return markupFrame
+
+        gray_full = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
         h, w = gray_full.shape[:2]
 
         # 1) Downscale for detection
-        if not (0.2 <= scale < 1.0):
+        if not (0.2 <= scale <= 1.0):
             scale = 0.6
-        small = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
-                           interpolation=cv2.INTER_AREA)
+        small_gray = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
+                                interpolation=cv2.INTER_AREA)
 
         # 2) Detect on smaller image
-        corners_small, ids, rejected = self.detector.detectMarkers(small)
+        corners_small, ids, rejected = self.detector.detectMarkers(small_gray)
 
         self.centers = None
         self.detectIDS = []
 
         if corners_small is None or ids is None or len(corners_small) == 0:
-            return
+            print(f'Corners_small is {corners_small}')
+            print(f'Ids: {ids}')
+            return markupFrame
 
         # 3) Upscale corners to full-res and pack into a single array
         all_pts = []
@@ -2797,11 +2825,11 @@ class CameraGui(CTkFrame):
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
 
             if not self.camConfig.hideAprilTags:
-                cv2.polylines(self.markup_frame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
-                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), clr.HUD_GREEN, 4)
-                cv2.putText(self.markup_frame, str(idx[0]), tuple(pixCenter),
-                            cv2.FONT_HERSHEY_SIMPLEX, small_text(self.curr_frame.shape[0]), (0, 0, 0), 1)
+                cv2.polylines(markupFrame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
+                cv2.putText(markupFrame, str(idx[0]), tuple(pixCenter),
+                            cv2.FONT_HERSHEY_SIMPLEX, small_text(markupFrame.shape[0]), clr.HUD_GREEN, 4)
+                cv2.putText(markupFrame, str(idx[0]), tuple(pixCenter),
+                            cv2.FONT_HERSHEY_SIMPLEX, small_text(markupFrame.shape[0]), (0, 0, 0), 1)
 
             self.detectIDS.append(idx)
 
@@ -2810,7 +2838,97 @@ class CameraGui(CTkFrame):
             else:
                 self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
 
-    def pnp3DTruthPoints(self):
+        if inpaint:
+            markupFrame = self.inpaint_apriltags(markupFrame,
+                                                 small_gray,
+                                                 corners_small)
+
+        return markupFrame
+
+    def inpaint_apriltags(self,
+                          markupFrame: NDArray,
+                          gray: NDArray,
+                          corners,
+                          radius_px: int = 3,
+                          dilate_px: int = 2,
+                          method: int = cv2.INPAINT_TELEA,
+                          feather: bool = True) -> NDArray:
+
+        mh, mw = markupFrame.shape[:2]
+        gh, gw = gray.shape[:2]
+
+        # scale factors from detection image to markup image
+        sx = mw / float(gw)
+        sy = mh / float(gh)
+
+        # how much to pad each ROI beyond the exact tag corners
+        pad = dilate_px + radius_px + 3
+
+        for c in corners:
+            # c shape ~ (1, 4, 2) -> (4, 2)
+            pts = np.asarray(c).squeeze().reshape(-1, 2).astype(np.float32)
+
+            # scale to markup_frame coords
+            pts_scaled = np.empty_like(pts, dtype=np.float32)
+            pts_scaled[:, 0] = pts[:, 0] * sx
+            pts_scaled[:, 1] = pts[:, 1] * sy
+
+            # tight bounding box around the tag
+            x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
+            x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
+            y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
+            y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
+
+            # clamp to image
+            x_min = max(x_min, 0)
+            y_min = max(y_min, 0)
+            x_max = min(x_max, mw - 1)
+            y_max = min(y_max, mh - 1)
+            if x_max <= x_min or y_max <= y_min:
+                continue  # degenerate ROI
+
+            roi_w = x_max - x_min + 1
+            roi_h = y_max - y_min + 1
+
+            # build local mask for this tag only
+            mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+
+            # shift tag points into ROI coordinates
+            pts_roi = pts_scaled.copy()
+            pts_roi[:, 0] -= x_min
+            pts_roi[:, 1] -= y_min
+            pts_int = pts_roi.astype(np.int32)
+
+            cv2.fillConvexPoly(mask_roi, pts_int, 255)
+
+            # optional dilation to cover borders
+            if dilate_px > 0:
+                k = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+                )
+                mask_roi = cv2.dilate(mask_roi, k)
+
+            # slice out the ROI from the big frame
+            frame_roi = markupFrame[y_min:y_max + 1, x_min:x_max + 1]
+
+            # inpaint only this small region
+            inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
+
+            if feather:
+                blur_ks = max(3, 2 * radius_px + 1)
+                soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
+                soft = soft[..., None]  # (H,W,1)
+
+                base = frame_roi.astype(np.float32)
+                inp = inpainted_roi.astype(np.float32)
+                blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
+
+                markupFrame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
+            else:
+                markupFrame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
+        return markupFrame
+
+    def pnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -2848,27 +2966,41 @@ class CameraGui(CTkFrame):
                                                             cameraMatrix=self.calibration.getCameraMatrix(),
                                                             distCoeffs=distParams)
 
-                self.plotOnImg(projectedPoints_orig[:, 0, :].astype(int),
-                               list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 0))
+                self.plotOnImg(markupFrame, projectedPoints_orig[:, 0, :].astype(int),
+                               list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), clr.LIGHTBLUE)
 
                 # quatCV = q.from_rodrigues(rvec)
                 # tCV = np.squeeze(tvec)
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
 
                 self.pnpResult = (quatPnP, vectPnP)
+                orient_text = 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f')
+                (txt_w, txt_h), _ = cv2.getTextSize(orient_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                    small_text(markupFrame.shape[0]),
+                                                    4)
 
-                cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f'),
-                            (50, 75),
-                            cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
-                            (255, 255, 0), 3,
-                            cv2.LINE_AA)
-                cv2.putText(self.markup_frame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
-                            (50, 150), cv2.FONT_HERSHEY_DUPLEX, small_text(self.markup_frame.shape[0]),
-                            (255, 255, 0), 3,
-                            cv2.LINE_AA)
+                cv2.putText(markupFrame, orient_text,
+                            (50, txt_h + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            small_text(markupFrame.shape[0]),
+                            clr.BLACK, 4)
+                cv2.putText(markupFrame, orient_text,
+                            (50, txt_h + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            small_text(markupFrame.shape[0]),
+                            clr.LIGHTBLUE, 2)
+                cv2.putText(markupFrame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
+                            (50, 2 * txt_h + 15), cv2.FONT_HERSHEY_SIMPLEX,
+                            small_text(markupFrame.shape[0]),
+                            clr.BLACK, 4)
+                cv2.putText(markupFrame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
+                            (50, 2 * txt_h + 15), cv2.FONT_HERSHEY_SIMPLEX,
+                            small_text(markupFrame.shape[0]),
+                            clr.LIGHTBLUE, 2)
                 # LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
+        return markupFrame
 
-    def qnp3DTruthPoints(self):
+    def qnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -2892,7 +3024,7 @@ class CameraGui(CTkFrame):
             points = np.array(points)
 
             if len(points) < 6:
-                return
+                return markupFrame
 
             quat, vect, *_ = solveQnP(points, centers, self.calibration, True)
             xyz_proj = quat * self.ThreeDTruthPoints.getTruthPointsNumpy() + vect
@@ -2909,19 +3041,35 @@ class CameraGui(CTkFrame):
             us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 0] / xyz_proj[:, 2] + self.calibration.cx
             us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 1] / xyz_proj[:, 2] + self.calibration.cy
 
-            self.plotOnImg(us_vs_s_proj.astype(int),
+            self.plotOnImg(markupFrame, us_vs_s_proj.astype(int),
                            list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
             self.qnpResult = (quat, vect)
-            cv2.putText(self.markup_frame, 'Orientation (quat) From Truth Points: ' + format(quat, 'ijk.6f'), (50, 225),
-                        cv2.FONT_HERSHEY_DUPLEX,
-                        small_text(self.markup_frame.shape[0]),
-                        (255, 255, 0), 3,
-                        cv2.LINE_AA)
-            cv2.putText(self.markup_frame, 'Location From Truth Frame: ' + np.array2string(vect), (50, 300),
-                        cv2.FONT_HERSHEY_DUPLEX,
-                        small_text(self.markup_frame.shape[0]),
-                        (255, 255, 0), 3,
-                        cv2.LINE_AA)
+
+            orient_text = 'Orientation (quat) From Truth Points: ' + format(quat, 'ijk.6f')
+            pos_text = 'Location From Truth Frame: ' + np.array2string(vect)
+            (txt_w, txt_h), _ = cv2.getTextSize(orient_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                                small_text(markupFrame.shape[0]),
+                                                4)
+            cv2.putText(markupFrame, orient_text,
+                        (50, 3 * txt_h + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]),
+                        clr.BLACK, 4)
+            cv2.putText(markupFrame, orient_text,
+                        (50, 3 * txt_h + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]),
+                        clr.LIGHTBLUE, 2)
+            cv2.putText(markupFrame, pos_text, (50, 4 * txt_h + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]),
+                        clr.BLACK, 4)
+            cv2.putText(markupFrame, pos_text, (50, 4 * txt_h + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]),
+                        clr.LIGHTBLUE, 2)
+
+        return markupFrame
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
@@ -2935,7 +3083,7 @@ class CameraGui(CTkFrame):
         t_ours = C_CV_TO_OURS @ t_cv
         return mat2quat(R_ours.T), t_ours
 
-    def detectHorizon(self):
+    def detectHorizon(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
 
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
@@ -2943,7 +3091,7 @@ class CameraGui(CTkFrame):
         edges = cv2.Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, 50,
-                                minLineLength=np.sum(self.curr_frame.shape) / 10.0,
+                                minLineLength=np.sum(markupFrame.shape) / 10.0,
                                 maxLineGap=20)
 
         color = clr.RED
@@ -2962,19 +3110,20 @@ class CameraGui(CTkFrame):
                 if np.abs(x2 - x1) > 0.000001:
                     m = (y2 - y1) / (x2 - x1)
                     y1 = y1 - m * x1
-                    x2 = self.curr_frame.shape[1]
+                    x2 = markupFrame.shape[1]
                     self.hor_last_midpoint = ((y1 + m * x2 / 2.0) + self.hor_last_midpoint) / 2.0
                     self.hor_last_slope = (m + self.hor_last_slope) / 2.0
                     color = clr.YELLOWGREEN
 
         x1 = 0
-        x2 = int(self.curr_frame.shape[1])
+        x2 = int(markupFrame.shape[1])
         y1 = int(self.hor_last_midpoint - self.hor_last_slope * x2 / 2.0)
         y2 = int(self.hor_last_midpoint + self.hor_last_slope * x2 / 2.0)
 
-        cv2.line(self.markup_frame, (x1, y1), (x2, y2), color, 2)
+        cv2.line(markupFrame, (x1, y1), (x2, y2), color, 2)
 
         self.horizon_line = (x1, y1, x2, y2)
+        return markupFrame
 
     def check_above_horizon(self, pt):
         if self.horizon_line is None:
@@ -2983,15 +3132,15 @@ class CameraGui(CTkFrame):
         x1, y1, x2, y2 = self.horizon_line
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
-    def hyper_focus(self):
+    def hyper_focus(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
 
         if not self.camConfig.factor_graph:
             if self.last_bounding_box_size is not None:
                 self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
                     1] + self.radius * 4.0) / 5.0
 
-            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 3.0 * self.radius, 0.00)
-            self.markup_frame = dim_except_circle(self.markup_frame, self.current_center_est, 1.5 * self.radius, 0.50)
+            markupFrame = dim_except_circle(markupFrame, self.current_center_est, 3.0 * self.radius, 0.00)
+            markupFrame = dim_except_circle(markupFrame, self.current_center_est, 1.5 * self.radius, 0.50)
 
             self.radius = min(800.0, self.radius + 12.0)
             if self.yoloSession is not None:
@@ -3005,17 +3154,18 @@ class CameraGui(CTkFrame):
             ellipse_width = 5.0 * self.current_var_y + self.min_radius
             ellipse_height = 5.0 * self.current_var_z + self.min_radius
 
-            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > self.curr_frame.shape[
-                1] or \
-                    self.curr_FG_pixel[1] > self.curr_frame.shape[0]:
-                return
+            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > markupFrame.shape[
+                1] or self.curr_FG_pixel[1] > markupFrame.shape[0]:
+                return markupFrame
 
-            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width,
-                                                  y_axes=ellipse_height, dim_factor=0.10)
-            self.markup_frame = dim_except_circle(self.markup_frame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
-                                                  y_axes=ellipse_height * 2.0, dim_factor=0.00)
+            markupFrame = dim_except_circle(markupFrame, self.curr_FG_pixel, x_axes=ellipse_width,
+                                            y_axes=ellipse_height, dim_factor=0.10)
+            markupFrame = dim_except_circle(markupFrame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
+                                            y_axes=ellipse_height * 2.0, dim_factor=0.00)
 
-    def run_yolo(self, orig_image):
+        return markupFrame
+
+    def run_yolo(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
         """
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
@@ -3032,8 +3182,8 @@ class CameraGui(CTkFrame):
         import support.viz.draw_pnp_qnp as pnpDrw
         if self.pnpDrawer is None:
             self.pnpDrawer = pnpDrw.pnp_qnp_draw()
-        self.markup_frame, output = self.yoloSession.inferOnImage(orig_image, self.markup_frame,
-                                                                  self.camConfig.yoloBiasTracking)
+        markupFrame, output = self.yoloSession.inferOnImage(frame, markupFrame,
+                                                            self.camConfig.yoloBiasTracking)
 
         want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
         want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
@@ -3044,7 +3194,7 @@ class CameraGui(CTkFrame):
         algos.use_qnp = want_qnp
         algos.use_wqnp = want_wqnp
 
-        self.pnpDrawer.markUpImage(image=self.markup_frame,
+        self.pnpDrawer.markUpImage(image=markupFrame,
                                    output=output,
                                    markup_is_undistorted=not self.camConfig.undistort,
                                    calibration=self.calibration,
@@ -3059,8 +3209,8 @@ class CameraGui(CTkFrame):
 
         if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
-            img_yolo_x_correction = self.curr_frame.shape[0] / self.yoloSession.reader.imageSize
-            img_yolo_y_correction = self.curr_frame.shape[1] / self.yoloSession.reader.imageSize
+            img_yolo_x_correction = markupFrame.shape[0] / self.yoloSession.reader.imageSize
+            img_yolo_y_correction = markupFrame.shape[1] / self.yoloSession.reader.imageSize
 
             self.last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
                                            (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
@@ -3077,20 +3227,21 @@ class CameraGui(CTkFrame):
 
             if self.check_above_horizon(self.last_yolo_center):
                 self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
-                w, h, _ = self.curr_frame.shape
-                cv2.putText(self.markup_frame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
-                cv2.putText(self.markup_frame,
-                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, \
-                                            z:{self.last_yolo_3d_estimate[2]:.3f}',
+                w, h, _ = markupFrame.shape
+                cv2.putText(markupFrame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(markupFrame.shape[0]), (50, 255, 255), 1)
+                cv2.putText(markupFrame,
+                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, ' +
+                            f'z:{self.last_yolo_3d_estimate[2]:.3f}',
                             (25, w - 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(self.markup_frame.shape[0]), (50, 255, 255), 1)
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), 1)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
                                            (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
-                return
+                return markupFrame
 
         self.last_bounding_box_size = None
         self.last_yolo_center = None
+        return markupFrame
 
     def pose_from_yolo(self):
         """Compute (optional) PnP / QnP / KF-weighted QnP poses from YOLO detections."""
@@ -3111,18 +3262,18 @@ class CameraGui(CTkFrame):
             self.qnpKFYoloResult = None
             return
 
-    def factor_graph(self, img_time):
+    def factor_graph(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
         from support.runtime.fg_drogue_only import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
         color = clr.YELLOWGREEN
 
         if self.last_yolo_3d_estimate is not None:
-            if img_time < self.last_time_update:
+            if ctx.img_time < self.last_time_update:
                 self.FG.reset()
-            elif img_time > self.last_time_update:
-                self.FG.newRecvMeas(self.last_yolo_3d_estimate, img_time)
-                self.last_time_update = img_time
+            elif ctx.img_time > self.last_time_update:
+                self.FG.newRecvMeas(self.last_yolo_3d_estimate, ctx.img_time)
+                self.last_time_update = ctx.img_time
             if self.FG.numMeas > 20:
                 self.FG.popOldestMeas()
             if self.FG.numMeas > 2:
@@ -3130,44 +3281,46 @@ class CameraGui(CTkFrame):
         else:
             color = clr.RED
 
-        if img_time is not None and self.FG.numMeas > 2:
+        if ctx.img_time is not None and self.FG.numMeas > 2:
             K = self.calibration.getCameraMatrix()
-            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (img_time - self.last_time_update) * self.FG.r_V_d[-1])
+            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (ctx.img_time - self.last_time_update) * self.FG.r_V_d[-1])
             self.curr_FG_pixel = (self.curr_FG_pixel / self.curr_FG_pixel[2])[:2]
 
-            h, w, _ = self.markup_frame.shape
+            h, w, _ = markupFrame.shape
             size = 15
             thickness = 2
-            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
+            cv2.circle(markupFrame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
                        thickness)
-            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
                      [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
-            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                      [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
-            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), (0, 0, 0), thickness)
+            cv2.putText(markupFrame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                        med_text(markupFrame.shape[0]), (0, 0, 0), thickness)
 
             thickness = 1
-            cv2.circle(self.markup_frame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
+            cv2.circle(markupFrame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
                        thickness)
-            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
+            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
                      [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
-            cv2.line(self.markup_frame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
+            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
                      [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
-            cv2.putText(self.markup_frame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), color, thickness)
+            cv2.putText(markupFrame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                        med_text(markupFrame.shape[0]), color, thickness)
 
             self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
 
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
 
-            self.current_var_x = var_x + var_vx * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
-            self.current_var_y = var_y + var_vy * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
-            self.current_var_z = var_z + var_vz * (img_time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
+            self.current_var_x = var_x + var_vx * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
+            self.current_var_y = var_y + var_vy * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
+            self.current_var_z = var_z + var_vz * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
 
         self.last_yolo_3d_estimate = None
 
-    def phase_correlation(self):
+        return markupFrame
+
+    def phase_correlation(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
 
         if self.calibration.validCal:
             cx = int(self.calibration.cx)
@@ -3177,65 +3330,70 @@ class CameraGui(CTkFrame):
             cy = int(self.curr_frame.shape[1] / 2)
 
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cv2.cvtColor(self.markup_frame, cv2.COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
 
         if self.last_image is not None and self.last_image.shape == self.curr_frame_gray.shape:
             lft_rt, ret = cv2.phaseCorrelate(self.curr_frame_gray.astype(np.float64) / 255.0,
                                              self.last_image.astype(np.float64) / 255.0)
             lft, rt = lft_rt
-            cv2.arrowedLine(self.markup_frame, (cx, cy), (int(cx + 10 * lft), int(cy + 10 * rt)), (0, 0, 255), 3)
+            cv2.arrowedLine(markupFrame,
+                            (cx, cy),
+                            (int(cx + 10 * lft),
+                             int(cy + 10 * rt)),
+                            clr.RED, 3)
 
         self.last_image = copy.deepcopy(self.curr_frame_gray)
+        return markupFrame
 
-    def cleanup(self):
+    def cleanup(self, markupFrame):
 
         if self.calibration.validCal:
             cx = int(self.calibration.cx)
             cy = int(self.calibration.cy)
         else:
-            cx = int(self.curr_frame.shape[0] / 2)
-            cy = int(self.curr_frame.shape[1] / 2)
+            cx = int(markupFrame.shape[0] / 2)
+            cy = int(markupFrame.shape[1] / 2)
 
-        width = self.curr_frame.shape[0]
-        height = self.curr_frame.shape[1]
+        width = markupFrame.shape[0]
+        height = markupFrame.shape[1]
         thickness = max(int(width / 250), 1)
 
         if self.camConfig.crosshairs:
             crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
             crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
 
-            cv2.polylines(self.markup_frame, [crosshairsH], True, clr.HUD_GREEN, thickness)
-            cv2.polylines(self.markup_frame, [crosshairsV], True, clr.HUD_GREEN, thickness)
+            cv2.polylines(markupFrame, [crosshairsH], True, clr.HUD_GREEN, thickness)
+            cv2.polylines(markupFrame, [crosshairsV], True, clr.HUD_GREEN, thickness)
 
-        self.potentialResize()
+        self.potentialResize(markupFrame)
 
-        cv2.imshow(self.windowName, cv2.resize(self.markup_frame, (self.lastWidth, self.lastHeight)))
+        cv2.imshow(self.windowName, cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
 
         if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
                 self.screenshot_impending):
-            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), self.markup_frame)
+            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), markupFrame)
             self.img_idx += 1
             self.lastImageTime = time.time()
             self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
             self.screenshot_impending = False
 
-    def plotOnImg(self, points, names, color):
+    def plotOnImg(self, markupFrame, points, names, color):
         for idx, pxPt in enumerate(points):
-            cv2.circle(self.markup_frame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
+            cv2.circle(markupFrame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
             textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), (0, 0, 0),
+            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
+                        med_text(markupFrame.shape[0]), (0, 0, 0),
                         12,
                         cv2.LINE_AA)
-            cv2.putText(self.markup_frame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(self.markup_frame.shape[0]), color, 3,
+            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
+                        med_text(markupFrame.shape[0]), color, 3,
                         cv2.LINE_AA)
 
-    def potentialResize(self):
+    def potentialResize(self, markupFrame):
         if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
             return
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
-        aspectRatio = self.curr_frame.shape[1] / self.curr_frame.shape[0]
+        aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]
         if not cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
             return
 

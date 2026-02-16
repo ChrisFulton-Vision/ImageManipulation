@@ -1,4 +1,3 @@
-
 import numpy as np
 from numpy import sin, cos, deg2rad
 from support.io.attitude_interpreter import AttitudeReader as AttRdr, ControlMode
@@ -80,7 +79,8 @@ class HUD_Marker:
         if x != self.last_xy[0] or y != self.last_xy[1]:
             self.update_storage(x, y)
 
-        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(img_time)  # + 173.11338 - 11.658461)
+        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
+            img_time)  # + 173.11338 - 11.658461)
 
         # Speed
         cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
@@ -97,7 +97,6 @@ class HUD_Marker:
         self.draw_controlMode(image, mode)
 
         # cv2.putText(image, f'BnkOffset: {self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
-
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy
@@ -288,16 +287,16 @@ class HUD_Marker:
         match mode:
             case ControlMode.controller:
                 cv2.putText(image, "MODE: CNTL", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 150, 0), 2)
             case ControlMode.manual:
                 cv2.putText(image, "MODE: MAN", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(), (255, 255, 0), 2)
             case ControlMode.auto:
                 cv2.putText(image, "MODE: AUTO", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
             case _:
                 cv2.putText(image, "MODE: ERR", self.controlMode_text_loc,
-                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(), (0, 0, 255), 2)
 
     @staticmethod
     def draw_playbackStats(image, lowPassFPS, target_fps, playback_mode, rt_speed, cam_to_log_time_offset):
@@ -320,12 +319,14 @@ class HUD_Marker:
                     (10, txt_pix_start_perRow * 3), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(w), clr.HUD_YELLOW, 2)
 
-def draw_name_on_image(frame, name):
+
+def draw_name_on_image(name, frame):
     (width, height), base = cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX,
                                             med_text(frame.shape[0]), 4)
     img_w, img_h, *_ = frame.shape
     cv2.putText(frame, name, (img_w - width - 10, img_h - height),
                 cv2.FONT_HERSHEY_SIMPLEX, med_text(frame.shape[0]), clr.HUD_GREEN, 2)
+
 
 def draw_time_on_image(frame, time_str):
     (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,

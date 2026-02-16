@@ -23,6 +23,7 @@ class ImageKernel(Enum):
     ScharrEdgeDetectHorizontal = 'ScharrEdgeDetectHorizontal'
     ScharrEdgeDetectVertical = 'ScharrEdgeDetectVertical'
     Unsharp = 'Unsharp'
+    Invert = 'Invert'
 
     @staticmethod
     def get_convolution(imageKernel):

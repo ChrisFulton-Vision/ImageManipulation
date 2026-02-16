@@ -306,9 +306,9 @@ class pnp_qnp_draw:
 
         (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         txt_height_perRow = txt_height + 15
-        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 15), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(image, 'Direct Inference', (10, h - 3 * txt_height_perRow - 20), cv2.FONT_HERSHEY_SIMPLEX,
                 med_text(w), clr.BLACK, 4)
-        cv2.putText(image, 'Direct Inference', (10, h - 2 * txt_height_perRow - 15), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.putText(image, 'Direct Inference', (10, h - 3 * txt_height_perRow - 20), cv2.FONT_HERSHEY_SIMPLEX,
                 med_text(w), clr.LIGHTBLUE, 2)
 
     @staticmethod

@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
+def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5) -> None:
     """
     Dims an image everywhere except inside a circle.
 
@@ -14,7 +14,8 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     if y_axes is None:
         radius = x_axes
         if dim_factor == 0.0:
-            return dim_entirely(frame, center, radius)
+            dim_entirely(frame, center, radius)
+            return
 
         # 1. Create a mask
         mask = np.zeros(frame.shape[:2], dtype="uint8")  # Black mask
@@ -40,9 +41,9 @@ def dim_except_circle(frame, center, x_axes, y_axes=None, dim_factor=0.5):
     masked_dimmed = cv2.bitwise_and(dimmed_img, dimmed_img, mask=inverted_mask)
 
     # Add the original circle back
-    frame = cv2.add(masked_circle, masked_dimmed)
+    cv2.add(masked_circle, masked_dimmed, dst=frame)
 
-    return frame
+    return
 
 
 def dim_entirely(frame, center, radius):
@@ -60,6 +61,6 @@ def dim_entirely(frame, center, radius):
     cv2.circle(mask, (int(center[0]), int(center[1])), int(radius), (255, 255, 255), -1)  # White circle on mask
 
     # 3. Copy the original circle area back to the dimmed image
-    return cv2.bitwise_and(frame, frame, mask=mask)
+    cv2.bitwise_and(frame, frame, dst=frame, mask=mask)
 
 

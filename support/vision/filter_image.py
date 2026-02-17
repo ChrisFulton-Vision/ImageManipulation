@@ -136,16 +136,19 @@ class Gabor:
 
 
 def applyConvolutionFilter(img: NDArray, kernel: ImageKernel, gabor: None | Gabor = None) -> None:
+    if kernel == ImageKernel.Unfiltered:
+        return
+
     if kernel == ImageKernel.Unsharp:
         gaussian_3 = GaussianBlur(img, (0, 0), 2.0)
-        img = addWeighted(img, 2.0, gaussian_3, -1.0, 0)
+        addWeighted(img, 2.0, gaussian_3, -1.0, 0, dst=img)
         return
 
     if kernel == ImageKernel.Gabor:
         convolution = gabor.filter_kernel()
-        img = filter2D(img, -1, convolution)
+        filter2D(img, -1, convolution, dst=img)
         return
 
     convolution = ImageKernel.get_convolution(kernel)
-    img = filter2D(img, -1, convolution)
+    filter2D(img, -1, convolution, dst=img)
 

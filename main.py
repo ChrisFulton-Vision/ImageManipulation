@@ -447,7 +447,7 @@ class App(ctk.CTk):
             page_w = self._section_reqwidth(page)
             main_h = self.mainnav.winfo_reqheight()
             sub_h = self.subnav.winfo_reqheight() if show_subnav else 0
-            page_h = page.winfo_reqheight()
+            page_h = self._section_layout_height(page)
 
             BORDER_W, BORDER_H = 12, 12
             target_w = main_w + sub_w + page_w + BORDER_W
@@ -513,6 +513,26 @@ class App(ctk.CTk):
                 w += 16  # safe default
 
         return int(w)
+
+    def _section_layout_height(self, page) -> int:
+        """
+        Height based on actual laid-out children, not requested size.
+        More stable for grid-heavy CTk pages that change reqheight after interaction.
+        """
+        try:
+            self.update_idletasks()
+            kids = [w for w in page.winfo_children() if w.winfo_exists() and w.winfo_ismapped()]
+            if not kids:
+                return int(page.winfo_reqheight())
+            bottoms = []
+            for w in kids:
+                try:
+                    bottoms.append(int(w.winfo_y() + w.winfo_height()))
+                except Exception:
+                    pass
+            return max(bottoms) if bottoms else int(page.winfo_reqheight())
+        except Exception:
+            return int(page.winfo_reqheight())
 
 
 if __name__ == "__main__":

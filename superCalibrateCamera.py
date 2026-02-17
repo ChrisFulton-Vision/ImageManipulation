@@ -9,16 +9,15 @@ from collections import deque
 # from vmbpy import *
 
 import numpy as np
-from dataclasses import dataclass
+
 from numpy.typing import NDArray
-from typing import Callable, List, Tuple, Any, Iterable, Optional
+from typing import List, Any
 from pathlib import Path
 from tkinter import filedialog
 
-from customtkinter import (CTkFrame, CTkButton, CTkLabel, CTkSlider, CTkEntry, CTkCheckBox, CTkComboBox, BooleanVar,
-                           DoubleVar, StringVar, CTkProgressBar, END)
+import customtkinter as ctk
 import cv2
-
+from collections.abc import Iterable
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 
@@ -30,6 +29,7 @@ import support.gui.CTKHotkeyPage as Hotkey_page
 import support.gui.utils as utils
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
+import support.gui.UserSelectQueue as GuiQueue
 
 import support.io.data_processing as data
 from support.io.camera_config import CameraConfig as CamConfig
@@ -61,19 +61,7 @@ cv2.setUseOptimized(True)
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 
-@dataclass(slots=True)
-class FrameCtx:
-    img_time: Optional[float] = None
-    name: Optional[str] = None
-    display_in_realtime: bool = True
-
-
-Args = Tuple[Any, ...]
-StepFn = Callable[[NDArray, NDArray, FrameCtx, Args], None]
-StepSpec = Tuple[StepFn, Args]
-
-
-class CameraGui(CTkFrame):
+class CameraGui(ctk.CTkFrame):
     def __init__(self, master, *args, **kwargs):
         self._playback_allowed = None
         self.curr_r_V_d = None
@@ -97,15 +85,15 @@ class CameraGui(CTkFrame):
         self._loading_config = True
 
         self.func_that_refits = None
-        self.list_of_image_process_functors: List[StepSpec] = []
+        self.list_of_image_process_functors: List[GuiQueue.StepSpec] = []
 
         # Debounced cache writes
         self._save_debounce_id = None
 
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
-        self._flag_vars: dict[str, BooleanVar | DoubleVar] = {}
-        self._checkboxes: dict[str, CTkCheckBox] = {}
+        self._flag_vars: dict[str, ctk.BooleanVar | ctk.DoubleVar] = {}
+        self._checkboxes: dict[str, ctk.CTkCheckBox] = {}
         self._flags = [
             "detectTags", "undistort", "pnp3DTruthPoints", "qnp3DTruthPoints",
             "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
@@ -121,7 +109,7 @@ class CameraGui(CTkFrame):
         self.vc = None
         self._thread = None
         self.shutting_down = False
-        self.stream_running_var = BooleanVar(value=False)
+        self.stream_running_var = ctk.BooleanVar(value=False)
 
         self.recording = False
         self.yoloSession = None
@@ -130,6 +118,49 @@ class CameraGui(CTkFrame):
         self.arucoParams = None
 
         self._init_flag_vars()
+
+        self.step_options: List[GuiQueue.StepOption] = [
+            GuiQueue.StepOption(label="Undistort",
+                                fn=self.undistort,
+                                arg_specs=()),
+            GuiQueue.StepOption(label="Draw Chessboard",
+                                fn=self.draw_chessboard,
+                                arg_specs=()),
+            GuiQueue.StepOption(label="Apply Image Filter",
+                                fn=self.applyKernel,
+                                arg_specs=(
+                                    GuiQueue.ArgSpec("Filter", ImageKernel, ImageKernel.Unfiltered),
+                                )),
+            GuiQueue.StepOption(label="Apply YOLO -> Q/PnP",
+                                fn=self.run_yolo,
+                                arg_specs=(
+                                    GuiQueue.ArgSpec("PnP", bool, False),
+                                    GuiQueue.ArgSpec("QnP", bool, False),
+                                        )
+                                ),
+            GuiQueue.StepOption(label="Detect Corners in Image",
+                                fn=self.detect_corners,
+                                arg_specs=()),
+            GuiQueue.StepOption(label="Show Phase Correlation",
+                                fn=self.phase_correlation,
+                                arg_specs=()),
+            GuiQueue.StepOption(label="Attempt Horizon Detection",
+                                fn=self.detectHorizon,
+                                arg_specs=()),
+            GuiQueue.StepOption(label="Draw HUD",
+                                fn=self.draw_HUD,
+                                arg_specs=()),
+            GuiQueue.StepOption(
+                                label="Detect AprilTags and Q/PnP",
+                                fn=self.detectAprilTags,
+                                arg_specs=(
+                                    GuiQueue.ArgSpec("scale", float, 1.0, min=0.1, max=1.0),
+                                    GuiQueue.ArgSpec("inpaint", bool, False),
+                                    GuiQueue.ArgSpec("PnP", bool, False),
+                                    GuiQueue.ArgSpec("QnP", bool, False),
+                                        ),
+                                ),
+        ]
 
         self.calibration = Calibration()
         self.config_store = ConfigStore(CACHE_FILEPATH, configs_dir="Configs", scheduler=self)
@@ -140,10 +171,10 @@ class CameraGui(CTkFrame):
         self.image_processing_page = Image_processing_page.ImageProcessing_page(master, controller=self)
         self.hotkey_page = Hotkey_page.Hotkey_page(master)
 
-        self.export_frame = CTkFrame(master=master)
-        self.playback_frame = CTkFrame(master=master)
-        self.data_frame = CTkFrame(master=master)
-        self.hotkey_frame = CTkFrame(master=master)
+        self.export_frame = ctk.CTkFrame(master=master)
+        self.playback_frame = ctk.CTkFrame(master=master)
+        self.data_frame = ctk.CTkFrame(master=master)
+        self.hotkey_frame = ctk.CTkFrame(master=master)
 
         self.showWindow = False
         self.GaborGUI = None
@@ -230,17 +261,17 @@ class CameraGui(CTkFrame):
 
         self.available_sources = [source.value for source in ImageSource]
 
-        self.recordButton = CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
-                                      hover_color='navy', command=self.recordOff)
-        self.printButton = CTkButton(master=self.export_frame, text='Print 3D Truth Correlation', fg_color='green',
-                                     hover_color='navy', command=self.print3DTruthPointsOnce)
-        self.screenshotButton = CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
-                                          hover_color='navy', command=self.screenshot)
+        self.recordButton = ctk.CTkButton(master=self.export_frame, text='Saving Imagery', fg_color='green',
+                                          hover_color='navy', command=self.recordOff)
+        self.printButton = ctk.CTkButton(master=self.export_frame, text='Print 3D Truth Correlation', fg_color='green',
+                                         hover_color='navy', command=self.print3DTruthPointsOnce)
+        self.screenshotButton = ctk.CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
+                                              hover_color='navy', command=self.screenshot)
 
-        self.playbackModeText = StringVar(value='Playback Mode: FPS')
+        self.playbackModeText = ctk.StringVar(value='Playback Mode: FPS')
 
-        self.exportQualityCombo = CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
-                                              command=self.updateQuality)
+        self.exportQualityCombo = ctk.CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
+                                                  command=self.updateQuality)
 
         self.making_gifOrVid = False
 
@@ -248,13 +279,13 @@ class CameraGui(CTkFrame):
 
         self.sync_flags_from_model()
 
-        self.exportStartFrame = CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame = CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
 
-        self.btn_checkerboard = CTkButton(self.export_frame,
-                                          state='normal',
-                                          text='Checkerboard',
-                                          command=self.launch_checkerboard)
+        self.btn_checkerboard = ctk.CTkButton(self.export_frame,
+                                              state='normal',
+                                              text='Checkerboard',
+                                              command=self.launch_checkerboard)
 
         self.img_idx = 0
         self.timeBetweenImgsEntry = None
@@ -272,6 +303,13 @@ class CameraGui(CTkFrame):
                                                          controller=self)
 
         self.setupFrame()
+
+        self.imgProcQueue_editor = GuiQueue.StepSpecQueueEditor(
+            master=self.image_processing_page,
+            options=self.step_options,
+            on_change=self._on_queue_changed,
+        )
+        self.imgProcQueue_editor.grid(row=20, column=0, columnspan=2, padx=5, pady=5)
 
         self._loading_config = False
 
@@ -299,6 +337,14 @@ class CameraGui(CTkFrame):
         except tk.TclError:
             pass
 
+    def _on_queue_changed(self, new_queue: List[GuiQueue.StepSpec]) -> None:
+        sig_did_change = self.list_of_image_process_functors != list(new_queue)
+        self.list_of_image_process_functors = list(new_queue)
+
+        if sig_did_change:
+            if self.func_that_refits is not None:
+                self.func_that_refits()
+
     def func_to_refit(self, func):
         self.func_that_refits = func
 
@@ -309,9 +355,9 @@ class CameraGui(CTkFrame):
                 setattr(self.camConfig, name, 1.0 if name in double_vars else False)
 
             if name in double_vars:
-                v = DoubleVar(value=getattr(self.camConfig, name, 1.0))
+                v = ctk.DoubleVar(value=getattr(self.camConfig, name, 1.0))
             else:
-                v = BooleanVar(value=bool(getattr(self.camConfig, name, False)))
+                v = ctk.BooleanVar(value=bool(getattr(self.camConfig, name, False)))
 
             # when UI flips, write to model
             v.trace_add("write", lambda var_name, index, op, n=name: self._on_flag_changed(n))
@@ -539,19 +585,19 @@ class CameraGui(CTkFrame):
         self.screenshotButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         rowID += 1
 
-        activeEntryButton = CTkButton(self.export_frame, text="Time Between Saved Frames",
-                                      command=self.getEntryValue)
-        self.timeBetweenImgsEntry = CTkEntry(self.export_frame,
-                                             placeholder_text=str(self.camConfig.secondsBetweenImages))
+        activeEntryButton = ctk.CTkButton(self.export_frame, text="Time Between Saved Frames",
+                                          command=self.getEntryValue)
+        self.timeBetweenImgsEntry = ctk.CTkEntry(self.export_frame,
+                                                 placeholder_text=str(self.camConfig.secondsBetweenImages))
         self.grid_sideBySide(rowID, activeEntryButton, self.timeBetweenImgsEntry)
         rowID += 1
 
-        qualityLabel = CTkLabel(self.export_frame, text="Export Quality: ")
+        qualityLabel = ctk.CTkLabel(self.export_frame, text="Export Quality: ")
         self.grid_sideBySide(rowID, qualityLabel, self.exportQualityCombo)
         rowID += 1
 
-        exportToGifButton = CTkButton(self.export_frame, text="Export to Gif")
-        exportToVidButton = CTkButton(self.export_frame, text="Export to Vid")
+        exportToGifButton = ctk.CTkButton(self.export_frame, text="Export to Gif")
+        exportToVidButton = ctk.CTkButton(self.export_frame, text="Export to Vid")
         exportToGifButton.configure(
             command=lambda gif=exportToGifButton, vid=exportToVidButton: self.exportToGif(gif, vid))
         exportToVidButton.configure(
@@ -607,7 +653,7 @@ class CameraGui(CTkFrame):
         f.grid_rowconfigure(99, weight=1)
         f.grid_columnconfigure(1, weight=1)
 
-        CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
+        ctk.CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
             row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
         )
 
@@ -617,30 +663,30 @@ class CameraGui(CTkFrame):
                 or self.camConfig.imageFilepath
                 or ""
         )
-        self._dp_img_dir_var = StringVar(value=str(img_dir_default))
+        self._dp_img_dir_var = ctk.StringVar(value=str(img_dir_default))
 
         def _choose_dir():
             d = filedialog.askdirectory(title="Select image folder")
             if d:
                 self._dp_img_dir_var.set(d)
 
-        CTkLabel(f, text="Folder:").grid(row=1, column=0, padx=12, pady=6, sticky="w")
-        CTkEntry(f, textvariable=self._dp_img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
-        CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
+        ctk.CTkLabel(f, text="Folder:").grid(row=1, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
+        ctk.CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
 
         # --- Confidence sweep controls ---
         conf_default = getattr(self.camConfig, "dp_conf_list", "0.80")
-        self._dp_conf_list = StringVar(value=str(conf_default))
+        self._dp_conf_list = ctk.StringVar(value=str(conf_default))
 
-        CTkLabel(f, text="YOLO conf values (comma-separated):").grid(
+        ctk.CTkLabel(f, text="YOLO conf values (comma-separated):").grid(
             row=3, column=0, padx=12, pady=6, sticky="w"
         )
-        CTkEntry(f, textvariable=self._dp_conf_list).grid(
+        ctk.CTkEntry(f, textvariable=self._dp_conf_list).grid(
             row=3, column=1, padx=12, pady=6, sticky="ew"
         )
 
         # Small hint below the entry
-        CTkLabel(
+        ctk.CTkLabel(
             f,
             text="Example: 0.50, 0.65, 0.80   (defaults to 0.80 on bad input)",
             font=("Segoe UI", 10, "italic")
@@ -650,35 +696,35 @@ class CameraGui(CTkFrame):
 
         # --- Checkpoint controls ---
         ckpt_default = getattr(self.camConfig, "dp_ckptN", 200)
-        self._dp_ckptN = StringVar(value=str(ckpt_default))
-        CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
-        CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
+        self._dp_ckptN = ctk.StringVar(value=str(ckpt_default))
+        ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
 
         # --- Prefetch controls ---
         prefetch_default = getattr(self.camConfig, "dp_prefetch", 32)
-        self._dp_prefetch = StringVar(value=str(prefetch_default))
-        CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
-        CTkEntry(f, textvariable=self._dp_prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
+        self._dp_prefetch = ctk.StringVar(value=str(prefetch_default))
+        ctk.CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
+        ctk.CTkEntry(f, textvariable=self._dp_prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
 
         # --- Progress UI ---
-        self._dp_progress_label = CTkLabel(f, text="Idle")
+        self._dp_progress_label = ctk.CTkLabel(f, text="Idle")
         self._dp_progress_label.grid(row=20, column=0, columnspan=3, padx=12, pady=(8, 4), sticky="w")
 
-        self._dp_progress = CTkProgressBar(f)  # determinate
+        self._dp_progress = ctk.CTkProgressBar(f)  # determinate
         self._dp_progress.grid(row=21, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
         self._dp_progress.set(0.0)
 
         gpu_display = bool(getattr(self.camConfig, "dp_gpu", False))
         # Keep a handle to the Tk var so config-load can resync the checkbox (no desync).
-        self._dp_gpu_var = BooleanVar(value=gpu_display)
-        gpu_checkbox = CTkCheckBox(
+        self._dp_gpu_var = ctk.BooleanVar(value=gpu_display)
+        gpu_checkbox = ctk.CTkCheckBox(
             f,
             text='Show GPU Util',
             variable=self._dp_gpu_var,
             command=self._on_toggle_show_gpu)
         gpu_checkbox.grid(row=25, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
 
-        self.gpu_slider = CTkSlider(f, from_=0, to=100)
+        self.gpu_slider = ctk.CTkSlider(f, from_=0, to=100)
         self.gpu_slider.grid(row=25, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
         self.gpu_slider.configure(state='disabled')
         self.gpu_slider.set(0)
@@ -709,7 +755,7 @@ class CameraGui(CTkFrame):
 
         # --- Batch action buttons row ---
         # Left: YOLO batch
-        self._dp_run_btn = CTkButton(
+        self._dp_run_btn = ctk.CTkButton(
             f,
             text="Run YOLO Batch",
             fg_color=clr.CTK_BUTTON_GREEN,
@@ -717,7 +763,7 @@ class CameraGui(CTkFrame):
         )
         self._dp_run_btn.grid(row=10, column=0, padx=12, pady=(16, 12), sticky="ew")
 
-        self._dp_kalman_btn = CTkButton(
+        self._dp_kalman_btn = ctk.CTkButton(
             f,
             text="Kalman Batch",
             command=self._run_kalman_batch_start,
@@ -725,7 +771,7 @@ class CameraGui(CTkFrame):
         self._dp_kalman_btn.grid(row=10, column=1, padx=12, pady=(16, 12), sticky="ew")
 
         # Center: SolvePnP/QnP batch (uses existing threaded worker)
-        self._dp_pnp_btn = CTkButton(
+        self._dp_pnp_btn = ctk.CTkButton(
             f,
             text="SolvePnP/QnP Batch",
             command=self.runPnP_QnP_on_folders_threaded,
@@ -733,7 +779,7 @@ class CameraGui(CTkFrame):
         self._dp_pnp_btn.grid(row=10, column=2, padx=12, pady=(16, 12), sticky="ew")
 
         # Cancel button in its own full-width row below
-        self._dp_cancel_btn = CTkButton(
+        self._dp_cancel_btn = ctk.CTkButton(
             f,
             text="Cancel",
             command=self._dp_cancel,
@@ -756,13 +802,13 @@ class CameraGui(CTkFrame):
                     self._plotter_close_plot_alias()
                     return
 
-        dp_plotter_btn = CTkButton(
+        dp_plotter_btn = ctk.CTkButton(
             f,
             text="Plot",
             command=plot_sequential, )
         dp_plotter_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
-        dp_close_plot_btn = CTkButton(
+        dp_close_plot_btn = ctk.CTkButton(
             f,
             text="Close Plots",
             command=self._plotter_close_plot_alias, )
@@ -1085,20 +1131,20 @@ class CameraGui(CTkFrame):
         rowID = 0
         self.update_playbackMenu()
 
-        playbackLabel = CTkLabel(f, textvariable=self.playbackModeText)
+        playbackLabel = ctk.CTkLabel(f, textvariable=self.playbackModeText)
         playbackLabel.grid(row=rowID, column=0, sticky='w', padx=8, pady=(8, 4))
         rowID += 1
 
         # --- Frame slider ---
-        self._pb_frame_text = StringVar(value="Frame: — / —")
+        self._pb_frame_text = ctk.StringVar(value="Frame: — / —")
         self._pb_slider_dragging = False
 
-        self._pb_frame_label = CTkLabel(f, textvariable=self._pb_frame_text)
+        self._pb_frame_label = ctk.CTkLabel(f, textvariable=self._pb_frame_text)
         self._pb_frame_label.grid(row=rowID, column=0, sticky="w", padx=8, pady=(4, 2))
         rowID += 1
 
         # Start with a safe dummy range; worker will update range once it knows num_images
-        self._pb_slider = CTkSlider(
+        self._pb_slider = ctk.CTkSlider(
             f,
             from_=0,
             to=1,
@@ -1117,11 +1163,11 @@ class CameraGui(CTkFrame):
         rowID += 1
 
         # --- Primary playback controls (mirror hotkeys) ---
-        btn_frame = CTkFrame(self.playback_frame)
+        btn_frame = ctk.CTkFrame(self.playback_frame)
         btn_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
 
         def mk(text, action, *args, col=0):
-            b = CTkButton(
+            b = ctk.CTkButton(
                 btn_frame,
                 text=text,
                 command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar), )
@@ -1136,10 +1182,10 @@ class CameraGui(CTkFrame):
         mk("Mode (f)", "toggle_fps_mode", col=4)
 
         rowID += 1
-        speed_frame = CTkFrame(self.playback_frame)
+        speed_frame = ctk.CTkFrame(self.playback_frame)
         speed_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
 
-        mk2 = lambda text, action, *args, col=0: CTkButton(
+        mk2 = lambda text, action, *args, col=0: ctk.CTkButton(
             speed_frame,
             text=text,
             command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
@@ -1371,10 +1417,10 @@ class CameraGui(CTkFrame):
             self.camConfig.secondsBetweenImages = float(self.timeBetweenImgsEntry.get())
         except ValueError:
             self.camConfig.secondsBetweenImages = 1.0
-            self.timeBetweenImgsEntry.delete(0, END)
+            self.timeBetweenImgsEntry.delete(0, ctk.END)
             self.timeBetweenImgsEntry.configure(placeholder_text='1')
         if self.camConfig.secondsBetweenImages <= 0.0:
-            self.timeBetweenImgsEntry.delete(0, END)
+            self.timeBetweenImgsEntry.delete(0, ctk.END)
             self.timeBetweenImgsEntry.configure(placeholder_text='1')
             self.camConfig.secondsBetweenImages = 1.0
 
@@ -2304,23 +2350,17 @@ class CameraGui(CTkFrame):
                       img_time=None,
                       name=None,
                       display_in_realtime=True,
-                      box_around=False):
+                      box_around=False) -> NDArray | None:
 
         if frame is None:
             return
 
-        ctx = FrameCtx(img_time=img_time, name=name, display_in_realtime=display_in_realtime)
+        ctx = GuiQueue.FrameCtx(img_time=img_time, name=name, display_in_realtime=display_in_realtime)
 
         self.pnpResult = None
         self.qnpResult = None
         self.curr_frame_gray = None
 
-        self.list_of_image_process_functors: List[StepSpec] = [
-            (self.undistort, ()),
-            (self.detectAprilTags, (True,)),
-            (self.applyKernel, (ImageKernel.Invert,)),
-            (self.corner_detection, ()),
-        ]
         markup_frame = self.markup_frame
         # np.copyto is faster (doesn't reallocate), but requires destination to match shape
         if markup_frame is None or markup_frame.shape != frame.shape:
@@ -2329,7 +2369,7 @@ class CameraGui(CTkFrame):
             np.copyto(markup_frame, frame)
 
         # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
-        calSize = (self.calibration.width, self.calibration.height)
+        calSize = (self.calibration.height, self.calibration.width)
         frameSize = frame.shape[:2]
         if self.calibration.validCal and frameSize != calSize:
             LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
@@ -2341,14 +2381,25 @@ class CameraGui(CTkFrame):
         else:
             markup_frame: NDArray = frame  # explicit reference passed, saves copy if not undistorting
 
-        # test_markup_frame: NDArray = np.copy(frame)
-        # cv2.imshow("Test", test_markup_frame)
-        # cv2.waitKey(0)
-        # for func, args in self.list_of_image_process_functors:
-        #     func(frame, test_markup_frame, ctx, args)
-        # cv2.resize(test_markup_frame, (864, 864), test_markup_frame)
-        # cv2.imshow("Test", test_markup_frame)
-        # cv2.waitKey(1)
+        test_markup_frame: NDArray = np.copy(frame)
+        for func, args in self.list_of_image_process_functors:
+            func(frame, test_markup_frame, ctx, args)
+
+        if box_around:
+            self.draw_boxAround(frame, test_markup_frame, ctx, ())
+
+        if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+            self.draw_name(frame, test_markup_frame, ctx, ())
+            if not self.screenshot_impending:
+                self.draw_playbackStats(frame, test_markup_frame, ctx, ())
+        self.draw_time(frame, test_markup_frame, ctx, ())
+
+        if display_in_realtime:
+            self.cleanup(test_markup_frame, 'test')
+            cv2.waitKey(1)
+        else:
+            return np.ascontiguousarray(markup_frame).copy()
+        ######################################################
 
         if self.camConfig.draw_chessboard:
             self.draw_chessboard(self.curr_frame,
@@ -2363,40 +2414,31 @@ class CameraGui(CTkFrame):
                              [self.camConfig.processingKernel])
 
         if self.camConfig.detect_corners:
-            self.corner_detection(frame,
-                                  markup_frame,
-                                  ctx,
-                                  ())
+            self.detect_corners(frame,
+                                markup_frame,
+                                ctx,
+                                ())
 
         if self.camConfig.detectTags and self.detector is not None:
             self.detectAprilTags(frame,
                                  markup_frame,
                                  ctx,
-                                 [self.camConfig.hideAprilTags])
-
-        if self.camConfig.pnp3DTruthPoints and self.detector is not None:
-            markup_frame = self.pnp3DTruthPoints(frame,
-                                                 markup_frame,
-                                                 ctx,
-                                                 ())
-
-        if self.camConfig.qnp3DTruthPoints and self.detector is not None:
-            markup_frame = self.qnp3DTruthPoints(frame,
-                                                 markup_frame,
-                                                 ctx,
-                                                 ())
+                                 [0.6,
+                                       self.camConfig.hideAprilTags,
+                                       self.camConfig.pnp3DTruthPoints,
+                                       self.camConfig.qnp3DTruthPoints,])
 
         if self.camConfig.detect_horizon:
-            markup_frame = self.detectHorizon(frame,
-                                              markup_frame,
-                                              ctx,
-                                              ())
+            self.detectHorizon(frame,
+                               markup_frame,
+                               ctx,
+                               ())
 
         if self.camConfig.hyper_focus:
-            markup_frame = self.hyper_focus(frame,
-                                            markup_frame,
-                                            ctx,
-                                            ())
+            self.hyper_focus(frame,
+                             markup_frame,
+                             ctx,
+                             ())
 
         if self.camConfig.phase_correlation:
             self.phase_correlation(frame,
@@ -2448,7 +2490,10 @@ class CameraGui(CTkFrame):
         else:
             return np.ascontiguousarray(markup_frame).copy()
 
-    def draw_playbackStats(self, frame, markupFrame, ctx: FrameCtx, args):
+    def draw_playbackStats(self, frame,
+                           markupFrame,
+                           ctx: GuiQueue.FrameCtx,
+                           args):
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
             self.hud_marker = HUD_Marker()
@@ -2461,18 +2506,24 @@ class CameraGui(CTkFrame):
                                            self.camConfig.rt_speed,
                                            self.camConfig.cam_to_log_time_offset)
 
-    def draw_time(self, frame, markupFrame, ctx: FrameCtx, args):
+    def draw_time(self, frame, markupFrame, ctx: GuiQueue.FrameCtx, args):
         if ctx.img_time is None:
             return
         time_str = f"Flight Time: {ctx.img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
         from support.viz.HUD_draw import draw_time_on_image
         draw_time_on_image(markupFrame, time_str)
 
-    def draw_name(self, frame, markupFrame, ctx: FrameCtx, args):
+    def draw_name(self, frame,
+                  markupFrame,
+                  ctx: GuiQueue.FrameCtx,
+                  args) -> None:
         from support.viz.HUD_draw import draw_name_on_image
         draw_name_on_image(os.path.basename(ctx.name), markupFrame)
 
-    def draw_HUD(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def draw_HUD(self, frame: NDArray,
+                 markupFrame: NDArray,
+                 ctx: GuiQueue.FrameCtx,
+                 args) -> None:
         if ctx.img_time is None:
             return
         from support.viz.HUD_draw import HUD_Marker
@@ -2481,11 +2532,17 @@ class CameraGui(CTkFrame):
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
         self.hud_marker.draw_HUD(markupFrame, ctx.img_time)
 
-    def draw_boxAround(self, frame, markupFrame, ctx: FrameCtx, args):
+    def draw_boxAround(self, frame,
+                       markupFrame,
+                       ctx: GuiQueue.FrameCtx,
+                       args) -> None:
         x, y, _ = markupFrame.shape
         cv2.rectangle(markupFrame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
 
-    def draw_chessboard(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> None:
+    def draw_chessboard(self, frame: NDArray,
+                        markupFrame: NDArray,
+                        ctx: GuiQueue.FrameCtx,
+                        args) -> None:
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
 
@@ -2666,7 +2723,7 @@ class CameraGui(CTkFrame):
 
         return stitched
 
-    def undistort(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def undistort(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args):
 
         if self.calibration.fisheye:
             if self.camConfig.cubemap:
@@ -2682,7 +2739,7 @@ class CameraGui(CTkFrame):
                     'right': (1, 2),
                     # 'back': (1, 0),
                     'top': (0, 1)}
-                markupFrame = self.stitch_cubemap_faces(layout, cells=3)
+                markupFrame[:] = self.stitch_cubemap_faces(layout, cells=3)
 
             else:
                 if self.face_size is None or self.face_size != min(markupFrame.shape[:2]):
@@ -2692,15 +2749,19 @@ class CameraGui(CTkFrame):
                 self.apply_fisheye_faces(markupFrame)
 
                 # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
-                markupFrame = self.cubemap_faces['front']
+                markupFrame[:] = self.cubemap_faces['front']
         else:
             if self.map1 is None or self.map2 is None:
                 raise ValueError("No calibration loaded!")
-            markupFrame = cv2.remap(markupFrame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR,
-                                    borderMode=cv2.BORDER_CONSTANT)
+            cv2.remap(markupFrame,
+                      self.map1,
+                      self.map2,
+                      interpolation=cv2.INTER_LINEAR,
+                      dst=markupFrame,
+                      borderMode=cv2.BORDER_CONSTANT)
 
     def applyKernel(self, frame: NDArray,
-                    markupFrame: NDArray, ctx: FrameCtx,
+                    markupFrame: NDArray, ctx: GuiQueue.FrameCtx,
                     args) -> None:
 
         if args == () or args is None:
@@ -2714,36 +2775,39 @@ class CameraGui(CTkFrame):
             self.GaborGUI.close()
             self.GaborGUI = None
 
-        from support.vision.filter_image import applyConvolutionFilter
-
         if process_kernel == ImageKernel.Invert:
-            markupFrame = cv2.bitwise_not(markupFrame)
+            cv2.bitwise_not(markupFrame, dst=markupFrame)
             return
 
+        from support.vision.filter_image import applyConvolutionFilter
         if process_kernel == ImageKernel.Gabor:
             from support.vision.filter_image import GaborGUI
             if self.GaborGUI is None:
                 self.GaborGUI = GaborGUI()
-            markupFrame = applyConvolutionFilter(markupFrame,
-                                                 process_kernel,
-                                                 self.GaborGUI.gaborFilter)
+            applyConvolutionFilter(markupFrame,
+                                   process_kernel,
+                                   self.GaborGUI.gaborFilter)
             return
 
-        markupFrame = applyConvolutionFilter(markupFrame,
-                                             process_kernel)
+        applyConvolutionFilter(markupFrame,
+                               process_kernel)
 
-    def corner_detection(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
+    def detect_corners(self,
+                       frame: NDArray,
+                       markupFrame: NDArray,
+                       ctx: GuiQueue.FrameCtx,
+                       args) -> None:
         if self.curr_frame_gray is None:
             self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
         harris_corners = cv2.cornerHarris(self.curr_frame_gray, 3, 3, 0.05)
 
         markupFrame[harris_corners > 0.025 * harris_corners.max()] = [0, 255, 255]
-        return markupFrame
+        return
 
     def detectAprilTags(self,
                         frame: NDArray,
-                        markupFrame: NDArray, ctx: FrameCtx,
-                        args) -> NDArray:
+                        markupFrame: NDArray, ctx: GuiQueue.FrameCtx,
+                        args) -> None:
         """
         Faster AprilTag detection:
           - detect on downscaled image
@@ -2751,31 +2815,116 @@ class CameraGui(CTkFrame):
           - refine on full-res gray image with cornerSubPix
         """
 
-        def process_single_arg(arg, scale, inpaint):
-            if isinstance(arg, float):
-                scale = arg
-            elif isinstance(arg, bool):
-                inpaint = arg
-            else:
-                raise AttributeError("Argument should be float or bool")
+        def parse_apriltag_args(args: Any) -> GuiQueue.AprilTagDetectOpts:
+            opts = GuiQueue.AprilTagDetectOpts()
 
-        scale = 1.0
-        inpaint = False
-        if isinstance(args, Iterable):
-            for arg in args:
-                process_single_arg(arg, scale, inpaint)
-        else:
-            process_single_arg(args, scale, inpaint)
+            if args is None:
+                return opts
+
+            def set_scale(v: Any) -> None:
+                if isinstance(v, bool):
+                    raise TypeError("AprilTag args: 'scale' must be numeric, not bool")
+                if not isinstance(v, (int, float)):
+                    raise TypeError(f"AprilTag args: 'scale' must be int/float, got {type(v)}")
+                opts.scale = float(v)
+
+            def set_bool(name: str, v: Any) -> None:
+                # allow 0/1 if they come in (but reject other ints)
+                if isinstance(v, bool):
+                    setattr(opts, name, v)
+                    return
+                if isinstance(v, int) and v in (0, 1):
+                    setattr(opts, name, bool(v))
+                    return
+                raise TypeError(f"AprilTag args: '{name}' must be bool (or 0/1), got {type(v)}")
+
+            # --- Preferred: mapping by name (unambiguous) ---
+            if isinstance(args, dict):
+                if "scale" in args:
+                    set_scale(args["scale"])
+                if "inpaint" in args:
+                    set_bool("inpaint", args["inpaint"])
+                if "pnp" in args:
+                    set_bool("pnp", args["pnp"])
+                if "qnp" in args:
+                    set_bool("qnp", args["qnp"])
+                return opts
+
+            # --- Single scalar legacy ---
+            # bool alone historically meant inpaint
+            if isinstance(args, bool):
+                opts.inpaint = args
+                return opts
+
+            if isinstance(args, (int, float)) and not isinstance(args, bool):
+                set_scale(args)
+                return opts
+
+            # --- Iterable legacy ---
+            if isinstance(args, Iterable) and not isinstance(args, (str, bytes)):
+                # Flatten any nested dicts and collect scalars
+                bools: list[bool] = []
+                saw_scale = False
+
+                for a in args:
+                    if isinstance(a, dict):
+                        if "scale" in a:
+                            set_scale(a["scale"])
+                            saw_scale = True
+                        if "inpaint" in a:
+                            set_bool("inpaint", a["inpaint"])
+                        if "pnp" in a:
+                            set_bool("pnp", a["pnp"])
+                        if "qnp" in a:
+                            set_bool("qnp", a["qnp"])
+                        continue
+
+                    if isinstance(a, bool):
+                        bools.append(a)
+                        continue
+
+                    if isinstance(a, (int, float)) and not isinstance(a, bool):
+                        set_scale(a)
+                        saw_scale = True
+                        continue
+
+                    raise TypeError(f"AprilTag args: expected numeric/bool/dict, got {type(a)}")
+
+                # If user provided unnamed bools, map them by order:
+                #   (inpaint, pnp, qnp)
+                if bools:
+                    if len(bools) >= 1:
+                        opts.inpaint = bools[0]
+                    if len(bools) >= 2:
+                        opts.pnp = bools[1]
+                    if len(bools) >= 3:
+                        opts.qnp = bools[2]
+                    if len(bools) > 3:
+                        raise TypeError(
+                            f"AprilTag args: too many unnamed bools ({len(bools)}). "
+                            "Use a dict: {'inpaint':..., 'pnp':..., 'qnp':...}."
+                        )
+
+                return opts
+
+            raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
+
+        opts = parse_apriltag_args(args)
+
+        scale = opts.scale
+        inpaint = opts.inpaint
+        pnp_points = opts.pnp
+        qnp_points = opts.qnp
 
         if self.detector is None:
-            return markupFrame
+            self.createDetector()
 
         gray_full = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
         h, w = gray_full.shape[:2]
 
         # 1) Downscale for detection
-        if not (0.2 <= scale <= 1.0):
-            scale = 0.6
+        # if not (0.1 <= scale <= 1.0):
+        #     scale = 0.6
         small_gray = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
                                 interpolation=cv2.INTER_AREA)
 
@@ -2786,9 +2935,7 @@ class CameraGui(CTkFrame):
         self.detectIDS = []
 
         if corners_small is None or ids is None or len(corners_small) == 0:
-            print(f'Corners_small is {corners_small}')
-            print(f'Ids: {ids}')
-            return markupFrame
+            return
 
         # 3) Upscale corners to full-res and pack into a single array
         all_pts = []
@@ -2824,7 +2971,7 @@ class CameraGui(CTkFrame):
             polyline = [corners.astype(np.int32).reshape((-1, 1, 2))]
             pixCenter = np.mean(corners, axis=0).astype(np.int32)
 
-            if not self.camConfig.hideAprilTags:
+            if not inpaint:
                 cv2.polylines(markupFrame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
                 cv2.putText(markupFrame, str(idx[0]), tuple(pixCenter),
                             cv2.FONT_HERSHEY_SIMPLEX, small_text(markupFrame.shape[0]), clr.HUD_GREEN, 4)
@@ -2839,11 +2986,22 @@ class CameraGui(CTkFrame):
                 self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
 
         if inpaint:
-            markupFrame = self.inpaint_apriltags(markupFrame,
-                                                 small_gray,
-                                                 corners_small)
+            self.inpaint_apriltags(markupFrame,
+                                   small_gray,
+                                   corners_small)
 
-        return markupFrame
+        if pnp_points:
+            self.pnp3DTruthPoints(frame,
+                                  markupFrame,
+                                  ctx,
+                                  ())
+        if qnp_points:
+            self.qnp3DTruthPoints(frame,
+                                  markupFrame,
+                                  ctx,
+                                  ())
+
+        return
 
     def inpaint_apriltags(self,
                           markupFrame: NDArray,
@@ -2852,7 +3010,7 @@ class CameraGui(CTkFrame):
                           radius_px: int = 3,
                           dilate_px: int = 2,
                           method: int = cv2.INPAINT_TELEA,
-                          feather: bool = True) -> NDArray:
+                          feather: bool = True) -> None:
 
         mh, mw = markupFrame.shape[:2]
         gh, gw = gray.shape[:2]
@@ -2926,9 +3084,9 @@ class CameraGui(CTkFrame):
                 markupFrame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
             else:
                 markupFrame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
-        return markupFrame
+        return
 
-    def pnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def pnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -2953,11 +3111,11 @@ class CameraGui(CTkFrame):
             if len(points) < 6:
                 return
 
-            ret, rvec, tvec = cv2.solvePnP(objectPoints=points,
-                                           imagePoints=centers,
-                                           cameraMatrix=self.calibration.getCameraMatrix(),
-                                           distCoeffs=distParams,
-                                           flags=cv2.SOLVEPNP_ITERATIVE)
+            ret, rvec, tvec, *_ = cv2.solvePnPRansac(objectPoints=points,
+                                                     imagePoints=centers,
+                                                     cameraMatrix=self.calibration.getCameraMatrix(),
+                                                     distCoeffs=distParams,
+                                                     flags=cv2.SOLVEPNP_ITERATIVE)
 
             if ret:
                 projectedPoints_orig, _ = cv2.projectPoints(self.ThreeDTruthPoints.getTruthPointsNumpy(),
@@ -2998,9 +3156,9 @@ class CameraGui(CTkFrame):
                             small_text(markupFrame.shape[0]),
                             clr.LIGHTBLUE, 2)
                 # LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
-        return markupFrame
+        return
 
-    def qnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
+    def qnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -3024,7 +3182,7 @@ class CameraGui(CTkFrame):
             points = np.array(points)
 
             if len(points) < 6:
-                return markupFrame
+                return
 
             quat, vect, *_ = solveQnP(points, centers, self.calibration, True)
             xyz_proj = quat * self.ThreeDTruthPoints.getTruthPointsNumpy() + vect
@@ -3069,7 +3227,7 @@ class CameraGui(CTkFrame):
                         small_text(markupFrame.shape[0]),
                         clr.LIGHTBLUE, 2)
 
-        return markupFrame
+        return
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
@@ -3083,10 +3241,13 @@ class CameraGui(CTkFrame):
         t_ours = C_CV_TO_OURS @ t_cv
         return mat2quat(R_ours.T), t_ours
 
-    def detectHorizon(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
+    def detectHorizon(self, frame: NDArray, 
+                      markupFrame: NDArray, 
+                      ctx: GuiQueue.FrameCtx, 
+                      args) -> None:
 
         if self.curr_frame_gray is None:
-            self.curr_frame_gray = cv2.cvtColor(self.curr_frame, cv2.COLOR_BGR2GRAY)
+            self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
 
         edges = cv2.Canny(self.curr_frame_gray, 100, 200, apertureSize=3)
 
@@ -3123,7 +3284,7 @@ class CameraGui(CTkFrame):
         cv2.line(markupFrame, (x1, y1), (x2, y2), color, 2)
 
         self.horizon_line = (x1, y1, x2, y2)
-        return markupFrame
+        return
 
     def check_above_horizon(self, pt):
         if self.horizon_line is None:
@@ -3132,15 +3293,15 @@ class CameraGui(CTkFrame):
         x1, y1, x2, y2 = self.horizon_line
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
-    def hyper_focus(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args) -> NDArray:
+    def hyper_focus(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
 
         if not self.camConfig.factor_graph:
             if self.last_bounding_box_size is not None:
                 self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
                     1] + self.radius * 4.0) / 5.0
 
-            markupFrame = dim_except_circle(markupFrame, self.current_center_est, 3.0 * self.radius, 0.00)
-            markupFrame = dim_except_circle(markupFrame, self.current_center_est, 1.5 * self.radius, 0.50)
+            dim_except_circle(markupFrame, self.current_center_est, 3.0 * self.radius, 0.00)
+            dim_except_circle(markupFrame, self.current_center_est, 1.5 * self.radius, 0.50)
 
             self.radius = min(800.0, self.radius + 12.0)
             if self.yoloSession is not None:
@@ -3156,16 +3317,20 @@ class CameraGui(CTkFrame):
 
             if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > markupFrame.shape[
                 1] or self.curr_FG_pixel[1] > markupFrame.shape[0]:
-                return markupFrame
+                return
 
-            markupFrame = dim_except_circle(markupFrame, self.curr_FG_pixel, x_axes=ellipse_width,
-                                            y_axes=ellipse_height, dim_factor=0.10)
-            markupFrame = dim_except_circle(markupFrame, self.curr_FG_pixel, x_axes=ellipse_width * 2.0,
-                                            y_axes=ellipse_height * 2.0, dim_factor=0.00)
+            dim_except_circle(markupFrame, self.curr_FG_pixel,
+                              x_axes=ellipse_width,
+                              y_axes=ellipse_height,
+                              dim_factor=0.10)
+            dim_except_circle(markupFrame, self.curr_FG_pixel,
+                              x_axes=ellipse_width * 2.0,
+                              y_axes=ellipse_height * 2.0,
+                              dim_factor=0.00)
 
-        return markupFrame
+        return
 
-    def run_yolo(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def run_yolo(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
         """
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
@@ -3182,8 +3347,8 @@ class CameraGui(CTkFrame):
         import support.viz.draw_pnp_qnp as pnpDrw
         if self.pnpDrawer is None:
             self.pnpDrawer = pnpDrw.pnp_qnp_draw()
-        markupFrame, output = self.yoloSession.inferOnImage(frame, markupFrame,
-                                                            self.camConfig.yoloBiasTracking)
+        output = self.yoloSession.inferOnImage(frame,
+                                               self.camConfig.yoloBiasTracking)
 
         want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
         want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
@@ -3237,11 +3402,11 @@ class CameraGui(CTkFrame):
                             cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), 1)
                 self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
                                            (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
-                return markupFrame
+                return
 
         self.last_bounding_box_size = None
         self.last_yolo_center = None
-        return markupFrame
+        return
 
     def pose_from_yolo(self):
         """Compute (optional) PnP / QnP / KF-weighted QnP poses from YOLO detections."""
@@ -3262,7 +3427,7 @@ class CameraGui(CTkFrame):
             self.qnpKFYoloResult = None
             return
 
-    def factor_graph(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def factor_graph(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
         from support.runtime.fg_drogue_only import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
@@ -3318,9 +3483,11 @@ class CameraGui(CTkFrame):
 
         self.last_yolo_3d_estimate = None
 
-        return markupFrame
-
-    def phase_correlation(self, frame: NDArray, markupFrame: NDArray, ctx: FrameCtx, args):
+    def phase_correlation(self,
+                          frame: NDArray,
+                          markupFrame: NDArray,
+                          ctx: GuiQueue.FrameCtx,
+                          args) -> None:
 
         if self.calibration.validCal:
             cx = int(self.calibration.cx)
@@ -3343,9 +3510,8 @@ class CameraGui(CTkFrame):
                             clr.RED, 3)
 
         self.last_image = copy.deepcopy(self.curr_frame_gray)
-        return markupFrame
 
-    def cleanup(self, markupFrame):
+    def cleanup(self, markupFrame, name=None):
 
         if self.calibration.validCal:
             cx = int(self.calibration.cx)
@@ -3367,7 +3533,8 @@ class CameraGui(CTkFrame):
 
         self.potentialResize(markupFrame)
 
-        cv2.imshow(self.windowName, cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
+        cv2.imshow(self.windowName if name is None else name,
+                   cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
 
         if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
                 self.screenshot_impending):
@@ -3377,17 +3544,17 @@ class CameraGui(CTkFrame):
             self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
             self.screenshot_impending = False
 
-    def plotOnImg(self, markupFrame, points, names, color):
+    @staticmethod
+    def plotOnImg(markupFrame, points, names, color):
         for idx, pxPt in enumerate(points):
+            offset = int(markupFrame.shape[0] * 0.02)
             cv2.circle(markupFrame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
-            textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
+            textLoc = (int(pxPt[0]) - offset, int(pxPt[1] - offset))
             cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(markupFrame.shape[0]), (0, 0, 0),
-                        12,
-                        cv2.LINE_AA)
+                        small_text(markupFrame.shape[0]), (0, 0, 0),
+                        4)
             cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(markupFrame.shape[0]), color, 3,
-                        cv2.LINE_AA)
+                        small_text(markupFrame.shape[0]), color, 2)
 
     def potentialResize(self, markupFrame):
         if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:

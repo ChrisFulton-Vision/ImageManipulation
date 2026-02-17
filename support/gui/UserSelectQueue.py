@@ -1,0 +1,454 @@
+import customtkinter as ctk
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type
+from enum import Enum
+
+DEFAULT_CHOICE = "(select)"
+
+ROW_H = 36          # fixed row height
+DROPDOWN_H = 32     # fixed optionmenu height
+ICON_BTN_W = 36
+
+Args = Tuple[Any, ...]
+ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type[Enum]]
+StepFn = Callable[..., None]
+StepSpec = Tuple[StepFn, Args]
+
+@dataclass(slots=True)
+class AprilTagDetectOpts:
+    scale: float = 1.0
+    inpaint: bool = False
+    pnp: bool = False
+    qnp: bool = False
+
+@dataclass(frozen=True)
+class ArgSpec:
+    name: str
+    typ: ArgType | tuple[ArgType, ...]
+    default: Any
+    min: float | None = None
+    max: float | None = None
+
+@dataclass(slots=True)
+class FrameCtx:
+    img_time: Optional[float] = None
+    name: Optional[str] = None
+    display_in_realtime: bool = True
+
+@dataclass
+class _QueueRow:
+    frame: ctk.CTkFrame
+    var: ctk.StringVar
+    dropdown: ctk.CTkOptionMenu
+    args_btn: ctk.CTkButton
+    remove_btn: ctk.CTkButton
+    args: Args
+
+# @dataclass(frozen=True)
+# class StepRule:
+#     step: Callable
+#     requires_before: tuple[Callable, ...] = ()
+
+@dataclass(frozen=True)
+class StepOption:
+    label: str
+    fn: StepFn
+    arg_specs: tuple[ArgSpec, ...] = ()
+
+    @property
+    def default_args(self) -> Args:
+        return tuple(spec.default for spec in self.arg_specs)
+
+    def to_spec(self) -> tuple[StepFn, Args]:
+        return (self.fn, self.default_args)
+
+
+def _label_for(fn: StepFn, default_args: Args) -> str:
+    # readable label; tweak as you like
+    name = getattr(fn, "__name__", "step")
+    if len(default_args) == 0:
+        return name
+    return f"{name}{default_args}"
+
+class StepSpecQueueEditor(ctk.CTkFrame):
+    """
+    Dynamic queue editor for StepSpec = (StepFn, Args)
+    - last row is placeholder
+    - selecting a real step in the last row adds a new placeholder row
+    - ✕ removes a row
+    """
+
+    def __init__(
+        self,
+        master,
+        *,
+        options: List["StepOption"],
+        on_change: Optional[Callable[[List[StepSpec]], None]] = None,
+        initial: Optional[List[StepSpec]] = None,
+        **kwargs,
+    ):
+        super().__init__(master, **kwargs)
+
+        # Build label->StepOption lookup
+        if any(o.label == DEFAULT_CHOICE for o in options):
+            raise ValueError(f"'{DEFAULT_CHOICE}' is reserved.")
+        self._step_options: List["StepOption"] = options
+        self._labels: List[str] = [DEFAULT_CHOICE] + [o.label for o in options]
+        self._label_to_opt: Dict[str, "StepOption"] = {o.label: o for o in options}
+
+        self._on_change = on_change
+        self._rows: List[_QueueRow] = []
+
+        # --- two-panel layout: queue left, args right ---
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._queue_panel = ctk.CTkFrame(self, fg_color="transparent")
+        self._queue_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
+        self._queue_panel.grid_columnconfigure(0, weight=1)
+
+        self._args_panel = ctk.CTkFrame(self)
+        self._args_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
+        self._args_panel.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(self._queue_panel, text="Image Processing Queue", anchor="w")
+        title.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        args_title = ctk.CTkLabel(self._args_panel, text="Step Arguments", anchor="w")
+        args_title.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        self._args_hint = ctk.StringVar(value="Select a step to edit its arguments.")
+        self._args_hint_label = ctk.CTkLabel(self._args_panel,
+                                             textvariable=self._args_hint,
+                                             anchor="w")
+        self._args_hint_label.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+
+        # NOTE: CTkFrame has a fairly large default requested height when it has no children.
+        # That makes the parent page look "too tall" until the first dropdown selection
+        # causes widgets to be created inside this body.
+        self._args_body = ctk.CTkFrame(self._args_panel, fg_color="transparent", height=1, width=1)
+        self._args_body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        self._args_body.grid_columnconfigure(1, weight=1)
+
+        # Ensure the frame size follows children (and stays tiny when empty).
+        self._args_body.grid_propagate(True)
+
+        self._active_idx: Optional[int] = None
+
+        # Seed from initial queue if provided
+        if initial:
+            for fn, args in initial:
+                # try to match an existing option by fn+args; else just show fn name
+                label = self._find_label_for(fn, args)
+                self._add_row(selected=label, args_override=args)
+
+        self._ensure_trailing_placeholder()
+
+        # auto-select first real row if present
+        self._active_idx = self._first_real_row_index()
+        self._render_args_panel()
+        self._emit_change()
+
+    def _on_first_map(self, _evt=None) -> None:
+        try:
+            self.unbind("<Map>")
+        except Exception:
+            pass
+
+        self._ensure_trailing_placeholder()
+        self._refresh_remove_buttons()
+
+        if self._active_idx is None:
+            self._active_idx = self._first_real_row_index()
+
+        # Let CTk finish internal measurement once, then render the args panel.
+        self.after_idle(self._render_args_panel)
+
+    def _find_label_for(self, fn: StepFn, args: Args) -> str:
+        for o in self._step_options:
+            if o.fn is fn and o.default_args == args:
+                return o.label
+        # fallback: still show something readable
+        name = getattr(fn, "__name__", "step")
+        return f"{name}{args}"
+
+    # -------- public API --------
+
+    def get_queue(self) -> List[StepSpec]:
+        out: List[StepSpec] = []
+        for r in self._rows:
+            lab = r.var.get()
+            if lab and lab != DEFAULT_CHOICE and lab in self._label_to_opt:
+                opt = self._label_to_opt[lab]
+                out.append((opt.fn, r.args))
+        return out
+
+    def set_queue(self, queue: List[StepSpec]) -> None:
+        for r in self._rows:
+            r.frame.destroy()
+        self._rows.clear()
+
+        for fn, args in queue:
+            self._add_row(selected=self._find_label_for(fn, args), args_override=args)
+        self._ensure_trailing_placeholder()
+        self._refresh_remove_buttons()
+        self._active_idx = self._first_real_row_index()
+        self._render_args_panel()
+        self._emit_change()
+
+    # -------- internals --------
+
+    def _add_row(self, *, selected: str = DEFAULT_CHOICE, args_override: Optional[Args] = None) -> None:
+        row_frame = ctk.CTkFrame(self._queue_panel, fg_color="transparent", height=ROW_H)
+        row_frame.grid(row=len(self._rows) + 1, column=0, sticky="ew", padx=8, pady=4)
+        row_frame.grid_columnconfigure(0, weight=1)
+
+        # IMPORTANT: fixed-height row; prevents CTkOptionMenu initial reqheight inflation
+        row_frame.grid_propagate(False)
+
+        var = ctk.StringVar(value=selected if selected in self._labels else DEFAULT_CHOICE)
+
+        # Seed args:
+        init_args: Args = tuple()
+        if var.get() in self._label_to_opt:
+            init_args = self._label_to_opt[var.get()].default_args
+        if args_override is not None:
+            init_args = args_override
+
+        dropdown = ctk.CTkOptionMenu(
+            row_frame,
+            values=self._labels,
+            variable=var,
+            command=lambda _=None, rf=row_frame: self._on_row_changed(rf),
+            anchor="w",
+            height=DROPDOWN_H,
+        )
+        dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
+        dropdown.bind("<Button-1>", lambda _evt, rf=row_frame: self._set_active_by_frame(rf))
+
+        args_btn = ctk.CTkButton(
+            row_frame,
+            text="⚙",
+            width=ICON_BTN_W,
+            height=DROPDOWN_H,
+            command=lambda rf=row_frame: self._edit_args_for_frame(rf),
+        )
+        args_btn.grid(row=0, column=1, sticky="e", padx=(0, 6), pady=0)
+
+        remove_btn = ctk.CTkButton(
+            row_frame,
+            text="✕",
+            width=ICON_BTN_W,
+            height=DROPDOWN_H,
+            command=lambda rf=row_frame: self._remove_row_by_frame(rf),
+        )
+        remove_btn.grid(row=0, column=2, sticky="e", pady=0)
+
+        self._rows.append(_QueueRow(row_frame, var, dropdown, args_btn, remove_btn, init_args))
+        self._refresh_remove_buttons()
+
+    def _remove_row_by_frame(self, frame: ctk.CTkFrame) -> None:
+        idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+        if idx is None:
+            return
+
+        self._rows[idx].frame.destroy()
+        del self._rows[idx]
+
+        self._regrid_rows()
+        self._ensure_trailing_placeholder()
+        self._refresh_remove_buttons()
+
+        # active row bookkeeping
+
+        if self._active_idx is not None:
+            if idx == self._active_idx:
+                self._active_idx = self._first_real_row_index()
+            elif idx < self._active_idx:
+                self._active_idx -= 1
+        self._render_args_panel()
+        self._emit_change()
+
+    def _regrid_rows(self) -> None:
+        for i, r in enumerate(self._rows):
+            r.frame.grid_configure(row=i + 1)
+
+    def _ensure_trailing_placeholder(self) -> None:
+        if not self._rows or self._rows[-1].var.get() != DEFAULT_CHOICE:
+            self._add_row(selected=DEFAULT_CHOICE)
+
+    def _refresh_remove_buttons(self) -> None:
+        for i, r in enumerate(self._rows):
+            is_trailing_placeholder = (i == len(self._rows) - 1) and (r.var.get() == DEFAULT_CHOICE)
+            r.remove_btn.configure(state="disabled" if is_trailing_placeholder else "normal")
+            r.args_btn.configure(state='disabled' if is_trailing_placeholder else 'normal')
+
+    def _on_row_changed(self, frame: ctk.CTkFrame) -> None:
+        """
+        Called when a row's dropdown selection changes.
+        - Ensures row.args matches the selected option
+        - Keeps existing edited args if selection didn't change
+        - Updates active row + args panel
+        """
+        idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+        if idx is not None:
+            row = self._rows[idx]
+            lab = row.var.get()
+
+            if lab in self._label_to_opt:
+                opt = self._label_to_opt[lab]
+                # If args are empty OR don't match this step's expected arity, reset to defaults.
+                # Otherwise, keep the existing args (user may have edited them).
+                if (not row.args) or (len(row.args) != len(opt.default_args)):
+                    row.args = opt.default_args
+            else:
+                # placeholder or invalid selection
+                row.args = tuple()
+
+            self._active_idx = idx
+
+        self._ensure_trailing_placeholder()
+        self._refresh_remove_buttons()
+        self._render_args_panel()
+        self._emit_change()
+
+    def _emit_change(self) -> None:
+        if self._on_change:
+            self._on_change(self.get_queue())
+
+     # -------- args panel helpers --------
+    def _first_real_row_index(self) -> Optional[int]:
+         for i, r in enumerate(self._rows):
+             if r.var.get() != DEFAULT_CHOICE:
+                 return i
+         return None
+
+    def _set_active_by_frame(self, frame: ctk.CTkFrame) -> None:
+         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+         if idx is None:
+             return
+         self._active_idx = idx
+         self._render_args_panel()
+
+    def _edit_args_for_frame(self, frame: ctk.CTkFrame) -> None:
+         # right panel is live; clicking ⚙ just forces focus to that row
+         self._set_active_by_frame(frame)
+
+    def _clear_args_body(self) -> None:
+         for w in self._args_body.winfo_children():
+             try:
+                 w.destroy()
+             except Exception:
+                 pass
+
+    def _render_args_panel(self) -> None:
+         self._clear_args_body()
+
+         if self._active_idx is None or self._active_idx >= len(self._rows):
+             self._args_hint.set("Select a step to edit its arguments.")
+             return
+
+         row = self._rows[self._active_idx]
+         lab = row.var.get()
+         if lab == DEFAULT_CHOICE or lab not in self._label_to_opt:
+             self._args_hint.set("Select a step to edit its arguments.")
+             return
+
+         opt = self._label_to_opt[lab]
+         self._args_hint.set(opt.label)
+
+         # If step has no args, say so.
+         if len(row.args) == 0:
+             ctk.CTkLabel(self._args_body, text="(no args)", anchor="w").grid(
+                 row=0, column=0, columnspan=2, sticky="w", pady=4
+             )
+             return
+
+         # Build per-arg editor widgets by type inference
+         for i, val in enumerate(row.args):
+             name = opt.arg_specs[i].name
+             ctk.CTkLabel(self._args_body, text=name, anchor="w").grid(
+                 row=i, column=0, sticky="w", padx=(0, 8), pady=4
+             )
+
+             if isinstance(val, Enum):
+                 enum_t = type(val)
+                 var = ctk.StringVar(value=val.name)
+                 dd = ctk.CTkOptionMenu(
+                     self._args_body,
+                     values=[e.name for e in enum_t],
+                     variable=var,
+                     command=lambda choice, k=i, et=enum_t: self._set_arg(k, et[choice]),
+                     anchor="w",
+                 )
+                 dd.grid(row=i, column=1, sticky="ew", pady=4)
+                 continue
+
+             if isinstance(val, bool):
+                 bvar = ctk.BooleanVar(value=bool(val))
+                 sw = ctk.CTkSwitch(
+                     self._args_body,
+                     text="",
+                     variable=bvar,
+                     command=lambda k=i, v=bvar: self._set_arg(k, bool(v.get())),
+                 )
+                 sw.grid(row=i, column=1, sticky="w", pady=4)
+                 continue
+
+             # int/float/str -> entry with cast on commit
+             svar = ctk.StringVar(value=str(val))
+             ent = ctk.CTkEntry(self._args_body, textvariable=svar)
+             ent.grid(row=i, column=1, sticky="ew", pady=4)
+
+             def _commit(_evt=None, k=i, sv=svar, old=val):
+                 txt = sv.get()
+                 try:
+                     if isinstance(old, int) and not isinstance(old, bool):
+                         newv = int(txt)
+                     elif isinstance(old, float):
+                         newv = float(txt)
+                     else:
+                         newv = txt
+                 except Exception:
+                     # revert on bad parse
+                     sv.set(str(old))
+                     return
+                 self._set_arg(k, newv)
+
+             ent.bind("<Return>", _commit)
+             ent.bind("<FocusOut>", _commit)
+
+    def _set_arg(self, idx: int, value: Any) -> None:
+        if self._active_idx is None or self._active_idx >= len(self._rows):
+            return
+        row = self._rows[self._active_idx]
+        lab = row.var.get()
+        if lab not in self._label_to_opt:
+            return
+
+        opt = self._label_to_opt[lab]
+        if idx < 0 or idx >= len(opt.arg_specs):
+            return
+
+        spec = opt.arg_specs[idx]
+
+        # type enforcement
+        allowed = spec.typ if isinstance(spec.typ, tuple) else (spec.typ,)
+        if not any(isinstance(value, t) for t in allowed if isinstance(t, type)):
+            return  # or raise / show UI error
+
+        # optional bounds
+        if isinstance(value, (int, float)):
+            if spec.min is not None and value < spec.min: value = spec.min
+            if spec.max is not None and value > spec.max: value = spec.max
+
+        args_list = list(row.args)
+        while len(args_list) < len(opt.arg_specs):
+            args_list.append(opt.arg_specs[len(args_list)].default)
+
+        args_list[idx] = value
+        row.args = tuple(args_list)
+
+        self._emit_change()
+

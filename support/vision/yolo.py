@@ -137,19 +137,17 @@ class YOLO:
 
     def inferOnImage(self,
                      image: NDArray,
-                     markup_image: NDArray,
-                     bias_tracking: bool = False) -> tuple[NDArray, tuple[list, list, list, list, float]]:
+                     bias_tracking: bool = False) -> tuple[list, list, list, list, float]:
         """
         Runs the sub-methods necessary to process an image with YOLO
         :param bias_tracking:
-        :param markup_image:
         :param image: np.array from OpenCV
         :return: Marked-up image post-yolo inference
         """
         self.bias_tracking_active = bias_tracking
         yoloImage = self.preprocessImage(image)
         output = self.processImage(yoloImage)
-        return markup_image, output
+        return output
 
     def set_calibration(self, calibration: Calibration) -> None:
         self.calibration = copy.deepcopy(calibration)
@@ -277,7 +275,7 @@ if __name__ == '__main__':
 
     for imgFP in allImages:
         img = cv2.imread(imgFP)
-        (newImg, rvec_tvec), sol = yolo.inferOnImage(img, img)
+        (newImg, rvec_tvec), sol = yolo.inferOnImage(img)
         cv2.imshow('YOLO', newImg)
         # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
         key = cv2.waitKey(0)

@@ -28,6 +28,9 @@ class CameraConfig:
     cubemap: bool = False
     hud: bool = False
     dp_gpu: bool = False
+    pnpYoloPoints: bool = False
+    qnpYoloPoints: bool = False
+    qnpKFYoloPoints: bool = False
 
     # numeric params
     secondsBetweenImages: float = 1.0

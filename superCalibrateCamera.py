@@ -136,7 +136,9 @@ class CameraGui(ctk.CTkFrame):
                                 arg_specs=(
                                     GuiQueue.ArgSpec("PnP", bool, False),
                                     GuiQueue.ArgSpec("QnP", bool, False),
-                                        )
+                                    GuiQueue.ArgSpec("wQnP", bool, False),
+                                    GuiQueue.ArgSpec("Factor Graph", bool, False),
+                                )
                                 ),
             GuiQueue.StepOption(label="Detect Corners in Image",
                                 fn=self.detect_corners,
@@ -151,15 +153,15 @@ class CameraGui(ctk.CTkFrame):
                                 fn=self.draw_HUD,
                                 arg_specs=()),
             GuiQueue.StepOption(
-                                label="Detect AprilTags and Q/PnP",
-                                fn=self.detectAprilTags,
-                                arg_specs=(
-                                    GuiQueue.ArgSpec("scale", float, 1.0, min=0.1, max=1.0),
-                                    GuiQueue.ArgSpec("inpaint", bool, False),
-                                    GuiQueue.ArgSpec("PnP", bool, False),
-                                    GuiQueue.ArgSpec("QnP", bool, False),
-                                        ),
-                                ),
+                label="Detect AprilTags and Q/PnP",
+                fn=self.detectAprilTags,
+                arg_specs=(
+                    GuiQueue.ArgSpec("scale", float, 1.0, min=0.1, max=1.0),
+                    GuiQueue.ArgSpec("inpaint", bool, False),
+                    GuiQueue.ArgSpec("PnP", bool, False),
+                    GuiQueue.ArgSpec("QnP", bool, False),
+                ),
+            ),
         ]
 
         self.calibration = Calibration()
@@ -2381,6 +2383,7 @@ class CameraGui(ctk.CTkFrame):
         else:
             markup_frame: NDArray = frame  # explicit reference passed, saves copy if not undistorting
 
+        ######################################################
         test_markup_frame: NDArray = np.copy(frame)
         for func, args in self.list_of_image_process_functors:
             func(frame, test_markup_frame, ctx, args)
@@ -2423,10 +2426,10 @@ class CameraGui(ctk.CTkFrame):
             self.detectAprilTags(frame,
                                  markup_frame,
                                  ctx,
-                                 [0.6,
-                                       self.camConfig.hideAprilTags,
-                                       self.camConfig.pnp3DTruthPoints,
-                                       self.camConfig.qnp3DTruthPoints,])
+                                 {"scale": 0.6,
+                                  "inpaint": self.camConfig.hideAprilTags,
+                                  "pnp": self.camConfig.pnp3DTruthPoints,
+                                  "qnp": self.camConfig.qnp3DTruthPoints, })
 
         if self.camConfig.detect_horizon:
             self.detectHorizon(frame,
@@ -2450,12 +2453,10 @@ class CameraGui(ctk.CTkFrame):
             self.run_yolo(frame,
                           markup_frame,
                           ctx,
-                          ())  # Takes original frame, not undistort. YOLO presumes original.
-            # Optional: pose estimation directly from YOLO centers (PnP / QnP / KF-weighted QnP)
-            try:
-                self.pose_from_yolo()
-            except Exception:
-                pass
+                          {"PnP": self.camConfig.pnpYoloPoints,
+                           "QnP": self.camConfig.qnpYoloPoints,
+                           "wQnP": self.camConfig.qnpKFYoloPoints,
+                           "Factor Graph": self.camConfig.factor_graph})  # Takes original frame, not undistort. YOLO presumes original.
         else:
             self.last_bounding_box_size = None
             self.last_yolo_center = None
@@ -2760,37 +2761,40 @@ class CameraGui(ctk.CTkFrame):
                       dst=markupFrame,
                       borderMode=cv2.BORDER_CONSTANT)
 
-    def applyKernel(self, frame: NDArray,
-                    markupFrame: NDArray, ctx: GuiQueue.FrameCtx,
+    def applyKernel(self,
+                    frame: NDArray,
+                    markupFrame: NDArray,
+                    ctx: GuiQueue.FrameCtx,
                     args) -> None:
+        if not 'Filter' in args:
+            return
 
-        if args == () or args is None:
-            raise ValueError("Image Kernel requires 1 ImageKernel enum object as argument")
-        process_kernel = args[0]
-        if len(args) > 1 or not isinstance(process_kernel, ImageKernel):
-            raise ValueError("Apply Kernel Argument should be 1 ImageKernel enum object.")
+        processKernel: ImageKernel = args['Filter']
+
+        if not isinstance(processKernel, ImageKernel):
+            raise ValueError(f'Image Kernel should be ImageKernel Enum class, but is instead {type(processKernel)}')
 
         #  TODO Move ownership of whether GaborGui is open to owning function queue
-        if process_kernel != ImageKernel.Gabor and self.GaborGUI is not None:
+        if processKernel != ImageKernel.Gabor and self.GaborGUI is not None:
             self.GaborGUI.close()
             self.GaborGUI = None
 
-        if process_kernel == ImageKernel.Invert:
+        if processKernel == ImageKernel.Invert:
             cv2.bitwise_not(markupFrame, dst=markupFrame)
             return
 
         from support.vision.filter_image import applyConvolutionFilter
-        if process_kernel == ImageKernel.Gabor:
+        if processKernel == ImageKernel.Gabor:
             from support.vision.filter_image import GaborGUI
             if self.GaborGUI is None:
                 self.GaborGUI = GaborGUI()
             applyConvolutionFilter(markupFrame,
-                                   process_kernel,
+                                   processKernel,
                                    self.GaborGUI.gaborFilter)
             return
 
         applyConvolutionFilter(markupFrame,
-                               process_kernel)
+                               processKernel)
 
     def detect_corners(self,
                        frame: NDArray,
@@ -2861,51 +2865,51 @@ class CameraGui(ctk.CTkFrame):
                 return opts
 
             # --- Iterable legacy ---
-            if isinstance(args, Iterable) and not isinstance(args, (str, bytes)):
-                # Flatten any nested dicts and collect scalars
-                bools: list[bool] = []
-                saw_scale = False
-
-                for a in args:
-                    if isinstance(a, dict):
-                        if "scale" in a:
-                            set_scale(a["scale"])
-                            saw_scale = True
-                        if "inpaint" in a:
-                            set_bool("inpaint", a["inpaint"])
-                        if "pnp" in a:
-                            set_bool("pnp", a["pnp"])
-                        if "qnp" in a:
-                            set_bool("qnp", a["qnp"])
-                        continue
-
-                    if isinstance(a, bool):
-                        bools.append(a)
-                        continue
-
-                    if isinstance(a, (int, float)) and not isinstance(a, bool):
-                        set_scale(a)
-                        saw_scale = True
-                        continue
-
-                    raise TypeError(f"AprilTag args: expected numeric/bool/dict, got {type(a)}")
-
-                # If user provided unnamed bools, map them by order:
-                #   (inpaint, pnp, qnp)
-                if bools:
-                    if len(bools) >= 1:
-                        opts.inpaint = bools[0]
-                    if len(bools) >= 2:
-                        opts.pnp = bools[1]
-                    if len(bools) >= 3:
-                        opts.qnp = bools[2]
-                    if len(bools) > 3:
-                        raise TypeError(
-                            f"AprilTag args: too many unnamed bools ({len(bools)}). "
-                            "Use a dict: {'inpaint':..., 'pnp':..., 'qnp':...}."
-                        )
-
-                return opts
+            # if isinstance(args, Iterable) and not isinstance(args, (str, bytes)):
+            #     # Flatten any nested dicts and collect scalars
+            #     bools: list[bool] = []
+            #     saw_scale = False
+            #
+            #     for a in args:
+            #         if isinstance(a, dict):
+            #             if "scale" in a:
+            #                 set_scale(a["scale"])
+            #                 saw_scale = True
+            #             if "inpaint" in a:
+            #                 set_bool("inpaint", a["inpaint"])
+            #             if "pnp" in a:
+            #                 set_bool("pnp", a["pnp"])
+            #             if "qnp" in a:
+            #                 set_bool("qnp", a["qnp"])
+            #             continue
+            #
+            #         if isinstance(a, bool):
+            #             bools.append(a)
+            #             continue
+            #
+            #         if isinstance(a, (int, float)) and not isinstance(a, bool):
+            #             set_scale(a)
+            #             saw_scale = True
+            #             continue
+            #
+            #         raise TypeError(f"AprilTag args: expected numeric/bool/dict, got {type(a)}")
+            #
+            #     # If user provided unnamed bools, map them by order:
+            #     #   (inpaint, pnp, qnp)
+            #     if bools:
+            #         if len(bools) >= 1:
+            #             opts.inpaint = bools[0]
+            #         if len(bools) >= 2:
+            #             opts.pnp = bools[1]
+            #         if len(bools) >= 3:
+            #             opts.qnp = bools[2]
+            #         if len(bools) > 3:
+            #             raise TypeError(
+            #                 f"AprilTag args: too many unnamed bools ({len(bools)}). "
+            #                 "Use a dict: {'inpaint':..., 'pnp':..., 'qnp':...}."
+            #             )
+            #
+            #     return opts
 
             raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
 
@@ -3241,9 +3245,9 @@ class CameraGui(ctk.CTkFrame):
         t_ours = C_CV_TO_OURS @ t_cv
         return mat2quat(R_ours.T), t_ours
 
-    def detectHorizon(self, frame: NDArray, 
-                      markupFrame: NDArray, 
-                      ctx: GuiQueue.FrameCtx, 
+    def detectHorizon(self, frame: NDArray,
+                      markupFrame: NDArray,
+                      ctx: GuiQueue.FrameCtx,
                       args) -> None:
 
         if self.curr_frame_gray is None:
@@ -3330,12 +3334,34 @@ class CameraGui(ctk.CTkFrame):
 
         return
 
-    def run_yolo(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+    def run_yolo(self,
+                 frame: NDArray,
+                 markupFrame: NDArray,
+                 ctx: GuiQueue.FrameCtx,
+                 args) -> None:
         """
         Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
         100 meters away, then it updates this class's estimation of the solution.
         :return: None, but does adjust
         """
+
+        def parse_yolo_args(yolo_args: dict) -> GuiQueue.YoloOpts:
+            opts = GuiQueue.YoloOpts()
+
+            if "PnP" in yolo_args:
+                opts.want_pnp = yolo_args["PnP"]
+            if "QnP" in yolo_args:
+                opts.want_qnp = yolo_args["QnP"]
+            if "wQnP" in yolo_args:
+                opts.want_wqnp = yolo_args["wQnP"]
+            if "Factor Graph" in yolo_args:
+                opts.factor_graph = yolo_args["Factor Graph"]
+            return opts
+        LOG.info('\n')
+        opts = parse_yolo_args(args)
+        LOG.info(f'Outside: {opts.want_pnp}')
+        LOG.info(args)
+
         from support.vision import yolo
         if self.yoloSession is None:
             self.yoloSession = yolo.YOLO()
@@ -3350,14 +3376,10 @@ class CameraGui(ctk.CTkFrame):
         output = self.yoloSession.inferOnImage(frame,
                                                self.camConfig.yoloBiasTracking)
 
-        want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
-        want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
-        want_wqnp = bool(getattr(self.camConfig, "qnpKFYoloPoints", False))
-
         algos = pnpDrw.twoToThreeSelectedAlgorithms()
-        algos.use_pnp = want_pnp
-        algos.use_qnp = want_qnp
-        algos.use_wqnp = want_wqnp
+        algos.use_pnp = opts.want_pnp
+        algos.use_qnp = opts.want_qnp
+        algos.use_wqnp = opts.want_wqnp
 
         self.pnpDrawer.markUpImage(image=markupFrame,
                                    output=output,
@@ -3406,9 +3428,11 @@ class CameraGui(ctk.CTkFrame):
 
         self.last_bounding_box_size = None
         self.last_yolo_center = None
-        return
 
-    def pose_from_yolo(self):
+    def pose_from_yolo(self,
+                       want_pnp: bool = False,
+                       want_qnp: bool = False,
+                       want_qnp_kf: bool = False):
         """Compute (optional) PnP / QnP / KF-weighted QnP poses from YOLO detections."""
         # Guard: must have calibration
         if not getattr(self.calibration, "validCal", False):

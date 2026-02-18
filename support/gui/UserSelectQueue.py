@@ -5,14 +5,15 @@ from enum import Enum
 
 DEFAULT_CHOICE = "(select)"
 
-ROW_H = 36          # fixed row height
-DROPDOWN_H = 32     # fixed optionmenu height
+ROW_H = 36  # fixed row height
+DROPDOWN_H = 32  # fixed optionmenu height
 ICON_BTN_W = 36
 
-Args = Tuple[Any, ...]
+Args = Dict[str, Any]
 ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type[Enum]]
 StepFn = Callable[..., None]
 StepSpec = Tuple[StepFn, Args]
+
 
 @dataclass(slots=True)
 class AprilTagDetectOpts:
@@ -20,6 +21,15 @@ class AprilTagDetectOpts:
     inpaint: bool = False
     pnp: bool = False
     qnp: bool = False
+
+
+@dataclass(slots=True)
+class YoloOpts:
+    want_pnp: bool = False
+    want_qnp: bool = False
+    want_wqnp: bool = False
+    factor_graph: bool = False
+
 
 @dataclass(frozen=True)
 class ArgSpec:
@@ -29,11 +39,13 @@ class ArgSpec:
     min: float | None = None
     max: float | None = None
 
+
 @dataclass(slots=True)
 class FrameCtx:
     img_time: Optional[float] = None
     name: Optional[str] = None
     display_in_realtime: bool = True
+
 
 @dataclass
 class _QueueRow:
@@ -43,6 +55,7 @@ class _QueueRow:
     args_btn: ctk.CTkButton
     remove_btn: ctk.CTkButton
     args: Args
+
 
 # @dataclass(frozen=True)
 # class StepRule:
@@ -57,7 +70,7 @@ class StepOption:
 
     @property
     def default_args(self) -> Args:
-        return tuple(spec.default for spec in self.arg_specs)
+        return {spec.name: spec.default for spec in self.arg_specs}
 
     def to_spec(self) -> tuple[StepFn, Args]:
         return (self.fn, self.default_args)
@@ -70,6 +83,7 @@ def _label_for(fn: StepFn, default_args: Args) -> str:
         return name
     return f"{name}{default_args}"
 
+
 class StepSpecQueueEditor(ctk.CTkFrame):
     """
     Dynamic queue editor for StepSpec = (StepFn, Args)
@@ -79,13 +93,13 @@ class StepSpecQueueEditor(ctk.CTkFrame):
     """
 
     def __init__(
-        self,
-        master,
-        *,
-        options: List["StepOption"],
-        on_change: Optional[Callable[[List[StepSpec]], None]] = None,
-        initial: Optional[List[StepSpec]] = None,
-        **kwargs,
+            self,
+            master,
+            *,
+            options: List["StepOption"],
+            on_change: Optional[Callable[[List[StepSpec]], None]] = None,
+            initial: Optional[List[StepSpec]] = None,
+            **kwargs,
     ):
         super().__init__(master, **kwargs)
 
@@ -210,11 +224,11 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         var = ctk.StringVar(value=selected if selected in self._labels else DEFAULT_CHOICE)
 
         # Seed args:
-        init_args: Args = tuple()
+        init_args: Args = {}
         if var.get() in self._label_to_opt:
-            init_args = self._label_to_opt[var.get()].default_args
+            init_args = dict(self._label_to_opt[var.get()].default_args)
         if args_override is not None:
-            init_args = args_override
+            init_args = dict(args_override)
 
         dropdown = ctk.CTkOptionMenu(
             row_frame,
@@ -300,11 +314,12 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                 opt = self._label_to_opt[lab]
                 # If args are empty OR don't match this step's expected arity, reset to defaults.
                 # Otherwise, keep the existing args (user may have edited them).
-                if (not row.args) or (len(row.args) != len(opt.default_args)):
-                    row.args = opt.default_args
+                expected_keys = {spec.name for spec in opt.arg_specs}
+                if set(row.args.keys()) != expected_keys:
+                    row.args = dict(opt.default_args)
             else:
                 # placeholder or invalid selection
-                row.args = tuple()
+                row.args = {}
 
             self._active_idx = idx
 
@@ -317,138 +332,137 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         if self._on_change:
             self._on_change(self.get_queue())
 
-     # -------- args panel helpers --------
+    # -------- args panel helpers --------
     def _first_real_row_index(self) -> Optional[int]:
-         for i, r in enumerate(self._rows):
-             if r.var.get() != DEFAULT_CHOICE:
-                 return i
-         return None
+        for i, r in enumerate(self._rows):
+            if r.var.get() != DEFAULT_CHOICE:
+                return i
+        return None
 
     def _set_active_by_frame(self, frame: ctk.CTkFrame) -> None:
-         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
-         if idx is None:
-             return
-         self._active_idx = idx
-         self._render_args_panel()
+        idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+        if idx is None:
+            return
+        self._active_idx = idx
+        self._render_args_panel()
 
     def _edit_args_for_frame(self, frame: ctk.CTkFrame) -> None:
-         # right panel is live; clicking ⚙ just forces focus to that row
-         self._set_active_by_frame(frame)
+        # right panel is live; clicking ⚙ just forces focus to that row
+        self._set_active_by_frame(frame)
 
     def _clear_args_body(self) -> None:
-         for w in self._args_body.winfo_children():
-             try:
-                 w.destroy()
-             except Exception:
-                 pass
+        for w in self._args_body.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
 
     def _render_args_panel(self) -> None:
-         self._clear_args_body()
+        self._clear_args_body()
 
-         if self._active_idx is None or self._active_idx >= len(self._rows):
-             self._args_hint.set("Select a step to edit its arguments.")
-             return
+        if self._active_idx is None or self._active_idx >= len(self._rows):
+            self._args_hint.set("Select a step to edit its arguments.")
+            return
 
-         row = self._rows[self._active_idx]
-         lab = row.var.get()
-         if lab == DEFAULT_CHOICE or lab not in self._label_to_opt:
-             self._args_hint.set("Select a step to edit its arguments.")
-             return
+        row = self._rows[self._active_idx]
+        lab = row.var.get()
+        if lab == DEFAULT_CHOICE or lab not in self._label_to_opt:
+            self._args_hint.set("Select a step to edit its arguments.")
+            return
 
-         opt = self._label_to_opt[lab]
-         self._args_hint.set(opt.label)
+        opt = self._label_to_opt[lab]
+        self._args_hint.set(opt.label)
 
-         # If step has no args, say so.
-         if len(row.args) == 0:
-             ctk.CTkLabel(self._args_body, text="(no args)", anchor="w").grid(
-                 row=0, column=0, columnspan=2, sticky="w", pady=4
-             )
-             return
+        # If step has no args, say so.
+        if len(row.args) == 0:
+            ctk.CTkLabel(self._args_body, text="(no args)", anchor="w").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=4
+            )
+            return
 
-         # Build per-arg editor widgets by type inference
-         for i, val in enumerate(row.args):
-             name = opt.arg_specs[i].name
-             ctk.CTkLabel(self._args_body, text=name, anchor="w").grid(
-                 row=i, column=0, sticky="w", padx=(0, 8), pady=4
-             )
+        # Build per-arg editor widgets by type inference
+        for i, spec in enumerate(opt.arg_specs):
+            name = spec.name
+            val = row.args.get(name, spec.default)
+            ctk.CTkLabel(self._args_body, text=name, anchor="w").grid(
+                row=i, column=0, sticky="w", padx=(0, 8), pady=4
+            )
 
-             if isinstance(val, Enum):
-                 enum_t = type(val)
-                 var = ctk.StringVar(value=val.name)
-                 dd = ctk.CTkOptionMenu(
-                     self._args_body,
-                     values=[e.name for e in enum_t],
-                     variable=var,
-                     command=lambda choice, k=i, et=enum_t: self._set_arg(k, et[choice]),
-                     anchor="w",
-                 )
-                 dd.grid(row=i, column=1, sticky="ew", pady=4)
-                 continue
+            if isinstance(val, Enum):
+                enum_t = type(val)
+                var = ctk.StringVar(value=val.name)
+                dd = ctk.CTkOptionMenu(
+                    self._args_body,
+                    values=[e.name for e in enum_t],
+                    variable=var,
+                    command=lambda choice, n=spec.name, et=enum_t: self._set_arg(n, et[choice]),
+                    anchor="w",
+                )
+                dd.grid(row=i, column=1, sticky="ew", pady=4)
+                continue
 
-             if isinstance(val, bool):
-                 bvar = ctk.BooleanVar(value=bool(val))
-                 sw = ctk.CTkSwitch(
-                     self._args_body,
-                     text="",
-                     variable=bvar,
-                     command=lambda k=i, v=bvar: self._set_arg(k, bool(v.get())),
-                 )
-                 sw.grid(row=i, column=1, sticky="w", pady=4)
-                 continue
+            if isinstance(val, bool):
+                bvar = ctk.BooleanVar(value=bool(val))
+                sw = ctk.CTkSwitch(
+                    self._args_body,
+                    text="",
+                    variable=bvar,
+                    command=lambda n=spec.name, v=bvar: self._set_arg(n, bool(v.get())),
+                )
+                sw.grid(row=i, column=1, sticky="w", pady=4)
+                continue
 
-             # int/float/str -> entry with cast on commit
-             svar = ctk.StringVar(value=str(val))
-             ent = ctk.CTkEntry(self._args_body, textvariable=svar)
-             ent.grid(row=i, column=1, sticky="ew", pady=4)
+            # int/float/str -> entry with cast on commit
+            svar = ctk.StringVar(value=str(val))
+            ent = ctk.CTkEntry(self._args_body, textvariable=svar)
+            ent.grid(row=i, column=1, sticky="ew", pady=4)
 
-             def _commit(_evt=None, k=i, sv=svar, old=val):
-                 txt = sv.get()
-                 try:
-                     if isinstance(old, int) and not isinstance(old, bool):
-                         newv = int(txt)
-                     elif isinstance(old, float):
-                         newv = float(txt)
-                     else:
-                         newv = txt
-                 except Exception:
-                     # revert on bad parse
-                     sv.set(str(old))
-                     return
-                 self._set_arg(k, newv)
+            spec_name = spec.name
 
-             ent.bind("<Return>", _commit)
-             ent.bind("<FocusOut>", _commit)
+            def _commit(_evt=None, n=spec_name, sv=svar, old=val):
+                txt = sv.get()
+                try:
+                    if isinstance(old, int) and not isinstance(old, bool):
+                        newv = int(txt)
+                    elif isinstance(old, float):
+                        newv = float(txt)
+                    else:
+                        newv = txt
+                except Exception:
+                    sv.set(str(old))
+                    return
+                self._set_arg(n, newv)
 
-    def _set_arg(self, idx: int, value: Any) -> None:
+            ent.bind("<Return>", _commit)
+            ent.bind("<FocusOut>", _commit)
+
+    def _set_arg(self, name: str, value: Any) -> None:
         if self._active_idx is None or self._active_idx >= len(self._rows):
             return
+
         row = self._rows[self._active_idx]
         lab = row.var.get()
         if lab not in self._label_to_opt:
             return
 
         opt = self._label_to_opt[lab]
-        if idx < 0 or idx >= len(opt.arg_specs):
-            return
 
-        spec = opt.arg_specs[idx]
+        spec = next((s for s in opt.arg_specs if s.name == name), None)
+        if spec is None:
+            return
 
         # type enforcement
         allowed = spec.typ if isinstance(spec.typ, tuple) else (spec.typ,)
         if not any(isinstance(value, t) for t in allowed if isinstance(t, type)):
-            return  # or raise / show UI error
+            return
 
-        # optional bounds
+        # bounds
         if isinstance(value, (int, float)):
-            if spec.min is not None and value < spec.min: value = spec.min
-            if spec.max is not None and value > spec.max: value = spec.max
+            if spec.min is not None and value < spec.min:
+                value = spec.min
+            if spec.max is not None and value > spec.max:
+                value = spec.max
 
-        args_list = list(row.args)
-        while len(args_list) < len(opt.arg_specs):
-            args_list.append(opt.arg_specs[len(args_list)].default)
-
-        args_list[idx] = value
-        row.args = tuple(args_list)
-
+        row.args[name] = value
         self._emit_change()
 

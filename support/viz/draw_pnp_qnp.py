@@ -211,8 +211,6 @@ class pnp_qnp_draw:
 
         # 1) Estimate PnP (optional)
         pnp_pose = None
-        from support.io.my_logging import LOG
-        LOG.info(f'Algo use_pnp: {usedAlgos.use_pnp}')
         if usedAlgos.use_pnp:
             pnp_pose = self._estimate_pnp(object_points, image_points, calibration)
 

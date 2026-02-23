@@ -1,6 +1,6 @@
 import customtkinter as ctk
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type, ClassVar
 from enum import Enum
 
 DEFAULT_CHOICE = "(select)"
@@ -14,23 +14,6 @@ ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type[Enum]]
 StepFn = Callable[..., None]
 StepSpec = Tuple[StepFn, Args]
 
-
-@dataclass(slots=True)
-class AprilTagDetectOpts:
-    scale: float = 1.0
-    inpaint: bool = False
-    pnp: bool = False
-    qnp: bool = False
-
-
-@dataclass(slots=True)
-class YoloOpts:
-    want_pnp: bool = False
-    want_qnp: bool = False
-    want_wqnp: bool = False
-    factor_graph: bool = False
-
-
 @dataclass(frozen=True)
 class ArgSpec:
     name: str
@@ -39,12 +22,123 @@ class ArgSpec:
     min: float | None = None
     max: float | None = None
 
+@dataclass(frozen=True, slots=True)
+class ArgBinding:
+    label: str          # GUI key / display name
+    field: str          # dataclass attribute name
+    object_type: type
+    default: object
+
+@dataclass(slots=True)
+class UndistortOpts:
+    cubemap: bool = False
+    BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Cubemap from Fisheye", "cubemap", bool, False),
+    )
+
+    # Derived, guaranteed consistent
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
+        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
+@dataclass(slots=True)
+class AprilTagDetectOpts:
+    scale: float = 1.0
+    inpaint: bool = False
+    pnp: bool = False
+    qnp: bool = False
+    BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Scale", "scale", float, True),
+        ArgBinding("Hide April Tags", "inpaint", bool, True),
+        ArgBinding("PnP from Truth", "pnp", bool, True),
+        ArgBinding("QnP from Truth", "qnp", bool, True),
+    )
+
+    # Derived, guaranteed consistent
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
+        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
+
+@dataclass(slots=True)
+class YoloOpts:
+    want_pnp: bool = False
+    want_qnp: bool = False
+    want_wqnp: bool = False
+    factor_graph: bool = False
+    hyper_focus: bool = False
+    feature_circles: bool = False
+    BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("PnP", "want_pnp", bool, False),
+        ArgBinding("QnP", "want_qnp", bool, False),
+        ArgBinding("wQnP", "want_wqnp", bool, False),
+        ArgBinding("Factor Graph", "factor_graph", bool, False),
+        ArgBinding("Hyper Attention", "hyper_focus", bool, False),
+        ArgBinding("Feature Circles", "feature_circles", bool, False),
+    )
+
+    # Derived, guaranteed consistent
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
+        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+    
+
+@dataclass(slots=True)
+class HudOpts:
+    draw_attitude: bool = True
+    draw_as_alt: bool = True
+    draw_title: bool = True
+    draw_crosshairs: bool = True
+    draw_mode: bool = True
+    BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Attitude", "draw_attitude", bool, True),
+        ArgBinding("Airspeed/Alt", "draw_as_alt", bool, True),
+        ArgBinding("Image Name", "draw_title", bool, True),
+        ArgBinding("Crosshairs", "draw_crosshairs", bool, True),
+        ArgBinding("Control Mode", "draw_mode", bool, True),
+    )
+
+    # Derived, guaranteed consistent
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
+        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
+_UNSET = object()
+
+
+class Slot:
+    def __init__(self):
+        self._v = _UNSET
+
+    def set(self, v):
+        self._v = v
+
+    def clear(self):
+        self._v = _UNSET
+
+    def is_set(self) -> bool:
+        return self._v is not _UNSET
+
+    def get(self):
+        if self._v is _UNSET:
+            raise KeyError("Slot is unset")
+        return self._v
+
+    def get_or(self, default=None):
+        return default if self._v is _UNSET else self._v
+
 
 @dataclass(slots=True)
 class FrameCtx:
     img_time: Optional[float] = None
     name: Optional[str] = None
     display_in_realtime: bool = True
+    yolo = Slot()
+    fg = Slot()
 
 
 @dataclass
@@ -465,4 +559,3 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
         row.args[name] = value
         self._emit_change()
-

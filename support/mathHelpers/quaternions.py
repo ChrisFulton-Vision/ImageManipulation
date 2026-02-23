@@ -1168,7 +1168,7 @@ def mat2quat(M):
     return Quaternion(s=float(q[0]), vec=q[1:])
 
 
-def se3s2quats(SE3s: NDArray) -> np.ndarray:
+def se3s2quats(SE3s: list[NDArray]) -> np.ndarray:
     return np.array([mat2quat(M[:3, :3]).ndarray for M in SE3s])
 
 

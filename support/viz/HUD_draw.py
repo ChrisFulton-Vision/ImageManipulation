@@ -10,7 +10,7 @@ from support.core.enums import PlaybackSpeed
 
 
 class HUD_Marker:
-    def __init__(self):
+    def __init__(self, filepath=None):
         self.cam_bank_offset = 0.0  # deg
         self.attRdr = AttRdr()
         self.bank_indicator_points = self.create_bank_indicator()
@@ -21,6 +21,9 @@ class HUD_Marker:
         self.throttle_circle_points = None
 
         self.update_storage(864, 864)
+
+        if filepath is not None:
+            self.read_attitude_files(filepath)
 
     def update_storage(self, x, y):
         self.last_xy = (x, y)
@@ -72,7 +75,15 @@ class HUD_Marker:
     def offset(self):
         return self.attRdr.offset
 
-    def draw_HUD(self, image: NDArray, img_time: float):
+    def draw_HUD(self,
+                 image: NDArray,
+                 img_time: float,
+                 cx_cy: tuple[float, float] = None,
+                 draw_attitude: bool = True,
+                 draw_as_alt: bool = True,
+                 draw_imgName: bool = True,
+                 draw_crosshairs: bool = True,
+                 draw_mode: bool = True):
         x, y, _ = image.shape
 
         # If image size changes
@@ -82,21 +93,38 @@ class HUD_Marker:
         speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
             img_time)  # + 173.11338 - 11.658461)
 
-        # Speed
-        cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
+        if draw_crosshairs:
+            self.draw_crosshairs(image, cx_cy)
+
+        if draw_as_alt:
+            cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
                     cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
+            self.draw_altitude(image, alt)
 
-        self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
+        if draw_attitude:
+            self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
+            self.draw_pitchAngle(image, pitch_angle, bank_angle)
+            self.draw_throttleResponse(image, cmd_throttle)
 
-        self.draw_pitchAngle(image, pitch_angle, bank_angle)
-
-        self.draw_altitude(image, alt)
-
-        self.draw_throttleResponse(image, cmd_throttle)
-
-        self.draw_controlMode(image, mode)
+        if draw_mode:
+            self.draw_controlMode(image, mode)
 
         # cv2.putText(image, f'BnkOffset: {self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+
+    @staticmethod
+    def draw_crosshairs(image, cx_cy):
+        if cx_cy is None:
+            return
+        cx, cy = cx_cy
+        width = image.shape[0]
+        height = image.shape[1]
+        thickness = max(int(width / 250), 1)
+
+        crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
+        crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
+
+        cv2.polylines(image, [crosshairsH], True, clr.HUD_GREEN, thickness)
+        cv2.polylines(image, [crosshairsV], True, clr.HUD_GREEN, thickness)
 
     def draw_bankAngle(self, image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle):
         x, y = self.last_xy

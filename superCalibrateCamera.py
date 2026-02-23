@@ -4,6 +4,7 @@ import time
 import sys
 import threading
 from collections import deque
+from dataclasses import dataclass
 
 # import vmbpy.c_binding
 # from vmbpy import *
@@ -17,7 +18,7 @@ from tkinter import filedialog
 
 import customtkinter as ctk
 import cv2
-from collections.abc import Iterable
+
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 
@@ -61,6 +62,22 @@ cv2.setUseOptimized(True)
 CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 
+@dataclass(slots=True)
+class YoloOutput:
+    last_bounding_box_size: tuple[float, float] = None
+    last_yolo_center: tuple[float, float] = None
+    last_yolo_3d_estimate: NDArray = None
+
+
+class FG_Output:
+    curr_FG_pixel: tuple[int, int] = None
+    curr_r_T_d: NDArray = None
+    curr_r_V_d: NDArray = None
+    curr_var_x: float = None
+    curr_var_z: float = None
+    curr_var_y: float = None
+
+
 class CameraGui(ctk.CTkFrame):
     def __init__(self, master, *args, **kwargs):
         self._playback_allowed = None
@@ -95,12 +112,6 @@ class CameraGui(ctk.CTkFrame):
         self._flag_vars: dict[str, ctk.BooleanVar | ctk.DoubleVar] = {}
         self._checkboxes: dict[str, ctk.CTkCheckBox] = {}
         self._flags = [
-            "detectTags", "undistort", "pnp3DTruthPoints", "qnp3DTruthPoints",
-            "yoloInference", "yoloBiasTracking", "detect_corners", "detect_horizon",
-            "factor_graph", "hyper_focus", "phase_correlation", "crosshairs",
-            "cubemap", "hud", "hideAprilTags", "draw_chessboard",
-            # --- Pose from YOLO detections (multi-feature) ---
-            "pnpYoloPoints", "qnpYoloPoints", "qnpKFYoloPoints", "circles_not_features",
             'yolo_conf', 'yolo_iou'
         ]
         self.threadStopper = utils.ThreadStopper()
@@ -122,7 +133,7 @@ class CameraGui(ctk.CTkFrame):
         self.step_options: List[GuiQueue.StepOption] = [
             GuiQueue.StepOption(label="Undistort",
                                 fn=self.undistort,
-                                arg_specs=()),
+                                arg_specs=GuiQueue.UndistortOpts.ARG_SPECS),
             GuiQueue.StepOption(label="Draw Chessboard",
                                 fn=self.draw_chessboard,
                                 arg_specs=()),
@@ -133,13 +144,7 @@ class CameraGui(ctk.CTkFrame):
                                 )),
             GuiQueue.StepOption(label="Apply YOLO -> Q/PnP",
                                 fn=self.run_yolo,
-                                arg_specs=(
-                                    GuiQueue.ArgSpec("PnP", bool, False),
-                                    GuiQueue.ArgSpec("QnP", bool, False),
-                                    GuiQueue.ArgSpec("wQnP", bool, False),
-                                    GuiQueue.ArgSpec("Factor Graph", bool, False),
-                                )
-                                ),
+                                arg_specs=GuiQueue.YoloOpts.ARG_SPECS),
             GuiQueue.StepOption(label="Detect Corners in Image",
                                 fn=self.detect_corners,
                                 arg_specs=()),
@@ -151,16 +156,11 @@ class CameraGui(ctk.CTkFrame):
                                 arg_specs=()),
             GuiQueue.StepOption(label="Draw HUD",
                                 fn=self.draw_HUD,
-                                arg_specs=()),
+                                arg_specs=GuiQueue.HudOpts.ARG_SPECS),
             GuiQueue.StepOption(
                 label="Detect AprilTags and Q/PnP",
                 fn=self.detectAprilTags,
-                arg_specs=(
-                    GuiQueue.ArgSpec("scale", float, 1.0, min=0.1, max=1.0),
-                    GuiQueue.ArgSpec("inpaint", bool, False),
-                    GuiQueue.ArgSpec("PnP", bool, False),
-                    GuiQueue.ArgSpec("QnP", bool, False),
-                ),
+                arg_specs=GuiQueue.AprilTagDetectOpts.ARG_SPECS,
             ),
         ]
 
@@ -181,10 +181,6 @@ class CameraGui(ctk.CTkFrame):
         self.showWindow = False
         self.GaborGUI = None
         self.radius = 800
-        self.last_bounding_box_size = (800, 800)
-        self.last_yolo_center = (400, 400)
-        self.last_yolo_3d_estimate = (10, 0, 0)
-        self.current_center_est = (400, 400)
         self.FG = None
         self.curr_frame = None
         self.curr_frame_gray = None
@@ -214,9 +210,6 @@ class CameraGui(ctk.CTkFrame):
         self.qnpResult = None
         self.pnpDrawer = None
         # --- Pose results from YOLO detections (multi-feature) ---
-        self.pnpYoloResult = None
-        self.qnpYoloResult = None
-        self.qnpKFYoloResult = None
         self.plotter = None
 
         # Checkerboard Handlers
@@ -377,12 +370,6 @@ class CameraGui(ctk.CTkFrame):
             self._flag_vars[name].set(False)
             return
 
-        if name == "detectTags":
-            if val and self.detector is None:
-                self.createDetector()
-            if not val:
-                self.detector = None
-
         setattr(self.camConfig, name, val)
         self.saveToCache()
 
@@ -392,9 +379,6 @@ class CameraGui(ctk.CTkFrame):
                 self._flag_vars[n].set(float(getattr(self.camConfig, n, 1.0)))
             else:
                 self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
-
-        if self.camConfig.detectTags:
-            self.createDetector()
 
     def _sync_dp_from_model(self):
         """Resync batch-processing (DP) UI controls from camConfig.
@@ -543,15 +527,6 @@ class CameraGui(ctk.CTkFrame):
             self.selectCalibLabel.update_idletasks()
             self.filepath_page.update_idletasks()
             self.update_idletasks()
-
-        self.image_processing_page.undistortCheckbox.configure(state='normal')
-        if self.calibration.fisheye:
-            cube_state = 'normal'
-        else:
-            cube_state = 'disabled'
-            self.camConfig.cubemap = False
-            self.image_processing_page.cubemapCheckbox.deselect()
-        self.image_processing_page.cubemapCheckbox.configure(state=cube_state)
 
         if self.yoloSession is not None:
             self.yoloSession.set_calibration(self.calibration)
@@ -1648,10 +1623,9 @@ class CameraGui(ctk.CTkFrame):
                 self.threadStopper.set()
                 break
 
-            if self._flag_vars['draw_chessboard'].get():
-                new_time = self._handle_chessboard_hotkeys(key)
-                if new_time is not None:
-                    stop_display_time = new_time
+            new_time = self._handle_chessboard_hotkeys(key)
+            if new_time is not None:
+                stop_display_time = new_time
 
             if stop_display_time is not None and time.monotonic() > stop_display_time:
                 stop_display_time = None
@@ -1694,6 +1668,7 @@ class CameraGui(ctk.CTkFrame):
                     cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
 
     def _handle_chessboard_hotkeys(self, key: int):
+
         # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
         changed = False
 
@@ -2311,10 +2286,6 @@ class CameraGui(ctk.CTkFrame):
             wall_start = time.monotonic() - (phase / fps)
         return wall_start
 
-    # def _toggle(self, attribute: str):
-    #     self._flag_vars[attribute].set(not self._flag_vars[attribute].get())
-    #     self.saveToCache()
-
     def _on_mark_start(self, curr_idx: int):
         self.camConfig.start_export_idx = curr_idx
         if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
@@ -2357,7 +2328,9 @@ class CameraGui(ctk.CTkFrame):
         if frame is None:
             return
 
-        ctx = GuiQueue.FrameCtx(img_time=img_time, name=name, display_in_realtime=display_in_realtime)
+        ctx = GuiQueue.FrameCtx(img_time=img_time,
+                                name=name,
+                                display_in_realtime=display_in_realtime)
 
         self.pnpResult = None
         self.qnpResult = None
@@ -2375,121 +2348,25 @@ class CameraGui(ctk.CTkFrame):
         frameSize = frame.shape[:2]
         if self.calibration.validCal and frameSize != calSize:
             LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
-        if self.calibration.validCal and self.camConfig.undistort:
-            self.undistort(frame,
-                           markup_frame,
-                           ctx,
-                           ())
-        else:
-            markup_frame: NDArray = frame  # explicit reference passed, saves copy if not undistorting
 
         ######################################################
-        test_markup_frame: NDArray = np.copy(frame)
         for func, args in self.list_of_image_process_functors:
-            func(frame, test_markup_frame, ctx, args)
+            func(frame, markup_frame, ctx, args)
 
-        if box_around:
-            self.draw_boxAround(frame, test_markup_frame, ctx, ())
-
-        if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.draw_name(frame, test_markup_frame, ctx, ())
-            if not self.screenshot_impending:
-                self.draw_playbackStats(frame, test_markup_frame, ctx, ())
-        self.draw_time(frame, test_markup_frame, ctx, ())
-
-        if display_in_realtime:
-            self.cleanup(test_markup_frame, 'test')
-            cv2.waitKey(1)
-        else:
-            return np.ascontiguousarray(markup_frame).copy()
-        ######################################################
-
-        if self.camConfig.draw_chessboard:
-            self.draw_chessboard(self.curr_frame,
-                                 markup_frame,
-                                 ctx,
-                                 ())
-
-        if self.camConfig.processingKernel != ImageKernel.Unfiltered:
-            self.applyKernel(frame,
-                             markup_frame,
-                             ctx,
-                             [self.camConfig.processingKernel])
-
-        if self.camConfig.detect_corners:
-            self.detect_corners(frame,
-                                markup_frame,
-                                ctx,
-                                ())
-
-        if self.camConfig.detectTags and self.detector is not None:
-            self.detectAprilTags(frame,
-                                 markup_frame,
-                                 ctx,
-                                 {"scale": 0.6,
-                                  "inpaint": self.camConfig.hideAprilTags,
-                                  "pnp": self.camConfig.pnp3DTruthPoints,
-                                  "qnp": self.camConfig.qnp3DTruthPoints, })
-
-        if self.camConfig.detect_horizon:
-            self.detectHorizon(frame,
-                               markup_frame,
-                               ctx,
-                               ())
-
-        if self.camConfig.hyper_focus:
-            self.hyper_focus(frame,
-                             markup_frame,
-                             ctx,
-                             ())
-
-        if self.camConfig.phase_correlation:
-            self.phase_correlation(frame,
-                                   markup_frame,
-                                   ctx,
-                                   ())
-
-        if self.camConfig.yoloInference:
-            self.run_yolo(frame,
-                          markup_frame,
-                          ctx,
-                          {"PnP": self.camConfig.pnpYoloPoints,
-                           "QnP": self.camConfig.qnpYoloPoints,
-                           "wQnP": self.camConfig.qnpKFYoloPoints,
-                           "Factor Graph": self.camConfig.factor_graph})  # Takes original frame, not undistort. YOLO presumes original.
-        else:
-            self.last_bounding_box_size = None
-            self.last_yolo_center = None
-            self.pnpYoloResult = None
-            self.qnpYoloResult = None
-            self.qnpKFYoloResult = None
-
-        if self.camConfig.factor_graph:
-            self.factor_graph(frame, markup_frame, ctx, ())
-        else:
-            self.last_yolo_3d_estimate = None
-
-        if self.camConfig.hud:
-            self.draw_HUD(frame, markup_frame, ctx, ())
-
-        if box_around:
+        if box_around and not self.screenshot_impending:
             self.draw_boxAround(frame, markup_frame, ctx, ())
 
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             self.draw_name(frame, markup_frame, ctx, ())
-
+            if not self.screenshot_impending:
+                self.draw_playbackStats(frame, markup_frame, ctx, ())
         self.draw_time(frame, markup_frame, ctx, ())
 
-        if self.print3DTruthOnce:
-            self.print_pnp_results()
-
         if display_in_realtime:
-            if self.camConfig.imageSource == ImageSource.Stream_from_Folder and not self.screenshot_impending:
-                self.draw_playbackStats(frame, markup_frame, ctx, ())
-            self.cleanup(markup_frame)
-
+            self.cleanup(markup_frame, )
         else:
             return np.ascontiguousarray(markup_frame).copy()
+        ######################################################
 
     def draw_playbackStats(self, frame,
                            markupFrame,
@@ -2507,19 +2384,47 @@ class CameraGui(ctk.CTkFrame):
                                            self.camConfig.rt_speed,
                                            self.camConfig.cam_to_log_time_offset)
 
-    def draw_time(self, frame, markupFrame, ctx: GuiQueue.FrameCtx, args):
+    @staticmethod
+    def draw_time(frame, markupFrame, ctx: GuiQueue.FrameCtx, args):
         if ctx.img_time is None:
             return
         time_str = f"Flight Time: {ctx.img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
         from support.viz.HUD_draw import draw_time_on_image
         draw_time_on_image(markupFrame, time_str)
 
-    def draw_name(self, frame,
+    @staticmethod
+    def draw_name(frame,
                   markupFrame,
                   ctx: GuiQueue.FrameCtx,
                   args) -> None:
         from support.viz.HUD_draw import draw_name_on_image
         draw_name_on_image(os.path.basename(ctx.name), markupFrame)
+
+    @staticmethod
+    def parse_args(args: dict, obj, *, ignore_unknown=True):
+        """
+        keymap maps incoming keys -> dataclass field names.
+        Mutates obj in-place; returns obj.
+        """
+        from dataclasses import is_dataclass, fields
+        if not is_dataclass(obj) or isinstance(obj, type):
+            raise TypeError("Expected a dataclass instance")
+
+        valid_fields = {f.name for f in fields(obj)}
+
+        for in_key, value in args.items():
+            if in_key not in obj.KEYMAP:
+                if not ignore_unknown:
+                    raise KeyError(f"Unknown incoming key: {in_key!r}")
+                continue
+
+            field_name = obj.KEYMAP[in_key]
+            if field_name not in valid_fields:
+                raise KeyError(f"keymap maps {in_key!r} -> {field_name!r}, but that field doesn't exist")
+
+            setattr(obj, field_name, value)
+
+        return obj
 
     def draw_HUD(self, frame: NDArray,
                  markupFrame: NDArray,
@@ -2527,11 +2432,25 @@ class CameraGui(ctk.CTkFrame):
                  args) -> None:
         if ctx.img_time is None:
             return
+
+        opts: GuiQueue.HudOpts = self.parse_args(args, GuiQueue.HudOpts())
+
+        if self.calibration.validCal:
+            cx_cy = (int(self.calibration.cx), int(self.calibration.cy))
+        else:
+            cx_cy = (int(markupFrame.shape[0] / 2), int(markupFrame.shape[1] / 2))
+
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
-            self.hud_marker = HUD_Marker()
-            self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-        self.hud_marker.draw_HUD(markupFrame, ctx.img_time)
+            self.hud_marker = HUD_Marker(self.camConfig.hud_data_filepath)
+        self.hud_marker.draw_HUD(image=markupFrame,
+                                 img_time=ctx.img_time,
+                                 cx_cy=cx_cy,
+                                 draw_attitude=opts.draw_attitude,
+                                 draw_as_alt=opts.draw_as_alt,
+                                 draw_imgName=opts.draw_title,
+                                 draw_crosshairs=opts.draw_crosshairs,
+                                 draw_mode=opts.draw_mode)
 
     def draw_boxAround(self, frame,
                        markupFrame,
@@ -2724,10 +2643,40 @@ class CameraGui(ctk.CTkFrame):
 
         return stitched
 
-    def undistort(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args):
+    def undistort(self,
+                  frame: NDArray,
+                  markupFrame: NDArray,
+                  ctx: GuiQueue.FrameCtx,
+                  args):
 
         if self.calibration.fisheye:
-            if self.camConfig.cubemap:
+
+            def _paste_into(frame_dst: np.ndarray, img_src: np.ndarray) -> None:
+                """Paste src into dst. If same shape, full copy.
+                If src is smaller, center it with black padding.
+                Otherwise, resize src to dst size.
+                """
+                h, w = frame_dst.shape[:2]
+                hs, ws = img_src.shape[:2]
+
+                if (h, w) == (hs, ws):
+                    frame_dst[:] = img_src
+                    return
+
+                # If src fits inside dst, center-blit with padding (no distortion)
+                if hs <= h and ws <= w:
+                    frame_dst[:] = 0
+                    y0 = (h - hs) // 2
+                    x0 = (w - ws) // 2
+                    frame_dst[y0:y0 + hs, x0:x0 + ws] = img_src
+                    return
+
+                # Otherwise resize to fit (may distort)
+                resized = cv2.resize(img_src, (w, h), interpolation=cv2.INTER_LINEAR)
+                frame_dst[:] = resized
+
+            opts: GuiQueue.UndistortOpts = self.parse_args(args, GuiQueue.UndistortOpts())
+            if opts.cubemap:
                 if self.face_size is None or self.face_size != 600:
                     self.face_size = 600
                     self.update_cube_map_vectors()
@@ -2740,7 +2689,8 @@ class CameraGui(ctk.CTkFrame):
                     'right': (1, 2),
                     # 'back': (1, 0),
                     'top': (0, 1)}
-                markupFrame[:] = self.stitch_cubemap_faces(layout, cells=3)
+                stitched = self.stitch_cubemap_faces(layout, cells=3)
+                _paste_into(markupFrame, stitched)
 
             else:
                 if self.face_size is None or self.face_size != min(markupFrame.shape[:2]):
@@ -2749,8 +2699,8 @@ class CameraGui(ctk.CTkFrame):
 
                 self.apply_fisheye_faces(markupFrame)
 
-                # self.curr_frame = self.stitch_cubemap_faces(layout, cells=1)
-                markupFrame[:] = self.cubemap_faces['front']
+                front = self.cubemap_faces['front']
+                _paste_into(markupFrame, front)
         else:
             if self.map1 is None or self.map2 is None:
                 raise ValueError("No calibration loaded!")
@@ -2766,7 +2716,7 @@ class CameraGui(ctk.CTkFrame):
                     markupFrame: NDArray,
                     ctx: GuiQueue.FrameCtx,
                     args) -> None:
-        if not 'Filter' in args:
+        if 'Filter' not in args:
             return
 
         processKernel: ImageKernel = args['Filter']
@@ -2863,53 +2813,6 @@ class CameraGui(ctk.CTkFrame):
             if isinstance(args, (int, float)) and not isinstance(args, bool):
                 set_scale(args)
                 return opts
-
-            # --- Iterable legacy ---
-            # if isinstance(args, Iterable) and not isinstance(args, (str, bytes)):
-            #     # Flatten any nested dicts and collect scalars
-            #     bools: list[bool] = []
-            #     saw_scale = False
-            #
-            #     for a in args:
-            #         if isinstance(a, dict):
-            #             if "scale" in a:
-            #                 set_scale(a["scale"])
-            #                 saw_scale = True
-            #             if "inpaint" in a:
-            #                 set_bool("inpaint", a["inpaint"])
-            #             if "pnp" in a:
-            #                 set_bool("pnp", a["pnp"])
-            #             if "qnp" in a:
-            #                 set_bool("qnp", a["qnp"])
-            #             continue
-            #
-            #         if isinstance(a, bool):
-            #             bools.append(a)
-            #             continue
-            #
-            #         if isinstance(a, (int, float)) and not isinstance(a, bool):
-            #             set_scale(a)
-            #             saw_scale = True
-            #             continue
-            #
-            #         raise TypeError(f"AprilTag args: expected numeric/bool/dict, got {type(a)}")
-            #
-            #     # If user provided unnamed bools, map them by order:
-            #     #   (inpaint, pnp, qnp)
-            #     if bools:
-            #         if len(bools) >= 1:
-            #             opts.inpaint = bools[0]
-            #         if len(bools) >= 2:
-            #             opts.pnp = bools[1]
-            #         if len(bools) >= 3:
-            #             opts.qnp = bools[2]
-            #         if len(bools) > 3:
-            #             raise TypeError(
-            #                 f"AprilTag args: too many unnamed bools ({len(bools)}). "
-            #                 "Use a dict: {'inpaint':..., 'pnp':..., 'qnp':...}."
-            #             )
-            #
-            #     return opts
 
             raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
 
@@ -3297,37 +3200,56 @@ class CameraGui(ctk.CTkFrame):
         x1, y1, x2, y2 = self.horizon_line
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
-    def hyper_focus(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+    def hyper_focus(self,
+                    frame: NDArray,
+                    markupFrame: NDArray,
+                    ctx: GuiQueue.FrameCtx, args) -> None:
 
-        if not self.camConfig.factor_graph:
-            if self.last_bounding_box_size is not None:
-                self.radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[
-                    1] + self.radius * 4.0) / 5.0
+        if not (yolo := ctx.yolo.get_or(False)):
+            return
 
-            dim_except_circle(markupFrame, self.current_center_est, 3.0 * self.radius, 0.00)
-            dim_except_circle(markupFrame, self.current_center_est, 1.5 * self.radius, 0.50)
+        if not ctx.fg.is_set():
+
+            if yolo.last_bounding_box_size is not None:
+                self.radius = (yolo.last_bounding_box_size[0] +
+                               yolo.last_bounding_box_size[1] +
+                               self.radius * 4.0) / 5.0
+
+            dim_except_circle(markupFrame,
+                              yolo.last_yolo_center,
+                              3.0 * self.radius, 0.00)
+            dim_except_circle(markupFrame,
+                              yolo.last_yolo_center,
+                              1.5 * self.radius, 0.50)
 
             self.radius = min(800.0, self.radius + 12.0)
             if self.yoloSession is not None:
                 self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
         else:
-            if self.last_bounding_box_size is not None:
+            if yolo.last_bounding_box_size is not None:
                 # 1.0 for single feature, 1.5 for drogue
-                self.min_radius = (self.last_bounding_box_size[0] + self.last_bounding_box_size[1]) * 1.0
+                self.min_radius = (yolo.last_bounding_box_size[0] +
+                                   yolo.last_bounding_box_size[1]) * 1.0
+
+            fg = ctx.fg.get()
 
             # 5.0 for single feature, 50.0 for drogue
-            ellipse_width = 5.0 * self.current_var_y + self.min_radius
-            ellipse_height = 5.0 * self.current_var_z + self.min_radius
+            ellipse_width = 5.0 * fg.curr_var_y + self.min_radius
+            ellipse_height = 5.0 * fg.curr_var_z + self.min_radius
 
-            if self.curr_FG_pixel[0] < 0 or self.curr_FG_pixel[1] < 0 or self.curr_FG_pixel[0] > markupFrame.shape[
-                1] or self.curr_FG_pixel[1] > markupFrame.shape[0]:
+            if (fg.curr_FG_pixel[0] < 0 or
+                    fg.curr_FG_pixel[1] < 0 or
+                    fg.curr_FG_pixel[0] > markupFrame.shape[1] or
+                    fg.curr_FG_pixel[1] > markupFrame.shape[0]):
                 return
 
-            dim_except_circle(markupFrame, self.curr_FG_pixel,
+            dim_except_circle(markupFrame,
+                              fg.curr_FG_pixel,
                               x_axes=ellipse_width,
                               y_axes=ellipse_height,
                               dim_factor=0.10)
-            dim_except_circle(markupFrame, self.curr_FG_pixel,
+            dim_except_circle(markupFrame,
+                              fg.curr_FG_pixel,
                               x_axes=ellipse_width * 2.0,
                               y_axes=ellipse_height * 2.0,
                               dim_factor=0.00)
@@ -3345,22 +3267,7 @@ class CameraGui(ctk.CTkFrame):
         :return: None, but does adjust
         """
 
-        def parse_yolo_args(yolo_args: dict) -> GuiQueue.YoloOpts:
-            opts = GuiQueue.YoloOpts()
-
-            if "PnP" in yolo_args:
-                opts.want_pnp = yolo_args["PnP"]
-            if "QnP" in yolo_args:
-                opts.want_qnp = yolo_args["QnP"]
-            if "wQnP" in yolo_args:
-                opts.want_wqnp = yolo_args["wQnP"]
-            if "Factor Graph" in yolo_args:
-                opts.factor_graph = yolo_args["Factor Graph"]
-            return opts
-        LOG.info('\n')
-        opts = parse_yolo_args(args)
-        LOG.info(f'Outside: {opts.want_pnp}')
-        LOG.info(args)
+        opts = self.parse_args(args, GuiQueue.YoloOpts())
 
         from support.vision import yolo
         if self.yoloSession is None:
@@ -3390,78 +3297,66 @@ class CameraGui(ctk.CTkFrame):
                                    yoloSize=self.yoloSession.yoloSize,
                                    idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
                                    usedAlgos=algos,
-                                   circles_not_features=self._flag_vars["circles_not_features"].get())
+                                   circles_not_features=opts.feature_circles)
 
         centers, boxes, scores, class_ids, img_time = output
 
         if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
+
             best_idx = scores.index(max(scores))
             img_yolo_x_correction = markupFrame.shape[0] / self.yoloSession.reader.imageSize
             img_yolo_y_correction = markupFrame.shape[1] / self.yoloSession.reader.imageSize
 
-            self.last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
-                                           (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
-            self.last_yolo_center = centers[best_idx]
-
-            self.last_yolo_center = (int(
-                self.last_yolo_center[0] * img_yolo_x_correction), int(
-                self.last_yolo_center[1] * img_yolo_y_correction))
+            last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
+                                      (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
+            last_yolo_center = (int(
+                centers[best_idx][0] * img_yolo_x_correction), int(
+                centers[best_idx][1] * img_yolo_y_correction))
 
             K = self.calibration.getCameraMatrix()
             # d = self.calibration.getDistortion()  # Presume undistorted image
-            twoD_points = np.array([self.last_yolo_center[0], self.last_yolo_center[1], 1.0])
-            dist_est = self.calibration.fx * 4.07 / (self.last_bounding_box_size[0])
+            twoD_points = np.array([last_yolo_center[0], last_yolo_center[1], 1.0])
+            dist_est = self.calibration.fx * 4.07 / (last_bounding_box_size[0])
 
-            if self.check_above_horizon(self.last_yolo_center):
-                self.last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
+            if self.check_above_horizon(last_yolo_center):
+                last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                 w, h, _ = markupFrame.shape
                 cv2.putText(markupFrame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
                             med_text(markupFrame.shape[0]), (50, 255, 255), 1)
                 cv2.putText(markupFrame,
-                            f'x:{self.last_yolo_3d_estimate[0]:.3f}, y:{self.last_yolo_3d_estimate[1]:.3f}, ' +
-                            f'z:{self.last_yolo_3d_estimate[2]:.3f}',
+                            f'x:{last_yolo_3d_estimate[0]:.3f}, y:{last_yolo_3d_estimate[1]:.3f}, ' +
+                            f'z:{last_yolo_3d_estimate[2]:.3f}',
                             (25, w - 50),
                             cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), 1)
-                self.current_center_est = ((self.current_center_est[0] * 2.0 + centers[best_idx][0]) / 3.0,
-                                           (self.current_center_est[1] * 2.0 + centers[best_idx][1]) / 3.0)
-                return
+            else:
+                last_yolo_3d_estimate = None
 
-        self.last_bounding_box_size = None
-        self.last_yolo_center = None
+            ctx.yolo.set(YoloOutput(last_bounding_box_size=last_bounding_box_size,
+                                    last_yolo_center=last_yolo_center,
+                                    last_yolo_3d_estimate=last_yolo_3d_estimate))
 
-    def pose_from_yolo(self,
-                       want_pnp: bool = False,
-                       want_qnp: bool = False,
-                       want_qnp_kf: bool = False):
-        """Compute (optional) PnP / QnP / KF-weighted QnP poses from YOLO detections."""
-        # Guard: must have calibration
-        if not getattr(self.calibration, "validCal", False):
-            self.pnpYoloResult = None
-            self.qnpYoloResult = None
-            self.qnpKFYoloResult = None
-            return
+        if opts.factor_graph:
+            self.factor_graph(frame, markupFrame, ctx, opts.hyper_focus)
 
-        # Quick exit if nothing enabled
-        want_pnp = bool(getattr(self.camConfig, "pnpYoloPoints", False))
-        want_qnp = bool(getattr(self.camConfig, "qnpYoloPoints", False))
-        want_qnp_kf = bool(getattr(self.camConfig, "qnpKFYoloPoints", False))
-        if not (want_pnp or want_qnp or want_qnp_kf):
-            self.pnpYoloResult = None
-            self.qnpYoloResult = None
-            self.qnpKFYoloResult = None
-            return
+    def factor_graph(self,
+                     frame: NDArray,
+                     markupFrame: NDArray,
+                     ctx: GuiQueue.FrameCtx,
+                     args) -> None:
 
-    def factor_graph(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+        hyper_focus = args
+
         from support.runtime.fg_drogue_only import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
         color = clr.YELLOWGREEN
 
-        if self.last_yolo_3d_estimate is not None:
+        yolo = ctx.yolo.get_or()  # Returns None if not set
+        if yolo is not None and yolo.last_yolo_3d_estimate is not None:
             if ctx.img_time < self.last_time_update:
                 self.FG.reset()
             elif ctx.img_time > self.last_time_update:
-                self.FG.newRecvMeas(self.last_yolo_3d_estimate, ctx.img_time)
+                self.FG.newRecvMeas(yolo.last_yolo_3d_estimate, ctx.img_time)
                 self.last_time_update = ctx.img_time
             if self.FG.numMeas > 20:
                 self.FG.popOldestMeas()
@@ -3471,41 +3366,51 @@ class CameraGui(ctk.CTkFrame):
             color = clr.RED
 
         if ctx.img_time is not None and self.FG.numMeas > 2:
+            fg_output = FG_Output()
             K = self.calibration.getCameraMatrix()
-            self.curr_FG_pixel = K.dot(self.FG.r_T_d[-1] + (ctx.img_time - self.last_time_update) * self.FG.r_V_d[-1])
-            self.curr_FG_pixel = (self.curr_FG_pixel / self.curr_FG_pixel[2])[:2]
+            threeD_proj = K.dot(self.FG.r_T_d[-1] + (ctx.img_time - self.last_time_update) * self.FG.r_V_d[-1])
+            fg_output.curr_FG_pixel = threeD_proj[:2] / threeD_proj[2]
+            pixel = (int(fg_output.curr_FG_pixel[0]), int(fg_output.curr_FG_pixel[1]))
 
             h, w, _ = markupFrame.shape
             size = 15
             thickness = 2
-            cv2.circle(markupFrame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, (0, 0, 0),
+            cv2.circle(markupFrame, pixel, size, (0, 0, 0),
                        thickness)
-            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
-                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], (0, 0, 0), thickness)
-            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
-                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], (0, 0, 0), thickness)
-            cv2.putText(markupFrame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.line(markupFrame, [pixel[0] + size, pixel[1]],
+                     [pixel[0] - size, pixel[1]], (0, 0, 0), thickness)
+            cv2.line(markupFrame, [pixel[0], pixel[1] + size],
+                     [pixel[0], pixel[1] - size], (0, 0, 0), thickness)
+            cv2.putText(markupFrame, 'Factor Graph Solution',
+                        (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
                         med_text(markupFrame.shape[0]), (0, 0, 0), thickness)
 
             thickness = 1
-            cv2.circle(markupFrame, (int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1])), size, color,
+            cv2.circle(markupFrame, pixel, size, color,
                        thickness)
-            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]) + size, int(self.curr_FG_pixel[1])],
-                     [int(self.curr_FG_pixel[0]) - size, int(self.curr_FG_pixel[1])], color, thickness)
-            cv2.line(markupFrame, [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) + size],
-                     [int(self.curr_FG_pixel[0]), int(self.curr_FG_pixel[1]) - size], color, thickness)
-            cv2.putText(markupFrame, 'Factor Graph Solution', (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.line(markupFrame, [pixel[0] + size, pixel[1]],
+                     [pixel[0] - size, pixel[1]], color, thickness)
+            cv2.line(markupFrame, [pixel[0], pixel[1] + size],
+                     [pixel[0], pixel[1] - size], color, thickness)
+            cv2.putText(markupFrame, 'Factor Graph Solution',
+                        (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
                         med_text(markupFrame.shape[0]), color, thickness)
 
-            self.curr_r_T_d, self.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
+            fg_output.curr_r_T_d, fg_output.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
 
             var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
 
-            self.current_var_x = var_x + var_vx * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[0])
-            self.current_var_y = var_y + var_vy * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[1])
-            self.current_var_z = var_z + var_vz * (ctx.img_time - self.last_time_update) * np.abs(self.curr_r_V_d[2])
+            fg_output.curr_var_x = var_x + var_vx * (ctx.img_time -
+                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[0])
+            fg_output.curr_var_y = var_y + var_vy * (ctx.img_time -
+                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[1])
+            fg_output.curr_var_z = var_z + var_vz * (ctx.img_time -
+                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[2])
 
-        self.last_yolo_3d_estimate = None
+            ctx.fg.set(fg_output)
+
+        if hyper_focus:
+            self.hyper_focus(frame, markupFrame, ctx, ())
 
     def phase_correlation(self,
                           frame: NDArray,
@@ -3536,24 +3441,6 @@ class CameraGui(ctk.CTkFrame):
         self.last_image = copy.deepcopy(self.curr_frame_gray)
 
     def cleanup(self, markupFrame, name=None):
-
-        if self.calibration.validCal:
-            cx = int(self.calibration.cx)
-            cy = int(self.calibration.cy)
-        else:
-            cx = int(markupFrame.shape[0] / 2)
-            cy = int(markupFrame.shape[1] / 2)
-
-        width = markupFrame.shape[0]
-        height = markupFrame.shape[1]
-        thickness = max(int(width / 250), 1)
-
-        if self.camConfig.crosshairs:
-            crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])
-            crosshairsV = np.array([[cx, cy + max(int(height / 50), 10)], [cx, cy - max(int(height / 50), 10)]])
-
-            cv2.polylines(markupFrame, [crosshairsH], True, clr.HUD_GREEN, thickness)
-            cv2.polylines(markupFrame, [crosshairsV], True, clr.HUD_GREEN, thickness)
 
         self.potentialResize(markupFrame)
 
@@ -3596,10 +3483,3 @@ class CameraGui(ctk.CTkFrame):
             cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
             self.lastWidth = width
             self.lastHeight = int(width / aspectRatio)
-
-    # @staticmethod
-    # def askFilepath(initDir, text):
-    #     poss_filepath = filedialog.askdirectory(initialdir=initDir, mustexist=True, title=text)
-    #     if poss_filepath == '':
-    #         return None
-    #     return poss_filepath

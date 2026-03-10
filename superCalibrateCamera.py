@@ -3,6 +3,7 @@ import os
 import time
 import sys
 import threading
+import enum
 from collections import deque
 from dataclasses import dataclass
 
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from numpy.typing import NDArray
-from typing import List, Any
+from typing import List, Any, Callable
 from pathlib import Path
 from tkinter import filedialog
 
@@ -102,7 +103,7 @@ class CameraGui(ctk.CTkFrame):
         self._loading_config = True
 
         self.func_that_refits = None
-        self.list_of_image_process_functors: List[GuiQueue.StepSpec] = []
+        self.list_of_image_process_functors: List[tuple[Callable, dict]] = []
 
         # Debounced cache writes
         self._save_debounce_id = None
@@ -163,6 +164,7 @@ class CameraGui(ctk.CTkFrame):
                 arg_specs=GuiQueue.AprilTagDetectOpts.ARG_SPECS,
             ),
         ]
+        self.fn_to_label = {opt.fn: opt.label for opt in self.step_options}
 
         self.calibration = Calibration()
         self.config_store = ConfigStore(CACHE_FILEPATH, configs_dir="Configs", scheduler=self)
@@ -288,7 +290,6 @@ class CameraGui(ctk.CTkFrame):
 
         self.lastWidth = 1
         self.lastHeight = 1
-        self.saveToCache(immediate=True)
 
         self._ui_active = True
         self._last_ui_tick = 0.0
@@ -299,12 +300,16 @@ class CameraGui(ctk.CTkFrame):
 
         self.setupFrame()
 
+        self.image_processing_page.grid_columnconfigure(0, weight=1, minsize=400)
+        self.image_processing_page.grid_columnconfigure(1, weight=1)
+
         self.imgProcQueue_editor = GuiQueue.StepSpecQueueEditor(
             master=self.image_processing_page,
             options=self.step_options,
             on_change=self._on_queue_changed,
         )
-        self.imgProcQueue_editor.grid(row=20, column=0, columnspan=2, padx=5, pady=5)
+        self.imgProcQueue_editor.grid(row=20, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+        self._sync_queue_from_model()
 
         self._loading_config = False
 
@@ -332,13 +337,66 @@ class CameraGui(ctk.CTkFrame):
         except tk.TclError:
             pass
 
-    def _on_queue_changed(self, new_queue: List[GuiQueue.StepSpec]) -> None:
-        sig_did_change = self.list_of_image_process_functors != list(new_queue)
-        self.list_of_image_process_functors = list(new_queue)
+    def _on_queue_changed(self, new_queue):
+        if getattr(self, "_loading_config", False):
+            return
+
+        normalized_queue = [
+            (fn, copy.deepcopy(args))
+            for fn, args in new_queue
+        ]
+
+        sig_did_change = self.list_of_image_process_functors != normalized_queue
+        self.list_of_image_process_functors = normalized_queue
 
         if sig_did_change:
+            self.camConfig.image_processing_queue = self._queue_to_config(normalized_queue)
+            self.saveToCache()
+
             if self.func_that_refits is not None:
                 self.func_that_refits()
+
+    def _sync_queue_from_model(self):
+        cfg = getattr(self.camConfig, "image_processing_queue", [])
+        rebuilt = self._queue_from_config(cfg)
+
+        self.list_of_image_process_functors = [
+            (fn, copy.deepcopy(args)) for fn, args in rebuilt
+        ]
+
+        if hasattr(self, "imgProcQueue_editor") and self.imgProcQueue_editor is not None:
+            self.imgProcQueue_editor.set_queue(
+                [(fn, copy.deepcopy(args)) for fn, args in rebuilt],
+                emit_change=False,
+            )
+
+    def _queue_stepspecs_from_config(self, queue_cfg):
+        if not queue_cfg:
+            return []
+
+        option_by_label = {opt.label: opt for opt in self.step_options}
+        rebuilt = []
+
+        for row in queue_cfg:
+            label = row["label"]
+
+            if label not in option_by_label:
+                LOG.warning("Skipping cached queue step '%s' (unknown)", label)
+                continue
+
+            opt = option_by_label[label]
+            args = copy.deepcopy(row.get("args", {}))
+
+            rebuilt.append(
+                GuiQueue.StepSpec(
+                    label=opt.label,
+                    fn=opt.fn,
+                    arg_specs=opt.arg_specs,
+                    args=args,
+                )
+            )
+
+        return rebuilt
 
     def func_to_refit(self, func):
         self.func_that_refits = func
@@ -437,9 +495,6 @@ class CameraGui(ctk.CTkFrame):
             self._loading_config = False
 
     def update_post_newCamConfig(self):
-
-        # Setting flag vars directly calls SaveToCache, overriding camConfig with current flag vars.
-        # Copy-store temp iou overrides this behavior.
         iou = copy.deepcopy(self.camConfig.yolo_iou)
         self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
         self._flag_vars["yolo_iou"].set(float(iou))
@@ -450,20 +505,17 @@ class CameraGui(ctk.CTkFrame):
         if self.ThreeDTruthPoints is not None:
             self.loadTruthPoints()
 
-        # --- model -> UI resync on config load (batch DP + flags) ---
         self.sync_flags_from_model()
         self._sync_dp_from_model()
+        self._sync_queue_from_model()
 
-        # Ensure GPU UI matches dp_gpu setting (avoid cached desync)
         try:
             if hasattr(self, "gpu_slider"):
                 self.gpu_slider.configure(
-                    state="normal" if bool(
-                        getattr(self.camConfig, "dp_gpu", False)) else "disabled")
-
+                    state="normal" if bool(getattr(self.camConfig, "dp_gpu", False)) else "disabled"
+                )
             if not bool(getattr(self.camConfig, "dp_gpu", False)):
                 self.gpu_slider.set(0.0)
-
         except Exception:
             pass
 
@@ -482,6 +534,99 @@ class CameraGui(ctk.CTkFrame):
         self.camConfig.yolo_iou = float(self._flag_vars["yolo_iou"].get())
 
         self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
+
+    def _queue_to_config(self, queue):
+        out = []
+
+        for fn, args in queue:
+            try:
+                label = self.fn_to_label[fn]
+            except KeyError:
+                raise RuntimeError(f"Queue contains unknown processing function: {fn}")
+
+            clean_args = {
+                k: self._serialize_queue_arg(v)
+                for k, v in args.items()
+            }
+
+            out.append({
+                "label": label,
+                "args": clean_args
+            })
+
+        return out
+
+    def _queue_from_config(self, queue_cfg):
+        if not queue_cfg:
+            return []
+
+        option_by_label = {opt.label: opt for opt in self.step_options}
+        rebuilt = []
+
+        for row in queue_cfg:
+            label = row["label"]
+
+            if label not in option_by_label:
+                LOG.warning("Skipping cached queue step '%s' (unknown)", label)
+                continue
+
+            opt = option_by_label[label]
+            raw_args = copy.deepcopy(row.get("args", {}))
+
+            # Start from defaults so missing fields are filled in automatically
+            parsed_args = opt.default_args.copy()
+
+            spec_by_name = {spec.name: spec for spec in opt.arg_specs}
+            for arg_name, raw_val in raw_args.items():
+                spec = spec_by_name.get(arg_name)
+                if spec is None:
+                    parsed_args[arg_name] = raw_val
+                    continue
+
+                parsed_args[arg_name] = self._deserialize_queue_arg(spec, raw_val)
+
+            rebuilt.append((opt.fn, parsed_args))
+
+        return rebuilt
+
+    def _serialize_queue_arg(self, v):
+        if isinstance(v, enum.Enum):
+            return v.value
+        return v
+
+    def _deserialize_queue_arg(self, spec, raw_val):
+        default = spec.default
+
+        # Enum args: rebuild from saved scalar/string value
+        if isinstance(default, enum.Enum):
+            enum_type = type(default)
+            try:
+                return enum_type(raw_val)
+            except Exception:
+                LOG.warning(
+                    "Failed to parse enum arg '%s' from cached value %r; using default %r",
+                    spec.name, raw_val, default
+                )
+                return default
+
+        # Optional: coerce basic scalar types back to the default's type
+        try:
+            if isinstance(default, bool):
+                return bool(raw_val)
+            if isinstance(default, int) and not isinstance(default, bool):
+                return int(raw_val)
+            if isinstance(default, float):
+                return float(raw_val)
+            if isinstance(default, str):
+                return str(raw_val)
+        except Exception:
+            LOG.warning(
+                "Failed to parse arg '%s' from cached value %r; using default %r",
+                spec.name, raw_val, default
+            )
+            return default
+
+        return raw_val
 
     def updateLogFile(self):
         if self.hud_marker is not None:
@@ -1463,9 +1608,11 @@ class CameraGui(ctk.CTkFrame):
     def exportToGif_worker(self,
                            exportToGifButton, exportToVidButton):
         try:
-            from support.io.convert_to_gif import make_gif
             frames = self._gather_annotated_frames()
-            make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
+            # from support.io.convert_to_gif import make_gif
+            # make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
+            from support.io.convert_to_gif import make_apng
+            make_apng(frames, 60, infinite=True, quality=self.camConfig.export_quality)
         finally:
             self.after(0, self._exportToGifOrVid_done,
                        exportToGifButton, exportToVidButton)
@@ -1568,7 +1715,7 @@ class CameraGui(ctk.CTkFrame):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
         frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
         while (not self.threadStopper.is_set()
-               and cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) > 0
+               and self._window_is_open()
                and self.showWindow):
 
             self.analyze_image(frame)
@@ -1631,7 +1778,7 @@ class CameraGui(ctk.CTkFrame):
                 stop_display_time = None
                 print('Time out')
 
-            if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) < 1:
+            if not self._window_is_open():
                 self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                 self.threadStopper.set()
                 break
@@ -1794,6 +1941,12 @@ class CameraGui(ctk.CTkFrame):
             stats.print_stats("ctk")
             stats.print_stats("tkinter")
 
+    def _window_is_open(self) -> bool:
+        try:
+            return cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) >= 1
+        except cv2.error:
+            return False
+
     def run_folder_reader(self):
         try:
             cv2.destroyWindow(self.windowName)
@@ -1888,7 +2041,8 @@ class CameraGui(ctk.CTkFrame):
         try:
             while (not self.threadStopper.is_set()
                    and self.showWindow
-                   and not self.making_gifOrVid):
+                   and not self.making_gifOrVid
+                   and self._window_is_open()):
 
                 curr_time = time.time()
                 if (curr_time - self.fps_time_log) > 0.000001:
@@ -2012,6 +2166,9 @@ class CameraGui(ctk.CTkFrame):
                     boxAround = False
                     if self.camConfig.start_export_idx <= self.playback.curr_idx <= self.camConfig.end_export_idx:
                         boxAround = True
+                    if not self._window_is_open():
+                        self.threadStopper.set()
+                        break
                     if ts is None:
                         self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[self.playback.curr_idx][0],
                                            box_around=boxAround)
@@ -2055,7 +2212,7 @@ class CameraGui(ctk.CTkFrame):
                             pass
 
                 pending_keys.extend(self._poll_keys(1))
-                if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
+                if not self._window_is_open():
                     self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                     self.threadStopper.set()
                     break
@@ -2358,7 +2515,7 @@ class CameraGui(ctk.CTkFrame):
 
         if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
             self.draw_name(frame, markup_frame, ctx, ())
-            if not self.screenshot_impending:
+            if not self.screenshot_impending and not self.making_gifOrVid:
                 self.draw_playbackStats(frame, markup_frame, ctx, ())
         self.draw_time(frame, markup_frame, ctx, ())
 
@@ -2456,7 +2613,7 @@ class CameraGui(ctk.CTkFrame):
                        markupFrame,
                        ctx: GuiQueue.FrameCtx,
                        args) -> None:
-        x, y, _ = markupFrame.shape
+        y, x, _ = markupFrame.shape
         cv2.rectangle(markupFrame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
 
     def draw_chessboard(self, frame: NDArray,
@@ -3468,11 +3625,11 @@ class CameraGui(ctk.CTkFrame):
                         small_text(markupFrame.shape[0]), color, 2)
 
     def potentialResize(self, markupFrame):
-        if cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) <= 0:
+        if not self._window_is_open():
             return
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
         aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]
-        if not cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE):
+        if not self._window_is_open():
             return
 
         if not self.lastHeight == height and height != 0:

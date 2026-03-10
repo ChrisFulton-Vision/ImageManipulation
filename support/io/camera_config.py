@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import support.core.enums as enums
 from support.io.my_logging import LOG
 
@@ -9,6 +9,8 @@ class CameraConfig:
     calibFilepath: str = 'Calibrations/GenericAlvium864.txt'
     imageFilepath: str = None
     cam_index: int = 0
+
+    image_processing_queue: list[dict] = field(default_factory=list)
 
     # feature flags
     draw_chessboard: bool = False

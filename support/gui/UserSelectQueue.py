@@ -147,6 +147,8 @@ class _QueueRow:
     var: ctk.StringVar
     dropdown: ctk.CTkOptionMenu
     args_btn: ctk.CTkButton
+    up_btn: ctk.CTkButton
+    down_btn: ctk.CTkButton
     remove_btn: ctk.CTkButton
     args: Args
 
@@ -275,9 +277,9 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
     def _find_label_for(self, fn: StepFn, args: Args) -> str:
         for o in self._step_options:
-            if o.fn is fn and o.default_args == args:
+            if o.fn is fn:
                 return o.label
-        # fallback: still show something readable
+
         name = getattr(fn, "__name__", "step")
         return f"{name}{args}"
 
@@ -289,21 +291,25 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             lab = r.var.get()
             if lab and lab != DEFAULT_CHOICE and lab in self._label_to_opt:
                 opt = self._label_to_opt[lab]
-                out.append((opt.fn, r.args))
+                out.append((opt.fn, dict(r.args)))  # <-- copy args
         return out
 
-    def set_queue(self, queue: List[StepSpec]) -> None:
+    def set_queue(self, queue: List[StepSpec], *, emit_change: bool = False) -> None:
         for r in self._rows:
             r.frame.destroy()
         self._rows.clear()
 
         for fn, args in queue:
-            self._add_row(selected=self._find_label_for(fn, args), args_override=args)
+            self._add_row(selected=self._find_label_for(fn, args), args_override=dict(args))
+
         self._ensure_trailing_placeholder()
         self._refresh_remove_buttons()
+        self._refresh_move_buttons()
         self._active_idx = self._first_real_row_index()
         self._render_args_panel()
-        self._emit_change()
+
+        if emit_change:
+            self._emit_change()
 
     # -------- internals --------
 
@@ -344,6 +350,24 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         )
         args_btn.grid(row=0, column=1, sticky="e", padx=(0, 6), pady=0)
 
+        up_btn = ctk.CTkButton(
+            row_frame,
+            text="↑",
+            width=ICON_BTN_W,
+            height=DROPDOWN_H,
+            command=lambda rf=row_frame: self._move_row_by_frame(rf, -1),
+        )
+        up_btn.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=0)
+
+        down_btn = ctk.CTkButton(
+            row_frame,
+            text="↓",
+            width=ICON_BTN_W,
+            height=DROPDOWN_H,
+            command=lambda rf=row_frame: self._move_row_by_frame(rf, +1),
+        )
+        down_btn.grid(row=0, column=3, sticky="e", padx=(0, 6), pady=0)
+
         remove_btn = ctk.CTkButton(
             row_frame,
             text="✕",
@@ -351,10 +375,56 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             height=DROPDOWN_H,
             command=lambda rf=row_frame: self._remove_row_by_frame(rf),
         )
-        remove_btn.grid(row=0, column=2, sticky="e", pady=0)
+        remove_btn.grid(row=0, column=4, sticky="e", pady=0)
 
-        self._rows.append(_QueueRow(row_frame, var, dropdown, args_btn, remove_btn, init_args))
+        self._rows.append(_QueueRow(row_frame, var, dropdown, args_btn, up_btn, down_btn, remove_btn, init_args))
         self._refresh_remove_buttons()
+        self._refresh_move_buttons()
+
+    def _move_row_by_frame(self, frame: ctk.CTkFrame, direction: int) -> None:
+        idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+        if idx is None:
+            return
+
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(self._rows):
+            return
+
+        # Never move into/out of the trailing placeholder row
+        if self._rows[idx].var.get() == DEFAULT_CHOICE:
+            return
+        if self._rows[new_idx].var.get() == DEFAULT_CHOICE:
+            return
+
+        self._rows[idx], self._rows[new_idx] = self._rows[new_idx], self._rows[idx]
+
+        if self._active_idx == idx:
+            self._active_idx = new_idx
+        elif self._active_idx == new_idx:
+            self._active_idx = idx
+
+        self._regrid_rows()
+        self._refresh_remove_buttons()
+        self._refresh_move_buttons()
+        self._render_args_panel()
+        self._emit_change()
+
+    def _refresh_move_buttons(self) -> None:
+        last_idx = len(self._rows) - 1
+
+        for i, r in enumerate(self._rows):
+            is_placeholder = (i == last_idx and r.var.get() == DEFAULT_CHOICE)
+
+            if is_placeholder:
+                r.up_btn.configure(state="disabled")
+                r.down_btn.configure(state="disabled")
+                continue
+
+            can_move_up = i > 0
+            can_move_down = i < last_idx - 1  # cannot move into trailing placeholder
+
+            r.up_btn.configure(state="normal" if can_move_up else "disabled")
+            r.down_btn.configure(state="normal" if can_move_down else "disabled")
 
     def _remove_row_by_frame(self, frame: ctk.CTkFrame) -> None:
         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
@@ -367,6 +437,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         self._regrid_rows()
         self._ensure_trailing_placeholder()
         self._refresh_remove_buttons()
+        self._refresh_move_buttons()
 
         # active row bookkeeping
 
@@ -419,6 +490,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
         self._ensure_trailing_placeholder()
         self._refresh_remove_buttons()
+        self._refresh_move_buttons()
         self._render_args_panel()
         self._emit_change()
 

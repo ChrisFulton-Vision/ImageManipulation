@@ -45,6 +45,7 @@ from support.vision.draw_circle_and_mask import dim_except_circle
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text
 from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
+from support.viz.draw_pnp_qnp import PoseOutput
 
 from copy import deepcopy
 from math import pow
@@ -65,18 +66,14 @@ CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 @dataclass(slots=True)
 class YoloOutput:
-    """Container for the most recent YOLO-derived measurement products.
-
-    Stores the last detected bounding-box size, image-space center, and
-    optional 3D estimate so downstream processing stages can reuse the
-    latest detection results without recomputing them.
-    """
+    """Container for the most recent YOLO-derived measurement products."""
     last_bounding_box_size: tuple[float, float] = None
     last_yolo_center: tuple[float, float] = None
     last_yolo_3d_estimate: NDArray = None
+    pose: PoseOutput | None = None
 
 
-class FG_Output:
+class FgOutput:
     """Container for the most recent factor-graph state estimate.
 
     Holds the current pixel projection, relative pose/velocity estimates,
@@ -97,6 +94,7 @@ class CameraGui(ctk.CTkFrame):
     batch processing, and the queued image-processing pipeline used to
     annotate or analyze frames from files, folders, or live cameras.
     """
+
     def __init__(self, master, *args, **kwargs):
         """Initialize UI state, runtime helpers, and processing pipeline options.
 
@@ -2897,15 +2895,15 @@ class CameraGui(ctk.CTkFrame):
             if self.map1 is None or self.map2 is None:
                 raise ValueError("No calibration loaded!")
             tmp = cv2.remap(markupFrame,
-                      self.map1,
-                      self.map2,
-                      interpolation=cv2.INTER_LINEAR,
-                      borderMode=cv2.BORDER_CONSTANT)
+                            self.map1,
+                            self.map2,
+                            interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT)
             markupFrame[:] = tmp
             if not ctx.undistorted.is_set():
                 ctx.undistorted.set(True)  # One undistort has been run
             else:
-                ctx.undistorted.set(False) # Multiple undistorts, invalid
+                ctx.undistorted.set(False)  # Multiple undistorts, invalid
 
     def applyKernel(self,
                     frame: NDArray,
@@ -3463,19 +3461,43 @@ class CameraGui(ctk.CTkFrame):
         algos.use_qnp = opts.want_qnp
         algos.use_wqnp = opts.want_wqnp
 
-        self.pnpDrawer.markUpImage(image=markupFrame,
-                                   output=output,
-                                   markup_is_undistorted=ctx.undistorted.get_or(False),
-                                   calibration=self.calibration,
-                                   conf=self.camConfig.yolo_conf,
-                                   iou=self.camConfig.yolo_iou,
-                                   yoloSize=self.yoloSession.yoloSize,
-                                   idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
-                                   usedAlgos=algos,
-                                   circles_not_features=opts.feature_circles)
+        pose_output = self.pnpDrawer.markUpImage(
+            image=markupFrame,
+            output=output,
+            markup_is_undistorted=ctx.undistorted.get_or(False),
+            calibration=self.calibration,
+            conf=self.camConfig.yolo_conf,
+            iou=self.camConfig.yolo_iou,
+            yoloSize=self.yoloSession.yoloSize,
+            idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
+            usedAlgos=algos,
+            circles_not_features=opts.feature_circles
+        )
+
+        if pose_output is not None:
+            self.pnpResult = {
+                "rvec": pose_output.pnp_rvec,
+                "tvec": pose_output.pnp_tvec,
+                "object_points": pose_output.object_points,
+                "image_points": pose_output.image_points,
+                "class_ids": pose_output.class_ids,
+            } if pose_output.pnp_rvec is not None and pose_output.pnp_tvec is not None else None
+
+            self.qnpResult = {
+                "q": pose_output.qnp_q,
+                "tvec": pose_output.qnp_tvec,
+                "object_points": pose_output.object_points,
+                "image_points": pose_output.image_points,
+                "class_ids": pose_output.class_ids,
+            } if pose_output.qnp_q is not None and pose_output.qnp_tvec is not None else None
+        else:
+            self.pnpResult = None
+            self.qnpResult = None
 
         centers, boxes, scores, class_ids, img_time = output
-
+        last_yolo_center = None
+        last_bounding_box_size = None
+        last_yolo_3d_estimate = None
         if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
 
             best_idx = scores.index(max(scores))
@@ -3506,9 +3528,12 @@ class CameraGui(ctk.CTkFrame):
             else:
                 last_yolo_3d_estimate = None
 
-            ctx.yolo.set(YoloOutput(last_bounding_box_size=last_bounding_box_size,
-                                    last_yolo_center=last_yolo_center,
-                                    last_yolo_3d_estimate=last_yolo_3d_estimate))
+        ctx.yolo.set(YoloOutput(
+            last_bounding_box_size=last_bounding_box_size,
+            last_yolo_center=last_yolo_center,
+            last_yolo_3d_estimate=last_yolo_3d_estimate,
+            pose=pose_output
+        ))
 
         if opts.factor_graph:
             self.factor_graph(frame, markupFrame, ctx, opts.hyper_focus)
@@ -3524,65 +3549,88 @@ class CameraGui(ctk.CTkFrame):
         from support.runtime.fg_drogue_only import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
-        color = clr.YELLOWGREEN
 
-        yolo = ctx.yolo.get_or()  # Returns None if not set
-        if yolo is not None and yolo.last_yolo_3d_estimate is not None:
+        color = clr.YELLOWGREEN
+        yolo = ctx.yolo.get_or()
+        meas_3d = None
+
+        if yolo is not None:
+            pose = getattr(yolo, "pose", None)
+
+            if pose is not None:
+                if pose.qnp_tvec is not None:
+                    meas_3d = np.asarray(pose.qnp_tvec, dtype=float).reshape(3)
+                elif pose.pnp_tvec is not None:
+                    meas_3d = np.asarray(pose.pnp_tvec, dtype=float).reshape(3)
+
+            if meas_3d is None and yolo.last_yolo_3d_estimate is not None:
+                meas_3d = np.asarray(yolo.last_yolo_3d_estimate, dtype=float).reshape(3)
+
+            if meas_3d is None:
+                color = clr.RED
+
+        if meas_3d is not None:
             if ctx.img_time < self.last_time_update:
                 self.FG.reset()
-            elif ctx.img_time > self.last_time_update:
-                self.FG.newRecvMeas(yolo.last_yolo_3d_estimate, ctx.img_time)
-                self.last_time_update = ctx.img_time
-            if self.FG.numMeas > 20:
-                self.FG.popOldestMeas()
-            if self.FG.numMeas > 2:
-                self.FG.opt()
-        else:
-            color = clr.RED
+
+            self.FG.newRecvMeas(meas_3d, ctx.img_time)
+            self.last_time_update = ctx.img_time
 
         if ctx.img_time is not None and self.FG.numMeas > 2:
-            fg_output = FG_Output()
-            K = self.calibration.getCameraMatrix()
-            threeD_proj = K.dot(self.FG.r_T_d[-1] + (ctx.img_time - self.last_time_update) * self.FG.r_V_d[-1])
-            fg_output.curr_FG_pixel = threeD_proj[:2] / threeD_proj[2]
-            pixel = (int(fg_output.curr_FG_pixel[0]), int(fg_output.curr_FG_pixel[1]))
+            pred = self.FG.predict(ctx.img_time)
 
-            h, w, _ = markupFrame.shape
-            size = 15
-            thickness = 2
-            cv2.circle(markupFrame, pixel, size, (0, 0, 0),
-                       thickness)
-            cv2.line(markupFrame, [pixel[0] + size, pixel[1]],
-                     [pixel[0] - size, pixel[1]], (0, 0, 0), thickness)
-            cv2.line(markupFrame, [pixel[0], pixel[1] + size],
-                     [pixel[0], pixel[1] - size], (0, 0, 0), thickness)
-            cv2.putText(markupFrame, 'Factor Graph Solution',
-                        (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(markupFrame.shape[0]), (0, 0, 0), thickness)
+            if pred is not None and pred.r_T_d is not None:
+                fg_output = FgOutput()
 
-            thickness = 1
-            cv2.circle(markupFrame, pixel, size, color,
-                       thickness)
-            cv2.line(markupFrame, [pixel[0] + size, pixel[1]],
-                     [pixel[0] - size, pixel[1]], color, thickness)
-            cv2.line(markupFrame, [pixel[0], pixel[1] + size],
-                     [pixel[0], pixel[1] - size], color, thickness)
-            cv2.putText(markupFrame, 'Factor Graph Solution',
-                        (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                        med_text(markupFrame.shape[0]), color, thickness)
+                K = self.calibration.getCameraMatrix()
+                threeD_proj = K.dot(pred.r_T_d)
 
-            fg_output.curr_r_T_d, fg_output.curr_r_V_d = self.FG.r_T_d[-1], self.FG.r_V_d[-1]
+                if threeD_proj[2] != 0:
+                    fg_output.curr_FG_pixel = threeD_proj[:2] / threeD_proj[2]
+                    pixel = (
+                        int(fg_output.curr_FG_pixel[0]),
+                        int(fg_output.curr_FG_pixel[1]),
+                    )
 
-            var_x, var_y, var_z, var_vx, var_vy, var_vz = self.FG.last_pos_covariance()
+                    h, w, _ = markupFrame.shape
+                    size = 15
+                    thickness = 2
 
-            fg_output.curr_var_x = var_x + var_vx * (ctx.img_time -
-                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[0])
-            fg_output.curr_var_y = var_y + var_vy * (ctx.img_time -
-                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[1])
-            fg_output.curr_var_z = var_z + var_vz * (ctx.img_time -
-                                                     self.last_time_update) * np.abs(fg_output.curr_r_V_d[2])
+                    cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
+                    cv2.line(markupFrame,
+                             [pixel[0] + size, pixel[1]],
+                             [pixel[0] - size, pixel[1]],
+                             (0, 0, 0), thickness)
+                    cv2.line(markupFrame,
+                             [pixel[0], pixel[1] + size],
+                             [pixel[0], pixel[1] - size],
+                             (0, 0, 0), thickness)
+                    cv2.putText(markupFrame, 'Factor Graph Solution',
+                                (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                                med_text(markupFrame.shape[0]), (0, 0, 0), thickness)
 
-            ctx.fg.set(fg_output)
+                    thickness = 1
+                    cv2.circle(markupFrame, pixel, size, color, thickness)
+                    cv2.line(markupFrame,
+                             [pixel[0] + size, pixel[1]],
+                             [pixel[0] - size, pixel[1]],
+                             color, thickness)
+                    cv2.line(markupFrame,
+                             [pixel[0], pixel[1] + size],
+                             [pixel[0], pixel[1] - size],
+                             color, thickness)
+                    cv2.putText(markupFrame, 'Factor Graph Solution',
+                                (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
+                                med_text(markupFrame.shape[0]), color, thickness)
+
+                fg_output.curr_r_T_d = pred.r_T_d
+                fg_output.curr_r_V_d = pred.r_V_d
+                fg_output.curr_r_A_d = pred.r_A_d
+                fg_output.curr_var_x = pred.var_x
+                fg_output.curr_var_y = pred.var_y
+                fg_output.curr_var_z = pred.var_z
+
+                ctx.fg.set(fg_output)
 
         if hyper_focus:
             self.hyper_focus(frame, markupFrame, ctx, ())

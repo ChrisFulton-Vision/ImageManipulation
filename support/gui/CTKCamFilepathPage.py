@@ -44,7 +44,7 @@ class Filepath_page(ctk.CTkFrame):
             self,
             master,
             *args,
-            controller: FilepathController,
+            controller,
             **kwargs,
     ):
         self.ctrl = controller

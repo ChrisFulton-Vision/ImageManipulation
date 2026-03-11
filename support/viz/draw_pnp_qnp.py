@@ -1,13 +1,27 @@
-
-
 import numpy as np
 from numpy.typing import NDArray
 import cv2
+from dataclasses import dataclass
 from support.vision.calibration import Calibration
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q
+
+
+@dataclass(slots=True)
+class PoseOutput:
+    """Container for pose solutions generated from feature correspondences."""
+    pnp_rvec: NDArray | None = None
+    pnp_tvec: NDArray | None = None
+
+    qnp_q: q = None  # Quaternion object from solveQnP
+    qnp_tvec: NDArray | None = None
+
+    object_points: NDArray | None = None
+    image_points: NDArray | None = None
+    class_ids: list[int] | None = None
+
 
 class twoToThreeSelectedAlgorithms:
     def __init__(self):
@@ -24,6 +38,7 @@ class pnp_qnp_draw:
         # -----------------------------
         # NEW: estimation-only helpers
         # -----------------------------
+
     @staticmethod
     def _estimate_pnp(object_points: NDArray,
                       image_points: NDArray,
@@ -107,13 +122,12 @@ class pnp_qnp_draw:
                     yoloSize: tuple[int, int],
                     idsNamesLocs,
                     usedAlgos: twoToThreeSelectedAlgorithms,
-                    circles_not_features: bool = False) -> None:
-
+                    circles_not_features: bool = False) -> PoseOutput | None:
 
         h, w, _ = image.shape
         centers_dist, boxes, scores, class_ids, time = output
         if len(centers_dist) < 1:
-            return
+            return None
         y_h, y_w = yoloSize
         sx = w / float(y_w)
         sy = h / float(y_h)
@@ -187,7 +201,7 @@ class pnp_qnp_draw:
             boxes_for_draw = undist_boxes
 
         if len(class_ids) == 0:
-            return
+            return None
 
         boxes_for_draw = boxes_for_draw if boxes_for_draw is not None else boxes
 
@@ -202,12 +216,12 @@ class pnp_qnp_draw:
             ])
 
         if len(class_ids) == 0:
-            return
+            return None
 
         indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores, conf, iou)
 
         if len(indices) == 0:
-            return
+            return None
 
         keep = np.array(
             [int(i[0]) if hasattr(i, "__len__") else int(i) for i in indices],
@@ -231,11 +245,11 @@ class pnp_qnp_draw:
         )
 
         if len(set(indices)) <= 5:
-            return
+            return None
 
         object_points, image_points = self._collect_objPts_and_imgPts(newClass_ids, newCentersForPnp, idsNamesLocs)
         if len(object_points) < 6:
-            return
+            return None
 
         # 1) Estimate PnP (optional)
         pnp_pose = None
@@ -289,10 +303,20 @@ class pnp_qnp_draw:
             )
             idx += 1
 
+        return PoseOutput(
+            pnp_rvec=pnp_pose[0] if pnp_pose is not None else None,
+            pnp_tvec=pnp_pose[1] if pnp_pose is not None else None,
+            qnp_q=qnp_pose[0] if qnp_pose is not None else None,
+            qnp_tvec=qnp_pose[1] if qnp_pose is not None else None,
+            object_points=object_points,
+            image_points=image_points,
+            class_ids=list(newClass_ids),
+        )
+
     @staticmethod
     def _drawBoxes(image: NDArray, newCenters: NDArray, newBoxes: NDArray,
-                  newClass_ids: list, newScores: list,
-                  yoloSize: tuple[float, float],
+                   newClass_ids: list, newScores: list,
+                   yoloSize: tuple[float, float],
                    draw_as_circles: bool = True,
                    circle_radius_px: int | None = None) -> None:
         '''
@@ -327,7 +351,7 @@ class pnp_qnp_draw:
                 cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, 1)
 
                 (txt_w, txt_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-                lowerLeftCorner = (int(x-txt_w/2.0), int(y+txt_h/2.0))
+                lowerLeftCorner = (int(x - txt_w / 2.0), int(y + txt_h / 2.0))
 
                 cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 6)
                 cv2.putText(image, label, lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 4)
@@ -335,9 +359,9 @@ class pnp_qnp_draw:
         (txt_width, txt_height), base = cv2.getTextSize('I', cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         txt_height_perRow = txt_height + 15
         cv2.putText(image, 'Direct Inference', (10, h - 3 * txt_height_perRow - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                med_text(w), clr.BLACK, 4)
+                    med_text(w), clr.BLACK, 4)
         cv2.putText(image, 'Direct Inference', (10, h - 3 * txt_height_perRow - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                med_text(w), clr.LIGHTBLUE, 2)
+                    med_text(w), clr.LIGHTBLUE, 2)
 
     @staticmethod
     def _collect_objPts_and_imgPts(y_class_ids, y_centers, idsNamesLocs):
@@ -351,18 +375,18 @@ class pnp_qnp_draw:
         return np.asarray(object_points, dtype=np.float64), np.asarray(image_points, dtype=np.float64)
 
     def _drawPnP_from_pose(self,
-                          image,
-                          y_class_ids,
-                          y_centers,
-                          object_points,
-                          rvec,
-                          tvec,
-                          markup_is_undistorted,
-                          calibration,
-                          yoloSize,
-                          idsNamesLocs,
-                          idx=0,
-                          draw_as_circles=False):
+                           image,
+                           y_class_ids,
+                           y_centers,
+                           object_points,
+                           rvec,
+                           tvec,
+                           markup_is_undistorted,
+                           calibration,
+                           yoloSize,
+                           idsNamesLocs,
+                           idx=0,
+                           draw_as_circles=False):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -383,7 +407,7 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'PNP: {tvec[0,0]:+6.3f}, {tvec[1,0]:+6.3f}, {tvec[2,0]:+6.3f}',
+            title=f'PNP: {tvec[0, 0]:+6.3f}, {tvec[1, 0]:+6.3f}, {tvec[2, 0]:+6.3f}',
             rowIDX=idx,
             txt_scale=0.75,
             draw_as_circles=draw_as_circles,
@@ -391,18 +415,18 @@ class pnp_qnp_draw:
         )
 
     def _drawQnP_from_pose(self,
-                          image,
-                          y_class_ids,
-                          y_centers,
-                          object_points,
-                          q_rvec,
-                          q_tvec,
-                          markup_is_undistorted,
-                          calibration,
-                          yoloSize,
-                          idsNamesLocs,
-                          idx=0,
-                          draw_as_circles=False):
+                           image,
+                           y_class_ids,
+                           y_centers,
+                           object_points,
+                           q_rvec,
+                           q_tvec,
+                           markup_is_undistorted,
+                           calibration,
+                           yoloSize,
+                           idsNamesLocs,
+                           idx=0,
+                           draw_as_circles=False):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -432,27 +456,27 @@ class pnp_qnp_draw:
 
     @staticmethod
     def draw_proj(image: NDArray,
-                      y_class_ids: list,
-                      y_centers: list,
-                      object_points: NDArray,
-                      rvec: NDArray,
-                      tvec: NDArray,
-                      markup_is_undistorted: bool,
-                      calibration: Calibration,
-                      yoloSize,
-                      idsNamesLocs,
-                      title: str,
-                      rowIDX: int,
-                      txt_color = clr.YELLOW,
-                      txt_scale = 1.0,
-                      draw_as_circles: bool = True,
-                      circle_radius_px: int | None = None):
+                  y_class_ids: list,
+                  y_centers: list,
+                  object_points: NDArray,
+                  rvec: NDArray,
+                  tvec: NDArray,
+                  markup_is_undistorted: bool,
+                  calibration: Calibration,
+                  yoloSize,
+                  idsNamesLocs,
+                  title: str,
+                  rowIDX: int,
+                  txt_color=clr.YELLOW,
+                  txt_scale=1.0,
+                  draw_as_circles: bool = True,
+                  circle_radius_px: int | None = None):
 
         h, w, _ = image.shape
         y_h, y_w = yoloSize
 
         (width, height), base = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-        lower_left_corner = (int(0.01*w), int(h - (0.01 * h * (rowIDX + 1)) - height * rowIDX))
+        lower_left_corner = (int(0.01 * w), int(h - (0.01 * h * (rowIDX + 1)) - height * rowIDX))
 
         cv2.putText(image, title, lower_left_corner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
         cv2.putText(image, title, lower_left_corner, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), txt_color, 2)

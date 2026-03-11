@@ -4,34 +4,41 @@ import matplotlib.pyplot as plt
 from numpy import linalg as la
 import copy
 import pickle as pkl
+from dataclasses import dataclass
 
-# def move_figure(f, x, y):
-#     """Move figure's upper left corner to pixel (x, y)"""
-#     backend = matplotlib.get_backend()
-#     if backend == 'TkAgg':
-#         f.canvas.manager.window.wm_geometry("+%d+%d" % (x, y))
-#     elif backend == 'WXAgg':
-#         f.canvas.manager.window.SetPosition((x, y))
-#     else:
-#         # This works for QT and GTK
-#         # You can also use window.setGeometry
-#         f.canvas.manager.window.move(x, y)
+
+@dataclass(slots=True)
+class PredictedState:
+    query_time: float | None = None
+    state_time: float | None = None
+    dt: float = 0.0
+
+    r_T_d: np.ndarray | None = None
+    r_V_d: np.ndarray | None = None
+    r_A_d: np.ndarray | None = None
+
+    var_x: float | None = None
+    var_y: float | None = None
+    var_z: float | None = None
+
+    is_extrapolated: bool = False
+
 
 class SolutionData:
     def __init__(self, numMeas):
         self.numMeas = numMeas
-        self.drg_pos = np.zeros((numMeas,3))
-        self.drg_vel = np.zeros((numMeas,3))
+        self.drg_pos = np.zeros((numMeas, 3))
+        self.drg_vel = np.zeros((numMeas, 3))
+        self.drg_acc = np.zeros((numMeas, 3))
 
         self.r_T_d = np.zeros((3,))
         self.r_V_d = np.zeros((3,))
+        self.r_A_d = np.zeros((3,))
 
         self.populated = False
 
-    def ingest_xh(self, states) -> None :
-
-        self.r_T_d, self.r_V_d = states
-
+    def ingest_xh(self, states) -> None:
+        self.r_T_d, self.r_V_d, self.r_A_d = states
         self.populated = True
 
     def __str__(self):
@@ -56,30 +63,35 @@ class FactorGraph:
         self.solution = None
         self.printStuff = printStuff
 
-        self.r_T_d = np.zeros((1,3))
-        self.r_V_d = np.zeros((1,3))
+        self.r_T_d = np.zeros((1, 3))
+        self.r_V_d = np.zeros((1, 3))
+        self.r_A_d = np.zeros((1, 3))
 
         self.meas = np.zeros((1,))
         self.curr_meas = np.zeros((1,))
 
-        self.L = np.zeros((1,1))
+        self.L = np.zeros((1, 1))
         self.y = np.zeros(1, )
 
         self.init_guess = np.zeros(1, )
         self.init_residual = np.zeros((1,))
         self.num_iters = 0
 
-        # self.cam_cov = np.array([0.6, 5.0, 5.0]) * 4.0 ** 2
-        # self.V_cov = np.array([1.0, 1.0, 1.0]) * 2.0 ** 2
-        # self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * 1.0 ** 2
         self.cam_cov = np.array([10.0, 10.0, 1.0]) * (5.0 ** 2)
-        self.V_cov = np.array([1.0, 1.0, 1.0]) * (5.00)
-        self.Vdot_cov = np.array([1.0, 1.0, 1.0]) * (10.00)
+
+        # Position-dynamics residual weight
+        self.V_cov = np.array([1.0, 1.0, 1.0]) * 5.0
+
+        # Velocity-dynamics residual weight
+        self.A_cov = np.array([1.0, 1.0, 1.0]) * 10.0
+
+        # Acceleration smoothness residual weight
+        self.Adot_cov = np.array([1.0, 1.0, 1.0]) * 1000.
 
         self.numMeas = 0
 
         if startT is None:
-            epoch = datetime.datetime(1970,1,1)
+            epoch = datetime.datetime(1970, 1, 1)
             self.startTime = (datetime.datetime.now() - epoch).total_seconds()
         else:
             self.startTime = startT
@@ -90,7 +102,6 @@ class FactorGraph:
     def __str__(self):
         selfStr = ''
         for idx, t in enumerate(self.time_log):
-
             recv_to_drog_pos = slice(idx * 16 + 0, idx * 16 + 3)
             recv_to_drog_vel = slice(idx * 16 + 3, idx * 16 + 6)
 
@@ -102,20 +113,17 @@ class FactorGraph:
 
     def newRecvMeas(self, drgVec, t=None):
         self.optComplete = False
-        # Realign measurements to:
-        # 0: Drogue from (recv or tanker) Camera
 
         if self.numMeas == 0:
-
             if drgVec[2] > 200.0:
                 return
 
             self.curr_meas = [drgVec]
-
             self.meas = self.curr_meas
 
             self.r_T_d[0, :] = drgVec
-            self.r_V_d = np.zeros((1,3))
+            self.r_V_d = np.zeros((1, 3))
+            self.r_A_d = np.zeros((1, 3))
 
             if t is None:
                 epoch = datetime.datetime(1970, 1, 1)
@@ -124,7 +132,6 @@ class FactorGraph:
                 self.time_log[0] = t - self.startTime
 
         else:
-
             if drgVec[2] > 200.0:
                 drgVec *= self.meas[-1][2] / drgVec[2]
 
@@ -136,103 +143,116 @@ class FactorGraph:
 
             delT = t - self.time_log[-1]
 
-            # If we've gone back in time, assume
-            # 1. we're in playback mode
-            # 2. the user is rewinding. So reset.
             if t <= self.time_log[-1]:
                 self.reset()
                 self.newRecvMeas(drgVec, t)
                 return
 
-            # Threshold extreme velocity jumps. But, delete old measurement, so
-            # we don't get stuck hold old, bad measurement.
             if np.linalg.norm((drgVec - self.r_T_d[-1]) / delT) > 100.0:
                 self.popOldestMeas()
                 return
 
             self.time_log = np.append(self.time_log, t)
-
             self.curr_meas = drgVec
-
             self.meas.append(self.curr_meas)
-            self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis, :], axis=0)  # Drg from Recv
-            self.r_V_d = np.append(self.r_V_d, ((self.r_T_d[-1] - self.r_T_d[-2]) / delT)[np.newaxis, :], axis=0)
+
+            # Seed new position from measurement
+            self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis, :], axis=0)
+
+            # Conservative tail seeding:
+            # do NOT initialize the newest vel/acc from raw local finite differences.
+            if self.r_V_d.shape[0] == 0:
+                new_vel = np.zeros((3,))
+            else:
+                new_vel = self.r_V_d[-1].copy()
+
+            if hasattr(self, "r_A_d") and self.r_A_d.shape[0] > 0:
+                new_acc = self.r_A_d[-1].copy()
+            else:
+                new_acc = np.zeros((3,))
+
+            # Optional gentle blend toward measured finite-difference velocity.
+            # Keep alpha small so noisy measurements do not dominate the new tail.
+            alpha_v = 0.15
+            if delT > 1e-6 and self.r_T_d.shape[0] >= 2:
+                fd_vel = (self.r_T_d[-1] - self.r_T_d[-2]) / delT
+                new_vel = (1.0 - alpha_v) * new_vel + alpha_v * fd_vel
+
+            self.r_V_d = np.append(self.r_V_d, new_vel[np.newaxis, :], axis=0)
+            self.r_A_d = np.append(self.r_A_d, new_acc[np.newaxis, :], axis=0)
 
         self.numMeas += 1
 
     def create_Q(self):
-        N_y = (self.numMeas - 1) * 9 + 3
-        Q = np.eye(N_y,N_y)
+        N_y = (self.numMeas - 1) * 12 + 3
+        Q = np.eye(N_y, N_y)
 
         for idx in range(self.numMeas):
-            iter = idx * 9
+            base = idx * 12
             cam_T_d = self.meas[idx]
 
-            Q[iter + 0: iter + 3, iter + 0: iter + 3] = 1.0 / la.norm(cam_T_d) * np.diag(self.cam_cov)
+            Q[base + 0: base + 3, base + 0: base + 3] = (
+                    1.0 / la.norm(cam_T_d) * np.diag(self.cam_cov)
+            )
 
             if idx < self.numMeas - 1:
-                Q[iter + 3: iter + 6, iter + 3: iter + 6] = np.diag(self.V_cov)
-                Q[iter + 6: iter + 9, iter + 6: iter + 9] = np.diag(self.Vdot_cov)
+                Q[base + 3: base + 6, base + 3: base + 6] = np.diag(self.V_cov)
+                Q[base + 6: base + 9, base + 6: base + 9] = np.diag(self.A_cov)
+                Q[base + 9: base + 12, base + 9: base + 12] = np.diag(self.Adot_cov)
 
         return Q
 
     def create_y(self, states=None):
-        '''
-
-        :param states: If states exists, it should be a list of five nparrays: [r_T_d, r_V_d, r_T_t, r_V_t, r_Q_t]
-        :param cameras: If cameras exists, it should be a list of two nparrays: [r_T_rc, t_T_tc]
-        :return: residual vector, y
-        '''
-
-        # y is the residual based on each measurement and dynamic model. There are
-        # three 3d measurements in each set (of the drogue, recv, and tanker). For every
-        # consecutive pair of measurements, there is 2 additional 3d velocities that can be inferred
-        # representing relative motion between drogue and receiver and relative motion between tanker and receiver.
-        # We can finally assume 2 more 3d connections between previous and current velocities.
-        # This implies 9 initial residual values, with 9+12=21 additional values for each measurement set.
-        N_y = (self.numMeas - 1) * 9 + 3
+        N_y = (self.numMeas - 1) * 12 + 3
 
         if states is None:
             states_r_T_d = copy.copy(self.r_T_d)
             states_r_V_d = copy.copy(self.r_V_d)
+            states_r_A_d = copy.copy(self.r_A_d)
         else:
-            states_r_T_d, states_r_V_d = states
-
+            states_r_T_d, states_r_V_d, states_r_A_d = states
 
         y = np.zeros(N_y)
 
         for meas_num in range(self.numMeas):
-
-            iter_Base = 9 * meas_num
-
-            # States ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            # [r_T_rc, t_T_tc]
             s_drgPos = states_r_T_d[meas_num]
             s_drgVel = states_r_V_d[meas_num]
+            s_drgAcc = states_r_A_d[meas_num]
 
-            # Direct Measurement Residuals ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-            delta_t, dyn_t, dyn_v = self.resFromTimestep(meas_num)
-
-            y[delta_t] = self.meas[meas_num] - s_drgPos
+            meas_res, dyn_t, dyn_v, dyn_a = self.resFromTimestep(meas_num)
+            y[meas_res] = self.meas[meas_num] - s_drgPos
 
             if meas_num < self.numMeas - 1:
-                # Dynamics Residuals ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
                 s_nextDrgPos = states_r_T_d[meas_num + 1]
                 s_nextDrgVel = states_r_V_d[meas_num + 1]
+                s_nextDrgAcc = states_r_A_d[meas_num + 1]
 
                 deltT = self.time_log[meas_num + 1] - self.time_log[meas_num]
 
-                # Dynamics equations:
-                y[dyn_t] = s_drgVel - (s_nextDrgPos - s_drgPos) / deltT
-                y[dyn_v] = (s_nextDrgVel - s_drgVel) / deltT
+                # p_{k+1} = p_k + dt v_k + 0.5 dt^2 a_k
+                y[dyn_t] = (
+                        s_nextDrgPos
+                        - s_drgPos
+                        - deltT * s_drgVel
+                        - 0.5 * (deltT ** 2) * s_drgAcc
+                )
+
+                # v_{k+1} = v_k + dt a_k
+                y[dyn_v] = (
+                        s_nextDrgVel
+                        - s_drgVel
+                        - deltT * s_drgAcc
+                )
+
+                # a_{k+1} = a_k
+                y[dyn_a] = s_nextDrgAcc - s_drgAcc
 
         return y
 
     def reset(self):
         self.r_T_d = np.zeros((1, 3))
         self.r_V_d = np.zeros((1, 3))
+        self.r_A_d = np.zeros((1, 3))
         self.time_log = np.zeros((1,))
         self.meas = np.zeros((1,))
         self.numMeas = 0
@@ -248,85 +268,90 @@ class FactorGraph:
 
             self.r_T_d = self.r_T_d[1:]
             self.r_V_d = self.r_V_d[1:]
-        elif self.numMeas <= 1:
+            self.r_A_d = self.r_A_d[1:]
+        else:
             self.reset()
 
     def stateFromTimestep(self, meas_idx):
-        # s: r_T_d, r_V_d
-        return slice(meas_idx * 6 + 0, meas_idx * 6 + 3), \
-               slice(meas_idx * 6 + 3, meas_idx * 6 + 6)
+        # s: r_T_d, r_V_d, r_A_d
+        base = meas_idx * 9
+        return (
+            slice(base + 0, base + 3),
+            slice(base + 3, base + 6),
+            slice(base + 6, base + 9),
+        )
 
     def measFromTimestep(self, meas_idx):
         # m: r_T_d
         return slice(meas_idx * 3 + 0, meas_idx * 3 + 3)
 
     def resFromTimestep(self, meas_idx):
-        # res eq: t(n+1) - t(n), v(n) - (t(n+1) - t(n))/delT, (v(n+1) - v(n)) / delT
-        # simply delta_t, dyn_t, dyn_v
-        return slice(meas_idx * 9 + 0, meas_idx * 9 + 3), \
-               slice(meas_idx * 9 + 3, meas_idx * 9 + 6), \
-               slice(meas_idx * 9 + 6, meas_idx * 9 + 9)
+        # meas, pos_dyn, vel_dyn, acc_dyn
+        base = meas_idx * 12
+        return (
+            slice(base + 0, base + 3),
+            slice(base + 3, base + 6),
+            slice(base + 6, base + 9),
+            slice(base + 9, base + 12),
+        )
 
     def create_L(self):
-
-        L = np.zeros((self.numMeas * 9 - 6, self.numMeas * 6))
+        N_y = self.numMeas * 12 - 9
+        N_x = self.numMeas * 9
+        L = np.zeros((N_y, N_x))
 
         for meas_num in range(self.numMeas):
-            rowStartID = meas_num * 9
-            colStartID = meas_num * 6
+            sID_r_T_d, sID_r_V_d, sID_r_A_d = self.stateFromTimestep(meas_num)
+            meas_res, dyn_t, dyn_v, dyn_a = self.resFromTimestep(meas_num)
 
-            ## MEASUREMENT ACCOUNTING
-            # States ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            sID_r_T_d, sID_r_V_d = self.stateFromTimestep(meas_num)
-            # Measurements ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            mID_r_T_d = self.measFromTimestep(meas_num)
-            # Residual Equations ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-            delta_t, dyn_t, dyn_v = self.resFromTimestep(meas_num)
-
-            # y[delta_t] = self.meas[meas_num] - s_drgPos
-            L[delta_t, sID_r_T_d ] = -np.eye(3)
+            # y_meas = meas - pos_k
+            L[meas_res, sID_r_T_d] = -np.eye(3)
 
             if meas_num < self.numMeas - 1:
-                ## DYNAMICS ACCOUNTING
-                sID_r_T_d_next, sID_r_V_d_next = self.stateFromTimestep(meas_num+1)
+                sID_r_T_d_next, sID_r_V_d_next, sID_r_A_d_next = self.stateFromTimestep(meas_num + 1)
                 deltT = self.time_log[meas_num + 1] - self.time_log[meas_num]
 
-                # y[self.rID_r_V_d(meas_num)] = s_drgVel - (s_nextDrgPos - s_drgPos) / deltT
-                L[dyn_t, sID_r_V_d] =       np.eye(3)
-                L[dyn_t, sID_r_T_d] =       np.eye(3) / deltT
-                L[dyn_t, sID_r_T_d_next] = -np.eye(3) / deltT
+                # y_pos = pos_{k+1} - pos_k - dt vel_k - 0.5 dt^2 acc_k
+                L[dyn_t, sID_r_T_d_next] = np.eye(3)
+                L[dyn_t, sID_r_T_d] = -np.eye(3)
+                L[dyn_t, sID_r_V_d] = -deltT * np.eye(3)
+                L[dyn_t, sID_r_A_d] = -0.5 * (deltT ** 2) * np.eye(3)
 
-                # y[dyn_v] = (s_nextDrgVel - s_drgVel) / deltT
-                L[dyn_v, sID_r_V_d_next] = np.eye(3) / deltT
-                L[dyn_v, sID_r_V_d] = -np.eye(3) / deltT
+                # y_vel = vel_{k+1} - vel_k - dt acc_k
+                L[dyn_v, sID_r_V_d_next] = np.eye(3)
+                L[dyn_v, sID_r_V_d] = -np.eye(3)
+                L[dyn_v, sID_r_A_d] = -deltT * np.eye(3)
 
-        # plt.spy(L)
-        # plt.show()
+                # y_acc = acc_{k+1} - acc_k
+                L[dyn_a, sID_r_A_d_next] = np.eye(3)
+                L[dyn_a, sID_r_A_d] = -np.eye(3)
 
         return L
 
     def update_states(self, states):
-        # [r_T_d, r_V_d]
-        self.r_T_d, self.r_V_d = states
+        self.r_T_d, self.r_V_d, self.r_A_d = states
 
     def calc_next_states(self, delta_x):
-
-        # [r_T_d, r_V_d, r_T_t, r_V_t, r_Q_t]
         r_T_d = copy.deepcopy(self.r_T_d)
         r_V_d = copy.deepcopy(self.r_V_d)
+        r_A_d = copy.deepcopy(self.r_A_d)
 
         for meas_num in range(self.numMeas):
-            r_T_d_slice, r_V_d_slice = self.stateFromTimestep(meas_num)
+            r_T_d_slice, r_V_d_slice, r_A_d_slice = self.stateFromTimestep(meas_num)
 
             r_T_d[meas_num] -= delta_x[r_T_d_slice]
 
+            # Do not let the freshest tail node freely absorb all dynamics noise.
             if meas_num < self.numMeas - 1:
                 r_V_d[meas_num] -= delta_x[r_V_d_slice]
+                r_A_d[meas_num] -= delta_x[r_A_d_slice]
 
-        r_V_d[-1] = r_V_d[-2]
-        # [r_T_d, r_V_d]
-        return [r_T_d, r_V_d]
+        # Tail stabilization: newest node inherits from prior stabilized node.
+        if self.numMeas > 1:
+            r_V_d[-1] = r_V_d[-2].copy()
+            r_A_d[-1] = r_A_d[-2].copy()
 
+        return [r_T_d, r_V_d, r_A_d]
 
     def opt(self, func=None):
         if self.time_log[-1] <= self.time_log[-2]:
@@ -422,12 +447,12 @@ class FactorGraph:
             # print(f'Time for Moore-Penrose Inversion: {(endInvTime - startInvTime).total_seconds():.3f}')
             # print(f'Time for processing total: {(startInvTime - startProcTime).total_seconds()}')
             # if self.numMeas > 2:
-                # std = np.sqrt(np.diag(la.inv(L.T.dot(L))))
-                # if self.haveAtLeastOneRecvMeas and self.haveAtLeastOneTankMeas:
-                #     print(f"Std of RCam Location: {std[-6:-3]}")
-                # else:
-                #     print(f"Std of Cam Location: {std[-3:]}")
-                # print("Size of L: ", QL.shape)
+            # std = np.sqrt(np.diag(la.inv(L.T.dot(L))))
+            # if self.haveAtLeastOneRecvMeas and self.haveAtLeastOneTankMeas:
+            #     print(f"Std of RCam Location: {std[-6:-3]}")
+            # else:
+            #     print(f"Std of Cam Location: {std[-3:]}")
+            # print("Size of L: ", QL.shape)
             # print("__________________________________________")
             # plt.spy(L)
             # plt.show()
@@ -450,25 +475,70 @@ class FactorGraph:
         cov = self.covariance()
         r_T_d_cov = []
         r_V_d_cov = []
+        r_A_d_cov = []
 
         for meas_num in range(self.numMeas):
-            # s: r_T_d, r_T_t, r_V_d, r_V_t, r_Q_t
-            r_T_d_slice, r_V_d_slice = self.stateFromTimestep(meas_num)
+            r_T_d_slice, r_V_d_slice, r_A_d_slice = self.stateFromTimestep(meas_num)
 
             r_T_d_cov.append(cov[r_T_d_slice])
+            r_V_d_cov.append(cov[r_V_d_slice])
+            r_A_d_cov.append(cov[r_A_d_slice])
 
-            if meas_num < self.numMeas - 1:
-                r_V_d_cov.append(cov[r_V_d_slice])
+        return [r_T_d_cov, r_V_d_cov, r_A_d_cov]
 
-        return [r_T_d_cov, r_V_d_cov]
-
-    def last_pos_covariance(self):
-        small_Q = self.create_Q()[-6:,-6:]
-        small_L = self.create_L()[-6:,-6:]
+    def last_state_covariance(self):
+        small_Q = self.create_Q()[-12:, -12:]
+        small_L = self.create_L()[-12:, -9:]
         small_QL = small_Q.dot(small_L)
         cov = np.sqrt(np.diag(la.inv(small_QL.T.dot(small_QL))))
         return cov
 
+    def predict(self, query_time) -> PredictedState | None:
+        if self.numMeas == 0:
+            return None
+
+        # Use the most recent stabilized node, not the freshest node.
+        # This dramatically reduces tail twitch.
+        if self.numMeas >= 2:
+            idx = -2
+        else:
+            idx = -1
+
+        if query_time is None:
+            dt = 0.0
+        else:
+            query_time_rel = query_time - self.startTime
+            dt = max(0.0, float(query_time_rel - self.time_log[idx]))
+
+        r_T_d = (
+                self.r_T_d[idx].copy()
+                + dt * self.r_V_d[idx].copy()
+                + 0.5 * (dt ** 2) * self.r_A_d[idx].copy()
+        )
+        r_V_d = self.r_V_d[idx].copy() + dt * self.r_A_d[idx].copy()
+        r_A_d = self.r_A_d[idx].copy()
+
+        var_x = var_y = var_z = None
+        try:
+            cov = self.last_state_covariance()
+            var_x = float(cov[0])
+            var_y = float(cov[1])
+            var_z = float(cov[2])
+        except Exception:
+            pass
+
+        return PredictedState(
+            query_time=query_time,
+            state_time=self.startTime + float(self.time_log[idx]),
+            dt=dt,
+            r_T_d=r_T_d,
+            r_V_d=r_V_d,
+            r_A_d=r_A_d,
+            var_x=var_x,
+            var_y=var_y,
+            var_z=var_z,
+            is_extrapolated=(dt > 0.0),
+        )
 
     def graphResults(self, gps=False, tspiFilename=None, tspiStartTime=None, tspiEndTime=None, true_r_V_d=None):
 
@@ -480,10 +550,8 @@ class FactorGraph:
         r_T_d_est_norm = []
 
         for idx, meas in enumerate(self.meas):
-
             r_T_d_meas.append(meas)
             # r_T_d_est.append(self.r_T_d[idx])
-
 
         for r_T_d in r_T_d_meas:
             r_T_d_meas_norm.append(np.linalg.norm(r_T_d))
@@ -498,7 +566,7 @@ class FactorGraph:
             est_Tnorm_low.append(self.r_T_d[idx] - 3 * r_T_d_cov[idx])
             est_Tnorm_high.append(self.r_T_d[idx] + 3 * r_T_d_cov[idx])
 
-            if idx < self.numMeas-1:
+            if idx < self.numMeas - 1:
                 est_Vnorm_low.append(self.r_V_d[idx] - 3 * r_V_d_cov[idx])
                 est_Vnorm_high.append(self.r_V_d[idx] + 3 * r_V_d_cov[idx])
 
@@ -511,10 +579,10 @@ class FactorGraph:
         t = self.time_log
         r_T_d_meas = np.array(r_T_d_meas)
         for idx in range(3):
-            ax1[idx].plot(t, r_T_d_meas[:,idx], label='Meas')
-            ax1[idx].plot(t, self.r_T_d[:,idx], label='Est')
+            ax1[idx].plot(t, r_T_d_meas[:, idx], label='Meas')
+            ax1[idx].plot(t, self.r_T_d[:, idx], label='Est')
 
-            ax1[idx].fill_between(t_log, est_Tnorm_low[:,idx], est_Tnorm_high[:,idx], alpha=0.3)
+            ax1[idx].fill_between(t_log, est_Tnorm_low[:, idx], est_Tnorm_high[:, idx], alpha=0.3)
 
         plt.rcParams['text.usetex'] = True
 
@@ -526,13 +594,12 @@ class FactorGraph:
 
         plt.legend()
 
-
         fig2, ax2 = plt.subplots(3)
         for idx in range(3):
             ax2[idx].plot(t, true_r_V_d[:, idx], label='True')
-            ax2[idx].plot(t, self.r_V_d[:,idx], label='Est')
+            ax2[idx].plot(t, self.r_V_d[:, idx], label='Est')
 
-            ax2[idx].fill_between(t_log[:-1], est_Vnorm_low[:,idx], est_Vnorm_high[:,idx], alpha=0.3)
+            ax2[idx].fill_between(t_log[:-1], est_Vnorm_low[:, idx], est_Vnorm_high[:, idx], alpha=0.3)
 
         ax2[0].set_title(r'Factor-Graph Optimized Velocity Estimations with 3$\sigma$')
         ax2[0].set_ylabel('Forward Velocity(m/s)')
@@ -544,6 +611,7 @@ class FactorGraph:
         plt.tight_layout(pad=0.5)
         # fig1.savefig("virtualSimResults.pdf", bbox_inches='tight')
         plt.show()
+
 
 def utc_to_gps_time_of_week(utc_time):
     """Converts a UTC datetime object to GPS time of week (seconds)."""
@@ -564,6 +632,7 @@ def utc_to_gps_time_of_week(utc_time):
     gps_tow = time_difference.total_seconds() % 604800
 
     return gps_week, gps_tow
+
 
 def importNovatelData(filename: str, startStorageTow: float, endStorageTow: float) -> np.array:
     with open(filename, 'r') as f:

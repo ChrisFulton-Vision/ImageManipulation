@@ -12,28 +12,6 @@ class CameraConfig:
 
     image_processing_queue: list[dict] = field(default_factory=list)
 
-    # feature flags
-    draw_chessboard: bool = False
-    detectTags: bool = False
-    hideAprilTags: bool = True
-    undistort: bool = False
-    pnp3DTruthPoints: bool = False
-    qnp3DTruthPoints: bool = False
-    yoloInference: bool = False
-    yoloBiasTracking: bool = False
-    detect_corners: bool = False
-    detect_horizon: bool = False
-    factor_graph: bool = False
-    hyper_focus: bool = False
-    phase_correlation: bool = False
-    crosshairs: bool = False
-    cubemap: bool = False
-    hud: bool = False
-    dp_gpu: bool = False
-    pnpYoloPoints: bool = False
-    qnpYoloPoints: bool = False
-    qnpKFYoloPoints: bool = False
-
     # numeric params
     secondsBetweenImages: float = 1.0
     aprilTagSize: float = 0.168

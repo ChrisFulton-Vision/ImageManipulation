@@ -3,7 +3,7 @@
 import numpy as np
 from numpy.typing import NDArray
 import cv2
-from support.vision.calibration import Calibration, undistort_points_px
+from support.vision.calibration import Calibration
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text
 from support.mathHelpers.twoD_to_threeD import solveQnP
@@ -122,75 +122,103 @@ class pnp_qnp_draw:
         centers_px[:, 0] *= sx
         centers_px[:, 1] *= sy
 
-        boxes_px = None
+        boxes_for_draw = None
         if boxes is not None and len(boxes) > 0:
             b = np.asarray(boxes, dtype=np.float64)
             b[:, 0] *= sx
             b[:, 2] *= sx
             b[:, 1] *= sy
             b[:, 3] *= sy
-            boxes_px = b
-
+            boxes_for_draw = b.tolist()
 
         text = f'Inference time: {time:.3f}s'
         (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, 4)
         cv2.putText(image, text, (10, 10 + int(txt_height)), cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, 2)
 
-        centers_und_px = None
-        boxes_for_draw_px = boxes_px
-
         if calibration is not None:
-            calibration.scaleCalibration(w)  # K now matches 'image' pixel space
+            calibration.scaleCalibration(w)  # K now matches 'image' pixel space, returns early if already correct
 
-            if centers_px is not None and len(centers_px) > 0:
-                centers_und_px = undistort_points_px(calibration, centers_px, eps_px=1e-6)
+        centers_for_draw = centers_px.copy()
+        centers_for_pnp = centers_px.copy()
 
-            if markup_is_undistorted and boxes_px is not None and len(boxes_px) > 0:
-                x1, y1, x2, y2 = boxes_px[:, 0], boxes_px[:, 1], boxes_px[:, 2], boxes_px[:, 3]
-                corners_px = np.stack([
-                    np.stack([x1, y1], axis=1),
-                    np.stack([x2, y1], axis=1),
-                    np.stack([x2, y2], axis=1),
-                    np.stack([x1, y2], axis=1),
-                ], axis=1).reshape(-1, 2)
+        if boxes_for_draw is None:
+            boxes_for_draw = []
+        else:
+            boxes_for_draw = [list(b) for b in boxes_for_draw]
 
-                corners_und_px = undistort_points_px(calibration, corners_px, eps_px=1e-6).reshape(-1, 4, 2)
+        if markup_is_undistorted:
+            pts = np.asarray(centers_for_draw, dtype=np.float32).reshape(-1, 1, 2)
+            centers_for_draw = cv2.undistortPoints(
+                pts,
+                calibration.getCameraMatrix(),
+                calibration.getDistortion(),
+                P=calibration.remapK,
+            ).reshape(-1, 2)
 
-                x_min = np.min(corners_und_px[:, :, 0], axis=1)
-                y_min = np.min(corners_und_px[:, :, 1], axis=1)
-                x_max = np.max(corners_und_px[:, :, 0], axis=1)
-                y_max = np.max(corners_und_px[:, :, 1], axis=1)
+            undist_boxes = []
+            for (x1, y1, x2, y2) in boxes_for_draw:
+                corners = np.array([
+                    [x1, y1],
+                    [x2, y1],
+                    [x2, y2],
+                    [x1, y2],
+                ], dtype=np.float32).reshape(-1, 1, 2)
 
-                x_min = np.clip(x_min, 0, w - 1)
-                x_max = np.clip(x_max, 0, w - 1)
-                y_min = np.clip(y_min, 0, h - 1)
-                y_max = np.clip(y_max, 0, h - 1)
+                und_corners = cv2.undistortPoints(
+                    corners,
+                    calibration.getCameraMatrix(),
+                    calibration.getDistortion(),
+                    P=calibration.remapK,
+                ).reshape(-1, 2)
 
-                boxes_for_draw_px = np.stack([x_min, y_min, x_max, y_max], axis=1)
+                xmin = float(np.min(und_corners[:, 0]))
+                xmax = float(np.max(und_corners[:, 0]))
+                ymin = float(np.min(und_corners[:, 1]))
+                ymax = float(np.max(und_corners[:, 1]))
 
-        centers_for_draw = centers_px
-        centers_for_pnp = centers_px
+                undist_boxes.append([
+                    xmin,
+                    ymin,
+                    xmax,
+                    ymax,
+                ])
 
-        if centers_und_px is not None:
-            centers_for_pnp = centers_und_px
-            if markup_is_undistorted:
-                centers_for_draw = centers_und_px
-
-        boxes_for_draw = boxes_for_draw_px.tolist() if boxes_for_draw_px is not None else boxes
+            boxes_for_draw = undist_boxes
 
         if len(class_ids) == 0:
             return
 
-        indices = cv2.dnn.NMSBoxes(boxes_for_draw, scores, conf, iou)
-        newCentersForDraw, newCentersForPnP, newBoxes, newClass_ids, newScores = [], [], [], [], []
-        for i in indices:
-            ii = int(i[0]) if hasattr(i, "__len__") else int(i)
-            newCentersForDraw.append(centers_for_draw[ii])
-            newCentersForPnP.append(centers_for_pnp[ii])
-            newBoxes.append(boxes_for_draw[ii])
-            newClass_ids.append(class_ids[ii])
-            newScores.append(scores[ii])
+        boxes_for_draw = boxes_for_draw if boxes_for_draw is not None else boxes
+
+        boxes_for_nms = []
+        for box in boxes_for_draw:
+            x1, y1, x2, y2 = box
+            boxes_for_nms.append([
+                float(x1),
+                float(y1),
+                float(x2 - x1),
+                float(y2 - y1),
+            ])
+
+        if len(class_ids) == 0:
+            return
+
+        indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores, conf, iou)
+
+        if len(indices) == 0:
+            return
+
+        keep = np.array(
+            [int(i[0]) if hasattr(i, "__len__") else int(i) for i in indices],
+            dtype=np.int32
+        )
+
+        newCentersForDraw = centers_for_draw[keep]
+        newCentersForPnp = centers_for_pnp[keep]
+        newBoxes = boxes_for_draw[keep] if isinstance(boxes_for_draw, np.ndarray) else [boxes_for_draw[i] for i in keep]
+        newClass_ids = [class_ids[i] for i in keep]
+        newScores = [scores[i] for i in keep]
 
         self._drawBoxes(
             image,
@@ -205,7 +233,7 @@ class pnp_qnp_draw:
         if len(set(indices)) <= 5:
             return
 
-        object_points, image_points = self._collect_objPts_and_imgPts(newClass_ids, newCentersForPnP, idsNamesLocs)
+        object_points, image_points = self._collect_objPts_and_imgPts(newClass_ids, newCentersForPnp, idsNamesLocs)
         if len(object_points) < 6:
             return
 
@@ -230,7 +258,7 @@ class pnp_qnp_draw:
             self._drawQnP_from_pose(
                 image=image,
                 y_class_ids=newClass_ids,
-                y_centers=newCentersForPnP,
+                y_centers=newCentersForPnp,
                 object_points=object_points,
                 q_rvec=q_rvec,
                 q_tvec=q_tvec,
@@ -248,7 +276,7 @@ class pnp_qnp_draw:
             self._drawPnP_from_pose(
                 image=image,
                 y_class_ids=newClass_ids,
-                y_centers=newCentersForPnP,
+                y_centers=newCentersForPnp,
                 object_points=object_points,
                 rvec=rvec,
                 tvec=tvec,
@@ -266,7 +294,7 @@ class pnp_qnp_draw:
                   newClass_ids: list, newScores: list,
                   yoloSize: tuple[float, float],
                    draw_as_circles: bool = True,
-                   circle_radius_px: int | None = None) -> NDArray:
+                   circle_radius_px: int | None = None) -> None:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -435,21 +463,20 @@ class pnp_qnp_draw:
             # id = y_class_id
             xyz = np.array(idsNamesLocs[y_class_id][2:])
 
-            if markup_is_undistorted:
-                dist_coeffs = np.zeros((5,))
-            else:
-                dist_coeffs = calibration.getDistortion()
-
             projectedPixel, _ = cv2.projectPoints(xyz, rvec=rvec, tvec=tvec,
                                                   cameraMatrix=calibration.getCameraMatrix(),
-                                                  distCoeffs=dist_coeffs)
+                                                  distCoeffs=np.zeros((5,)))
 
+            if markup_is_undistorted:
+                projectedPixel = cv2.undistortPoints(projectedPixel,
+                                                     calibration.getCameraMatrix(),
+                                                     calibration.getDistortion(),
+                                                     P=calibration.remapK,  # If undistorted, remap produces new K
+                                                     )
             x, y = np.squeeze(projectedPixel)
+
             if np.isnan(x) or np.isnan(y):
                 return
-
-            # x = float(w / y_w * x)
-            # y = float(h / y_h * y)
 
             if (0 < x < w and 0 < y < h):
                 if draw_as_circles:

@@ -267,6 +267,8 @@ class App(ctk.CTk):
             p.grid_remove()
             if hasattr(p, 'camGui'):
                 p.camGui.func_to_refit(self.passToChild_fit_to_content(p))
+            if hasattr(p, 'calPage'):
+                p.calPage.func_to_refit(self.passToChild_fit_to_content(p))
 
         self.protocol("WM_DELETE_WINDOW", self.pages["Camera"].camGui.on_app_close)
 
@@ -516,23 +518,30 @@ class App(ctk.CTk):
 
     def _section_layout_height(self, page) -> int:
         """
-        Height based on actual laid-out children, not requested size.
-        More stable for grid-heavy CTk pages that change reqheight after interaction.
+        Height based on the currently visible section only.
+        This prevents hidden/stale sections from inflating the window height.
         """
-        try:
-            self.update_idletasks()
-            kids = [w for w in page.winfo_children() if w.winfo_exists() and w.winfo_ismapped()]
-            if not kids:
-                return int(page.winfo_reqheight())
-            bottoms = []
-            for w in kids:
-                try:
-                    bottoms.append(int(w.winfo_y() + w.winfo_height()))
-                except Exception:
-                    pass
-            return max(bottoms) if bottoms else int(page.winfo_reqheight())
-        except Exception:
-            return int(page.winfo_reqheight())
+        """Return the natural width of the *visible* section, with scrollable frames handled."""
+        target = self._active_section(page)
+
+        # If it's a CTkScrollableFrame, measure the inner content frame (no manual summing)
+        inner = getattr(target, "_scrollable_frame", target)
+
+        # Force Tk to compute requested sizes after any layout change
+        inner.update_idletasks()
+
+        h = inner.winfo_reqheight()
+        if h <= 1:  # very defensive fallback
+            h = target.winfo_reqheight()
+        # Account for a possible vertical scrollbar gutter if present (kept tiny)
+        scrollbar = getattr(target, "_scrollbar", None)
+        if scrollbar and scrollbar.winfo_ismapped():
+            try:
+                h += scrollbar.winfo_reqheight()
+            except Exception:
+                h += 16  # safe default
+
+        return int(h)
 
 
 if __name__ == "__main__":

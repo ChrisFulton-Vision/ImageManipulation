@@ -137,8 +137,9 @@ class FrameCtx:
     img_time: Optional[float] = None
     name: Optional[str] = None
     display_in_realtime: bool = True
-    yolo = Slot()
-    fg = Slot()
+    undistorted: Slot = field(default_factory=Slot)
+    yolo: Slot = field(default_factory=Slot)
+    fg: Slot = field(default_factory=Slot)
 
 
 @dataclass
@@ -153,11 +154,6 @@ class _QueueRow:
     args: Args
 
 
-# @dataclass(frozen=True)
-# class StepRule:
-#     step: Callable
-#     requires_before: tuple[Callable, ...] = ()
-
 @dataclass(frozen=True)
 class StepOption:
     label: str
@@ -170,15 +166,6 @@ class StepOption:
 
     def to_spec(self) -> tuple[StepFn, Args]:
         return (self.fn, self.default_args)
-
-
-def _label_for(fn: StepFn, default_args: Args) -> str:
-    # readable label; tweak as you like
-    name = getattr(fn, "__name__", "step")
-    if len(default_args) == 0:
-        return name
-    return f"{name}{default_args}"
-
 
 class StepSpecQueueEditor(ctk.CTkFrame):
     """

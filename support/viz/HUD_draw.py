@@ -116,8 +116,8 @@ class HUD_Marker:
         if cx_cy is None:
             return
         cx, cy = cx_cy
-        width = image.shape[0]
-        height = image.shape[1]
+        width = image.shape[1]
+        height = image.shape[0]
         thickness = max(int(width / 250), 1)
 
         crosshairsH = np.array([[cx + max(int(width / 50), 10), cy], [cx - max(int(width / 50), 10), cy]])

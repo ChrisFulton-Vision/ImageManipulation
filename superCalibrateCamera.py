@@ -111,7 +111,7 @@ class CameraGui(ctk.CTkFrame):
         # Super class init, necessary for customTkinter
         super().__init__(master, *args, **kwargs)
         self._flag_vars: dict[str, ctk.BooleanVar | ctk.DoubleVar] = {}
-        self._checkboxes: dict[str, ctk.CTkCheckBox] = {}
+
         self._flags = [
             'yolo_conf', 'yolo_iou'
         ]
@@ -370,34 +370,6 @@ class CameraGui(ctk.CTkFrame):
                 emit_change=False,
             )
 
-    def _queue_stepspecs_from_config(self, queue_cfg):
-        if not queue_cfg:
-            return []
-
-        option_by_label = {opt.label: opt for opt in self.step_options}
-        rebuilt = []
-
-        for row in queue_cfg:
-            label = row["label"]
-
-            if label not in option_by_label:
-                LOG.warning("Skipping cached queue step '%s' (unknown)", label)
-                continue
-
-            opt = option_by_label[label]
-            args = copy.deepcopy(row.get("args", {}))
-
-            rebuilt.append(
-                GuiQueue.StepSpec(
-                    label=opt.label,
-                    fn=opt.fn,
-                    arg_specs=opt.arg_specs,
-                    args=args,
-                )
-            )
-
-        return rebuilt
-
     def func_to_refit(self, func):
         self.func_that_refits = func
 
@@ -422,11 +394,6 @@ class CameraGui(ctk.CTkFrame):
             val = float(self._flag_vars[name].get())
         else:
             val = bool(self._flag_vars[name].get())
-
-        # guard rails / side effects
-        if name == "undistort" and not self.calibration.validCal:
-            self._flag_vars[name].set(False)
-            return
 
         setattr(self.camConfig, name, val)
         self.saveToCache()
@@ -479,6 +446,8 @@ class CameraGui(ctk.CTkFrame):
     def on_section_show(self, name: str):
         # Example: only allow OpenCV windows / key polling while in Playback
         self._playback_allowed = (name == "Playback")
+        if self.func_that_refits:
+            self.func_that_refits()
 
     # def on_section_hide(self, name: str):
     # if name == "Playback":
@@ -682,8 +651,9 @@ class CameraGui(ctk.CTkFrame):
 
         newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
 
+        self.calibration.remapK = newK
         self.map1, self.map2 = cv2.initUndistortRectifyMap(
-            K, D, None, newK, (w, h), cv2.CV_16SC2
+            K, D, None, newK, (w, h), cv2.CV_32FC1
         )
 
         self.saveToCache()
@@ -2861,12 +2831,16 @@ class CameraGui(ctk.CTkFrame):
         else:
             if self.map1 is None or self.map2 is None:
                 raise ValueError("No calibration loaded!")
-            cv2.remap(markupFrame,
+            tmp = cv2.remap(markupFrame,
                       self.map1,
                       self.map2,
                       interpolation=cv2.INTER_LINEAR,
-                      dst=markupFrame,
                       borderMode=cv2.BORDER_CONSTANT)
+            markupFrame[:] = tmp
+            if not ctx.undistorted.is_set():
+                ctx.undistorted.set(True)  # One undistort has been run
+            else:
+                ctx.undistorted.set(False) # Multiple undistorts, invalid
 
     def applyKernel(self,
                     frame: NDArray,
@@ -2959,16 +2933,6 @@ class CameraGui(ctk.CTkFrame):
                     set_bool("pnp", args["pnp"])
                 if "qnp" in args:
                     set_bool("qnp", args["qnp"])
-                return opts
-
-            # --- Single scalar legacy ---
-            # bool alone historically meant inpaint
-            if isinstance(args, bool):
-                opts.inpaint = args
-                return opts
-
-            if isinstance(args, (int, float)) and not isinstance(args, bool):
-                set_scale(args)
                 return opts
 
             raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
@@ -3437,8 +3401,9 @@ class CameraGui(ctk.CTkFrame):
         import support.viz.draw_pnp_qnp as pnpDrw
         if self.pnpDrawer is None:
             self.pnpDrawer = pnpDrw.pnp_qnp_draw()
+        # TODO Clean-up bias tracking logic, second input here
         output = self.yoloSession.inferOnImage(frame,
-                                               self.camConfig.yoloBiasTracking)
+                                               False)
 
         algos = pnpDrw.twoToThreeSelectedAlgorithms()
         algos.use_pnp = opts.want_pnp
@@ -3447,7 +3412,7 @@ class CameraGui(ctk.CTkFrame):
 
         self.pnpDrawer.markUpImage(image=markupFrame,
                                    output=output,
-                                   markup_is_undistorted=not self.camConfig.undistort,
+                                   markup_is_undistorted=ctx.undistorted.get_or(False),
                                    calibration=self.calibration,
                                    conf=self.camConfig.yolo_conf,
                                    iou=self.camConfig.yolo_iou,

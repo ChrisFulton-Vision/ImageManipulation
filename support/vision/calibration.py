@@ -37,6 +37,8 @@ class Calibration:
         self.fisheye = False
         self.calDatetime = None
 
+        self.remapK = None
+
         self.scale = 1.0
 
         if filepath is not None:

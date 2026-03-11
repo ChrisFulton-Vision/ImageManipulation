@@ -160,6 +160,8 @@ class CalibrateGui(CTkFrame):
         self.imageConfigWindowObjects = []
         self.scale = 1.0
 
+        self.func_that_refits = None
+
         self.filepath = ''
         self.loadFromCache(True)
 
@@ -229,6 +231,13 @@ class CalibrateGui(CTkFrame):
         self._ui_active = bool(active)
         # Stop/avoid background refreshers when hidden (threads/after loops).
         # If you have repeating after() callbacks, guard their reschedule on this flag.
+
+    def func_to_refit(self, func):
+        self.func_that_refits = func
+
+    def on_section_show(self, name: str):
+        if self.func_that_refits:
+            self.func_that_refits()
 
     def setup_configFrame(self, master_frame):
         f = CTkFrame(master_frame)

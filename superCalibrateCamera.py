@@ -65,12 +65,23 @@ CACHE_FILEPATH = str(Path.cwd() / "Caches" / "last_config.pkl")
 
 @dataclass(slots=True)
 class YoloOutput:
+    """Container for the most recent YOLO-derived measurement products.
+
+    Stores the last detected bounding-box size, image-space center, and
+    optional 3D estimate so downstream processing stages can reuse the
+    latest detection results without recomputing them.
+    """
     last_bounding_box_size: tuple[float, float] = None
     last_yolo_center: tuple[float, float] = None
     last_yolo_3d_estimate: NDArray = None
 
 
 class FG_Output:
+    """Container for the most recent factor-graph state estimate.
+
+    Holds the current pixel projection, relative pose/velocity estimates,
+    and per-axis variances produced by the fusion pipeline.
+    """
     curr_FG_pixel: tuple[int, int] = None
     curr_r_T_d: NDArray = None
     curr_r_V_d: NDArray = None
@@ -80,7 +91,19 @@ class FG_Output:
 
 
 class CameraGui(ctk.CTkFrame):
+    """Main CustomTkinter controller for camera calibration and image analysis.
+
+    This widget manages UI pages, persistent configuration, live playback,
+    batch processing, and the queued image-processing pipeline used to
+    annotate or analyze frames from files, folders, or live cameras.
+    """
     def __init__(self, master, *args, **kwargs):
+        """Initialize UI state, runtime helpers, and processing pipeline options.
+
+        Builds the controller state, creates child pages and frames, restores
+        cached configuration, and wires the queue editor to the underlying
+        image-processing model.
+        """
         self._playback_allowed = None
         self.curr_r_V_d = None
         self.curr_r_T_d = None
@@ -202,8 +225,8 @@ class CameraGui(ctk.CTkFrame):
         self.face_size = None
         self.faces_dirs = None
         self.cubemap_faces = None
-        self.map_x = None
-        self.map_y = None
+        self.cubemap_x = None
+        self.cubemap_y = None
         self.hud_marker = None
         self.lowPassFPS = 20.0
         self.ThreeDTruthPoints = None
@@ -314,6 +337,12 @@ class CameraGui(ctk.CTkFrame):
         self._loading_config = False
 
     def on_app_close(self):
+        """Shut down background activity and destroy the application cleanly.
+
+        Stops GPU monitoring, cancels scheduled callbacks where possible, closes
+        plot windows, and tears down the Tk root without raising shutdown-time
+        GUI exceptions.
+        """
         import tkinter as tk
         root = self.winfo_toplevel()
 
@@ -337,43 +366,20 @@ class CameraGui(ctk.CTkFrame):
         except tk.TclError:
             pass
 
-    def _on_queue_changed(self, new_queue):
-        if getattr(self, "_loading_config", False):
-            return
-
-        normalized_queue = [
-            (fn, copy.deepcopy(args))
-            for fn, args in new_queue
-        ]
-
-        sig_did_change = self.list_of_image_process_functors != normalized_queue
-        self.list_of_image_process_functors = normalized_queue
-
-        if sig_did_change:
-            self.camConfig.image_processing_queue = self._queue_to_config(normalized_queue)
-            self.saveToCache()
-
-            if self.func_that_refits is not None:
-                self.func_that_refits()
-
-    def _sync_queue_from_model(self):
-        cfg = getattr(self.camConfig, "image_processing_queue", [])
-        rebuilt = self._queue_from_config(cfg)
-
-        self.list_of_image_process_functors = [
-            (fn, copy.deepcopy(args)) for fn, args in rebuilt
-        ]
-
-        if hasattr(self, "imgProcQueue_editor") and self.imgProcQueue_editor is not None:
-            self.imgProcQueue_editor.set_queue(
-                [(fn, copy.deepcopy(args)) for fn, args in rebuilt],
-                emit_change=False,
-            )
-
     def func_to_refit(self, func):
+        """Register a callback used to resize or refit the parent layout.
+
+        The callback is invoked after configuration changes that may alter the
+        required GUI geometry.
+        """
         self.func_that_refits = func
 
     def _init_flag_vars(self):
+        """Create Tk variable wrappers for config-backed UI flags.
+
+        Initializes tracked variables from the config model and attaches change
+        callbacks so user edits immediately propagate back into the config.
+        """
         double_vars = ['yolo_conf', 'yolo_iou']
         for name in self._flags:
             if not hasattr(self.camConfig, name):
@@ -389,6 +395,11 @@ class CameraGui(ctk.CTkFrame):
             self._flag_vars[name] = v
 
     def _on_flag_changed(self, name: str):
+        """Handle a write to a tracked UI flag variable.
+
+        Normalizes the value to the correct scalar type, stores it on the
+        camera config, and triggers a cache save.
+        """
         # DoubleVars must stay float; everything else is bool
         if name in ("yolo_conf", "yolo_iou"):
             val = float(self._flag_vars[name].get())
@@ -399,6 +410,7 @@ class CameraGui(ctk.CTkFrame):
         self.saveToCache()
 
     def sync_flags_from_model(self):
+        """Push config-backed flag values into their Tk variable mirrors."""
         for n in self._flags:
             if n in ("yolo_conf", "yolo_iou"):
                 self._flag_vars[n].set(float(getattr(self.camConfig, n, 1.0)))
@@ -430,81 +442,57 @@ class CameraGui(ctk.CTkFrame):
         if hasattr(self, "_dp_gpu_var") and self._dp_gpu_var is not None:
             self._dp_gpu_var.set(bool(getattr(self.camConfig, "dp_gpu", False)))
 
-    def set_ui_active(self, active: bool):
-        import tkinter as tk
-        self._ui_active = bool(active)
-        # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
-        if not self._ui_active:
-            if not self.winfo_exists():
-                return
-            try:
-                self.after(100, self.startStreamOff)  # type: ignore[call-arg]
-            except tk.TclError:
-                pass
+    def _on_queue_changed(self, new_queue):
+        """Accept a queue edit from the GUI editor and persist it to the model.
 
-    # Optional: react to section changes if you want different behavior
-    def on_section_show(self, name: str):
-        # Example: only allow OpenCV windows / key polling while in Playback
-        self._playback_allowed = (name == "Playback")
-        if self.func_that_refits:
-            self.func_that_refits()
-
-    # def on_section_hide(self, name: str):
-    # if name == "Playback":
-    # Close imshow windows / pause playback, etc.
-    # try: destroyWindow(self.windowName)
-    # except Exception: pass
-
-    def loadFromCache(self):
-        self._loading_config = True
-        res = self.config_store.load_from_cache(self.camConfig)
-        if res.loaded_yaml:
-            self.update_post_newCamConfig()
-        else:
-            self._loading_config = False
-
-    def update_post_newCamConfig(self):
-        iou = copy.deepcopy(self.camConfig.yolo_iou)
-        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
-        self._flag_vars["yolo_iou"].set(float(iou))
-
-        self.updateLogFile()
-        self.ingestCalibration()
-        self.updateYOLOModel()
-        if self.ThreeDTruthPoints is not None:
-            self.loadTruthPoints()
-
-        self.sync_flags_from_model()
-        self._sync_dp_from_model()
-        self._sync_queue_from_model()
-
-        try:
-            if hasattr(self, "gpu_slider"):
-                self.gpu_slider.configure(
-                    state="normal" if bool(getattr(self.camConfig, "dp_gpu", False)) else "disabled"
-                )
-            if not bool(getattr(self.camConfig, "dp_gpu", False)):
-                self.gpu_slider.set(0.0)
-        except Exception:
-            pass
-
-        self.saveToCache()
-
-        if self.func_that_refits is not None:
-            self.func_that_refits()
-
-    def saveToCache(self,
-                    immediate: bool = False,
-                    delay_ms: int = 500):
+        Normalizes queue arguments via deep copy, updates the active processing
+        pipeline, writes the serialized queue into the camera config, and saves
+        the new state to cache when the signature changes.
+        """
         if getattr(self, "_loading_config", False):
             return
 
-        self.camConfig.yolo_conf = float(self._flag_vars["yolo_conf"].get())
-        self.camConfig.yolo_iou = float(self._flag_vars["yolo_iou"].get())
+        normalized_queue = [
+            (fn, copy.deepcopy(args))
+            for fn, args in new_queue
+        ]
 
-        self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
+        sig_did_change = self.list_of_image_process_functors != normalized_queue
+        self.list_of_image_process_functors = normalized_queue
+
+        if sig_did_change:
+            self.camConfig.image_processing_queue = self._queue_to_config(normalized_queue)
+            self.saveToCache()
+
+            if self.func_that_refits is not None:
+                self.func_that_refits()
+
+    def _sync_queue_from_model(self):
+        """Rebuild the runtime queue and queue editor from cached config data.
+
+        Deserializes the saved queue specification into callable steps plus
+        arguments, updates the in-memory processing list, and refreshes the
+        queue editor without re-emitting change events.
+        """
+        cfg = getattr(self.camConfig, "image_processing_queue", [])
+        rebuilt = self._queue_from_config(cfg)
+
+        self.list_of_image_process_functors = [
+            (fn, copy.deepcopy(args)) for fn, args in rebuilt
+        ]
+
+        if hasattr(self, "imgProcQueue_editor") and self.imgProcQueue_editor is not None:
+            self.imgProcQueue_editor.set_queue(
+                [(fn, copy.deepcopy(args)) for fn, args in rebuilt],
+                emit_change=False,
+            )
 
     def _queue_to_config(self, queue):
+        """Serialize a runtime processing queue into cache-friendly config data.
+
+        Converts each processing function to its user-facing label and serializes
+        its argument values into a plain dictionary representation.
+        """
         out = []
 
         for fn, args in queue:
@@ -526,6 +514,12 @@ class CameraGui(ctk.CTkFrame):
         return out
 
     def _queue_from_config(self, queue_cfg):
+        """Deserialize a saved queue specification into callable pipeline steps.
+
+        Unknown step labels are skipped with a warning. Missing arguments are
+        filled from defaults, and cached values are coerced back into their
+        expected runtime types where possible.
+        """
         if not queue_cfg:
             return []
 
@@ -559,11 +553,21 @@ class CameraGui(ctk.CTkFrame):
         return rebuilt
 
     def _serialize_queue_arg(self, v):
+        """Convert a queue argument into a cache-safe scalar representation.
+
+        Enum values are stored by value; all other types are passed through
+        unchanged.
+        """
         if isinstance(v, enum.Enum):
             return v.value
         return v
 
     def _deserialize_queue_arg(self, spec, raw_val):
+        """Reconstruct a typed queue argument from cached data.
+
+        Uses the argument spec's default value to infer the desired runtime type
+        and falls back to that default if conversion fails.
+        """
         default = spec.default
 
         # Enum args: rebuild from saved scalar/string value
@@ -597,16 +601,84 @@ class CameraGui(ctk.CTkFrame):
 
         return raw_val
 
+    def loadFromCache(self):
+        """Load cached configuration into the active camera config object.
+
+        If a YAML-backed config is restored successfully, performs the full
+        post-load synchronization path to refresh dependent runtime state.
+        """
+        self._loading_config = True
+        res = self.config_store.load_from_cache(self.camConfig)
+        if res.loaded_yaml:
+            self.update_post_newCamConfig()
+        else:
+            self._loading_config = False
+
+    def update_post_newCamConfig(self):
+        """Refresh runtime systems after loading or replacing the camera config.
+
+        Synchronizes UI variables, calibration, YOLO state, optional truth data,
+        batch-processing controls, queue editor state, and any layout refit
+        callback that depends on the new configuration.
+        """
+        iou = copy.deepcopy(self.camConfig.yolo_iou)
+        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
+        self._flag_vars["yolo_iou"].set(float(iou))
+
+        self.updateLogFile()
+        self.ingestCalibration()
+        self.updateYOLOModel()
+        if self.ThreeDTruthPoints is not None:
+            self.loadTruthPoints()
+
+        self.sync_flags_from_model()
+        self._sync_dp_from_model()
+        self._sync_queue_from_model()
+
+        try:
+            if hasattr(self, "gpu_slider"):
+                self.gpu_slider.configure(
+                    state="normal" if bool(getattr(self.camConfig, "dp_gpu", False)) else "disabled"
+                )
+            if not bool(getattr(self.camConfig, "dp_gpu", False)):
+                self.gpu_slider.set(0.0)
+        except Exception:
+            pass
+
+        self.saveToCache()
+
+        if self.func_that_refits is not None:
+            self.func_that_refits()
+
+    def saveToCache(self,
+                    immediate: bool = False,
+                    delay_ms: int = 500):
+        """Persist the current camera configuration to cache.
+
+        Copies selected live UI values back into the config model before
+        delegating to the config store, with optional debounced saving.
+        """
+        if getattr(self, "_loading_config", False):
+            return
+
+        self.camConfig.yolo_conf = float(self._flag_vars["yolo_conf"].get())
+        self.camConfig.yolo_iou = float(self._flag_vars["yolo_iou"].get())
+
+        self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
+
     def updateLogFile(self):
+        """Reload HUD attitude/log data from the configured source path."""
         if self.hud_marker is not None:
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
         self.saveToCache()
 
     def updateYOLOModel(self):
+        """Point the active YOLO session at the configured model directory."""
         if self.camConfig.yoloFilepath and self.yoloSession is not None:
             self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
 
     def loadTruthPoints(self):
+        """Load 3D truth points from the configured truth-data file, if present."""
         if not self.camConfig.ThreeDTruthFilepath:
             return
 
@@ -617,11 +689,19 @@ class CameraGui(ctk.CTkFrame):
         self.ThreeDTruthPoints.try_load(truth_path)
 
     def updateQuality(self, qualityValue: str):
+        """Update the configured export quality and persist the change."""
         self.camConfig.export_quality = ExportQuality(qualityValue)
         self.saveToCache()
 
     def ingestCalibration(self):
+        """Load calibration data and prepare undistortion maps.
 
+        Attempts to read the configured calibration file, updates related UI,
+        propagates the calibration into the YOLO session, and precomputes
+        OpenCV remap matrices for fast undistortion during playback.
+
+        Important note: the undistort map does not have the same focal parameters as the original projection!
+        """
         if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(
                 self.camConfig.calibFilepath):
             if self.selectCalibLabel is not None:
@@ -659,16 +739,29 @@ class CameraGui(ctk.CTkFrame):
         self.saveToCache()
 
     def setupFrame(self):
+        """Build the major secondary UI sections for export, data, and playback."""
         self.setup_exportFrame()
         self.setup_dataFrame()
         self.setup_playbackFrame()
 
     @staticmethod
     def grid_sideBySide(row, *args, col=0):
+        """Grid multiple widgets into consecutive columns on the same row.
+
+        Args:
+            row: Grid row index.
+            *args: Widgets to place.
+            col: Starting column index.
+        """
         for idx, item in enumerate(args):
             item.grid(row=row, column=col + idx, padx=5, pady=5, sticky='nsew')
 
     def setup_exportFrame(self):
+        """Construct the export tools section of the GUI.
+
+        Adds controls for screenshots, saved imagery, export cadence, quality,
+        GIF/video export, export frame bounds, and checkerboard launching.
+        """
         rowID = 0
         self.recordOff()
         self.grid_sideBySide(rowID, self.recordButton, self.printButton)
@@ -705,9 +798,11 @@ class CameraGui(ctk.CTkFrame):
         self.btn_checkerboard.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
 
     def _on_checker_status(self, btn_state: str, btn_text: str) -> None:
+        """Update the checkerboard launcher button state and text."""
         self.btn_checkerboard.configure(state=btn_state, text=btn_text)
 
     def _on_gpu_sample(self, sample: GpuSample) -> None:
+        """Consume a GPU utilization sample and refresh the display widget."""
         if sample.err:
             #     self.gpuLabel.configure(text=f"GPU: {sample.err}")
             return
@@ -716,6 +811,11 @@ class CameraGui(ctk.CTkFrame):
             # self.gpuLabel.configure(text=f"GPU: {sample.util}%  MEM: {sample.mem}%")
 
     def _on_toggle_show_gpu(self):
+        """Enable or disable GPU utilization monitoring from the UI.
+
+        Updates config state, toggles the slider widget, and starts or stops the
+        background monitor as needed.
+        """
         enabled = bool(self._dp_gpu_var.get())  # authoritative
         self.camConfig.dp_gpu = enabled
         self.saveToCache()
@@ -737,7 +837,12 @@ class CameraGui(ctk.CTkFrame):
         self.gpu_monitor.set_enabled(enabled)
 
     def setup_dataFrame(self):
-        """Build the 'Data Processing' page: folder pick, CSV pick, params, run."""
+        """Build the batch-processing page for folder-based offline analysis.
+
+        Creates controls for image-folder selection, confidence sweeps,
+        checkpointing, prefetch count, progress display, GPU monitoring, and
+        batch actions for YOLO, Kalman, SolvePnP/QnP, and plotting.
+        """
         f = self.data_frame
         for w in f.winfo_children():
             w.destroy()
@@ -906,7 +1011,117 @@ class CameraGui(ctk.CTkFrame):
             command=self._plotter_close_plot_alias, )
         dp_close_plot_btn.grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
+    def setup_playbackFrame(self):
+        """Construct the playback controls section of the GUI.
+
+        Builds the frame slider, transport controls, and speed/overlay/export
+        boundary controls used during folder playback.
+        """
+        f = self.playback_frame
+
+        for w in f.winfo_children():
+            w.destroy()
+
+        rowID = 0
+        self.update_playbackMenu()
+
+        playbackLabel = ctk.CTkLabel(f, textvariable=self.playbackModeText)
+        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=8, pady=(8, 4))
+        rowID += 1
+
+        # --- Frame slider ---
+        self._pb_frame_text = ctk.StringVar(value="Frame: — / —")
+        self._pb_slider_dragging = False
+
+        self._pb_frame_label = ctk.CTkLabel(f, textvariable=self._pb_frame_text)
+        self._pb_frame_label.grid(row=rowID, column=0, sticky="w", padx=8, pady=(4, 2))
+        rowID += 1
+
+        # Start with a safe dummy range; worker will update range once it knows num_images
+        self._pb_slider = ctk.CTkSlider(
+            f,
+            from_=0,
+            to=1,
+            number_of_steps=1,
+            command=self._on_pb_slider_drag,  # live label only
+        )
+        self._pb_slider.grid(row=rowID, column=0, sticky="ew", padx=8, pady=(0, 8))
+        rowID += 1
+
+        # Only seek on release (prevents seek spam while dragging)
+        self._pb_slider.bind("<ButtonPress-1>", lambda *_: self._set_pb_slider_dragging(True))
+        self._pb_slider.bind("<ButtonRelease-1>", self._on_pb_slider_release)
+
+        f.grid_columnconfigure(0, weight=1)
+
+        rowID += 1
+
+        # --- Primary playback controls (mirror hotkeys) ---
+        btn_frame = ctk.CTkFrame(self.playback_frame)
+        btn_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
+
+        def mk(text, action, *args, col=0):
+            b = ctk.CTkButton(
+                btn_frame,
+                text=text,
+                command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar), )
+            b.grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+            return b
+
+        # Order roughly like a transport bar
+        mk("⟲ Rev (r)", "reverse", col=0)
+        mk("⟸ Back (z)", "step_back", col=1)
+        mk("⏯ Pause (space)", "toggle_pause", col=2)
+        mk("Fwd (c) ⟹", "step_forward", col=3)
+        mk("Mode (f)", "toggle_fps_mode", col=4)
+
+        rowID += 1
+        speed_frame = ctk.CTkFrame(self.playback_frame)
+        speed_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
+
+        mk2 = lambda text, action, *args, col=0: ctk.CTkButton(
+            speed_frame,
+            text=text,
+            command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
+        ).grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+
+        mk2("Slower (a)", "speed_down", col=0)
+        mk2("Faster (d)", "speed_up", col=1)
+        mk2("Overlays (w)", "toggle_overlays", col=2)
+        mk2("Mark Start (s)", "mark_start", col=3)
+        mk2("Mark End (e)", "mark_end", col=4)
+
+    def set_ui_active(self, active: bool):
+        """Enable or disable this page's active runtime behavior.
+
+        When deactivated, schedules the live stream to stop so hidden pages do
+        not continue consuming CPU or GPU resources.
+        """
+        import tkinter as tk
+        self._ui_active = bool(active)
+        # Stop camera stream if page is hidden (don’t burn CPU/GPU off-screen)
+        if not self._ui_active:
+            if not self.winfo_exists():
+                return
+            try:
+                self.after(100, self.startStreamOff)  # type: ignore[call-arg]
+            except tk.TclError:
+                pass
+
+    # Optional: react to section changes if you want different behavior
+    def on_section_show(self, name: str):
+        """Update section-specific behavior when this page becomes visible.
+
+        Currently records whether playback interactions should be allowed and
+        requests a parent layout refit if one is registered.
+        """
+        # Example: only allow OpenCV windows / key polling while in Playback
+        self._playback_allowed = (name == "Playback")
+        if self.func_that_refits:
+            self.func_that_refits()
+
     def _plotter_close_plot_alias(self):
+        """Close any open plotting windows through the plotting helper."""
         if self.plotter is None:
             return False
 
@@ -916,6 +1131,11 @@ class CameraGui(ctk.CTkFrame):
         return True
 
     def runPnP_QnP_on_folders_threaded(self):
+        """Launch SolvePnP/QnP batch processing on a background thread.
+
+        Builds UI-safe progress callbacks and delegates the actual folder sweep
+        to the data-processing runner.
+        """
         img_dir_str = (
                 (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
                 or (getattr(self.camConfig, "imageFilepath", "") or "")
@@ -966,6 +1186,11 @@ class CameraGui(ctk.CTkFrame):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _run_kalman_batch_start(self):
+        """Start a Kalman-filter confidence sweep in a worker thread.
+
+        Prepares UI state, validates prerequisites, constructs progress/status
+        callbacks, and launches the configured batch operation.
+        """
         if getattr(self, "_dp_worker", None) and self._dp_worker.is_alive():
             return
 
@@ -1036,6 +1261,11 @@ class CameraGui(ctk.CTkFrame):
         self._dp_worker.start()
 
     def _dp_cancel(self):
+        """Request cancellation of the active batch-processing job.
+
+        Signals the runner's cancel event and updates the UI to indicate that
+        the current step is being allowed to finish cleanly.
+        """
         # 1) Signal cancel
         runner = getattr(self, "_dp_runner", None)
         if runner is not None:
@@ -1053,6 +1283,11 @@ class CameraGui(ctk.CTkFrame):
             self._dp_run_btn.configure(state="disabled")  # optional, but usually correct
 
     def _run_yolo_batch_start(self):
+        """Start a YOLO confidence sweep over the selected image folder.
+
+        Initializes the YOLO session if needed, builds the input timebase, wires
+        UI-thread callbacks, and launches the worker that writes detection CSVs.
+        """
         if getattr(self, "_dp_worker", None) and self._dp_worker.is_alive():
             return
 
@@ -1154,14 +1389,10 @@ class CameraGui(ctk.CTkFrame):
             progress_cb=None,
             cancel_cb=False,
     ) -> None:
-        """
-        Thin GUI wrapper around support.io.data_processing.run_pnp_qnp_from_detection_csv.
+        """Run SolvePnP/QnP over an existing detection CSV using GUI state.
 
-        Keeps:
-          - yoloSession/metaYolo linkage (truth_dict source)
-          - GUI checkpoint field
-          - GUI cancel_event
-          - progress_cb forwarding
+        This thin wrapper injects calibration, truth metadata, checkpoint cadence,
+        cancel support, and progress forwarding before delegating to the runner.
         """
 
         # ---- checkpoint cadence ----
@@ -1212,85 +1443,12 @@ class CameraGui(ctk.CTkFrame):
         )
 
     def launch_checkerboard(self):
+        """Toggle the external checkerboard launcher process."""
         self.checkerboard_launcher.toggle()
-
-    def setup_playbackFrame(self):
-        f = self.playback_frame
-
-        for w in f.winfo_children():
-            w.destroy()
-
-        rowID = 0
-        self.update_playbackMenu()
-
-        playbackLabel = ctk.CTkLabel(f, textvariable=self.playbackModeText)
-        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=8, pady=(8, 4))
-        rowID += 1
-
-        # --- Frame slider ---
-        self._pb_frame_text = ctk.StringVar(value="Frame: — / —")
-        self._pb_slider_dragging = False
-
-        self._pb_frame_label = ctk.CTkLabel(f, textvariable=self._pb_frame_text)
-        self._pb_frame_label.grid(row=rowID, column=0, sticky="w", padx=8, pady=(4, 2))
-        rowID += 1
-
-        # Start with a safe dummy range; worker will update range once it knows num_images
-        self._pb_slider = ctk.CTkSlider(
-            f,
-            from_=0,
-            to=1,
-            number_of_steps=1,
-            command=self._on_pb_slider_drag,  # live label only
-        )
-        self._pb_slider.grid(row=rowID, column=0, sticky="ew", padx=8, pady=(0, 8))
-        rowID += 1
-
-        # Only seek on release (prevents seek spam while dragging)
-        self._pb_slider.bind("<ButtonPress-1>", lambda *_: self._set_pb_slider_dragging(True))
-        self._pb_slider.bind("<ButtonRelease-1>", self._on_pb_slider_release)
-
-        f.grid_columnconfigure(0, weight=1)
-
-        rowID += 1
-
-        # --- Primary playback controls (mirror hotkeys) ---
-        btn_frame = ctk.CTkFrame(self.playback_frame)
-        btn_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
-
-        def mk(text, action, *args, col=0):
-            b = ctk.CTkButton(
-                btn_frame,
-                text=text,
-                command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar), )
-            b.grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
-            return b
-
-        # Order roughly like a transport bar
-        mk("⟲ Rev (r)", "reverse", col=0)
-        mk("⟸ Back (z)", "step_back", col=1)
-        mk("⏯ Pause (space)", "toggle_pause", col=2)
-        mk("Fwd (c) ⟹", "step_forward", col=3)
-        mk("Mode (f)", "toggle_fps_mode", col=4)
-
-        rowID += 1
-        speed_frame = ctk.CTkFrame(self.playback_frame)
-        speed_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
-
-        mk2 = lambda text, action, *args, col=0: ctk.CTkButton(
-            speed_frame,
-            text=text,
-            command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
-        ).grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
-
-        mk2("Slower (a)", "speed_down", col=0)
-        mk2("Faster (d)", "speed_up", col=1)
-        mk2("Overlays (w)", "toggle_overlays", col=2)
-        mk2("Mark Start (s)", "mark_start", col=3)
-        mk2("Mark End (e)", "mark_end", col=4)
 
     # --- Playback slider helpers ---
     def _set_pb_slider_dragging(self, dragging: bool):
+        """Record whether the playback slider is actively being dragged."""
         self._pb_slider_dragging = bool(dragging)
 
     def _on_pb_slider_drag(self, value):
@@ -1440,9 +1598,9 @@ class CameraGui(ctk.CTkFrame):
             self.update_playbackMenu()
 
         # HUD bank offsets (optional buttons)
-        elif action == "bank_minus":
+        elif action == "bank_minus" and self.hud_marker is not None:
             self.hud_marker.cam_bank_offset -= 0.1
-        elif action == "bank_plus":
+        elif action == "bank_plus" and self.hud_marker is not None:
             self.hud_marker.cam_bank_offset += 0.1
 
         # Time offset adjustments (optional buttons)
@@ -1451,7 +1609,7 @@ class CameraGui(ctk.CTkFrame):
             (delta,) = args
             self._on_adjust_offset(float(delta))
         elif action == "persist_offset":
-            self._on_persist_offset()
+            self.write_offset_csv()
 
         return curr_idx, wall_start
 
@@ -1504,322 +1662,247 @@ class CameraGui(ctk.CTkFrame):
             return "persist_offset", ()
         return None, None
 
-    def getEntryValue(self):
-        try:
-            self.camConfig.secondsBetweenImages = float(self.timeBetweenImgsEntry.get())
-        except ValueError:
-            self.camConfig.secondsBetweenImages = 1.0
-            self.timeBetweenImgsEntry.delete(0, ctk.END)
-            self.timeBetweenImgsEntry.configure(placeholder_text='1')
-        if self.camConfig.secondsBetweenImages <= 0.0:
-            self.timeBetweenImgsEntry.delete(0, ctk.END)
-            self.timeBetweenImgsEntry.configure(placeholder_text='1')
-            self.camConfig.secondsBetweenImages = 1.0
+    def update_playbackMenu(self):
+        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
+            def mode(pauseStatus, playbackSpeed):
+                if pauseStatus:
+                    return 'Pause'
+                if playbackSpeed < 0:
+                    return "Rewind"
+                return "Play"
 
-    def _gather_annotated_frames(self) -> list[NDArray]:
-        directory = Path(self.camConfig.imageFilepath).parent
-        self.populate_idsTimes(str(directory))
+            self.playbackModeText.set(
+                value=f"Playback Mode: FPS\n \
+                    Target FPS: {self.camConfig.target_fps:.2f}\n{mode(self.pause, self.playback.speed)}")
+        else:
+            self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
 
-        paths = []
-        for rec in self.ImageTimeReader.idsTimes:
-            p = Path(rec[0])
-            paths.append(p if p.is_absolute() else (directory / p))
+    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t) -> float:
+        """
+        Re-anchor wall_start so the current frame stays fixed when switching modes,
+        including while reversing. Uses time.monotonic() to match the main loop.
+        """
+        now = time.monotonic()
 
-        try:
-            import pandas as pd
-            offset_dict = pd.read_csv(directory / '__TIME_OFFSET.csv')
-            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
-        except FileNotFoundError:
-            self.camConfig.cam_to_log_time_offset = 0.0
+        if new_mode == PlaybackSpeed.Real_time:
+            # Map wall clock to log time (direction-aware)
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if self.last_nonzero_sign < 0:
+                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
+                return now - (tN - t[curr_idx]) / rs
+            else:
+                # forward: (now - wall_start)*rs == t[curr_idx] - t0
+                return now - (t[curr_idx] - t0) / rs
 
-        cv_imgs = []
-        start = self.camConfig.start_export_idx
-        end = self.camConfig.end_export_idx + 1
-        for idx, img_path in zip(range(start, end), paths[start:end]):
-            frame = cv2.imread(str(img_path))
-            ts = self.ImageTimeReader.idsTimes[idx][1]
-            cv_img = self.analyze_image(
-                frame,
-                img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
-                name=self.ImageTimeReader.idsTimes[idx][0],
-                display_in_realtime=False
-            )
-            if cv_img is not None:
-                cv_imgs.append(cv_img)
+        else:
+            # Fixed-FPS: anchor to the correct phase for direction
+            fps = max(0.001, float(self.camConfig.target_fps))
+            num_images = len(t)
+            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
+            return now - (phase / fps)
 
-        return cv_imgs
+    @staticmethod
+    def _rt_reanchor(now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
+        """Return a new wall_start so that the effective RT timeline still maps to t[curr_idx]."""
+        rt_rate = max(1e-6, float(rt_rate))
+        t0, tN = t[0], t[-1]
+        if sign < 0:
+            # reverse: tN - (now - wall_start)*rt_rate == t[curr_idx]
+            return now - (tN - t[curr_idx]) / rt_rate
+        else:
+            # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
+            return now - (t[curr_idx] - t0) / rt_rate
 
-    def exportToGif(self, exportToGifButton, exportToVidButton):
-        if self.making_gifOrVid:
+    def _on_reverse(self, loader, curr_idx: int, t):
+        """
+        Toggle playback direction without jumping the current frame.
+        Returns: (new_wall_start)
+        """
+        # New direction (+1 forward, -1 reverse)
+        self.last_nonzero_sign = -1 if self.last_nonzero_sign > 0 else 1
+
+        # If actively playing, flip speed sign and update stride, then realign buffer at current index.
+        if self.playback.speed != 0:
+            self.playback.speed = -self.playback.speed
+            s_abs = self._stride_for_speed(abs(self.playback.speed))
+            if s_abs > 0:
+                loader.set_stride(self.last_nonzero_sign * s_abs)
+                loader.seek(curr_idx, clear_buffer=True)
+
+        now = time.monotonic()
+
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            # --- Real-time: direction-aware re-anchor on the log timeline ---
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if self.last_nonzero_sign < 0:
+                # reverse:  tN - (now - wall_start)*rs == t[curr_idx]
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                # forward:  (now - wall_start)*rs == t[curr_idx] - t0
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            # --- Fixed-FPS: anchor MUST match the phase used in the loop ---
+            # In forward, phase = curr_idx; in reverse, phase = num_images - curr_idx.
+            fps = max(0.001, float(self.camConfig.target_fps))
+            period = 1.0 / fps
+            num_images = len(t)  # or use your existing num_images variable if already in scope
+            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
+            wall_start = now - period * phase
+
+        return wall_start
+
+    def _on_toggle_fps_mode(self):
+        """Swap Fixed_fps <-> Real_time, preserving perceived position."""
+        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
+        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
+            self.camConfig.rt_speed = 1.0
+
+    def _on_step_forward(self, curr_idx: int, num_images: int) -> int:
+        curr_idx = min(curr_idx + 1, num_images - 1)
+        self.playback.speed = 0.0
+        return curr_idx
+
+    def _on_step_back(self, curr_idx: int) -> int:
+        curr_idx = max(curr_idx - 1, 0)
+        self.playback.speed = 0.0
+        return curr_idx
+
+    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float) -> float:
+        self.pause = not self.pause
+        playing = (self.playback.speed != 0)
+        if playing:
+            self._resume_speed_mag = max(1.0, abs(self.playback.speed))
+            self.playback.speed = 0.0
+            return wall_start
+
+        prev_mag = getattr(self, "_resume_speed_mag", 1.0)
+        self.playback.speed = float(self.last_nonzero_sign or 1) * prev_mag
+
+        now = time.monotonic()
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if self.last_nonzero_sign < 0:
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            fps = max(0.001, float(self.camConfig.target_fps))
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
+        return wall_start
+
+    def _on_speed_up(self, curr_idx: int, t) -> float:
+        """
+        Increase playback speed.
+        - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
+        - Fixed-FPS: increase target_fps, then re-anchor to current frame index.
+        Returns new wall_start.
+        """
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            # adjust rate
+            prev_rt = self.camConfig.rt_speed
+            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * SPEED_STEP, 128.0)
+            if prev_rt < 0.99 and self.camConfig.rt_speed > 1.0:
+                self.camConfig.rt_speed = 1.0
+            # direction-aware reanchor
+            now = time.monotonic()
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if self.last_nonzero_sign < 0:
+                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                # forward: (now - wall_start)*rs == t[curr_idx] - t0
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            # Fixed-FPS
+            prev_tgt = self.camConfig.target_fps
+            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * SPEED_STEP, 320.0)
+            if prev_tgt < 19.9 and self.camConfig.target_fps > 20.0:
+                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
+            fps = max(0.001, float(self.camConfig.target_fps))
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
+        return wall_start
+
+    def _on_speed_down(self, curr_idx: int, t) -> float:
+        """
+        Decrease playback speed.
+        - RT mode: divide rt_speed, then re-anchor so current frame stays put.
+        - Fixed-FPS: decrease target_fps, then re-anchor to current frame index.
+        Returns new wall_start.
+        """
+        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
+            prev_rt = self.camConfig.rt_speed
+            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) * SPEED_STEP_INV, 0.01)
+            if prev_rt > 1.01 and self.camConfig.rt_speed < 1.0:
+                self.camConfig.rt_speed = 1.0
+            now = time.monotonic()
+            rs = max(1e-6, float(self.camConfig.rt_speed))
+            t0, tN = t[0], t[-1]
+            if self.last_nonzero_sign < 0:
+                wall_start = now - (tN - t[curr_idx]) / rs
+            else:
+                wall_start = now - (t[curr_idx] - t0) / rs
+        else:
+            prev_tgt = self.camConfig.target_fps
+            self.camConfig.target_fps = max(float(self.camConfig.target_fps) * SPEED_STEP_INV, 0.1)
+            if prev_tgt > 20.1 and self.camConfig.target_fps < 20.0:
+                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
+            fps = max(0.001, float(self.camConfig.target_fps))
+            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
+            wall_start = time.monotonic() - (phase / fps)
+        return wall_start
+
+    def _on_mark_start(self, curr_idx: int):
+        self.camConfig.start_export_idx = curr_idx
+        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
+        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.saveToCache()
+
+    def _on_mark_end(self, curr_idx):
+        self.camConfig.end_export_idx = curr_idx
+        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
+            self.camConfig.end_export_idx = max(0, self.camConfig.end_export_idx - 1)
+        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
+        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
+        self.saveToCache()
+
+    def _on_adjust_offset(self, delta: float):
+        self.camConfig.cam_to_log_time_offset += float(delta)
+
+    def write_offset_csv(self):
+        if self.hud_marker is None:
             return
 
-        exportToGifButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
-        exportToVidButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
-        self.making_gifOrVid = True
+        self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
+        out_csv = Path(self.camConfig.hud_data_filepath)
+        import pandas as pd
+        pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
 
-        t = threading.Thread(target=self.exportToGif_worker,
-                             daemon=True,
-                             args=(exportToGifButton, exportToVidButton))
-        t.start()
+        LOG.info(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
+        self.camConfig.cam_to_log_time_offset = 0.0
 
-    def exportToVid(self, exportToGifButton, exportToVidButton):
-        if self.making_gifOrVid:
-            return
-
-        exportToGifButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
-        exportToVidButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
-        self.making_gifOrVid = True
-
-        t = threading.Thread(target=self.exportToVid_worker,
-                             daemon=True,
-                             args=(exportToGifButton, exportToVidButton))
-        t.start()
-
-    def exportToGif_worker(self,
-                           exportToGifButton, exportToVidButton):
-        try:
-            frames = self._gather_annotated_frames()
-            # from support.io.convert_to_gif import make_gif
-            # make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
-            from support.io.convert_to_gif import make_apng
-            make_apng(frames, 60, infinite=True, quality=self.camConfig.export_quality)
-        finally:
-            self.after(0, self._exportToGifOrVid_done,
-                       exportToGifButton, exportToVidButton)
-
-    def exportToVid_worker(self,
-                           exportToGifButton, exportToVidButton):
-        try:
-            frames = self._gather_annotated_frames()
-            h, w = frames[0].shape[:2]
-            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-            out = cv2.VideoWriter('output_video.mp4', fourcc, 10, (w, h))
-            for f in frames:
-                out.write(f)
-            out.release()
-        finally:
-            self.after(0, self._exportToGifOrVid_done,
-                       exportToGifButton, exportToVidButton)
-
-    def _exportToGifOrVid_done(self,
-                               exportToGifButton, exportToVidButton):
-        exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
-        exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
-        self.making_gifOrVid = False
-
-    def startStreamToggle(self):
-        if self._thread is None or not self._thread.is_alive():  # thread not running
-            self.startStreamOn()
-            self.stream_running_var.set(True)
-            return True
-
-        self.startStreamOffBool()
-        self.stream_running_var.set(False)
-        return False
-
-    def startStreamOn(self):
-        self.showWindow = True
-        self.threadStopper = utils.ThreadStopper()
-        self.stream_running_var.set(True)
-        self._thread = threading.Thread(target=self.run, daemon=True)
-        self._thread.start()
-
-    def startStreamOffBool(self):
-        self.showWindow = False
-        self.stream_running_var.set(False)
-
-    def startStreamOff(self):
-        cv2.waitKey(1)
-
-        self.threadStopper.set()
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass  # Window not yet open
-
-        if self.vc is not None and self.vc.isOpened():
-            self.vc.release()
-            self.vc = None
-
-        # Only join if we're on a different thread than the worker.
-        if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
-            self._thread.join(timeout=1.0)
-        self._thread = None
-
-        if not self.shutting_down:
-            self.showWindow = False
-
-    def screenshot(self):
-        self.screenshot_impending = True
-        self.screenshotButton.configure(fg_color=clr.CTK_BLACK)
-        self.after(500, lambda: self.screenshotButton.configure(fg_color=clr.CTK_GREEN))  # type: ignore[call-arg]
-
-    def recordOn(self):
-        self.recordButton.configure(fg_color=clr.CTK_GREEN, text='Saving Imagery', hover_color=clr.CTK_NAVY,
-                                    command=self.recordOff)
-        self.recording = True
-
-    def recordOff(self):
-        self.recordButton.configure(fg_color=clr.CTK_BUTTON_RED, text=f'Saved Imagery: #{self.img_idx}',
-                                    hover_color=clr.CTK_BLUE,
-                                    command=self.recordOn)
-        self.recording = False
-
-    def print3DTruthPointsOnce(self):
-        self.print3DTruthOnce = True
-
-    def createDetector(self):
-        if self.detector is None:
-            self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
-            self.arucoParams = cv2.aruco.DetectorParameters()
-            self.arucoParams.adaptiveThreshWinSizeMin = 5
-            self.arucoParams.adaptiveThreshWinSizeMax = 35
-            self.arucoParams.adaptiveThreshWinSizeStep = 5
-            self.arucoParams.minMarkerPerimeterRate = 0.02  # or higher if tags are big
-            self.arucoParams.maxMarkerPerimeterRate = 1.0
-            self.arucoParams.cornerRefinementMinAccuracy = 0.1  # or 0.2
-            self.arucoParams.cornerRefinementMaxIterations = 20
-        self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
-
-    def run_detectSingleImage(self):
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
-        while (not self.threadStopper.is_set()
-               and self._window_is_open()
-               and self.showWindow):
-
-            self.analyze_image(frame)
-
-            key = cv2.waitKey(1)
-            if key == 27:
-                self.threadStopper.set()
-                break
-
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass
-        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-
-    def run(self):
-
-        if self.camConfig.imageSource == ImageSource.Camera_Stream:
-            self.run_video_stream()
-        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.run_folder_reader()
-        elif self.camConfig.imageSource == ImageSource.Static_Image:
-            self.run_detectSingleImage()
-
-    def run_video_stream(self):
-
-        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
-
-        self.vc.set(cv2.CAP_PROP_FPS, 60)
-
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        rval, self.curr_frame = self.vc.read()
-        if rval:
-            cv2.resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
-            self.lastHeight = self.curr_frame.shape[0]
-            self.lastWidth = self.curr_frame.shape[1]
-
-        stop_display_time = None
-
-        while (rval and not self.threadStopper.is_set() and
-               self.showWindow and not self.making_gifOrVid):
-            rval, frame = self.vc.read()
-
-            if stop_display_time is not None:
-                self._draw_chessboard_state(frame)
-
-            self.analyze_image(frame)
-            key = cv2.waitKey(1)
-
-            if key == 27:  # exit on ESC
-                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                self.threadStopper.set()
-                break
-
-            new_time = self._handle_chessboard_hotkeys(key)
-            if new_time is not None:
-                stop_display_time = new_time
-
-            if stop_display_time is not None and time.monotonic() > stop_display_time:
-                stop_display_time = None
-                print('Time out')
-
-            if not self._window_is_open():
-                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                self.threadStopper.set()
-                break
-
-        # Minimal teardown in the worker; the UI thread will handle buttons/state.
-        if self.vc is not None and self.vc.isOpened():
-            self.vc.release()
-            self.vc = None
-
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass
-
-        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-        return
-
-    def _draw_chessboard_state(self, frame):
-        width, height, _ = frame.shape
-        org1 = (int(width * 0.1), int(height * 0.20))
-        org2 = (int(width * 0.1), int(height * 0.25))
-
-        instr_text_a = f'{self._cb_pattern[0]} inner row corners'
-        instr_text_b = f'{self._cb_pattern[1]} inner col corners'
-
-        # Draw on A
-        cv2.putText(frame, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
-        cv2.putText(frame, instr_text_a, org1,
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
-        cv2.putText(frame, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
-        cv2.putText(frame, instr_text_b, org2,
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
-
-    def _handle_chessboard_hotkeys(self, key: int):
-
-        # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
-        changed = False
-
-        if key == ord('4'):  # fewer columns
-            if self._cb_pattern[0] > 3:
-                self._cb_pattern[0] -= 1
-                changed = True
-
-        elif key == ord('6'):  # more columns
-            self._cb_pattern[0] += 1
-            changed = True
-
-        elif key == ord('8'):  # more rows
-            self._cb_pattern[1] += 1
-            changed = True
-
-        elif key == ord('2'):  # fewer rows
-            if self._cb_pattern[1] > 3:
-                self._cb_pattern[1] -= 1
-                changed = True
-
-        elif key == ord('r'):  # optional: reset to default
-            self._cb_pattern[:] = [11, 8]
-            changed = True
-
-        if changed:
-            # force an immediate re-detect instead of waiting for throttle
-            self._cb_last_ts = 0.0
-            # clear cached result so you don't draw stale corners
-            self._cb_last_found = False
-            self._cb_last_corners = None
-            return time.monotonic() + 2
-
-        return None
+    @staticmethod
+    def _make_timebase(ts_raw, fallback_fps, n):
+        t = np.array([np.nan if v is None else float(v) for v in ts_raw], dtype='float64')
+        if n == 0:  # <-- guard
+            return t
+        if np.all(np.isnan(t)):
+            step = 1.0 / max(1e-6, float(fallback_fps))
+            t = np.arange(n, dtype='float64') * step
+        else:
+            nans = np.isnan(t)
+            if nans.any():
+                notn = ~nans
+                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
+        t -= float(t[0])
+        return t
 
     @staticmethod
     def _stride_for_speed(speed_abs: float) -> float:
@@ -1829,6 +1912,14 @@ class CameraGui(ctk.CTkFrame):
         if s == 1:
             return 1
         return min(8.0, s)
+
+    @staticmethod
+    def _poll_keys(max_ms: int = 8) -> list[int]:
+        # One-shot poll: wait up to max_ms for a key
+        k = cv2.waitKey(max_ms) & 0xFF
+        if k not in (0, 0xFF, 255, -1):
+            return [k]
+        return []
 
     def populate_idsTimes(self, directory):
         d = Path(directory)
@@ -1841,14 +1932,6 @@ class CameraGui(ctk.CTkFrame):
             image_list = data.natural_sort([str(p) for p in image_list])
             for image in image_list:
                 self.ImageTimeReader.idsTimes.append([image, None])
-
-    @staticmethod
-    def _poll_keys(max_ms: int = 8) -> list[int]:
-        # One-shot poll: wait up to max_ms for a key
-        k = cv2.waitKey(max_ms) & 0xFF
-        if k not in (0, 0xFF, 255, -1):
-            return [k]
-        return []
 
     @staticmethod
     def load_time_offset(directory):
@@ -1875,42 +1958,6 @@ class CameraGui(ctk.CTkFrame):
 
         return paths, t
 
-    def run_folder_reader_profiled(self):
-        import cProfile
-        import pstats
-
-        prof = cProfile.Profile()
-        try:
-            prof.enable()
-            self.run_folder_reader()
-        finally:
-            prof.disable()
-            prof.dump_stats("run_folder_reader.prof")
-
-            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            print("\n=== superCalibrateCamera functions ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== run_folder_reader / analyze_image ===")
-            stats.print_stats("run_folder_reader")
-            stats.print_stats("analyze_image")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            # Narrow view: only functions from your GUI modules
-            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== CustomTkinter / Tk wrappers ===")
-            stats.print_stats("customtkinter")
-            stats.print_stats("ctk")
-            stats.print_stats("tkinter")
-
     def _window_is_open(self) -> bool:
         try:
             return cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) >= 1
@@ -1918,6 +1965,11 @@ class CameraGui(ctk.CTkFrame):
             return False
 
     def run_folder_reader(self):
+        """Run the main folder-based playback and analysis loop.
+
+        Supports real-time and fixed-FPS playback, queued UI commands, frame
+        seeking, export bounds, overlays, and cached pause behavior.
+        """
         try:
             cv2.destroyWindow(self.windowName)
         except cv2.error:
@@ -2195,255 +2247,267 @@ class CameraGui(ctk.CTkFrame):
             self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
             loader.stop()
 
-    def update_playbackMenu(self):
-        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-            def mode(pauseStatus, playbackSpeed):
-                if pauseStatus:
-                    return 'Pause'
-                if playbackSpeed < 0:
-                    return "Rewind"
-                return "Play"
+    def startStreamToggle(self):
+        if self._thread is None or not self._thread.is_alive():  # thread not running
+            self.startStreamOn()
+            self.stream_running_var.set(True)
+            return True
 
-            self.playbackModeText.set(
-                value=f"Playback Mode: FPS\n \
-                    Target FPS: {self.camConfig.target_fps:.2f}\n{mode(self.pause, self.playback.speed)}")
-        else:
-            self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
+        self.startStreamOffBool()
+        self.stream_running_var.set(False)
+        return False
 
-    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t) -> float:
-        """
-        Re-anchor wall_start so the current frame stays fixed when switching modes,
-        including while reversing. Uses time.monotonic() to match the main loop.
-        """
-        now = time.monotonic()
+    def startStreamOn(self):
+        self.showWindow = True
+        self.threadStopper = utils.ThreadStopper()
+        self.stream_running_var.set(True)
+        self._thread = threading.Thread(target=self.run, daemon=True)
+        self._thread.start()
 
-        if new_mode == PlaybackSpeed.Real_time:
-            # Map wall clock to log time (direction-aware)
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
-                return now - (tN - t[curr_idx]) / rs
-            else:
-                # forward: (now - wall_start)*rs == t[curr_idx] - t0
-                return now - (t[curr_idx] - t0) / rs
+    def startStreamOffBool(self):
+        self.showWindow = False
+        self.stream_running_var.set(False)
 
-        else:
-            # Fixed-FPS: anchor to the correct phase for direction
-            fps = max(0.001, float(self.camConfig.target_fps))
-            num_images = len(t)
-            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            return now - (phase / fps)
+    def startStreamOff(self):
+        cv2.waitKey(1)
 
-    @staticmethod
-    def _rt_reanchor(now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
-        """Return a new wall_start so that the effective RT timeline still maps to t[curr_idx]."""
-        rt_rate = max(1e-6, float(rt_rate))
-        t0, tN = t[0], t[-1]
-        if sign < 0:
-            # reverse: tN - (now - wall_start)*rt_rate == t[curr_idx]
-            return now - (tN - t[curr_idx]) / rt_rate
-        else:
-            # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
-            return now - (t[curr_idx] - t0) / rt_rate
+        self.threadStopper.set()
+        try:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error:
+            pass  # Window not yet open
 
-    def _on_reverse(self, loader, curr_idx: int, t):
-        """
-        Toggle playback direction without jumping the current frame.
-        Returns: (new_wall_start)
-        """
-        # New direction (+1 forward, -1 reverse)
-        self.last_nonzero_sign = -1 if self.last_nonzero_sign > 0 else 1
+        if self.vc is not None and self.vc.isOpened():
+            self.vc.release()
+            self.vc = None
 
-        # If actively playing, flip speed sign and update stride, then realign buffer at current index.
-        if self.playback.speed != 0:
-            self.playback.speed = -self.playback.speed
-            s_abs = self._stride_for_speed(abs(self.playback.speed))
-            if s_abs > 0:
-                loader.set_stride(self.last_nonzero_sign * s_abs)
-                loader.seek(curr_idx, clear_buffer=True)
+        # Only join if we're on a different thread than the worker.
+        if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
+            self._thread.join(timeout=1.0)
+        self._thread = None
 
-        now = time.monotonic()
+        if not self.shutting_down:
+            self.showWindow = False
 
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            # --- Real-time: direction-aware re-anchor on the log timeline ---
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse:  tN - (now - wall_start)*rs == t[curr_idx]
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                # forward:  (now - wall_start)*rs == t[curr_idx] - t0
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            # --- Fixed-FPS: anchor MUST match the phase used in the loop ---
-            # In forward, phase = curr_idx; in reverse, phase = num_images - curr_idx.
-            fps = max(0.001, float(self.camConfig.target_fps))
-            period = 1.0 / fps
-            num_images = len(t)  # or use your existing num_images variable if already in scope
-            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = now - period * phase
+    def run_detectSingleImage(self):
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+        frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
+        while (not self.threadStopper.is_set()
+               and self._window_is_open()
+               and self.showWindow):
 
-        return wall_start
+            self.analyze_image(frame)
 
-    @staticmethod
-    def _make_timebase(ts_raw, fallback_fps, n):
-        t = np.array([np.nan if v is None else float(v) for v in ts_raw], dtype='float64')
-        if n == 0:  # <-- guard
-            return t
-        if np.all(np.isnan(t)):
-            step = 1.0 / max(1e-6, float(fallback_fps))
-            t = np.arange(n, dtype='float64') * step
-        else:
-            nans = np.isnan(t)
-            if nans.any():
-                notn = ~nans
-                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
-        t -= float(t[0])
-        return t
+            key = cv2.waitKey(1)
+            if key == 27:
+                self.threadStopper.set()
+                break
+
+        try:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error:
+            pass
+        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
+
+    def run(self):
+
+        if self.camConfig.imageSource == ImageSource.Camera_Stream:
+            self.run_video_stream()
+        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
+            self.run_folder_reader()
+        elif self.camConfig.imageSource == ImageSource.Static_Image:
+            self.run_detectSingleImage()
+
+    def run_video_stream(self):
+
+        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
+
+        self.vc.set(cv2.CAP_PROP_FPS, 60)
+
+        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+        rval, self.curr_frame = self.vc.read()
+        if rval:
+            cv2.resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
+            self.lastHeight = self.curr_frame.shape[0]
+            self.lastWidth = self.curr_frame.shape[1]
+
+        stop_display_time = None
+
+        while (rval and not self.threadStopper.is_set() and
+               self.showWindow and not self.making_gifOrVid):
+            rval, frame = self.vc.read()
+
+            if stop_display_time is not None:
+                self._draw_chessboard_state(frame)
+
+            self.analyze_image(frame)
+            key = cv2.waitKey(1)
+
+            if key == 27:  # exit on ESC
+                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
+                self.threadStopper.set()
+                break
+
+            new_time = self._handle_chessboard_hotkeys(key)
+            if new_time is not None:
+                stop_display_time = new_time
+
+            if stop_display_time is not None and time.monotonic() > stop_display_time:
+                stop_display_time = None
+                print('Time out')
+
+            if not self._window_is_open():
+                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
+                self.threadStopper.set()
+                break
+
+        # Minimal teardown in the worker; the UI thread will handle buttons/state.
+        if self.vc is not None and self.vc.isOpened():
+            self.vc.release()
+            self.vc = None
+
+        try:
+            cv2.destroyWindow(self.windowName)
+        except cv2.error:
+            pass
+
+        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
+        return
 
     def _on_worker_exit(self):
         # Mark no live worker and reset run-state
         self._thread = None
         self.showWindow = False
 
-    # --- Key action helpers (CameraGui) ---
+    def getEntryValue(self):
+        """Parse and validate the export frame-spacing entry from the UI."""
+        try:
+            self.camConfig.secondsBetweenImages = float(self.timeBetweenImgsEntry.get())
+        except ValueError:
+            self.camConfig.secondsBetweenImages = 1.0
+            self.timeBetweenImgsEntry.delete(0, ctk.END)
+            self.timeBetweenImgsEntry.configure(placeholder_text='1')
+        if self.camConfig.secondsBetweenImages <= 0.0:
+            self.timeBetweenImgsEntry.delete(0, ctk.END)
+            self.timeBetweenImgsEntry.configure(placeholder_text='1')
+            self.camConfig.secondsBetweenImages = 1.0
 
-    def _on_toggle_fps_mode(self):
-        """Swap Fixed_fps <-> Real_time, preserving perceived position."""
-        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
-        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-            self.camConfig.rt_speed = 1.0
+    def _gather_annotated_frames(self) -> list[NDArray]:
+        """Render the selected export frame range into annotated image arrays.
 
-    def _on_step_forward(self, curr_idx: int, num_images: int) -> int:
-        curr_idx = min(curr_idx + 1, num_images - 1)
-        self.playback.speed = 0.0
-        return curr_idx
-
-    def _on_step_back(self, curr_idx: int) -> int:
-        curr_idx = max(curr_idx - 1, 0)
-        self.playback.speed = 0.0
-        return curr_idx
-
-    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float) -> float:
-        self.pause = not self.pause
-        playing = (self.playback.speed != 0)
-        if playing:
-            self._resume_speed_mag = max(1.0, abs(self.playback.speed))
-            self.playback.speed = 0.0
-            return wall_start
-
-        prev_mag = getattr(self, "_resume_speed_mag", 1.0)
-        self.playback.speed = float(self.last_nonzero_sign or 1) * prev_mag
-
-        now = time.monotonic()
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
-
-    def _on_speed_up(self, curr_idx: int, t) -> float:
+        Loads each source frame, applies the configured analysis pipeline, and
+        returns a list of processed images suitable for GIF or video export.
         """
-        Increase playback speed.
-        - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
-        - Fixed-FPS: increase target_fps, then re-anchor to current frame index.
-        Returns new wall_start.
-        """
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            # adjust rate
-            prev_rt = self.camConfig.rt_speed
-            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * SPEED_STEP, 128.0)
-            if prev_rt < 0.99 and self.camConfig.rt_speed > 1.0:
-                self.camConfig.rt_speed = 1.0
-            # direction-aware reanchor
-            now = time.monotonic()
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                # forward: (now - wall_start)*rs == t[curr_idx] - t0
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            # Fixed-FPS
-            prev_tgt = self.camConfig.target_fps
-            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * SPEED_STEP, 320.0)
-            if prev_tgt < 19.9 and self.camConfig.target_fps > 20.0:
-                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
+        directory = Path(self.camConfig.imageFilepath).parent
+        self.populate_idsTimes(str(directory))
 
-    def _on_speed_down(self, curr_idx: int, t) -> float:
-        """
-        Decrease playback speed.
-        - RT mode: divide rt_speed, then re-anchor so current frame stays put.
-        - Fixed-FPS: decrease target_fps, then re-anchor to current frame index.
-        Returns new wall_start.
-        """
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            prev_rt = self.camConfig.rt_speed
-            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) * SPEED_STEP_INV, 0.01)
-            if prev_rt > 1.01 and self.camConfig.rt_speed < 1.0:
-                self.camConfig.rt_speed = 1.0
-            now = time.monotonic()
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            prev_tgt = self.camConfig.target_fps
-            self.camConfig.target_fps = max(float(self.camConfig.target_fps) * SPEED_STEP_INV, 0.1)
-            if prev_tgt > 20.1 and self.camConfig.target_fps < 20.0:
-                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
+        paths = []
+        for rec in self.ImageTimeReader.idsTimes:
+            p = Path(rec[0])
+            paths.append(p if p.is_absolute() else (directory / p))
 
-    def _on_mark_start(self, curr_idx: int):
-        self.camConfig.start_export_idx = curr_idx
-        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
-        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-        self.saveToCache()
+        try:
+            import pandas as pd
+            offset_dict = pd.read_csv(directory / '__TIME_OFFSET.csv')
+            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
+        except FileNotFoundError:
+            self.camConfig.cam_to_log_time_offset = 0.0
 
-    def _on_mark_end(self, curr_idx):
-        self.camConfig.end_export_idx = curr_idx
-        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-            self.camConfig.end_export_idx = max(0, self.camConfig.end_export_idx - 1)
-        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-        self.saveToCache()
+        cv_imgs = []
+        start = self.camConfig.start_export_idx
+        end = self.camConfig.end_export_idx + 1
+        for idx, img_path in zip(range(start, end), paths[start:end]):
+            frame = cv2.imread(str(img_path))
+            ts = self.ImageTimeReader.idsTimes[idx][1]
+            cv_img = self.analyze_image(
+                frame,
+                img_time=(ts + self.camConfig.cam_to_log_time_offset if ts is not None else None),
+                name=self.ImageTimeReader.idsTimes[idx][0],
+                display_in_realtime=False
+            )
+            if cv_img is not None:
+                cv_imgs.append(cv_img)
 
-    def _on_adjust_offset(self, delta: float):
-        self.camConfig.cam_to_log_time_offset += float(delta)
+        return cv_imgs
 
-    def _on_persist_offset(self):
-        offset = deepcopy(self.camConfig.cam_to_log_time_offset)
-        self.write_offset_csv()
-        print(f"Saved offset {offset:+.3f}s to __TIME_OFFSET.csv")
+    def exportToGif(self, exportToGifButton, exportToVidButton):
+        """Begin asynchronous GIF/APNG export for the current frame range."""
+        if self.making_gifOrVid:
+            return
 
-    def write_offset_csv(self):
-        self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
-        out_csv = Path(self.camConfig.hud_data_filepath)
-        import pandas as pd
-        pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
+        exportToGifButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
+        exportToVidButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
+        self.making_gifOrVid = True
 
-        self.camConfig.cam_to_log_time_offset = 0.0
+        t = threading.Thread(target=self.exportToGif_worker,
+                             daemon=True,
+                             args=(exportToGifButton, exportToVidButton))
+        t.start()
+
+    def exportToVid(self, exportToGifButton, exportToVidButton):
+        """Begin asynchronous video export for the current frame range."""
+        if self.making_gifOrVid:
+            return
+
+        exportToGifButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
+        exportToVidButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
+        self.making_gifOrVid = True
+
+        t = threading.Thread(target=self.exportToVid_worker,
+                             daemon=True,
+                             args=(exportToGifButton, exportToVidButton))
+        t.start()
+
+    def exportToGif_worker(self,
+                           exportToGifButton, exportToVidButton):
+        try:
+            frames = self._gather_annotated_frames()
+            # from support.io.convert_to_gif import make_gif
+            # make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
+            from support.io.convert_to_gif import make_apng
+            make_apng(frames, 60, infinite=True, quality=self.camConfig.export_quality)
+        finally:
+            self.after(0, self._exportToGifOrVid_done,
+                       exportToGifButton, exportToVidButton)
+
+    def exportToVid_worker(self,
+                           exportToGifButton, exportToVidButton):
+        try:
+            frames = self._gather_annotated_frames()
+            h, w = frames[0].shape[:2]
+            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
+            out = cv2.VideoWriter('output_video.mp4', fourcc, 10, (w, h))
+            for f in frames:
+                out.write(f)
+            out.release()
+        finally:
+            self.after(0, self._exportToGifOrVid_done,
+                       exportToGifButton, exportToVidButton)
+
+    def _exportToGifOrVid_done(self,
+                               exportToGifButton, exportToVidButton):
+        exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        self.making_gifOrVid = False
+
+    def screenshot(self):
+        self.screenshot_impending = True
+        self.screenshotButton.configure(fg_color=clr.CTK_BLACK)
+        self.after(500, lambda: self.screenshotButton.configure(fg_color=clr.CTK_GREEN))  # type: ignore[call-arg]
+
+    def recordOn(self):
+        self.recordButton.configure(fg_color=clr.CTK_GREEN, text='Saving Imagery', hover_color=clr.CTK_NAVY,
+                                    command=self.recordOff)
+        self.recording = True
+
+    def recordOff(self):
+        self.recordButton.configure(fg_color=clr.CTK_BUTTON_RED, text=f'Saved Imagery: #{self.img_idx}',
+                                    hover_color=clr.CTK_BLUE,
+                                    command=self.recordOn)
+        self.recording = False
+
+    def print3DTruthPointsOnce(self):
+        self.print3DTruthOnce = True
 
     def analyze_image(self,
                       frame,
@@ -2451,6 +2515,13 @@ class CameraGui(ctk.CTkFrame):
                       name=None,
                       display_in_realtime=True,
                       box_around=False) -> NDArray | None:
+
+        """Run the queued processing pipeline on a frame and optionally display it.
+
+        Creates a per-frame context object, applies enabled image-processing
+        steps in order, adds fixed overlays, and either displays the result or
+        returns a processed image buffer for export.
+        """
 
         if frame is None:
             return
@@ -2478,7 +2549,10 @@ class CameraGui(ctk.CTkFrame):
 
         ######################################################
         for func, args in self.list_of_image_process_functors:
-            func(frame, markup_frame, ctx, args)
+            step_args = args if isinstance(args, dict) else {}
+            if not bool(step_args.get("state", True)):
+                continue
+            func(frame, markup_frame, ctx, step_args)
 
         if box_around and not self.screenshot_impending:
             self.draw_boxAround(frame, markup_frame, ctx, ())
@@ -2494,6 +2568,60 @@ class CameraGui(ctk.CTkFrame):
         else:
             return np.ascontiguousarray(markup_frame).copy()
         ######################################################
+
+    def cleanup(self, markupFrame, name=None):
+
+        self.potentialResize(markupFrame)
+
+        cv2.imshow(self.windowName if name is None else name,
+                   cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
+
+        if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
+                self.screenshot_impending):
+            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), markupFrame)
+            self.img_idx += 1
+            self.lastImageTime = time.time()
+            self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
+            self.screenshot_impending = False
+
+    @staticmethod
+    def parse_args(args: dict, obj, *, ignore_unknown=True):
+        """
+        keymap maps incoming keys -> dataclass field names.
+        Mutates obj in-place; returns obj.
+        """
+        from dataclasses import is_dataclass, fields
+        if not is_dataclass(obj) or isinstance(obj, type):
+            raise TypeError("Expected a dataclass instance")
+
+        valid_fields = {f.name for f in fields(obj)}
+
+        for in_key, value in args.items():
+            if in_key not in obj.KEYMAP:
+                if not ignore_unknown:
+                    raise KeyError(f"Unknown incoming key: {in_key!r}")
+                continue
+
+            field_name = obj.KEYMAP[in_key]
+            if field_name not in valid_fields:
+                raise KeyError(f"keymap maps {in_key!r} -> {field_name!r}, but that field doesn't exist")
+
+            setattr(obj, field_name, value)
+
+        return obj
+
+    def createDetector(self):
+        if self.detector is None:
+            self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
+            self.arucoParams = cv2.aruco.DetectorParameters()
+            self.arucoParams.adaptiveThreshWinSizeMin = 5
+            self.arucoParams.adaptiveThreshWinSizeMax = 35
+            self.arucoParams.adaptiveThreshWinSizeStep = 5
+            self.arucoParams.minMarkerPerimeterRate = 0.02  # or higher if tags are big
+            self.arucoParams.maxMarkerPerimeterRate = 1.0
+            self.arucoParams.cornerRefinementMinAccuracy = 0.1  # or 0.2
+            self.arucoParams.cornerRefinementMaxIterations = 20
+        self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
     def draw_playbackStats(self, frame,
                            markupFrame,
@@ -2526,32 +2654,6 @@ class CameraGui(ctk.CTkFrame):
                   args) -> None:
         from support.viz.HUD_draw import draw_name_on_image
         draw_name_on_image(os.path.basename(ctx.name), markupFrame)
-
-    @staticmethod
-    def parse_args(args: dict, obj, *, ignore_unknown=True):
-        """
-        keymap maps incoming keys -> dataclass field names.
-        Mutates obj in-place; returns obj.
-        """
-        from dataclasses import is_dataclass, fields
-        if not is_dataclass(obj) or isinstance(obj, type):
-            raise TypeError("Expected a dataclass instance")
-
-        valid_fields = {f.name for f in fields(obj)}
-
-        for in_key, value in args.items():
-            if in_key not in obj.KEYMAP:
-                if not ignore_unknown:
-                    raise KeyError(f"Unknown incoming key: {in_key!r}")
-                continue
-
-            field_name = obj.KEYMAP[in_key]
-            if field_name not in valid_fields:
-                raise KeyError(f"keymap maps {in_key!r} -> {field_name!r}, but that field doesn't exist")
-
-            setattr(obj, field_name, value)
-
-        return obj
 
     def draw_HUD(self, frame: NDArray,
                  markupFrame: NDArray,
@@ -2594,6 +2696,90 @@ class CameraGui(ctk.CTkFrame):
             self.curr_frame_gray = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
 
         self._checker_residual.draw_chessboard(markupFrame, self.curr_frame_gray, self._cb_pattern)
+
+    def _draw_chessboard_state(self, frame):
+        width, height, _ = frame.shape
+        org1 = (int(width * 0.1), int(height * 0.20))
+        org2 = (int(width * 0.1), int(height * 0.25))
+
+        instr_text_a = f'{self._cb_pattern[0]} inner row corners'
+        instr_text_b = f'{self._cb_pattern[1]} inner col corners'
+
+        # Draw on A
+        cv2.putText(frame, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        cv2.putText(frame, instr_text_a, org1,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+        cv2.putText(frame, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (0, 0, 0), 4)
+        cv2.putText(frame, instr_text_b, org2,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(width), (255, 255, 0), 1)
+
+    def _handle_chessboard_hotkeys(self, key: int):
+
+        # mimic CalBoardGenerator hotkeys: 4/6 adjust cols, 8/2 adjust rows
+        changed = False
+
+        if key == ord('4'):  # fewer columns
+            if self._cb_pattern[0] > 3:
+                self._cb_pattern[0] -= 1
+                changed = True
+
+        elif key == ord('6'):  # more columns
+            self._cb_pattern[0] += 1
+            changed = True
+
+        elif key == ord('8'):  # more rows
+            self._cb_pattern[1] += 1
+            changed = True
+
+        elif key == ord('2'):  # fewer rows
+            if self._cb_pattern[1] > 3:
+                self._cb_pattern[1] -= 1
+                changed = True
+
+        elif key == ord('r'):  # optional: reset to default
+            self._cb_pattern[:] = [11, 8]
+            changed = True
+
+        if changed:
+            # force an immediate re-detect instead of waiting for throttle
+            self._cb_last_ts = 0.0
+            # clear cached result so you don't draw stale corners
+            self._cb_last_found = False
+            self._cb_last_corners = None
+            return time.monotonic() + 2
+
+        return None
+
+    @staticmethod
+    def plotOnImg(markupFrame, points, names, color):
+        for idx, pxPt in enumerate(points):
+            offset = int(markupFrame.shape[0] * 0.02)
+            cv2.circle(markupFrame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
+            textLoc = (int(pxPt[0]) - offset, int(pxPt[1] - offset))
+            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]), (0, 0, 0),
+                        4)
+            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
+                        small_text(markupFrame.shape[0]), color, 2)
+
+    def potentialResize(self, markupFrame):
+        if not self._window_is_open():
+            return
+        x, y, width, height = cv2.getWindowImageRect(self.windowName)
+        aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]
+        if not self._window_is_open():
+            return
+
+        if not self.lastHeight == height and height != 0:
+            cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
+            self.lastHeight = height
+            self.lastWidth = int(height * aspectRatio)
+        elif not self.lastWidth == width and width != 0:
+            cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
+            self.lastWidth = width
+            self.lastHeight = int(width / aspectRatio)
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
@@ -2648,127 +2834,6 @@ class CameraGui(ctk.CTkFrame):
             LOG.info(b1_lne)
         finally:
             LOG.setLevel(curr_level)
-
-    def update_cube_map_vectors(self):
-        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
-        axes = {
-            'right': ([1, 0, 0], [0, -1, 0]),
-            'left': ([-1, 0, 0], [0, -1, 0]),
-            'top': ([0, -1, 0], [0, 0, -1]),
-            'bottom': ([0, 1, 0], [0, 0, 1]),
-            'front': ([0, 0, 1], [0, -1, 0]),
-            # 'back': ([0, 0, -1], [0, -1, 0]),
-        }
-
-        self.faces_dirs = {}
-        rng = np.linspace(-1, 1, self.face_size)
-        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
-
-        for name, (center, up) in axes.items():
-            center = np.array(center)
-            up = np.array(up)
-            # noinspection PyUnreachableCode
-            right = np.cross(center, up)
-
-            dirs = (
-                    center[None, None, :]
-                    + xx[..., None] * right[None, None, :]
-                    + yy[..., None] * up[None, None, :]
-            )
-            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
-            self.faces_dirs[name] = dirs.astype(np.float32)
-
-        # return faces
-        self.fisheye_to_cubemap_vectorized()
-
-    def update_frontFace_vector(self):
-        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
-        axes = {
-            'front': ([0, 0, 1], [0, -1, 0])
-        }
-
-        self.faces_dirs = {}
-        rng = np.linspace(-1, 1, self.face_size)
-        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
-
-        for name, (center, up) in axes.items():
-            center = np.array(center)
-            up = np.array(up)
-            # noinspection PyUnreachableCode
-            right = np.cross(center, up)
-
-            dirs = (
-                    center[None, None, :]
-                    + xx[..., None] * right[None, None, :]
-                    + yy[..., None] * up[None, None, :]
-            )
-            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
-            self.faces_dirs[name] = dirs.astype(np.float32)
-
-        # return faces
-        self.fisheye_to_cubemap_vectorized()
-
-    def fisheye_to_cubemap_vectorized(self):
-
-        self.map_x = {}
-        self.map_y = {}
-
-        for face, dirs in self.faces_dirs.items():
-            dirs_reshaped = dirs.reshape(-1, 1, 3)
-
-            # Only keep directions roughly facing the front hemisphere
-            forward_mask = dirs_reshaped[:, 0, 2] > 0  # Z > 0 means forward
-            valid_dirs = dirs_reshaped[forward_mask]
-
-            if valid_dirs.size > 0:
-                # Project valid directions
-                img_points, _ = cv2.fisheye.projectPoints(
-                    valid_dirs, np.zeros(3), np.zeros(3),
-                    self.calibration.getCameraMatrix(),
-                    self.calibration.getDistortion()
-                )
-                img_points = img_points.reshape(-1, 2)
-
-                # Prepare remap coordinates
-                full_img_points = np.full((self.face_size * self.face_size, 2), -1, dtype=np.float32)
-                full_img_points[forward_mask] = img_points
-
-                self.map_x[face] = full_img_points[:, 0].reshape(self.face_size, self.face_size)
-                self.map_y[face] = full_img_points[:, 1].reshape(self.face_size, self.face_size)
-
-    def apply_fisheye_faces(self, frame):
-        self.cubemap_faces = {}
-
-        for face in self.faces_dirs:
-            self.cubemap_faces[face] = self.remap(face, frame)
-
-    def remap(self, face, frame):
-        return cv2.remap(
-            frame, self.map_x[face], self.map_y[face],
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0))
-
-    def stitch_cubemap_faces(self, layout, cells=3):
-        """
-        Arrange the 6 cubemap faces into a 2x3 stitched layout.
-        Layout:
-            +--------+--------+--------+
-            |        |   top  |        |
-            +--------+--------+--------+
-            |  left   | front |  right |
-            +--------+--------+--------+
-            |        | bottom |        |
-            +--------+--------+--------+
-        """
-        stitched = np.zeros((cells * self.face_size, cells * self.face_size, 3), dtype=np.uint8)
-
-        for face, (row, col) in layout.items():
-            if face in self.cubemap_faces:
-                y, x = row * self.face_size, col * self.face_size
-                stitched[y:y + self.face_size, x:x + self.face_size] = self.cubemap_faces[face]
-
-        return stitched
 
     def undistort(self,
                   frame: NDArray,
@@ -3257,18 +3322,6 @@ class CameraGui(ctk.CTkFrame):
 
         return
 
-    @staticmethod
-    def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
-        """Convert OpenCV camera pose to your convention (proper rotation)."""
-        S_MODEL = np.diag([1., -1., 1.])  # det = -1
-        C_OURS_TO_CV = np.array([[0., -1., 0.],
-                                 [0., 0., 1.],
-                                 [1., 0., 0.]], dtype=float)
-        C_CV_TO_OURS = C_OURS_TO_CV.T
-        R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
-        t_ours = C_CV_TO_OURS @ t_cv
-        return mat2quat(R_ours.T), t_ours
-
     def detectHorizon(self, frame: NDArray,
                       markupFrame: NDArray,
                       ctx: GuiQueue.FrameCtx,
@@ -3562,46 +3615,171 @@ class CameraGui(ctk.CTkFrame):
 
         self.last_image = copy.deepcopy(self.curr_frame_gray)
 
-    def cleanup(self, markupFrame, name=None):
-
-        self.potentialResize(markupFrame)
-
-        cv2.imshow(self.windowName if name is None else name,
-                   cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
-
-        if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
-                self.screenshot_impending):
-            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), markupFrame)
-            self.img_idx += 1
-            self.lastImageTime = time.time()
-            self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
-            self.screenshot_impending = False
-
     @staticmethod
-    def plotOnImg(markupFrame, points, names, color):
-        for idx, pxPt in enumerate(points):
-            offset = int(markupFrame.shape[0] * 0.02)
-            cv2.circle(markupFrame, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
-            textLoc = (int(pxPt[0]) - offset, int(pxPt[1] - offset))
-            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]), (0, 0, 0),
-                        4)
-            cv2.putText(markupFrame, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]), color, 2)
+    def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
+        """Convert OpenCV camera pose to your convention (proper rotation)."""
+        S_MODEL = np.diag([1., -1., 1.])  # det = -1
+        C_OURS_TO_CV = np.array([[0., -1., 0.],
+                                 [0., 0., 1.],
+                                 [1., 0., 0.]], dtype=float)
+        C_CV_TO_OURS = C_OURS_TO_CV.T
+        R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
+        t_ours = C_CV_TO_OURS @ t_cv
+        return mat2quat(R_ours.T), t_ours
 
-    def potentialResize(self, markupFrame):
-        if not self._window_is_open():
-            return
-        x, y, width, height = cv2.getWindowImageRect(self.windowName)
-        aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]
-        if not self._window_is_open():
-            return
+    def run_folder_reader_profiled(self):
+        import cProfile
+        import pstats
 
-        if not self.lastHeight == height and height != 0:
-            cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
-            self.lastHeight = height
-            self.lastWidth = int(height * aspectRatio)
-        elif not self.lastWidth == width and width != 0:
-            cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
-            self.lastWidth = width
-            self.lastHeight = int(width / aspectRatio)
+        prof = cProfile.Profile()
+        try:
+            prof.enable()
+            self.run_folder_reader()
+        finally:
+            prof.disable()
+            prof.dump_stats("run_folder_reader.prof")
+
+            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            print("\n=== superCalibrateCamera functions ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== run_folder_reader / analyze_image ===")
+            stats.print_stats("run_folder_reader")
+            stats.print_stats("analyze_image")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            # Narrow view: only functions from your GUI modules
+            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== CustomTkinter / Tk wrappers ===")
+            stats.print_stats("customtkinter")
+            stats.print_stats("ctk")
+            stats.print_stats("tkinter")
+
+    def update_cube_map_vectors(self):
+        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
+        axes = {
+            'right': ([1, 0, 0], [0, -1, 0]),
+            'left': ([-1, 0, 0], [0, -1, 0]),
+            'top': ([0, -1, 0], [0, 0, -1]),
+            'bottom': ([0, 1, 0], [0, 0, 1]),
+            'front': ([0, 0, 1], [0, -1, 0]),
+            # 'back': ([0, 0, -1], [0, -1, 0]),
+        }
+
+        self.faces_dirs = {}
+        rng = np.linspace(-1, 1, self.face_size)
+        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
+
+        for name, (center, up) in axes.items():
+            center = np.array(center)
+            up = np.array(up)
+            # noinspection PyUnreachableCode
+            right = np.cross(center, up)
+
+            dirs = (
+                    center[None, None, :]
+                    + xx[..., None] * right[None, None, :]
+                    + yy[..., None] * up[None, None, :]
+            )
+            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
+            self.faces_dirs[name] = dirs.astype(np.float32)
+
+        # return faces
+        self.fisheye_to_cubemap_vectorized()
+
+    def update_frontFace_vector(self):
+        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
+        axes = {
+            'front': ([0, 0, 1], [0, -1, 0])
+        }
+
+        self.faces_dirs = {}
+        rng = np.linspace(-1, 1, self.face_size)
+        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
+
+        for name, (center, up) in axes.items():
+            center = np.array(center)
+            up = np.array(up)
+            # noinspection PyUnreachableCode
+            right = np.cross(center, up)
+
+            dirs = (
+                    center[None, None, :]
+                    + xx[..., None] * right[None, None, :]
+                    + yy[..., None] * up[None, None, :]
+            )
+            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
+            self.faces_dirs[name] = dirs.astype(np.float32)
+
+        # return faces
+        self.fisheye_to_cubemap_vectorized()
+
+    def fisheye_to_cubemap_vectorized(self):
+
+        self.cubemap_x = {}
+        self.cubemap_y = {}
+
+        for face, dirs in self.faces_dirs.items():
+            dirs_reshaped = dirs.reshape(-1, 1, 3)
+
+            # Only keep directions roughly facing the front hemisphere
+            forward_mask = dirs_reshaped[:, 0, 2] > 0  # Z > 0 means forward
+            valid_dirs = dirs_reshaped[forward_mask]
+
+            if valid_dirs.size > 0:
+                # Project valid directions
+                img_points, _ = cv2.fisheye.projectPoints(
+                    valid_dirs, np.zeros(3), np.zeros(3),
+                    self.calibration.getCameraMatrix(),
+                    self.calibration.getDistortion()
+                )
+                img_points = img_points.reshape(-1, 2)
+
+                # Prepare remap coordinates
+                full_img_points = np.full((self.face_size * self.face_size, 2), -1, dtype=np.float32)
+                full_img_points[forward_mask] = img_points
+
+                self.cubemap_x[face] = full_img_points[:, 0].reshape(self.face_size, self.face_size)
+                self.cubemap_y[face] = full_img_points[:, 1].reshape(self.face_size, self.face_size)
+
+    def apply_fisheye_faces(self, frame):
+        self.cubemap_faces = {}
+
+        for face in self.faces_dirs:
+            self.cubemap_faces[face] = self.remap(face, frame)
+
+    def remap(self, face, frame):
+        return cv2.remap(
+            frame, self.cubemap_x[face], self.cubemap_y[face],
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0))
+
+    def stitch_cubemap_faces(self, layout, cells=3):
+        """
+        Arrange the 6 cubemap faces into a 2x3 stitched layout.
+        Layout:
+            +--------+--------+--------+
+            |        |   top  |        |
+            +--------+--------+--------+
+            |  left   | front |  right |
+            +--------+--------+--------+
+            |        | bottom |        |
+            +--------+--------+--------+
+        """
+        stitched = np.zeros((cells * self.face_size, cells * self.face_size, 3), dtype=np.uint8)
+
+        for face, (row, col) in layout.items():
+            if face in self.cubemap_faces:
+                y, x = row * self.face_size, col * self.face_size
+                stitched[y:y + self.face_size, x:x + self.face_size] = self.cubemap_faces[face]
+
+        return stitched

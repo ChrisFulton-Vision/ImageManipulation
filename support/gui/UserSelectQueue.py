@@ -147,6 +147,8 @@ class _QueueRow:
     frame: ctk.CTkFrame
     var: ctk.StringVar
     dropdown: ctk.CTkOptionMenu
+    enabled_var: ctk.BooleanVar
+    enabled_chk: ctk.CTkCheckBox
     args_btn: ctk.CTkButton
     up_btn: ctk.CTkButton
     down_btn: ctk.CTkButton
@@ -317,6 +319,8 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         if args_override is not None:
             init_args = dict(args_override)
 
+        init_args.setdefault("state", True)
+
         dropdown = ctk.CTkOptionMenu(
             row_frame,
             values=self._labels,
@@ -328,6 +332,18 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
         dropdown.bind("<Button-1>", lambda _evt, rf=row_frame: self._set_active_by_frame(rf))
 
+        enabled_var = ctk.BooleanVar(value=bool(init_args.get("state", True)))
+        enabled_chk = ctk.CTkCheckBox(
+            row_frame,
+            text="On",
+            width=60,
+            height=DROPDOWN_H,
+            variable=enabled_var,
+            command=lambda rf=row_frame: self._on_enabled_toggled(rf),
+        )
+        enabled_chk.grid(row=0, column=1, sticky="e", padx=(0, 6), pady=0)
+        enabled_chk.bind("<Button-1>", lambda _evt, rf=row_frame: self._set_active_by_frame(rf))
+
         args_btn = ctk.CTkButton(
             row_frame,
             text="⚙",
@@ -335,7 +351,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             height=DROPDOWN_H,
             command=lambda rf=row_frame: self._edit_args_for_frame(rf),
         )
-        args_btn.grid(row=0, column=1, sticky="e", padx=(0, 6), pady=0)
+        args_btn.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=0)
 
         up_btn = ctk.CTkButton(
             row_frame,
@@ -344,7 +360,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             height=DROPDOWN_H,
             command=lambda rf=row_frame: self._move_row_by_frame(rf, -1),
         )
-        up_btn.grid(row=0, column=2, sticky="e", padx=(0, 6), pady=0)
+        up_btn.grid(row=0, column=3, sticky="e", padx=(0, 6), pady=0)
 
         down_btn = ctk.CTkButton(
             row_frame,
@@ -353,7 +369,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             height=DROPDOWN_H,
             command=lambda rf=row_frame: self._move_row_by_frame(rf, +1),
         )
-        down_btn.grid(row=0, column=3, sticky="e", padx=(0, 6), pady=0)
+        down_btn.grid(row=0, column=4, sticky="e", padx=(0, 6), pady=0)
 
         remove_btn = ctk.CTkButton(
             row_frame,
@@ -362,11 +378,35 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             height=DROPDOWN_H,
             command=lambda rf=row_frame: self._remove_row_by_frame(rf),
         )
-        remove_btn.grid(row=0, column=4, sticky="e", pady=0)
+        remove_btn.grid(row=0, column=5, sticky="e", pady=0)
 
-        self._rows.append(_QueueRow(row_frame, var, dropdown, args_btn, up_btn, down_btn, remove_btn, init_args))
+        self._rows.append(
+            _QueueRow(
+                row_frame,
+                var,
+                dropdown,
+                enabled_var,
+                enabled_chk,
+                args_btn,
+                up_btn,
+                down_btn,
+                remove_btn,
+                init_args,
+            )
+        )
         self._refresh_remove_buttons()
         self._refresh_move_buttons()
+
+    def _on_enabled_toggled(self, frame: ctk.CTkFrame) -> None:
+        idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
+        if idx is None:
+            return
+
+        row = self._rows[idx]
+        row.args["state"] = bool(row.enabled_var.get())
+        self._active_idx = idx
+        self._render_args_panel()
+        self._emit_change()
 
     def _move_row_by_frame(self, frame: ctk.CTkFrame, direction: int) -> None:
         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
@@ -447,14 +487,17 @@ class StepSpecQueueEditor(ctk.CTkFrame):
     def _refresh_remove_buttons(self) -> None:
         for i, r in enumerate(self._rows):
             is_trailing_placeholder = (i == len(self._rows) - 1) and (r.var.get() == DEFAULT_CHOICE)
-            r.remove_btn.configure(state="disabled" if is_trailing_placeholder else "normal")
-            r.args_btn.configure(state='disabled' if is_trailing_placeholder else 'normal')
+            widget_state = "disabled" if is_trailing_placeholder else "normal"
+            r.remove_btn.configure(state=widget_state)
+            r.args_btn.configure(state=widget_state)
+            r.enabled_chk.configure(state=widget_state)
 
     def _on_row_changed(self, frame: ctk.CTkFrame) -> None:
         """
         Called when a row's dropdown selection changes.
         - Ensures row.args matches the selected option
         - Keeps existing edited args if selection didn't change
+        - Preserves row.args["state"]
         - Updates active row + args panel
         """
         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
@@ -464,14 +507,19 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
             if lab in self._label_to_opt:
                 opt = self._label_to_opt[lab]
-                # If args are empty OR don't match this step's expected arity, reset to defaults.
-                # Otherwise, keep the existing args (user may have edited them).
                 expected_keys = {spec.name for spec in opt.arg_specs}
-                if set(row.args.keys()) != expected_keys:
+                state_val = bool(row.args.get("state", row.enabled_var.get()))
+
+                arg_keys_without_state = set(row.args.keys()) - {"state"}
+                if arg_keys_without_state != expected_keys:
                     row.args = dict(opt.default_args)
+
+                row.args["state"] = state_val
+                row.enabled_var.set(state_val)
             else:
                 # placeholder or invalid selection
                 row.args = {}
+                row.enabled_var.set(True)
 
             self._active_idx = idx
 
@@ -526,8 +574,8 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         opt = self._label_to_opt[lab]
         self._args_hint.set(opt.label)
 
-        # If step has no args, say so.
-        if len(row.args) == 0:
+        # If step has no real args, say so.
+        if len(opt.arg_specs) == 0:
             ctk.CTkLabel(self._args_body, text="(no args)", anchor="w").grid(
                 row=0, column=0, columnspan=2, sticky="w", pady=4
             )

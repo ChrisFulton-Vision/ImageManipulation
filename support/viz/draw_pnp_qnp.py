@@ -290,7 +290,7 @@ class pnp_qnp_draw:
             idx += 1
 
     @staticmethod
-    def _drawBoxes(image: NDArray, newCenters: list, newBoxes: list,
+    def _drawBoxes(image: NDArray, newCenters: NDArray, newBoxes: NDArray,
                   newClass_ids: list, newScores: list,
                   yoloSize: tuple[float, float],
                    draw_as_circles: bool = True,

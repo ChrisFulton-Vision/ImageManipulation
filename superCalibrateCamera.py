@@ -2679,7 +2679,8 @@ class CameraGui(ctk.CTkFrame):
                                             draw_as_alt=opts.draw_as_alt,
                                             draw_imgName=opts.draw_title,
                                             draw_crosshairs=opts.draw_crosshairs,
-                                            draw_mode=opts.draw_mode)
+                                            draw_mode=opts.draw_mode,
+                                            map_transparency=opts.map_transparency)
         if opts.store_attitude:
             self.own_attitude = attitude
 
@@ -3600,6 +3601,12 @@ class CameraGui(ctk.CTkFrame):
                     h, w, _ = markupFrame.shape
                     size = 15
                     thickness = 2
+                    text = 'Factor Graph Solution'
+                    (txt_width, txt_height), base = cv2.getTextSize(text,
+                                                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                                                    med_text(w), thickness)
+                    txt_height_perRow = txt_height + 15
+                    loc = (10, h - 4 * txt_height_perRow - 20)
 
                     cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
                     cv2.line(markupFrame,
@@ -3610,9 +3617,6 @@ class CameraGui(ctk.CTkFrame):
                              [pixel[0], pixel[1] + size],
                              [pixel[0], pixel[1] - size],
                              (0, 0, 0), thickness)
-                    cv2.putText(markupFrame, 'Factor Graph Solution',
-                                (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), (0, 0, 0), thickness)
 
                     thickness = 1
                     cv2.circle(markupFrame, pixel, size, color, thickness)
@@ -3624,9 +3628,13 @@ class CameraGui(ctk.CTkFrame):
                              [pixel[0], pixel[1] + size],
                              [pixel[0], pixel[1] - size],
                              color, thickness)
+
                     cv2.putText(markupFrame, 'Factor Graph Solution',
-                                (25, h - 125), cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), color, thickness)
+                                loc, cv2.FONT_HERSHEY_SIMPLEX,
+                                med_text(markupFrame.shape[0]), (0, 0, 0), 4)
+                    cv2.putText(markupFrame, 'Factor Graph Solution',
+                                loc, cv2.FONT_HERSHEY_SIMPLEX,
+                                med_text(markupFrame.shape[0]), color, 2)
 
                 fg_output.curr_r_T_d = pred.r_T_d
                 fg_output.curr_r_V_d = pred.r_V_d

@@ -28,6 +28,8 @@ class ArgBinding:
     field: str          # dataclass attribute name
     object_type: type
     default: object
+    min: float | None = None
+    max: float | None = None
 
 @dataclass(slots=True)
 class UndistortOpts:
@@ -38,7 +40,7 @@ class UndistortOpts:
 
     # Derived, guaranteed consistent
     ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
-        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
 
@@ -49,7 +51,7 @@ class AprilTagDetectOpts:
     pnp: bool = False
     qnp: bool = False
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
-        ArgBinding("Scale", "scale", float, True),
+        ArgBinding("Scale", "scale", float, 1.0),
         ArgBinding("Hide April Tags", "inpaint", bool, True),
         ArgBinding("PnP from Truth", "pnp", bool, True),
         ArgBinding("QnP from Truth", "qnp", bool, True),
@@ -57,7 +59,7 @@ class AprilTagDetectOpts:
 
     # Derived, guaranteed consistent
     ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
-        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
 
@@ -81,7 +83,7 @@ class YoloOpts:
 
     # Derived, guaranteed consistent
     ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
-        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
     
@@ -89,13 +91,15 @@ class YoloOpts:
 @dataclass(slots=True)
 class HudOpts:
     store_attitude: bool = True
+    map_transparency: float = 0.35
     draw_attitude: bool = True
     draw_as_alt: bool = True
     draw_title: bool = True
     draw_crosshairs: bool = True
     draw_mode: bool = True
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
-        ArgBinding("Att for FG", "store_attitude", bool, True),
+        ArgBinding("Store Attitude for FG", "store_attitude", bool, True),
+        ArgBinding("Map Alpha", "map_transparency", float, 0.35, 0.0, 1.0),
         ArgBinding("Attitude", "draw_attitude", bool, True),
         ArgBinding("Airspeed/Alt", "draw_as_alt", bool, True),
         ArgBinding("Image Name", "draw_title", bool, True),
@@ -103,9 +107,8 @@ class HudOpts:
         ArgBinding("Control Mode", "draw_mode", bool, True),
     )
 
-    # Derived, guaranteed consistent
     ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
-        ArgSpec(b.label, b.object_type, b.default) for b in BINDINGS
+        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
 
@@ -583,13 +586,12 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             )
             return
 
-        # Build per-arg editor widgets by type inference
         for i, spec in enumerate(opt.arg_specs):
             name = spec.name
             val = row.args.get(name, spec.default)
-            ctk.CTkLabel(self._args_body, text=name, anchor="w").grid(
-                row=i, column=0, sticky="w", padx=(0, 8), pady=4
-            )
+
+            lbl = ctk.CTkLabel(self._args_body, text=name, anchor="w")
+            lbl.grid(row=i, column=0, sticky="w", padx=(0, 8), pady=4)
 
             if isinstance(val, Enum):
                 enum_t = type(val)
@@ -615,7 +617,33 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                 sw.grid(row=i, column=1, sticky="w", pady=4)
                 continue
 
-            # int/float/str -> entry with cast on commit
+            # float -> slider (default 0..1 unless bounds provided)
+            if isinstance(val, float):
+                min_v = spec.min if getattr(spec, "min", None) is not None else 0.0
+                max_v = spec.max if getattr(spec, "max", None) is not None else 1.0
+
+                lbl_var = ctk.StringVar(value=f"{name}: {float(val):.2f}")
+                lbl.configure(textvariable=lbl_var)
+
+                fvar = ctk.DoubleVar(value=float(val))
+
+                def _on_slider(v, n=spec.name, lv=lbl_var, label=name):
+                    fv = float(v)
+                    lv.set(f"{label}: {fv:.2f}")
+                    self._set_arg(n, fv)
+
+                slider = ctk.CTkSlider(
+                    self._args_body,
+                    from_=float(min_v),
+                    to=float(max_v),
+                    variable=fvar,
+                    command=_on_slider,
+                    width=75
+                )
+                slider.grid(row=i, column=1, sticky="ew", pady=4)
+                continue
+
+            # int/str -> entry with cast on commit
             svar = ctk.StringVar(value=str(val))
             ent = ctk.CTkEntry(self._args_body, textvariable=svar)
             ent.grid(row=i, column=1, sticky="ew", pady=4)
@@ -627,8 +655,6 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                 try:
                     if isinstance(old, int) and not isinstance(old, bool):
                         newv = int(txt)
-                    elif isinstance(old, float):
-                        newv = float(txt)
                     else:
                         newv = txt
                 except Exception:

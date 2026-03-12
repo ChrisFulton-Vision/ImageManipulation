@@ -20,6 +20,14 @@ class HUD_Marker:
         self.throttle_loc = None
         self.throttle_circle_points = None
 
+        # --- minimap state ---
+        self.minimap_rect = None           # (x0, y0, x1, y1)
+        self.minimap_inner_rect = None     # (x0, y0, x1, y1)
+        self.minimap_start_px = None       # (x, y) once GPS is available
+        self.minimap_trail_px = []         # recent [(x, y), ...]
+        self.minimap_trail_maxlen = 40
+        self.minimap_last_time_s = None
+
         self.update_storage(864, 864)
 
         if filepath is not None:
@@ -42,6 +50,24 @@ class HUD_Marker:
         self.throttle_circle_points = [points]
 
         self.controlMode_text_loc = np.array([.65 * x, .90 * y]).astype(int)
+
+        # --- minimap geometry ---
+        map_w = int(0.18 * x)
+        map_h = int(0.18 * y)
+        margin = int(0.025 * x)
+        pad = max(4, int(0.008 * x))
+
+        x1 = x - margin
+        y0 = margin
+        x0 = x1 - map_w
+        y1 = y0 + map_h
+
+        self.minimap_rect = (x0, y0, x1, y1)
+        self.minimap_inner_rect = (x0 + pad, y0 + pad, x1 - pad, y1 - pad)
+
+        # image resized -> force recompute next GPS frame
+        self.minimap_start_px = None
+        self.minimap_trail_px.clear()
 
     @staticmethod
     def create_bank_indicator():
@@ -68,12 +94,110 @@ class HUD_Marker:
         self.attRdr = AttRdr()
         self.attRdr.read_files(filepath)
 
+        # New data set -> reset minimap state
+        self.minimap_start_px = None
+        self.minimap_trail_px.clear()
+        self.minimap_last_time_s = None
+
     def update_offset(self, delta_offset):
         self.attRdr.offset += delta_offset
 
     @property
     def offset(self):
         return self.attRdr.offset
+
+    def _map_to_minimap_px(self, map_x: float, map_y: float) -> tuple[int, int] | None:
+        if not getattr(self.attRdr, 'has_gps', False):
+            return None
+
+        x_min = float(self.attRdr.map_x_min)
+        x_max = float(self.attRdr.map_x_max)
+        y_min = float(self.attRdr.map_y_min)
+        y_max = float(self.attRdr.map_y_max)
+
+        dx = x_max - x_min
+        dy = y_max - y_min
+        if dx <= 1e-12 or dy <= 1e-12:
+            return None
+
+        ix0, iy0, ix1, iy1 = self.minimap_inner_rect
+        iw = max(1, ix1 - ix0)
+        ih = max(1, iy1 - iy0)
+
+        # preserve aspect ratio
+        scale = min(iw / dx, ih / dy)
+        draw_w = dx * scale
+        draw_h = dy * scale
+
+        off_x = 0.5 * (iw - draw_w)
+        off_y = 0.5 * (ih - draw_h)
+
+        px = ix0 + off_x + (map_x - x_min) * scale
+        py = iy0 + off_y + (y_max - map_y) * scale  # invert y for screen coords
+
+        return int(round(px)), int(round(py))
+
+    def draw_minimap(self, image, att, map_transparency):
+        if not getattr(att, 'gps_valid', False):
+            return
+        if not getattr(self.attRdr, 'has_gps', False):
+            return
+        if map_transparency < 0.01:
+            return
+
+        rect = self.minimap_rect
+        inner = self.minimap_inner_rect
+        x0, y0, x1, y1 = rect
+        ix0, iy0, ix1, iy1 = inner
+
+        # background box
+        alpha = map_transparency
+        roi = image[y0:y1, x0:x1]
+        overlay = roi.copy()
+        cv2.rectangle(overlay, (0, 0), (x1 - x0, y1 - y0), clr.BLACK, -1)
+        cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0.0, dst=roi)
+
+        cv2.rectangle(image, (x0, y0), (x1, y1), clr.HUD_GREEN, 2)
+
+        cur_px = self._map_to_minimap_px(att.map_x, att.map_y)
+        if cur_px is None:
+            return
+
+        # establish start point lazily from first valid GPS draw
+        if self.minimap_start_px is None:
+            self.minimap_start_px = cur_px
+
+        # reset trail if playback jumps around hard
+        if self.minimap_last_time_s is not None:
+            if abs(att.time_s - self.minimap_last_time_s) > 2.0:
+                self.minimap_trail_px.clear()
+        self.minimap_last_time_s = att.time_s
+
+        # append only if moved enough to matter
+        if len(self.minimap_trail_px) == 0:
+            self.minimap_trail_px.append(cur_px)
+        else:
+            last_px = self.minimap_trail_px[-1]
+            if (abs(cur_px[0] - last_px[0]) >= 1) or (abs(cur_px[1] - last_px[1]) >= 1):
+                self.minimap_trail_px.append(cur_px)
+                if len(self.minimap_trail_px) > self.minimap_trail_maxlen:
+                    self.minimap_trail_px.pop(0)
+
+        # trail
+        if len(self.minimap_trail_px) >= 2:
+            pts = np.array(self.minimap_trail_px, dtype=np.int32)
+            cv2.polylines(image, [pts], False, clr.HUD_GREEN, 1)
+
+        # start marker "X"
+        if self.minimap_start_px is not None:
+            sx, sy = self.minimap_start_px
+            s = 4
+            cv2.line(image, (sx - s, sy - s), (sx + s, sy + s), clr.DARKBLUE, 2)
+            cv2.line(image, (sx - s, sy + s), (sx + s, sy - s), clr.DARKBLUE, 2)
+
+        # current marker "O"
+        cx, cy = cur_px
+        cv2.circle(image, (cx, cy), 4, clr.HUD_GREEN, 1)
 
     def draw_HUD(self,
                  image: NDArray,
@@ -83,7 +207,8 @@ class HUD_Marker:
                  draw_as_alt: bool = True,
                  draw_imgName: bool = True,
                  draw_crosshairs: bool = True,
-                 draw_mode: bool = True):
+                 draw_mode: bool = True,
+                 map_transparency: float = 0.35):
         h, w = image.shape[:2]
 
         # If image size changes
@@ -112,8 +237,10 @@ class HUD_Marker:
         if draw_mode:
             self.draw_controlMode(image, att.mode)
 
-        return att
+        # --- minimap ---
+        self.draw_minimap(image, att, map_transparency)
 
+        return att
 
     @staticmethod
     def draw_crosshairs(image, cx_cy):
@@ -217,37 +344,29 @@ class HUD_Marker:
         cy = 0.5 * y
 
         img_height = image.shape[1]
-        # Hoist constants & lookups
         pitch_spacing = 16.0 * img_height / 864.0
         inner = 0.04 * x
         outer = 0.15 * x
         s_b = sin(radians(bank_angle + self.cam_bank_offset))
         c_b = cos(radians(bank_angle + self.cam_bank_offset))
 
-        to_int = int  # local alias is slightly faster than global lookup
+        to_int = int
         green = clr.HUD_GREEN
-        # Cache the scale once per call (your no-arg cached version)
         txt_scale = med_text()
 
-        # Compute only the ticks that can possibly render (±25° window, 10° spacing)
-        # Center tick index
         k = int(round(pitch_angle / 10.0))
-        # Candidate tick values in degrees, clamped to [-30, 30]
         candidates = []
-        for dk in (-2, -1, 0, 1, 2):  # at most 5 ticks
+        for dk in (-2, -1, 0, 1, 2):
             val = 10 * (k + dk)
             if -30 <= val <= 30 and abs(pitch_angle - val) < 25.0:
                 candidates.append(val)
 
         for i in candidates:
-            # vertical spacing; dy < 0 means higher on screen
             dy = -(pitch_angle - i) * pitch_spacing
 
-            # offset rotated by bank
             x_off = dy * s_b
             y_off = dy * c_b
 
-            # left line: outer -> inner
             x1 = cx - outer * c_b - x_off
             y1 = cy + outer * s_b - y_off
             x2 = cx - inner * c_b - x_off
@@ -255,7 +374,6 @@ class HUD_Marker:
 
             cv2.line(image, (to_int(x1), to_int(y1)), (to_int(x2), to_int(y2)), green, 2)
 
-            # right line: inner -> outer
             x3 = cx + inner * c_b - x_off
             y3 = cy - inner * s_b - y_off
             x4 = cx + outer * c_b - x_off
@@ -263,7 +381,6 @@ class HUD_Marker:
 
             cv2.line(image, (to_int(x3), to_int(y3)), (to_int(x4), to_int(y4)), green, 2)
 
-            # label; avoid f-string format cost by int()
             cv2.putText(
                 image, str(int(i)),
                 (to_int(x4 + x * 0.02), to_int(y4)),
@@ -285,14 +402,7 @@ class HUD_Marker:
                     (int(0.775 * x - width / 2.0), int(0.4 * y - height / 2.0)),
                     cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
 
-        # cv2.rectangle(image,
-        #               (int(0.773 * x - width / 2.0 ), int(0.4 * y - height * 2.0 )),
-        #               (int(0.777 * x + width / 2.0 ), int(0.4 * y + height / 2.0)),
-        #               HUD_GREEN,
-        #               2)
-
     def draw_throttleResponse(self, image, cmd_throttle):
-        # Throttle response
         x, y = self.last_xy
         r = 0.06
         theta = cmd_throttle * 2.450
@@ -304,9 +414,9 @@ class HUD_Marker:
                         [self.throttle_loc[0] + (np.sin(np.deg2rad(theta - 5.0)) * x * (r * 0.8)),
                          self.throttle_loc[1] - (np.cos(np.deg2rad(theta - 5.0)) * x * (r * 0.6))]], np.int32)
 
-        cv2.polylines(image, self.throttle_circle_points, False, clr.HUD_GREEN, 2)  # Arc
+        cv2.polylines(image, self.throttle_circle_points, False, clr.HUD_GREEN, 2)
 
-        cv2.fillPoly(image, [tri], clr.HUD_GREEN)  # Triangle Pointer
+        cv2.fillPoly(image, [tri], clr.HUD_GREEN)
         (width, height), baseline = cv2.getTextSize(f'{cmd_throttle:.1f}%',
                                                     cv2.FONT_HERSHEY_SIMPLEX,
                                                     med_text(), 2)

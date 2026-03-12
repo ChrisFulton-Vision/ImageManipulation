@@ -514,7 +514,7 @@ class App(ctk.CTk):
             except Exception:
                 w += 16  # safe default
 
-        return int(w)
+        return int(w + 30)
 
     def _section_layout_height(self, page) -> int:
         """

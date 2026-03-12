@@ -160,11 +160,10 @@ class CameraGui(ctk.CTkFrame):
             GuiQueue.StepOption(label="Draw Chessboard",
                                 fn=self.draw_chessboard,
                                 arg_specs=()),
-            GuiQueue.StepOption(label="Apply Image Filter",
+            GuiQueue.StepOption(
+                                label="Apply Image Filter",
                                 fn=self.applyKernel,
-                                arg_specs=(
-                                    GuiQueue.ArgSpec("Filter", ImageKernel, ImageKernel.Unfiltered),
-                                )),
+                                arg_specs_fn=self.image_filter_arg_specs),
             GuiQueue.StepOption(label="Apply YOLO -> Q/PnP",
                                 fn=self.run_yolo,
                                 arg_specs=GuiQueue.YoloOpts.ARG_SPECS),
@@ -538,7 +537,7 @@ class CameraGui(ctk.CTkFrame):
             # Start from defaults so missing fields are filled in automatically
             parsed_args = opt.default_args.copy()
 
-            spec_by_name = {spec.name: spec for spec in opt.arg_specs}
+            spec_by_name = {spec.name: spec for spec in opt.get_arg_specs(parsed_args)}
             for arg_name, raw_val in raw_args.items():
                 spec = spec_by_name.get(arg_name)
                 if spec is None:
@@ -546,6 +545,11 @@ class CameraGui(ctk.CTkFrame):
                     continue
 
                 parsed_args[arg_name] = self._deserialize_queue_arg(spec, raw_val)
+
+            # Recompute once more after deserialization in case one arg changes which specs exist
+            spec_by_name = {spec.name: spec for spec in opt.get_arg_specs(parsed_args)}
+            for spec in spec_by_name.values():
+                parsed_args.setdefault(spec.name, spec.default)
 
             rebuilt.append((opt.fn, parsed_args))
 
@@ -2910,6 +2914,21 @@ class CameraGui(ctk.CTkFrame):
             else:
                 ctx.undistorted.set(False)  # Multiple undistorts, invalid
 
+    def image_filter_arg_specs(self, args):
+        filt = args.get("Filter", ImageKernel.Unfiltered)
+
+        specs = [
+            GuiQueue.ArgSpec("Filter", ImageKernel, ImageKernel.Unfiltered),
+        ]
+
+        if filt == ImageKernel.Gain:
+            specs.append(GuiQueue.ArgSpec("Gain", float, 1.0, 0.0, 3.0))
+
+        if filt == ImageKernel.Brightness:
+            specs.append(GuiQueue.ArgSpec("Brightness", float, 0.0, -100.0, 100.0))
+
+        return tuple(specs)
+
     def applyKernel(self,
                     frame: NDArray,
                     markupFrame: NDArray,
@@ -2928,22 +2947,20 @@ class CameraGui(ctk.CTkFrame):
             self.GaborGUI.close()
             self.GaborGUI = None
 
-        if processKernel == ImageKernel.Invert:
-            cv2.bitwise_not(markupFrame, dst=markupFrame)
-            return
-
         from support.vision.filter_image import applyConvolutionFilter
         if processKernel == ImageKernel.Gabor:
             from support.vision.filter_image import GaborGUI
             if self.GaborGUI is None:
                 self.GaborGUI = GaborGUI()
-            applyConvolutionFilter(markupFrame,
-                                   processKernel,
-                                   self.GaborGUI.gaborFilter)
-            return
+
+        gain = float(args.get('Gain', 1.0))
+        brightness = int(args.get('Brightness', 0))
 
         applyConvolutionFilter(markupFrame,
-                               processKernel)
+                               processKernel,
+                               self.GaborGUI,
+                               gain,
+                               brightness)
 
     def detect_corners(self,
                        frame: NDArray,

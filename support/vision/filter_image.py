@@ -1,4 +1,4 @@
-from cv2 import getGaborKernel, GaussianBlur, addWeighted, filter2D
+import cv2
 from numpy import rad2deg, deg2rad
 from numpy.typing import NDArray
 import customtkinter as ctk
@@ -91,7 +91,7 @@ class GaborGUI:
             self.pop_up.grid_columnconfigure([0, 1], weight=1)
             self.configure_pop_up()
 
-        return getGaborKernel(self.gaborFilter.ksize,
+        return cv2.getGaborKernel(self.gaborFilter.ksize,
                                   self.gaborFilter.sigma,
                                   self.gaborFilter.theta,
                                   self.gaborFilter.lambd,
@@ -127,7 +127,7 @@ class Gabor:
         self.psi = new_psi
 
     def filter_kernel(self):
-        return getGaborKernel(self.ksize,
+        return cv2.getGaborKernel(self.ksize,
                                   self.sigma,
                                   self.theta,
                                   self.lambd,
@@ -135,20 +135,36 @@ class Gabor:
                                   self.psi)
 
 
-def applyConvolutionFilter(img: NDArray, kernel: ImageKernel, gabor: None | Gabor = None) -> None:
-    if kernel == ImageKernel.Unfiltered:
-        return
+def applyConvolutionFilter(img: NDArray,
+                           kernel: ImageKernel,
+                           gabor: None | Gabor = None,
+                           gain: float = 1.0,
+                           brightness: int = 0) -> None:
 
-    if kernel == ImageKernel.Unsharp:
-        gaussian_3 = GaussianBlur(img, (0, 0), 2.0)
-        addWeighted(img, 2.0, gaussian_3, -1.0, 0, dst=img)
-        return
+    match kernel:
+        case ImageKernel.Unfiltered:
+            return
 
-    if kernel == ImageKernel.Gabor:
-        convolution = gabor.filter_kernel()
-        filter2D(img, -1, convolution, dst=img)
-        return
+        case ImageKernel.Unsharp:
+            gaussian_3 = cv2.GaussianBlur(img, (0, 0), 2.0)
+            cv2.addWeighted(img, 2.0, gaussian_3, -1.0, 0, dst=img)
 
-    convolution = ImageKernel.get_convolution(kernel)
-    filter2D(img, -1, convolution, dst=img)
+        case ImageKernel.Gabor:
+            convolution = gabor.filter_kernel()
+            cv2.filter2D(img, -1, convolution, dst=img)
+
+        case ImageKernel.Invert:
+            cv2.bitwise_not(img, dst=img)
+
+        case ImageKernel.Gain:
+            cv2.convertScaleAbs(img, alpha=gain, beta=0.0, dst=img)
+
+        case ImageKernel.Brightness:
+            from support.io.my_logging import LOG
+            LOG.info(f'Brightness: {brightness}')
+            cv2.convertScaleAbs(img, alpha=1.0, beta=float(brightness), dst=img)
+
+        case _:
+            convolution = ImageKernel.get_convolution(kernel)
+            cv2.filter2D(img, -1, convolution, dst=img)
 

@@ -166,13 +166,16 @@ class StepOption:
     label: str
     fn: StepFn
     arg_specs: tuple[ArgSpec, ...] = ()
+    arg_specs_fn: Optional[Callable[[Args], tuple[ArgSpec, ...]]] = None
+
+    def get_arg_specs(self, args: Optional[Args] = None) -> tuple[ArgSpec, ...]:
+        if self.arg_specs_fn is not None:
+            return self.arg_specs_fn(args or {})
+        return self.arg_specs
 
     @property
     def default_args(self) -> Args:
-        return {spec.name: spec.default for spec in self.arg_specs}
-
-    def to_spec(self) -> tuple[StepFn, Args]:
-        return (self.fn, self.default_args)
+        return {spec.name: spec.default for spec in self.get_arg_specs({})}
 
 class StepSpecQueueEditor(ctk.CTkFrame):
     """
@@ -512,7 +515,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
             if lab in self._label_to_opt:
                 opt = self._label_to_opt[lab]
-                expected_keys = {spec.name for spec in opt.arg_specs}
+                expected_keys = {spec.name for spec in opt.get_arg_specs(row.args)}
                 state_val = bool(row.args.get("state", row.enabled_var.get()))
 
                 arg_keys_without_state = set(row.args.keys()) - {"state"}
@@ -580,13 +583,13 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         self._args_hint.set(opt.label)
 
         # If step has no real args, say so.
-        if len(opt.arg_specs) == 0:
+        if len(opt.get_arg_specs(row.args)) == 0:
             ctk.CTkLabel(self._args_body, text="(no args)", anchor="w").grid(
                 row=0, column=0, columnspan=2, sticky="w", pady=4
             )
             return
 
-        for i, spec in enumerate(opt.arg_specs):
+        for i, spec in enumerate(opt.get_arg_specs(row.args)):
             name = spec.name
             val = row.args.get(name, spec.default)
 
@@ -594,13 +597,19 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             lbl.grid(row=i, column=0, sticky="w", padx=(0, 8), pady=4)
 
             if isinstance(val, Enum):
+
                 enum_t = type(val)
                 var = ctk.StringVar(value=val.name)
+
+                def _on_enum_change(choice, n=spec.name, et=enum_t):
+                    self._set_arg(n, et[choice])
+                    self._render_args_panel()
+
                 dd = ctk.CTkOptionMenu(
                     self._args_body,
                     values=[e.name for e in enum_t],
                     variable=var,
-                    command=lambda choice, n=spec.name, et=enum_t: self._set_arg(n, et[choice]),
+                    command=_on_enum_change,
                     anchor="w",
                 )
                 dd.grid(row=i, column=1, sticky="ew", pady=4)
@@ -622,14 +631,14 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                 min_v = spec.min if getattr(spec, "min", None) is not None else 0.0
                 max_v = spec.max if getattr(spec, "max", None) is not None else 1.0
 
-                lbl_var = ctk.StringVar(value=f"{name}: {float(val):.2f}")
+                lbl_var = ctk.StringVar(value=f"{name}: {float(val):8.2f}")
                 lbl.configure(textvariable=lbl_var)
 
                 fvar = ctk.DoubleVar(value=float(val))
 
                 def _on_slider(v, n=spec.name, lv=lbl_var, label=name):
                     fv = float(v)
-                    lv.set(f"{label}: {fv:.2f}")
+                    lv.set(f"{label}: {fv:8.2f}")
                     self._set_arg(n, fv)
 
                 slider = ctk.CTkSlider(
@@ -676,7 +685,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
         opt = self._label_to_opt[lab]
 
-        spec = next((s for s in opt.arg_specs if s.name == name), None)
+        spec = next((s for s in opt.get_arg_specs(row.args) if s.name == name), None)
         if spec is None:
             return
 

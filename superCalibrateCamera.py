@@ -102,6 +102,7 @@ class CameraGui(ctk.CTkFrame):
         cached configuration, and wires the queue editor to the underlying
         image-processing model.
         """
+        self.own_attitude = None
         self._playback_allowed = None
         self.curr_r_V_d = None
         self.curr_r_T_d = None
@@ -2670,14 +2671,17 @@ class CameraGui(ctk.CTkFrame):
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
             self.hud_marker = HUD_Marker(self.camConfig.hud_data_filepath)
-        self.hud_marker.draw_HUD(image=markupFrame,
-                                 img_time=ctx.img_time,
-                                 cx_cy=cx_cy,
-                                 draw_attitude=opts.draw_attitude,
-                                 draw_as_alt=opts.draw_as_alt,
-                                 draw_imgName=opts.draw_title,
-                                 draw_crosshairs=opts.draw_crosshairs,
-                                 draw_mode=opts.draw_mode)
+
+        attitude = self.hud_marker.draw_HUD(image=markupFrame,
+                                            img_time=ctx.img_time,
+                                            cx_cy=cx_cy,
+                                            draw_attitude=opts.draw_attitude,
+                                            draw_as_alt=opts.draw_as_alt,
+                                            draw_imgName=opts.draw_title,
+                                            draw_crosshairs=opts.draw_crosshairs,
+                                            draw_mode=opts.draw_mode)
+        if opts.store_attitude:
+            self.own_attitude = attitude
 
     def draw_boxAround(self, frame,
                        markupFrame,
@@ -3546,7 +3550,7 @@ class CameraGui(ctk.CTkFrame):
 
         hyper_focus = args
 
-        from support.runtime.fg_drogue_only import FactorGraph
+        from support.runtime.fg_singleTarget import FactorGraph
         if self.FG is None:
             self.FG = FactorGraph()
 
@@ -3569,15 +3573,16 @@ class CameraGui(ctk.CTkFrame):
             if meas_3d is None:
                 color = clr.RED
 
+        R_wr = self.own_attitude.rotmat_wr() if self.own_attitude is not None and self.own_attitude.valid else None
         if meas_3d is not None:
             if ctx.img_time < self.last_time_update:
                 self.FG.reset()
 
-            self.FG.newRecvMeas(meas_3d, ctx.img_time)
+            self.FG.addRecvMeas(meas_3d, t=ctx.img_time, R_wr=R_wr)
             self.last_time_update = ctx.img_time
 
         if ctx.img_time is not None and self.FG.numMeas > 2:
-            pred = self.FG.predict(ctx.img_time)
+            pred = self.FG.predict(ctx.img_time, R_wr=R_wr)
 
             if pred is not None and pred.r_T_d is not None:
                 fg_output = FgOutput()

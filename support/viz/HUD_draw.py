@@ -84,32 +84,36 @@ class HUD_Marker:
                  draw_imgName: bool = True,
                  draw_crosshairs: bool = True,
                  draw_mode: bool = True):
-        x, y, _ = image.shape
+        h, w = image.shape[:2]
 
         # If image size changes
-        if x != self.last_xy[0] or y != self.last_xy[1]:
-            self.update_storage(x, y)
+        if h != self.last_xy[0] or w != self.last_xy[1]:
+            self.update_storage(h, w)
 
-        speed, alt, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle, cmd_throttle, mode = self.attRdr.get_attitude_at(
-            img_time)  # + 173.11338 - 11.658461)
+        att = self.attRdr.get_attitude_at(img_time)
 
         if draw_crosshairs:
             self.draw_crosshairs(image, cx_cy)
 
         if draw_as_alt:
-            cv2.putText(image, f'AS: {speed:.0f}', (int(x * 0.20), int(y * 0.5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
-            self.draw_altitude(image, alt)
+            cv2.putText(image, f'AS: {att.speed_mps:.0f}', (int(h * 0.20), int(w * 0.5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, med_text(), clr.HUD_GREEN, 2)
+            self.draw_altitude(image, att.altitude_m)
 
-        if draw_attitude:
-            self.draw_bankAngle(image, bank_angle, cmd_bank_angle, pitch_angle, cmd_pitch_angle)
-            self.draw_pitchAngle(image, pitch_angle, bank_angle)
-            self.draw_throttleResponse(image, cmd_throttle)
+        if draw_attitude and att.valid:
+            self.draw_bankAngle(image,
+                                att.roll_deg,
+                                att.cmd_roll_deg,
+                                att.pitch_deg,
+                                att.cmd_pitch_deg)
+            self.draw_pitchAngle(image, att.pitch_deg, att.roll_deg)
+            self.draw_throttleResponse(image, att.throttle_pct)
 
         if draw_mode:
-            self.draw_controlMode(image, mode)
+            self.draw_controlMode(image, att.mode)
 
-        # cv2.putText(image, f'BnkOffset: {self.cam_bank_offset:.1f}', (100,100), cv2.FONT_HERSHEY_SIMPLEX, med_text(), HUD_YELLOW, 2)
+        return att
+
 
     @staticmethod
     def draw_crosshairs(image, cx_cy):

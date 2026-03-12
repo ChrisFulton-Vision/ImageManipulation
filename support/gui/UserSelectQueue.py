@@ -88,12 +88,14 @@ class YoloOpts:
 
 @dataclass(slots=True)
 class HudOpts:
+    store_attitude: bool = True
     draw_attitude: bool = True
     draw_as_alt: bool = True
     draw_title: bool = True
     draw_crosshairs: bool = True
     draw_mode: bool = True
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Att for FG", "store_attitude", bool, True),
         ArgBinding("Attitude", "draw_attitude", bool, True),
         ArgBinding("Airspeed/Alt", "draw_as_alt", bool, True),
         ArgBinding("Image Name", "draw_title", bool, True),

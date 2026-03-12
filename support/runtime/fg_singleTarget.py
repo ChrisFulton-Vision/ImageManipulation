@@ -111,17 +111,65 @@ class FactorGraph:
     def copy(self, classToCopy):
         self.__dict__.update(copy.deepcopy(classToCopy.__dict__))
 
-    def newRecvMeas(self, drgVec, t=None):
+    @staticmethod
+    def _as_rotmat(q_wr=None, R_wr=None):
+        """
+        Return a 3x3 rotation matrix R_wr mapping receiver-frame vectors into
+        the stabilized/world frame.
+
+        Accepts either:
+          - R_wr directly, or
+          - q_wr as an object with a known matrix conversion method.
+        """
+        if R_wr is not None:
+            R = np.asarray(R_wr, dtype=float)
+            if R.shape != (3, 3):
+                raise ValueError(f'R_wr must have shape (3,3), got {R.shape}')
+            return R
+
+        if q_wr is None:
+            return None
+
+        # Common quaternion helper names
+        for attr in ('rotmat_wr', 'toRotMat', 'toMat3', 'as_rotmat', 'as_matrix'):
+            if hasattr(q_wr, attr):
+                obj = getattr(q_wr, attr)
+                R = obj() if callable(obj) else obj
+                R = np.asarray(R, dtype=float)
+                if R.shape != (3, 3):
+                    raise ValueError(f'q_wr.{attr} did not produce shape (3,3), got {R.shape}')
+                return R
+
+        raise ValueError('q_wr was provided, but no recognized rotation-matrix conversion exists.')
+
+    def addRecvMeas(self,
+                    drgVec,
+                    t=None,
+                    q_wr=None,
+                    R_wr=None):
         self.optComplete = False
 
+        drgVec = np.asarray(drgVec, dtype=float).reshape(3)
+
+        R_wr = self._as_rotmat(q_wr=q_wr, R_wr=R_wr)
+
+        # If receiver attitude is provided, rotate receiver-frame measurement into world frame.
+        # Otherwise preserve legacy behavior.
+        if R_wr is not None:
+            meas_vec = R_wr @ drgVec
+        else:
+            meas_vec = drgVec.copy()
+
+        # Then the rest is basically your current addRecvMeas logic,
+        # but use meas_vec instead of drgVec.
         if self.numMeas == 0:
-            if drgVec[2] > 200.0:
+            if meas_vec[2] > 200.0:
                 return
 
-            self.curr_meas = [drgVec]
+            self.curr_meas = [meas_vec]
             self.meas = self.curr_meas
 
-            self.r_T_d[0, :] = drgVec
+            self.r_T_d[0, :] = meas_vec
             self.r_V_d = np.zeros((1, 3))
             self.r_A_d = np.zeros((1, 3))
 
@@ -130,10 +178,9 @@ class FactorGraph:
                 self.time_log[0] = (datetime.datetime.now() - epoch).total_seconds() - self.startTime
             else:
                 self.time_log[0] = t - self.startTime
-
         else:
-            if drgVec[2] > 200.0:
-                drgVec *= self.meas[-1][2] / drgVec[2]
+            if meas_vec[2] > 200.0:
+                meas_vec *= self.meas[-1][2] / meas_vec[2]
 
             if t is None:
                 epoch = datetime.datetime(1970, 1, 1)
@@ -145,34 +192,22 @@ class FactorGraph:
 
             if t <= self.time_log[-1]:
                 self.reset()
-                self.newRecvMeas(drgVec, t)
+                self.addRecvMeas(meas_vec, t=self.startTime + t)
                 return
 
-            if np.linalg.norm((drgVec - self.r_T_d[-1]) / delT) > 100.0:
+            if np.linalg.norm((meas_vec - self.r_T_d[-1]) / delT) > 100.0:
                 self.popOldestMeas()
                 return
 
             self.time_log = np.append(self.time_log, t)
-            self.curr_meas = drgVec
+            self.curr_meas = meas_vec
             self.meas.append(self.curr_meas)
 
-            # Seed new position from measurement
-            self.r_T_d = np.append(self.r_T_d, drgVec[np.newaxis, :], axis=0)
+            self.r_T_d = np.append(self.r_T_d, meas_vec[np.newaxis, :], axis=0)
 
-            # Conservative tail seeding:
-            # do NOT initialize the newest vel/acc from raw local finite differences.
-            if self.r_V_d.shape[0] == 0:
-                new_vel = np.zeros((3,))
-            else:
-                new_vel = self.r_V_d[-1].copy()
+            new_vel = self.r_V_d[-1].copy() if self.r_V_d.shape[0] > 0 else np.zeros((3,))
+            new_acc = self.r_A_d[-1].copy() if self.r_A_d.shape[0] > 0 else np.zeros((3,))
 
-            if hasattr(self, "r_A_d") and self.r_A_d.shape[0] > 0:
-                new_acc = self.r_A_d[-1].copy()
-            else:
-                new_acc = np.zeros((3,))
-
-            # Optional gentle blend toward measured finite-difference velocity.
-            # Keep alpha small so noisy measurements do not dominate the new tail.
             alpha_v = 0.15
             if delT > 1e-6 and self.r_T_d.shape[0] >= 2:
                 fd_vel = (self.r_T_d[-1] - self.r_T_d[-2]) / delT
@@ -363,8 +398,11 @@ class FactorGraph:
         keep_going = True
         stop = False
         Q = self.create_Q()
-        # Q = np.eye(len(self.create_y()))
         scale = 1.0
+
+        next_states = [copy.deepcopy(self.r_T_d),
+                       copy.deepcopy(self.r_V_d),
+                       copy.deepcopy(self.r_A_d)]
         while keep_going:
             startProcTime = datetime.datetime.now()
             np.set_printoptions(precision=3, threshold=np.inf)
@@ -493,16 +531,15 @@ class FactorGraph:
         cov = np.sqrt(np.diag(la.inv(small_QL.T.dot(small_QL))))
         return cov
 
-    def predict(self, query_time) -> PredictedState | None:
+    def predict(self,
+                query_time,
+                q_wr=None,
+                R_wr=None,
+                return_frame='receiver') -> PredictedState | None:
         if self.numMeas == 0:
             return None
 
-        # Use the most recent stabilized node, not the freshest node.
-        # This dramatically reduces tail twitch.
-        if self.numMeas >= 2:
-            idx = -2
-        else:
-            idx = -1
+        idx = -2 if self.numMeas >= 2 else -1
 
         if query_time is None:
             dt = 0.0
@@ -510,13 +547,26 @@ class FactorGraph:
             query_time_rel = query_time - self.startTime
             dt = max(0.0, float(query_time_rel - self.time_log[idx]))
 
-        r_T_d = (
+        # World/stabilized propagation
+        w_T_d = (
                 self.r_T_d[idx].copy()
                 + dt * self.r_V_d[idx].copy()
                 + 0.5 * (dt ** 2) * self.r_A_d[idx].copy()
         )
-        r_V_d = self.r_V_d[idx].copy() + dt * self.r_A_d[idx].copy()
-        r_A_d = self.r_A_d[idx].copy()
+        w_V_d = self.r_V_d[idx].copy() + dt * self.r_A_d[idx].copy()
+        w_A_d = self.r_A_d[idx].copy()
+
+        out_T_d = w_T_d
+        out_V_d = w_V_d
+        out_A_d = w_A_d
+
+        R_wr = self._as_rotmat(q_wr=q_wr, R_wr=R_wr)
+
+        if return_frame.lower() in ('receiver', 'body', 'camera') and R_wr is not None:
+            R_rw = R_wr.T
+            out_T_d = R_rw @ w_T_d
+            out_V_d = R_rw @ w_V_d
+            out_A_d = R_rw @ w_A_d
 
         var_x = var_y = var_z = None
         try:
@@ -531,9 +581,9 @@ class FactorGraph:
             query_time=query_time,
             state_time=self.startTime + float(self.time_log[idx]),
             dt=dt,
-            r_T_d=r_T_d,
-            r_V_d=r_V_d,
-            r_A_d=r_A_d,
+            r_T_d=out_T_d,
+            r_V_d=out_V_d,
+            r_A_d=out_A_d,
             var_x=var_x,
             var_y=var_y,
             var_z=var_z,

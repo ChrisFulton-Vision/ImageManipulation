@@ -45,6 +45,19 @@ class UndistortOpts:
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
 
 @dataclass(slots=True)
+class ResizeOpts:
+    scale: float = 1.0
+    BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Exp Scale Image", "scale", float, 1.0, 0.05, 1.5),
+    )
+
+    # Derived, guaranteed consistent
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
+        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
+@dataclass(slots=True)
 class AprilTagDetectOpts:
     scale: float = 1.0
     inpaint: bool = False
@@ -145,6 +158,7 @@ class FrameCtx:
     undistorted: Slot = field(default_factory=Slot)
     yolo: Slot = field(default_factory=Slot)
     fg: Slot = field(default_factory=Slot)
+    resize: Slot = field(default_factory=Slot)
 
 
 @dataclass

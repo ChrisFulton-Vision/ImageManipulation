@@ -160,8 +160,6 @@ def applyConvolutionFilter(img: NDArray,
             cv2.convertScaleAbs(img, alpha=gain, beta=0.0, dst=img)
 
         case ImageKernel.Brightness:
-            from support.io.my_logging import LOG
-            LOG.info(f'Brightness: {brightness}')
             cv2.convertScaleAbs(img, alpha=1.0, beta=float(brightness), dst=img)
 
         case _:

@@ -131,7 +131,7 @@ class BufferedImageLoader:
             # fill buffer unless it’s nearly full
             if self._q.qsize() >= self.max_buffer - 2:
                 # light sleep lets UI thread run and queue drain
-                time.sleep(0.001)
+                time.sleep(0.000)
                 continue
 
             # decode

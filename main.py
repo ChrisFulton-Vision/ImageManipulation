@@ -8,7 +8,7 @@ import superCalibrateCamera as cam
 import superCalibrate as calibrate
 from functools import partial
 # from SupportModules.LidarTruth import TruthPoints
-
+ctk.deactivate_automatic_dpi_awareness()
 GREEN = '#2FA572'
 DEFAULT_HOVER = ('#0C955A', '#106A43')
 

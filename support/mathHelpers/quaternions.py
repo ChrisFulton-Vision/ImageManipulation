@@ -603,8 +603,8 @@ class Quaternion:
 
     @property
     def exp(self):
-        if np.linalg.norm(self.vec) > 0.00000001:
-            vec_norm = np.linalg.norm(self.vec)
+        vec_norm = np.linalg.norm(self.vec)
+        if vec_norm > 0.00000001:
             return np.exp(self.s) * Quaternion(s=cos(vec_norm), vec=self.vec / vec_norm * sin(vec_norm),
                                                makeUnitQuat=False)
         return Quaternion(s=1.0, vec=np.zeros((3,)), makeUnitQuat=False)

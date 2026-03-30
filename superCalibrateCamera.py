@@ -43,7 +43,7 @@ from support.vision.calibration import Calibration, undistort_points_px
 from support.vision.draw_circle_and_mask import dim_except_circle
 
 import support.viz.colors as clr
-from support.viz.CVFontScaling import small_text, med_text
+from support.viz.CVFontScaling import small_text, med_text, med_thick, lrg_thick
 from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
 from support.viz.draw_pnp_qnp import PoseOutput
 
@@ -160,6 +160,9 @@ class CameraGui(ctk.CTkFrame):
             GuiQueue.StepOption(label="Draw Chessboard",
                                 fn=self.draw_chessboard,
                                 arg_specs=()),
+            GuiQueue.StepOption(label="Resize",
+                                fn=self.resize_image,
+                                arg_specs=GuiQueue.ResizeOpts.ARG_SPECS),
             GuiQueue.StepOption(
                                 label="Apply Image Filter",
                                 fn=self.applyKernel,
@@ -780,7 +783,7 @@ class CameraGui(ctk.CTkFrame):
         self.grid_sideBySide(rowID, activeEntryButton, self.timeBetweenImgsEntry)
         rowID += 1
 
-        qualityLabel = ctk.CTkLabel(self.export_frame, text="Export Quality: ")
+        qualityLabel = ctk.CTkLabel(self.export_frame, text="GIF Export Quality: ")
         self.grid_sideBySide(rowID, qualityLabel, self.exportQualityCombo)
         rowID += 1
 
@@ -1133,6 +1136,36 @@ class CameraGui(ctk.CTkFrame):
         self.plotter.close_plot()
         return True
 
+    def _get_dp_conf_text(self) -> str:
+        try:
+            return str(self._dp_conf_list.get()).strip()
+        except Exception:
+            return str(getattr(self.camConfig, "dp_conf_list", "0.80") or "0.80")
+
+    def _get_dp_ckpt_n(self) -> int:
+        try:
+            return int(str(self._dp_ckptN.get()).strip())
+        except Exception:
+            try:
+                return int(getattr(self.camConfig, "dp_ckptN", 200) or 200)
+            except Exception:
+                return 200
+
+    def _get_dp_prefetch_n(self) -> int:
+        try:
+            return int(str(self._dp_prefetch.get()).strip())
+        except Exception:
+            try:
+                return int(getattr(self.camConfig, "dp_prefetch", 32) or 32)
+            except Exception:
+                return 32
+
+    def _get_dp_gpu_enabled(self) -> bool:
+        try:
+            return bool(self._dp_gpu_var.get())
+        except Exception:
+            return bool(getattr(self.camConfig, "dp_gpu", False))
+
     def runPnP_QnP_on_folders_threaded(self):
         """Launch SolvePnP/QnP batch processing on a background thread.
 
@@ -1360,9 +1393,9 @@ class CameraGui(ctk.CTkFrame):
                 params = data.YoloSweepParams(
                     img_dir=img_dir,
                     out_csv_base=out_csv_base,
-                    conf_list_var=getattr(self, "_dp_conf_list", None),
-                    ckpt_every_var=getattr(self, "_dp_ckptN", None),
-                    prefetch_var=getattr(self, "_dp_prefetch", None),
+                    conf_list_var=self._get_dp_conf_text(), # getattr(self, "_dp_conf_list", None),
+                    ckpt_every_var=self._get_dp_ckpt_n(), # getattr(self, "_dp_ckptN", None),
+                    prefetch_var=self._get_dp_prefetch_n(), # getattr(self, "_dp_prefetch", None),
                     cam_to_log_time_offset=float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0)),
                 )
 
@@ -2676,15 +2709,13 @@ class CameraGui(ctk.CTkFrame):
         if self.hud_marker is None:
             self.hud_marker = HUD_Marker(self.camConfig.hud_data_filepath)
 
+        scale = ctx.resize.get_or(1.0)
+
         attitude = self.hud_marker.draw_HUD(image=markupFrame,
                                             img_time=ctx.img_time,
-                                            cx_cy=cx_cy,
-                                            draw_attitude=opts.draw_attitude,
-                                            draw_as_alt=opts.draw_as_alt,
-                                            draw_imgName=opts.draw_title,
-                                            draw_crosshairs=opts.draw_crosshairs,
-                                            draw_mode=opts.draw_mode,
-                                            map_transparency=opts.map_transparency)
+                                            opts=opts,
+                                            cx_cy_ori=cx_cy,
+                                            scale=scale)
         if opts.store_attitude:
             self.own_attitude = attitude
 
@@ -2692,8 +2723,8 @@ class CameraGui(ctk.CTkFrame):
                        markupFrame,
                        ctx: GuiQueue.FrameCtx,
                        args) -> None:
-        y, x, _ = markupFrame.shape
-        cv2.rectangle(markupFrame, (0, 0), (x - 1, y - 1), clr.HUD_YELLOW, 10)
+        h, w, _ = markupFrame.shape
+        cv2.rectangle(markupFrame, (0, 0), (w - 1, h - 1), clr.HUD_YELLOW, med_thick(h))
 
     def draw_chessboard(self, frame: NDArray,
                         markupFrame: NDArray,
@@ -2908,11 +2939,50 @@ class CameraGui(ctk.CTkFrame):
                             self.map2,
                             interpolation=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT)
-            markupFrame[:] = tmp
+
+            # Faster to assign value, but error if incorrect size
+
+            self._replace_array_in_place(markupFrame, tmp)
+
             if not ctx.undistorted.is_set():
                 ctx.undistorted.set(True)  # One undistort has been run
             else:
                 ctx.undistorted.set(False)  # Multiple undistorts, invalid
+
+    @staticmethod
+    def _replace_array_in_place(dst: np.ndarray, src: np.ndarray) -> None:
+        if dst.dtype != src.dtype:
+            raise TypeError(
+                f"Cannot replace ndarray in-place when dtype changes: "
+                f"{dst.dtype} -> {src.dtype}"
+            )
+
+        if not dst.flags.c_contiguous:
+            raise ValueError("markupFrame must be C-contiguous for in-place resize")
+
+        if not dst.flags.owndata:
+            raise ValueError("markupFrame must own its data for in-place resize")
+
+        if dst.shape != src.shape:
+            dst.resize(src.shape, refcheck=False)
+
+        dst[...] = src
+
+    def resize_image(self,
+                     frame: NDArray,
+                     markupFrame: NDArray,
+                     ctx: GuiQueue.FrameCtx,
+                     args):
+        opts: GuiQueue.ResizeOpts = self.parse_args(args, GuiQueue.ResizeOpts())
+        scale = (10.0 ** opts.scale) / 10.0
+        h, w, _ = markupFrame.shape
+        newShape = (scale * np.array([h, w])).astype(np.int32)
+
+        tmp = cv2.resize(markupFrame, newShape, interpolation=cv2.INTER_LINEAR)
+
+        self._replace_array_in_place(markupFrame, tmp)
+
+        ctx.resize.set(scale)
 
     def image_filter_arg_specs(self, args):
         filt = args.get("Filter", ImageKernel.Unfiltered)
@@ -3116,8 +3186,8 @@ class CameraGui(ctk.CTkFrame):
 
         return
 
-    def inpaint_apriltags(self,
-                          markupFrame: NDArray,
+    @staticmethod
+    def inpaint_apriltags(markupFrame: NDArray,
                           gray: NDArray,
                           corners,
                           radius_px: int = 3,
@@ -3199,7 +3269,11 @@ class CameraGui(ctk.CTkFrame):
                 markupFrame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
         return
 
-    def pnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+    def pnp3DTruthPoints(self,
+                         frame: NDArray,
+                         markupFrame: NDArray,
+                         ctx: GuiQueue.FrameCtx,
+                         args) -> None:
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -3271,7 +3345,11 @@ class CameraGui(ctk.CTkFrame):
                 # LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
         return
 
-    def qnp3DTruthPoints(self, frame: NDArray, markupFrame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+    def qnp3DTruthPoints(self,
+                         frame: NDArray,
+                         markupFrame: NDArray,
+                         ctx: GuiQueue.FrameCtx,
+                         args) -> None:
 
         if self.ThreeDTruthPoints is None:
             self.loadTruthPoints()
@@ -3483,6 +3561,8 @@ class CameraGui(ctk.CTkFrame):
         algos.use_qnp = opts.want_qnp
         algos.use_wqnp = opts.want_wqnp
 
+        scale = ctx.resize.get_or(1.0)
+
         pose_output = self.pnpDrawer.markUpImage(
             image=markupFrame,
             output=output,
@@ -3493,7 +3573,9 @@ class CameraGui(ctk.CTkFrame):
             yoloSize=self.yoloSession.yoloSize,
             idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
             usedAlgos=algos,
-            circles_not_features=opts.feature_circles
+            originalSize=frame.shape[:2],
+            circles_not_features=opts.feature_circles,
+            img_scale=scale
         )
 
         if pose_output is not None:
@@ -3532,21 +3614,28 @@ class CameraGui(ctk.CTkFrame):
                 centers[best_idx][0] * img_yolo_x_correction), int(
                 centers[best_idx][1] * img_yolo_y_correction))
 
+            self.calibration.scaleCalibration(markupFrame.shape[0])
             K = self.calibration.getCameraMatrix()
             # d = self.calibration.getDistortion()  # Presume undistorted image
-            twoD_points = np.array([last_yolo_center[0], last_yolo_center[1], 1.0])
+            twoD_points = np.array([last_yolo_center[0], last_yolo_center[1], 1.0]) * scale
             dist_est = self.calibration.fx * 4.07 / (last_bounding_box_size[0])
 
             if self.check_above_horizon(last_yolo_center):
                 last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
                 w, h, _ = markupFrame.shape
-                cv2.putText(markupFrame, 'BB-Width Solution', (25, w - 75), cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(markupFrame.shape[0]), (50, 255, 255), 1)
+                (txt_width, txt_height), base = cv2.getTextSize('I',
+                                                                cv2.FONT_HERSHEY_SIMPLEX,
+                                                                med_text(w), med_thick(h))
+                pad = int(0.3 * txt_height)
+                cv2.putText(markupFrame, 'BB-Width Solution',
+                            (pad, w - 2 * pad - txt_height),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            med_text(markupFrame.shape[0]), (50, 255, 255), med_thick(h))
                 cv2.putText(markupFrame,
-                            f'x:{last_yolo_3d_estimate[0]:.3f}, y:{last_yolo_3d_estimate[1]:.3f}, ' +
-                            f'z:{last_yolo_3d_estimate[2]:.3f}',
-                            (25, w - 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), 1)
+                            f'x:{last_yolo_3d_estimate[0]:+.3f}, y:{last_yolo_3d_estimate[1]:+.3f}, ' +
+                            f'z:{last_yolo_3d_estimate[2]:+.3f}',
+                            (pad, h - pad),
+                            cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), med_thick(h))
             else:
                 last_yolo_3d_estimate = None
 
@@ -3593,7 +3682,7 @@ class CameraGui(ctk.CTkFrame):
 
         R_wr = self.own_attitude.rotmat_wr() if self.own_attitude is not None and self.own_attitude.valid else None
         if meas_3d is not None:
-            if ctx.img_time < self.last_time_update:
+            if ctx.img_time is None or ctx.img_time < self.last_time_update:
                 self.FG.reset()
 
             self.FG.addRecvMeas(meas_3d, t=ctx.img_time, R_wr=R_wr)
@@ -3606,6 +3695,12 @@ class CameraGui(ctk.CTkFrame):
                 fg_output = FgOutput()
 
                 K = self.calibration.getCameraMatrix()
+                if yolo.last_yolo_3d_estimate is None:
+                    curr_scale = np.copy(self.calibration.scale)
+                    self.calibration.scaleCalibration(markupFrame.shape[0])
+                    K = self.calibration.getCameraMatrix()
+                    self.calibration.scale = curr_scale
+
                 threeD_proj = K.dot(pred.r_T_d)
 
                 if threeD_proj[2] != 0:
@@ -3616,14 +3711,15 @@ class CameraGui(ctk.CTkFrame):
                     )
 
                     h, w, _ = markupFrame.shape
-                    size = 15
-                    thickness = 2
+                    size = int(0.025*h)
+                    thickness = lrg_thick(h)
                     text = 'Factor Graph Solution'
                     (txt_width, txt_height), base = cv2.getTextSize(text,
                                                                     cv2.FONT_HERSHEY_SIMPLEX,
                                                                     med_text(w), thickness)
-                    txt_height_perRow = txt_height + 15
-                    loc = (10, h - 4 * txt_height_perRow - 20)
+                    pad = int(0.3 * txt_height)
+                    txt_height_perRow = txt_height + pad
+                    loc = (pad, h - 4 * txt_height_perRow - pad)
 
                     cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
                     cv2.line(markupFrame,
@@ -3635,7 +3731,7 @@ class CameraGui(ctk.CTkFrame):
                              [pixel[0], pixel[1] - size],
                              (0, 0, 0), thickness)
 
-                    thickness = 1
+                    thickness = med_thick(h)
                     cv2.circle(markupFrame, pixel, size, color, thickness)
                     cv2.line(markupFrame,
                              [pixel[0] + size, pixel[1]],
@@ -3648,10 +3744,10 @@ class CameraGui(ctk.CTkFrame):
 
                     cv2.putText(markupFrame, 'Factor Graph Solution',
                                 loc, cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), (0, 0, 0), 4)
+                                med_text(markupFrame.shape[0]), (0, 0, 0), lrg_thick(h))
                     cv2.putText(markupFrame, 'Factor Graph Solution',
                                 loc, cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), color, 2)
+                                med_text(markupFrame.shape[0]), color, med_thick(h))
 
                 fg_output.curr_r_T_d = pred.r_T_d
                 fg_output.curr_r_V_d = pred.r_V_d
@@ -3704,42 +3800,6 @@ class CameraGui(ctk.CTkFrame):
         R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
         t_ours = C_CV_TO_OURS @ t_cv
         return mat2quat(R_ours.T), t_ours
-
-    def run_folder_reader_profiled(self):
-        import cProfile
-        import pstats
-
-        prof = cProfile.Profile()
-        try:
-            prof.enable()
-            self.run_folder_reader()
-        finally:
-            prof.disable()
-            prof.dump_stats("run_folder_reader.prof")
-
-            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            print("\n=== superCalibrateCamera functions ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== run_folder_reader / analyze_image ===")
-            stats.print_stats("run_folder_reader")
-            stats.print_stats("analyze_image")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            # Narrow view: only functions from your GUI modules
-            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== CustomTkinter / Tk wrappers ===")
-            stats.print_stats("customtkinter")
-            stats.print_stats("ctk")
-            stats.print_stats("tkinter")
 
     def update_cube_map_vectors(self):
         """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
@@ -3861,3 +3921,39 @@ class CameraGui(ctk.CTkFrame):
                 stitched[y:y + self.face_size, x:x + self.face_size] = self.cubemap_faces[face]
 
         return stitched
+
+    def run_folder_reader_profiled(self):
+        import cProfile
+        import pstats
+
+        prof = cProfile.Profile()
+        try:
+            prof.enable()
+            self.run_folder_reader()
+        finally:
+            prof.disable()
+            prof.dump_stats("run_folder_reader.prof")
+
+            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            print("\n=== superCalibrateCamera functions ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== run_folder_reader / analyze_image ===")
+            stats.print_stats("run_folder_reader")
+            stats.print_stats("analyze_image")
+
+            print("\n=== Top 40 functions overall (cumtime) ===")
+            stats.print_stats(40)
+
+            # Narrow view: only functions from your GUI modules
+            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
+            stats.print_stats("superCalibrateCamera")
+
+            print("\n=== CustomTkinter / Tk wrappers ===")
+            stats.print_stats("customtkinter")
+            stats.print_stats("ctk")
+            stats.print_stats("tkinter")

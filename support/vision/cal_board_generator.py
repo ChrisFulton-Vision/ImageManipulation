@@ -381,7 +381,7 @@ class Checkerboard:
             # If we didn't block all the way to the toggle, optionally yield a little more
             # (waitKey already yields, so this can be tiny or omitted)
             if dt_to_toggle > (block_ms / 1000.0):
-                time.sleep(0.0005)
+                time.sleep(0.0)
 
             if key == ord('a'):  # decrease frequency
                 flash_freq_hz, period, display_until, timer_frame_a, timer_frame_b = self.adjust_frequency_and_build_hud(

@@ -1,16 +1,24 @@
 from __future__ import annotations
-from typing import Callable, Optional, Protocol
+from typing import Callable, Optional, Protocol, Any
 from support.io.camera_config import CameraConfig
 from support.viz.draw_pnp_qnp import pnp_qnp_draw
 from support.core.enums import ImageSource
 import support.viz.colors as clr
 import customtkinter as ctk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from pathlib import Path
 from yaml import safe_load, dump
 import os
 import cv2
 
+from support.io.my_logging import LOG
+
+try:
+    from vmbpy import VmbSystem
+    HAVE_VMBPY = True
+except ImportError:
+    VmbSystem = None
+    HAVE_VMBPY = False
 
 # This protocol class enforces typesafe appropriate usage of super-class functions
 # This list of functions is for things this page GUI does not control, but does update
@@ -50,19 +58,30 @@ class Filepath_page(ctk.CTkFrame):
         self.ctrl = controller
         self.default_filepath = '/..'
 
-        self.indexDict = {}
+        self.cameraChoices: dict[str, dict[str, Any]] = {}
+        self._last_valid_camera_key: str | None = None
+        self._suppress_camera_callback = False
+
         self.scanForCameras()
 
         super().__init__(master, *args, **kwargs)
-        self.grid_rowconfigure(list(range(3)), weight=1)  # configure grid system
+        self.grid_rowconfigure(list(range(3)), weight=1)
         self.grid_columnconfigure(list(range(3)), weight=1)
 
         ###### BUTTON CREATION #######
-        self.streamOrImgCombo = ctk.CTkComboBox(self,
-                                                values=['Camera Stream', 'Static Image', 'Stream from Folder'],
-                                                command=self.sourceUpdate)
-        self.selectCameraCombo = ctk.CTkComboBox(self, values=list(self.indexDict.keys()),
-                                                 command=self.selectCamera)
+        self.streamOrImgCombo = ctk.CTkComboBox(
+            self,
+            values=['Camera Stream', 'Static Image', 'Stream from Folder'],
+            command=self.sourceUpdate
+        )
+
+        camera_values = list(self.cameraChoices.keys()) if self.cameraChoices else ['No Cameras Found']
+        self.selectCameraCombo = ctk.CTkComboBox(
+            self,
+            values=camera_values,
+            command=self.selectCamera,
+            state='normal' if self.cameraChoices else 'disabled',
+        )
 
         self.startStreamButton = ctk.CTkButton(master=self, text='Start Stream', fg_color=clr.CTK_BUTTON_RED,
                                                hover_color='blue',
@@ -93,9 +112,6 @@ class Filepath_page(ctk.CTkFrame):
 
         if self.ctrl.camConfig.imageFilepath is not None:
             self.multiImageTextButton.configure(text=Path(self.ctrl.camConfig.imageFilepath).parent.name)
-
-        self.streamOrImgCombo.set(self.ctrl.camConfig.imageSource.value)
-        self.sourceUpdate(self.ctrl.camConfig.imageSource.value)
 
         # Calibration Selector
         selectCalibButton = ctk.CTkButton(self, text='Select Calibration', command=self.loadCalibration)
@@ -138,6 +154,63 @@ class Filepath_page(ctk.CTkFrame):
         aprilTagSizeEntryButton = ctk.CTkButton(self, text="Enter Size of April Tag (m)",
                                                 command=lambda entry=aprilTagSizeEntry: self.setAprilTagSize(entry))
 
+        # Alvium / Vimba camera controls
+        self._ensure_vimba_control_defaults()
+        self.vimba_gain_auto_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_gain_auto", "Off")))
+        self.vimba_gain_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_gain", 0.0)))
+        self.vimba_exposure_auto_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_exposure_auto", "Off")))
+        self.vimba_exposure_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_exposure_us", 10000.0)))
+        self.vimba_status_text = ctk.StringVar(value="Alvium controls apply when the Vimba stream starts.")
+
+        self.vimba_controls_frame = ctk.CTkFrame(self)
+        self.vimba_controls_frame.grid_columnconfigure(0, weight=0)
+        self.vimba_controls_frame.grid_columnconfigure(1, weight=1)
+        self.vimba_controls_frame.grid_columnconfigure(2, weight=0)
+        self.vimba_controls_frame.grid_columnconfigure(3, weight=1)
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Alvium Controls", font=("Segoe UI", 13, "bold")).grid(
+            row=0, column=0, columnspan=4, padx=5, pady=(5, 2), sticky='w')
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Gain Auto").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        self.vimba_gain_auto_combo = ctk.CTkComboBox(
+            self.vimba_controls_frame,
+            values=["Off", "Once", "Continuous"],
+            variable=self.vimba_gain_auto_var,
+            command=lambda *_: self._on_vimba_mode_changed(),
+        )
+        self.vimba_gain_auto_combo.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Gain").grid(row=1, column=2, padx=5, pady=5, sticky='w')
+        self.vimba_gain_entry = ctk.CTkEntry(self.vimba_controls_frame, textvariable=self.vimba_gain_var)
+        self.vimba_gain_entry.grid(row=1, column=3, padx=5, pady=5, sticky='ew')
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Exposure Auto").grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        self.vimba_exposure_auto_combo = ctk.CTkComboBox(
+            self.vimba_controls_frame,
+            values=["Off", "Once", "Continuous"],
+            variable=self.vimba_exposure_auto_var,
+            command=lambda *_: self._on_vimba_mode_changed(),
+        )
+        self.vimba_exposure_auto_combo.grid(row=2, column=1, padx=5, pady=5, sticky='ew')
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Exposure (us)").grid(row=2, column=2, padx=5, pady=5, sticky='w')
+        self.vimba_exposure_entry = ctk.CTkEntry(self.vimba_controls_frame, textvariable=self.vimba_exposure_var)
+        self.vimba_exposure_entry.grid(row=2, column=3, padx=5, pady=5, sticky='ew')
+
+        self.vimba_read_button = ctk.CTkButton(self.vimba_controls_frame, text="Read Camera", command=self.read_vimba_controls)
+        self.vimba_read_button.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+
+        self.vimba_save_button = ctk.CTkButton(self.vimba_controls_frame, text="Save Settings", command=self.save_vimba_controls)
+        self.vimba_save_button.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+
+        ctk.CTkLabel(self.vimba_controls_frame, textvariable=self.vimba_status_text, justify='left').grid(
+            row=3, column=2, columnspan=2, padx=5, pady=5, sticky='w')
+        self._refresh_vimba_manual_widgets()
+
+        self.streamOrImgCombo.set(self.ctrl.camConfig.imageSource.value)
+        self.sourceUpdate(self.ctrl.camConfig.imageSource.value)
+        self._restore_selected_camera_combo()
+
         ###### BUTTON GRIDDING #######
         rowID = 0
         self.streamOrImgCombo.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
@@ -166,6 +239,14 @@ class Filepath_page(ctk.CTkFrame):
         self.sync_labels()
 
     def toggle_stream(self):
+        # If we're about to START a stream, first push any UI-edited Vimba values
+        # into camConfig so the stream thread uses the latest settings.
+        stream_var = getattr(self.ctrl, "stream_running_var", None)
+        currently_running = bool(stream_var.get()) if stream_var is not None else False
+
+        if not currently_running and self._should_show_vimba_controls():
+            self.save_vimba_controls()
+
         running = self.ctrl.startStreamToggle()
         self.update_buttonsForStream(running)
 
@@ -181,6 +262,8 @@ class Filepath_page(ctk.CTkFrame):
             self.selectCameraCombo.configure(state='normal')
             self.streamOrImgCombo.configure(state='normal')
 
+        self._set_vimba_controls_enabled(not running)
+
     def selectSaveFolder(self):
         init_dir = Path(self.ctrl.camConfig.saveFolder or Path(self.default_filepath) or Path.cwd())
         fp = self.askFilepath(str(init_dir), "Select Folder For Saving")
@@ -195,6 +278,12 @@ class Filepath_page(ctk.CTkFrame):
 
     def sourceUpdate(self, source):
         self.ctrl.camConfig.imageSource = ImageSource(source)
+
+        if self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream:
+            self.scanForCameras()
+            self._refresh_camera_combo_values()
+            self._restore_selected_camera_combo()
+
         self.updateSingleOrStream(rowID=1)
 
     def updateSingleOrStream(self, rowID):
@@ -203,6 +292,8 @@ class Filepath_page(ctk.CTkFrame):
                 self.selectCameraCombo.grid_forget()
             if self.startStreamButton.grid_info():
                 self.startStreamButton.grid_forget()
+            if self.vimba_controls_frame.grid_info():
+                self.vimba_controls_frame.grid_forget()
 
         if not self.ctrl.camConfig.imageSource == ImageSource.Static_Image:
             if self.singleImageFolderSelect.grid_info():
@@ -222,6 +313,17 @@ class Filepath_page(ctk.CTkFrame):
                 self.startStreamButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
             if not self.selectCameraCombo.grid_info():
                 self.selectCameraCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='nsew')
+
+            if self._should_show_vimba_controls():
+                self._sync_vimba_controls_from_model()
+                if not self.vimba_controls_frame.grid_info():
+                    self.vimba_controls_frame.grid(row=rowID + 1, column=0, columnspan=2, padx=5, pady=5, sticky='nsew')
+
+                stream_var = getattr(self.ctrl, "stream_running_var", None)
+                running = bool(stream_var.get()) if stream_var is not None else False
+                self._set_vimba_controls_enabled(not running)
+            elif self.vimba_controls_frame.grid_info():
+                self.vimba_controls_frame.grid_forget()
 
         elif self.ctrl.camConfig.imageSource == ImageSource.Static_Image:
 
@@ -254,29 +356,286 @@ class Filepath_page(ctk.CTkFrame):
         self.ctrl.saveToCache()
 
     ### HELPERS ########################
+    def _ensure_vimba_control_defaults(self):
+        defaults = {
+            "vimba_gain_auto": "Off",
+            "vimba_gain": 0.0,
+            "vimba_exposure_auto": "Off",
+            "vimba_exposure_us": 10000.0,
+        }
+        for name, value in defaults.items():
+            if not hasattr(self.ctrl.camConfig, name):
+                setattr(self.ctrl.camConfig, name, value)
+
+    @staticmethod
+    def _normalize_vimba_auto_mode(value: Any) -> str:
+        text = str(value or "Off").strip().lower()
+        mapping = {
+            "off": "Off",
+            "once": "Once",
+            "continuous": "Continuous",
+            "manual": "Off",
+            "false": "Off",
+            "true": "Continuous",
+        }
+        return mapping.get(text, "Off")
+
+    def _should_show_vimba_controls(self) -> bool:
+        return (
+            self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream
+            and bool(getattr(self.ctrl.camConfig, "use_vimba", False))
+        )
+
+    def _set_vimba_controls_enabled(self, enabled: bool):
+        state = 'normal' if enabled else 'disabled'
+        for widget_name in (
+            'vimba_gain_auto_combo',
+            'vimba_gain_entry',
+            'vimba_exposure_auto_combo',
+            'vimba_exposure_entry',
+            'vimba_read_button',
+            'vimba_save_button',
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+
+        if enabled:
+            self._refresh_vimba_manual_widgets()
+
+    def _refresh_vimba_manual_widgets(self):
+        gain_state = 'normal' if self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get()) == 'Off' else 'disabled'
+        exp_state = 'normal' if self._normalize_vimba_auto_mode(self.vimba_exposure_auto_var.get()) == 'Off' else 'disabled'
+        try:
+            self.vimba_gain_entry.configure(state=gain_state)
+        except Exception:
+            pass
+        try:
+            self.vimba_exposure_entry.configure(state=exp_state)
+        except Exception:
+            pass
+
+    def _on_vimba_mode_changed(self):
+        self._refresh_vimba_manual_widgets()
+
+    def _sync_vimba_controls_from_model(self):
+        self._ensure_vimba_control_defaults()
+
+        # Constructor-order guard: this may be called before Vimba widgets exist.
+        if not hasattr(self, "vimba_gain_auto_var"):
+            return
+
+        self.vimba_gain_auto_var.set(
+            self._normalize_vimba_auto_mode(
+                getattr(self.ctrl.camConfig, "vimba_gain_auto", "Off")
+            )
+        )
+        self.vimba_gain_var.set(str(getattr(self.ctrl.camConfig, "vimba_gain", 0.0)))
+        self.vimba_exposure_auto_var.set(
+            self._normalize_vimba_auto_mode(
+                getattr(self.ctrl.camConfig, "vimba_exposure_auto", "Off")
+            )
+        )
+        self.vimba_exposure_var.set(str(getattr(self.ctrl.camConfig, "vimba_exposure_us", 10000.0)))
+        self._refresh_vimba_manual_widgets()
+
+    def save_vimba_controls(self):
+        self._ensure_vimba_control_defaults()
+
+        self.ctrl.camConfig.vimba_gain_auto = self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get())
+        self.ctrl.camConfig.vimba_exposure_auto = self._normalize_vimba_auto_mode(self.vimba_exposure_auto_var.get())
+
+        try:
+            self.ctrl.camConfig.vimba_gain = float(self.vimba_gain_var.get())
+        except ValueError:
+            self.vimba_gain_var.set(str(getattr(self.ctrl.camConfig, "vimba_gain", 0.0)))
+
+        try:
+            self.ctrl.camConfig.vimba_exposure_us = float(self.vimba_exposure_var.get())
+        except ValueError:
+            self.vimba_exposure_var.set(str(getattr(self.ctrl.camConfig, "vimba_exposure_us", 10000.0)))
+
+        self.ctrl.saveToCache(immediate=True)
+        self.vimba_status_text.set("Alvium settings saved. They will apply on the next Vimba stream start.")
+        self._refresh_vimba_manual_widgets()
+
+    @staticmethod
+    def _try_get_camera_feature(cam, *feature_names: str):
+        for feature_name in feature_names:
+            try:
+                feature = getattr(cam, feature_name)
+            except Exception:
+                feature = None
+            if feature is not None:
+                return feature, feature_name
+        return None, None
+
+    def read_vimba_controls(self):
+        if not HAVE_VMBPY:
+            messagebox.showerror("VmbPy Missing", "VmbPy is not installed, so Alvium controls cannot be read.")
+            return
+
+        meta = self.cameraChoices.get(self.selectCameraCombo.get())
+        if not meta or meta.get("backend") != "vimba":
+            messagebox.showinfo("No Alvium Selected", "Select a Vimba/Alvium camera first.")
+            return
+
+        cam_id = str(meta.get("camera_id") or getattr(self.ctrl.camConfig, "vimba_camera_id", "") or "").strip()
+        if not cam_id:
+            messagebox.showerror("Camera ID Missing", "Could not determine the selected Alvium camera id.")
+            return
+
+        try:
+            with VmbSystem.get_instance() as vmb:
+                cam = vmb.get_camera_by_id(cam_id)
+                with cam:
+                    gain_auto_feat, _ = self._try_get_camera_feature(cam, "GainAuto")
+                    gain_feat, _ = self._try_get_camera_feature(cam, "Gain")
+                    exposure_auto_feat, _ = self._try_get_camera_feature(cam, "ExposureAuto")
+                    exposure_feat, _ = self._try_get_camera_feature(cam, "ExposureTime", "ExposureTimeAbs")
+
+                    if gain_auto_feat is not None:
+                        self.vimba_gain_auto_var.set(self._normalize_vimba_auto_mode(gain_auto_feat.get()))
+                    if gain_feat is not None:
+                        self.vimba_gain_var.set(str(gain_feat.get()))
+                    if exposure_auto_feat is not None:
+                        self.vimba_exposure_auto_var.set(self._normalize_vimba_auto_mode(exposure_auto_feat.get()))
+                    if exposure_feat is not None:
+                        self.vimba_exposure_var.set(str(exposure_feat.get()))
+        except Exception as e:
+            LOG.warning(f"Could not read Vimba camera controls: {e}")
+            messagebox.showerror("Read Failed", f"Could not read Alvium controls.\n\n{e}")
+            return
+
+        self.save_vimba_controls()
+        self.vimba_status_text.set("Alvium settings loaded from the selected camera.")
+
+    def _refresh_camera_combo_values(self):
+        values = list(self.cameraChoices.keys()) if self.cameraChoices else ['No Cameras Found']
+        self.selectCameraCombo.configure(
+            values=values,
+            state='normal' if self.cameraChoices else 'disabled',
+        )
+
+    def _preferred_camera_key_from_model(self) -> str | None:
+        use_vimba = bool(getattr(self.ctrl.camConfig, "use_vimba", False))
+        vimba_camera_id = str(getattr(self.ctrl.camConfig, "vimba_camera_id", "") or "")
+        cam_index = getattr(self.ctrl.camConfig, "cam_index", None)
+
+        if use_vimba and vimba_camera_id:
+            for key, meta in self.cameraChoices.items():
+                if meta.get("backend") == "vimba" and meta.get("camera_id") == vimba_camera_id:
+                    return key
+
+        for key, meta in self.cameraChoices.items():
+            if meta.get("backend") == "opencv" and meta.get("cam_index") == cam_index:
+                return key
+
+        return next(iter(self.cameraChoices), None)
+
+    def _restore_selected_camera_combo(self):
+        key = self._preferred_camera_key_from_model()
+        if key is None:
+            self._last_valid_camera_key = None
+            if hasattr(self, "selectCameraCombo"):
+                self._suppress_camera_callback = True
+                try:
+                    self.selectCameraCombo.set("No Cameras Found")
+                finally:
+                    self._suppress_camera_callback = False
+            return
+
+        self._last_valid_camera_key = key
+        if hasattr(self, "selectCameraCombo"):
+            self._suppress_camera_callback = True
+            try:
+                self.selectCameraCombo.set(key)
+            finally:
+                self._suppress_camera_callback = False
+
+    def _probe_camera_choice(self, meta: dict[str, Any]) -> tuple[bool, str | None]:
+        backend = meta.get("backend")
+
+        if backend == "opencv":
+            idx = int(meta["cam_index"])
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            try:
+                if not cap.isOpened():
+                    return False, f"OpenCV camera index {idx} could not be opened."
+                ok, _ = cap.read()
+                if not ok:
+                    return False, f"OpenCV camera index {idx} opened but did not return a frame."
+                return True, None
+            finally:
+                cap.release()
+
+        if backend == "vimba":
+            if not HAVE_VMBPY:
+                return False, "VmbPy is not installed."
+
+            cam_id = meta["camera_id"]
+            try:
+                with VmbSystem.get_instance() as vmb:
+                    cam = vmb.get_camera_by_id(cam_id)
+                    with cam:
+                        pass
+                return True, None
+            except Exception as e:
+                return False, f"Vimba camera could not be opened: {e}"
+
+        return False, f"Unknown camera backend: {backend}"
 
     def scanForCameras(self):
-        self.indexDict = {}
-        from cv2_enumerate_cameras import enumerate_cameras
-        for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
-            self.indexDict[camera_info.name] = camera_info.index
+        self.cameraChoices = {}
 
-        # with VmbSystem.get_instance() as vmb:
-        #     cams = vmb.get_all_cameras()
-        #     if cams:
-        #         cam = cams[0]
-        #         try:
-        #             cam._open()
-        #         except vmbpy.c_binding.VmbError as e:
-        #             LOG.warning(f'Could not open camera: {e}')
-        #             return
-        #         try:
-        #             cam.start_streaming(
-        #                 lambda cam, stream, frame: self.display_frame(cam, stream, frame, "Camera Stream"))
-        #             time.sleep(5)
-        #             cam.stop_streaming()
-        #         finally:
-        #             cam._close()
+        # --- OpenCV / DirectShow cameras ---
+        try:
+            from cv2_enumerate_cameras import enumerate_cameras
+            for camera_info in enumerate_cameras(cv2.CAP_DSHOW):
+                label = f"OpenCV: {camera_info.name} [{camera_info.index}]"
+                self.cameraChoices[label] = {
+                    "backend": "opencv",
+                    "cam_index": int(camera_info.index),
+                    "display_name": camera_info.name,
+                }
+        except Exception as e:
+            LOG.warning(f"Could not enumerate OpenCV cameras: {e}")
+
+        # --- Vimba cameras ---
+        if HAVE_VMBPY:
+            try:
+                with VmbSystem.get_instance() as vmb:
+                    for cam in vmb.get_all_cameras():
+                        try:
+                            cam_id = cam.get_id()
+                        except Exception:
+                            cam_id = ""
+
+                        try:
+                            serial = cam.get_serial()
+                        except Exception:
+                            serial = ""
+
+                        try:
+                            name = cam.get_name()
+                        except Exception:
+                            name = cam_id or "Unknown Vimba Camera"
+
+                        suffix = serial if serial else cam_id
+                        label = f"Vimba: {name} [{suffix}]"
+
+                        self.cameraChoices[label] = {
+                            "backend": "vimba",
+                            "camera_id": cam_id,
+                            "camera_serial": serial,
+                            "display_name": name,
+                        }
+            except Exception as e:
+                LOG.warning(f"Could not enumerate Vimba cameras: {e}")
 
     @staticmethod
     def askFilepath(initDir, text):
@@ -292,7 +651,47 @@ class Filepath_page(ctk.CTkFrame):
 
     ### BUTTON ACTIONS #################
     def selectCamera(self, key):
-        self.ctrl.camConfig.cam_index = self.indexDict[key]
+        if self._suppress_camera_callback:
+            return
+
+        meta = self.cameraChoices.get(key)
+        if meta is None:
+            self._restore_selected_camera_combo()
+            return
+
+        ok, err = self._probe_camera_choice(meta)
+        if not ok:
+            LOG.warning(f"Rejected camera selection '{key}': {err}")
+            messagebox.showerror("Camera Connection Failed", err or f"Could not open camera:\n{key}")
+
+            # Snap back to previous valid choice
+            self._suppress_camera_callback = True
+            try:
+                if self._last_valid_camera_key is not None:
+                    self.selectCameraCombo.set(self._last_valid_camera_key)
+                else:
+                    fallback = self._preferred_camera_key_from_model()
+                    if fallback is not None:
+                        self.selectCameraCombo.set(fallback)
+            finally:
+                self._suppress_camera_callback = False
+            return
+
+        # Accept selection
+        if meta["backend"] == "opencv":
+            self.ctrl.camConfig.cam_index = int(meta["cam_index"])
+            self.ctrl.camConfig.use_vimba = False
+            self.ctrl.camConfig.vimba_camera_id = ""
+            self.vimba_status_text.set("OpenCV camera selected.")
+        elif meta["backend"] == "vimba":
+            self.ctrl.camConfig.use_vimba = True
+            self.ctrl.camConfig.vimba_camera_id = str(meta["camera_id"])
+            self.vimba_status_text.set("Alvium selected. Settings apply when the Vimba stream starts.")
+
+        self._last_valid_camera_key = key
+        self._sync_vimba_controls_from_model()
+        self.updateSingleOrStream(rowID=1)
+        self.ctrl.saveToCache(immediate=True)
 
     def selectImagesFilepath(self):
         if self.ctrl.camConfig.imageFilepath is None:
@@ -335,6 +734,7 @@ class Filepath_page(ctk.CTkFrame):
         self.configSelectText.set(Path(self.ctrl.camConfig.configFilepath).name)
 
     def sync_labels(self):
+        self._sync_vimba_controls_from_model()
         self.updateSingleOrStream(rowID=1)
         self.updateConfigLabel()
         self.updateSaveFolderLabel()

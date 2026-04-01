@@ -90,6 +90,7 @@ class SeedConfig:
     score_quick_M: int = 2                # 0 => score all points always
     z_eps: float = 1e-3
 
+############################################ REGULAR OPT PATH, NO ONLINE CAL ##########################################
 
 @njit(cache=True, fastmath=False)
 def _project_accum_irls_numba(object_pts, meas_2N,
@@ -622,25 +623,77 @@ def _row_normed(A, eps=1e-12):
 
 # --- Camera projection ----------------------------------------------------------
 
-def h(est_q: q, est_t: NDArray, feature_points, cal: Calibration):
-    """Project all `FEATURE_OFFSETS` into pixel coordinates given pose (q, t).
+def _get_cal_distortion(cal: Calibration) -> tuple[float, float, float, float, float]:
+    """
+    Returns Brown-Conrady distortion in the internal order:
+      (k1, k2, k3, p1, p2)
 
-    The pose maps model points into the camera frame as:  X_cam = q.T * X + t
-    Then the custom pinhole projection computes pixels [u, v]:
-        u = FX * (x / z) + CX
-        v = FY * (y / z) + CY
+    Missing attributes default to zero so old Calibration objects still work.
+    """
+    return (
+        float(getattr(cal, "k1", 0.0)),
+        float(getattr(cal, "k2", 0.0)),
+        float(getattr(cal, "k3", 0.0)),
+        float(getattr(cal, "p1", 0.0)),
+        float(getattr(cal, "p2", 0.0)),
+    )
+
+
+def _opencv_dist_coeffs_from_cal(cal: Calibration) -> np.ndarray:
+    """
+    OpenCV distortion order is [k1, k2, p1, p2, k3].
+    """
+    k1, k2, k3, p1, p2 = _get_cal_distortion(cal)
+    return np.array([k1, k2, p1, p2, k3], dtype=np.float64).reshape(-1, 1)
+
+
+def _project_points_brown_from_xyz(XYZ: np.ndarray, cal: Calibration) -> np.ndarray:
+    """
+    Brown-Conrady projection from camera-frame XYZ -> pixels.
+
+    Distortion model:
+      x_d = x_n * radial + 2*p1*x_n*y_n + p2*(r^2 + 2*x_n^2)
+      y_d = y_n * radial + p1*(r^2 + 2*y_n^2) + 2*p2*x_n*y_n
+      radial = 1 + k1*r^2 + k2*r^4 + k3*r^6
+    """
+    XYZ = np.asarray(XYZ, dtype=np.float64)
+    X = XYZ[:, 0]
+    Y = XYZ[:, 1]
+    Z = XYZ[:, 2]
+
+    # avoid blowups at/near z=0
+    Zs = np.where(np.abs(Z) < 1e-12, np.where(Z >= 0.0, 1e-12, -1e-12), Z)
+
+    xn = X / Zs
+    yn = Y / Zs
+
+    k1, k2, k3, p1, p2 = _get_cal_distortion(cal)
+
+    r2 = xn * xn + yn * yn
+    r4 = r2 * r2
+    r6 = r4 * r2
+
+    radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+    xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
+    yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
+
+    uv = np.empty((XYZ.shape[0], 2), dtype=np.float64)
+    uv[:, 0] = float(cal.fx) * xd + float(cal.cx)
+    uv[:, 1] = float(cal.fy) * yd + float(cal.cy)
+    return uv
+
+
+# --- Camera projection ----------------------------------------------------------
+
+def h(est_q: q, est_t: NDArray, feature_points, cal: Calibration):
+    """
+    Project all model points into pixel coordinates using Brown-Conrady distortion.
 
     Returns a flattened length-2N vector [u0, v0, u1, v1, ...].
     """
-
     XYZ_proj = est_q * feature_points + est_t
-    X, Y, Z = XYZ_proj[:, 0], XYZ_proj[:, 1], XYZ_proj[:, 2]
-
-    us_vs_s_proj = np.zeros((XYZ_proj.shape[0], 2), dtype=float)
-    us_vs_s_proj[:, 0] = cal.fx * (X / Z) + cal.cx
-    us_vs_s_proj[:, 1] = cal.fy * (Y / Z) + cal.cy
-
-    return us_vs_s_proj.flatten()
+    return _project_points_brown_from_xyz(XYZ_proj, cal).reshape(-1)
 
 
 def _skew(v: np.ndarray) -> np.ndarray:
@@ -924,6 +977,630 @@ def opt(
         s2=float(s2),
         cov6=cov6
     )
+
+############################################ REGULAR OPT PATH, NO ONLINE CAL END ######################################
+
+
+############################################ SUPER OPT PATH WITH ONLINE CAL ###########################################
+# =========================
+# Joint pose + intrinsics + Brown-Conrady distortion
+# =========================
+
+@dataclass
+class JointPnPStats:
+    N: int
+    dof: int
+    sse_meas_w: float
+    sse_prior: float
+    sse_total: float
+    s2: float
+    cov15: np.ndarray               # full solver covariance in state [pose6, cal9]
+    cov9: np.ndarray                # calibration block covariance in solver state
+    cal_state: np.ndarray           # [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+
+    # Backward-ish compatibility fields
+    cov10: np.ndarray | None = None
+    cov4: np.ndarray | None = None
+    intr_state: np.ndarray | None = None
+
+
+def _intr_dist_state_from_cal(cal: Calibration) -> np.ndarray:
+    fx = float(cal.fx)
+    fy = float(cal.fy)
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(f"Calibration focal lengths must be positive, got fx={fx}, fy={fy}")
+
+    k1 = float(getattr(cal, "k1", 0.0))
+    k2 = float(getattr(cal, "k2", 0.0))
+    k3 = float(getattr(cal, "k3", 0.0))
+    p1 = float(getattr(cal, "p1", 0.0))
+    p2 = float(getattr(cal, "p2", 0.0))
+
+    return np.array(
+        [np.log(fx), np.log(fy), float(cal.cx), float(cal.cy), k1, k2, k3, p1, p2],
+        dtype=np.float64
+    )
+
+
+def _intr_dist_from_state(theta9: np.ndarray) -> tuple[float, float, float, float, float, float, float, float, float]:
+    log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2 = [float(v) for v in np.asarray(theta9, dtype=np.float64).reshape(9)]
+    fx = float(np.exp(log_fx))
+    fy = float(np.exp(log_fy))
+    return fx, fy, cx, cy, k1, k2, k3, p1, p2
+
+
+def _clone_cal_with_intrinsics_and_distortion(
+    cal: Calibration,
+    fx: float, fy: float, cx: float, cy: float,
+    k1: float, k2: float, k3: float, p1: float, p2: float
+) -> Calibration:
+    import copy
+    cal_out = copy.deepcopy(cal)
+    cal_out.fx = float(fx)
+    cal_out.fy = float(fy)
+    cal_out.cx = float(cx)
+    cal_out.cy = float(cy)
+    cal_out.k1 = float(k1)
+    cal_out.k2 = float(k2)
+    cal_out.k3 = float(k3)
+    cal_out.p1 = float(p1)
+    cal_out.p2 = float(p2)
+    return cal_out
+
+
+def _prior_info_from_cov_or_info(
+    prior_cov: np.ndarray | None = None,
+    prior_info: np.ndarray | None = None,
+    state_dim: int = 9,
+) -> np.ndarray:
+    if prior_info is not None:
+        I = np.asarray(prior_info, dtype=np.float64)
+        if I.shape != (state_dim, state_dim):
+            raise ValueError(f"prior_info must be {state_dim}x{state_dim}, got {I.shape}")
+        return I
+
+    if prior_cov is not None:
+        P = np.asarray(prior_cov, dtype=np.float64)
+        if P.shape != (state_dim, state_dim):
+            raise ValueError(f"prior_cov must be {state_dim}x{state_dim}, got {P.shape}")
+        return np.linalg.pinv(P)
+
+    return np.zeros((state_dim, state_dim), dtype=np.float64)
+
+
+def _prior_cost_and_rhs(theta: np.ndarray, prior_mean: np.ndarray | None, prior_info: np.ndarray | None):
+    """
+    Prior residual is:
+        r_prior = prior_mean - theta
+    with information matrix prior_info.
+    """
+    theta = np.asarray(theta, dtype=np.float64).reshape(-1)
+    n = theta.size
+
+    if prior_mean is None or prior_info is None:
+        return np.zeros((n, n), dtype=np.float64), np.zeros(n, dtype=np.float64), 0.0
+
+    d = np.asarray(prior_mean, dtype=np.float64).reshape(n) - theta
+    H = np.asarray(prior_info, dtype=np.float64).reshape(n, n)
+    g = H @ d
+    c = float(d @ H @ d)
+    return H, g, c
+
+
+def _default_raw_dist_cov5() -> np.ndarray:
+    """
+    Default raw-state prior covariance for [k1, k2, k3, p1, p2].
+
+    These are intentionally loose enough to move,
+    but not so loose that single-view optimization explodes into interpretive dance.
+    """
+    stds = np.array([0.10, 0.05, 0.02, 0.005, 0.005], dtype=np.float64)
+    return np.diag(stds * stds)
+
+
+def _build_prior_mean_cov9_from_cal(cal: Calibration) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Builds solver-space prior for:
+      theta9 = [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+
+    Expected raw-space covariance ordering if present:
+      [fx, fy, cx, cy, k1, k2, k3, p1, p2]
+    """
+    fx = float(cal.fx)
+    fy = float(cal.fy)
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError(f"Calibration focal lengths must be positive, got fx={fx}, fy={fy}")
+
+    k1 = float(getattr(cal, "k1", 0.0))
+    k2 = float(getattr(cal, "k2", 0.0))
+    k3 = float(getattr(cal, "k3", 0.0))
+    p1 = float(getattr(cal, "p1", 0.0))
+    p2 = float(getattr(cal, "p2", 0.0))
+
+    prior_mean9 = np.array(
+        [np.log(fx), np.log(fy), float(cal.cx), float(cal.cy), k1, k2, k3, p1, p2],
+        dtype=np.float64
+    )
+
+    raw_cov9 = np.zeros((9, 9), dtype=np.float64)
+    cov_intr_dist = getattr(cal, "cov_intr_dist", None)
+
+    if cov_intr_dist is not None:
+        cov_intr_dist = np.asarray(cov_intr_dist, dtype=np.float64)
+        if cov_intr_dist.shape != (9, 9):
+            raise ValueError(f"cal.cov_intr_dist must be 9x9, got {cov_intr_dist.shape}")
+        raw_cov9[:, :] = cov_intr_dist
+    else:
+        cov4 = getattr(cal, "cov", None)
+        if cov4 is not None:
+            cov4 = np.asarray(cov4, dtype=np.float64)
+            if cov4.shape != (4, 4):
+                raise ValueError(f"cal.cov must be 4x4 when used as intrinsics prior, got {cov4.shape}")
+            raw_cov9[:4, :4] = cov4
+        else:
+            raw_cov9[:4, :4] = np.diag(np.array([100.0, 100.0, 50.0, 50.0], dtype=np.float64) ** 2)
+
+        raw_cov9[4:, 4:] = _default_raw_dist_cov5()
+
+    # raw -> solver state transform
+    # raw:    [fx, fy, cx, cy, k1, k2, k3, p1, p2]
+    # solver: [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+    G = np.eye(9, dtype=np.float64)
+    G[0, 0] = 1.0 / fx
+    G[1, 1] = 1.0 / fy
+
+    prior_cov9 = G @ raw_cov9 @ G.T
+    return prior_mean9, prior_cov9
+
+
+@njit(cache=True, fastmath=False)
+def _brown_conrady_norm_and_partials(xn, yn, k1, k2, k3, p1, p2):
+    """
+    Returns:
+      xd, yd,
+      dxd_dxn, dxd_dyn,
+      dyd_dxn, dyd_dyn,
+      dxd_dk1, dxd_dk2, dxd_dk3, dxd_dp1, dxd_dp2,
+      dyd_dk1, dyd_dk2, dyd_dk3, dyd_dp1, dyd_dp2
+    """
+    r2 = xn * xn + yn * yn
+    r4 = r2 * r2
+    r6 = r4 * r2
+
+    radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+    xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
+    yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
+
+    common = k1 + 2.0 * k2 * r2 + 3.0 * k3 * r4
+    drad_dxn = 2.0 * xn * common
+    drad_dyn = 2.0 * yn * common
+
+    dxd_dxn = radial + xn * drad_dxn + 2.0 * p1 * yn + 6.0 * p2 * xn
+    dxd_dyn = xn * drad_dyn + 2.0 * p1 * xn + 2.0 * p2 * yn
+
+    dyd_dxn = yn * drad_dxn + 2.0 * p1 * xn + 2.0 * p2 * yn
+    dyd_dyn = radial + yn * drad_dyn + 6.0 * p1 * yn + 2.0 * p2 * xn
+
+    dxd_dk1 = xn * r2
+    dxd_dk2 = xn * r4
+    dxd_dk3 = xn * r6
+    dxd_dp1 = 2.0 * xn * yn
+    dxd_dp2 = r2 + 2.0 * xn * xn
+
+    dyd_dk1 = yn * r2
+    dyd_dk2 = yn * r4
+    dyd_dk3 = yn * r6
+    dyd_dp1 = r2 + 2.0 * yn * yn
+    dyd_dp2 = 2.0 * xn * yn
+
+    return (
+        xd, yd,
+        dxd_dxn, dxd_dyn,
+        dyd_dxn, dyd_dyn,
+        dxd_dk1, dxd_dk2, dxd_dk3, dxd_dp1, dxd_dp2,
+        dyd_dk1, dyd_dk2, dyd_dk3, dyd_dp1, dyd_dp2
+    )
+
+
+@njit(cache=True, fastmath=False)
+def _project_accum_joint_irls_dist_numba(
+        object_pts, meas_2N,
+        qw, qx, qy, qz, tx, ty, tz,
+        log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2,
+        kind_int, c,
+        inv_sigma_2N,
+        z_eps=1e-3):
+    """
+    Joint accumulator for state:
+      [drx, dry, drz, tx, ty, tz,
+       dlog_fx, dlog_fy, dcx, dcy,
+       dk1, dk2, dk3, dp1, dp2]
+    """
+    N = object_pts.shape[0]
+    R = _quat_to_R_numba(qw, qx, qy, qz)
+
+    fx = np.exp(log_fx)
+    fy = np.exp(log_fy)
+
+    LtL = np.zeros((15, 15), dtype=np.float64)
+    Lty = np.zeros(15, dtype=np.float64)
+    y2 = 0.0
+    front = 0
+
+    eps = 1e-12
+    if c <= 0.0:
+        c = 1.0
+
+    for i in range(N):
+        X = object_pts[i, 0]
+        Y = object_pts[i, 1]
+        Z = object_pts[i, 2]
+
+        rx = R[0, 0] * X + R[0, 1] * Y + R[0, 2] * Z
+        ry = R[1, 0] * X + R[1, 1] * Y + R[1, 2] * Z
+        rz = R[2, 0] * X + R[2, 1] * Y + R[2, 2] * Z
+
+        x = rx + tx
+        y = ry + ty
+        z = rz + tz
+
+        if z > z_eps:
+            front += 1
+
+        invz = 1.0 / z
+        xn = x * invz
+        yn = y * invz
+
+        (xd, yd,
+         dxd_dxn, dxd_dyn,
+         dyd_dxn, dyd_dyn,
+         dxd_dk1, dxd_dk2, dxd_dk3, dxd_dp1, dxd_dp2,
+         dyd_dk1, dyd_dk2, dyd_dk3, dyd_dp1, dyd_dp2) = _brown_conrady_norm_and_partials(
+            xn, yn, k1, k2, k3, p1, p2
+        )
+
+        u = fx * xd + cx
+        v = fy * yd + cy
+
+        r2i = 2 * i
+        du = meas_2N[r2i + 0] - u
+        dv = meas_2N[r2i + 1] - v
+
+        if inv_sigma_2N is None:
+            iu = 1.0
+            iv = 1.0
+        else:
+            iu = inv_sigma_2N[r2i + 0]
+            iv = inv_sigma_2N[r2i + 1]
+
+        if kind_int == 0:
+            sw = 1.0
+        else:
+            rwu = du * iu
+            rwv = dv * iv
+            rmag = np.sqrt(rwu * rwu + rwv * rwv)
+
+            if rmag < eps:
+                w = 1.0
+            elif kind_int == 1:  # huber
+                w = 1.0 if rmag <= c else (c / rmag)
+            elif kind_int == 2:  # cauchy
+                t = rmag / c
+                w = 1.0 / (1.0 + t * t)
+            else:  # tukey
+                t = rmag / c
+                if t >= 1.0:
+                    w = 0.0
+                else:
+                    a = 1.0 - t * t
+                    w = a * a
+
+            sw = np.sqrt(w)
+
+        wu = iu * sw
+        wv = iv * sw
+
+        ru = wu * du
+        rv = wv * dv
+
+        y2 += ru * ru + rv * rv
+
+        # normalized-coordinate derivatives
+        dxn_dx = invz
+        dxn_dy = 0.0
+        dxn_dz = -xn * invz
+
+        dyn_dx = 0.0
+        dyn_dy = invz
+        dyn_dz = -yn * invz
+
+        # chain rule: XYZ -> normalized -> distorted normalized -> pixel
+        du_dX = fx * (dxd_dxn * dxn_dx + dxd_dyn * dyn_dx)
+        du_dY = fx * (dxd_dxn * dxn_dy + dxd_dyn * dyn_dy)
+        du_dZ = fx * (dxd_dxn * dxn_dz + dxd_dyn * dyn_dz)
+
+        dv_dX = fy * (dyd_dxn * dxn_dx + dyd_dyn * dyn_dx)
+        dv_dY = fy * (dyd_dxn * dxn_dy + dyd_dyn * dyn_dy)
+        dv_dZ = fy * (dyd_dxn * dxn_dz + dyd_dyn * dyn_dz)
+
+        a = rx
+        b = ry
+        cR = rz
+
+        # row gradient g dotted into (-skew(RX))
+        Lurx = b * du_dZ - cR * du_dY
+        Lury = cR * du_dX - a * du_dZ
+        Lurz = a * du_dY - b * du_dX
+
+        Lvrx = b * dv_dZ - cR * dv_dY
+        Lvry = cR * dv_dX - a * dv_dZ
+        Lvrz = a * dv_dY - b * dv_dX
+
+        ju = np.empty(15, dtype=np.float64)
+        jv = np.empty(15, dtype=np.float64)
+
+        # pose cols
+        ju[0] = wu * Lurx
+        ju[1] = wu * Lury
+        ju[2] = wu * Lurz
+        ju[3] = wu * du_dX
+        ju[4] = wu * du_dY
+        ju[5] = wu * du_dZ
+
+        jv[0] = wv * Lvrx
+        jv[1] = wv * Lvry
+        jv[2] = wv * Lvrz
+        jv[3] = wv * dv_dX
+        jv[4] = wv * dv_dY
+        jv[5] = wv * dv_dZ
+
+        # intrinsics cols
+        ju[6] = wu * (fx * xd)   # du / d log_fx
+        ju[7] = 0.0
+        ju[8] = wu * 1.0         # du / d cx
+        ju[9] = 0.0
+
+        jv[6] = 0.0
+        jv[7] = wv * (fy * yd)   # dv / d log_fy
+        jv[8] = 0.0
+        jv[9] = wv * 1.0         # dv / d cy
+
+        # distortion cols
+        ju[10] = wu * (fx * dxd_dk1)
+        ju[11] = wu * (fx * dxd_dk2)
+        ju[12] = wu * (fx * dxd_dk3)
+        ju[13] = wu * (fx * dxd_dp1)
+        ju[14] = wu * (fx * dxd_dp2)
+
+        jv[10] = wv * (fy * dyd_dk1)
+        jv[11] = wv * (fy * dyd_dk2)
+        jv[12] = wv * (fy * dyd_dk3)
+        jv[13] = wv * (fy * dyd_dp1)
+        jv[14] = wv * (fy * dyd_dp2)
+
+        # accumulate g = J^T r
+        for cidx in range(15):
+            Lty[cidx] += ju[cidx] * ru + jv[cidx] * rv
+
+        # accumulate H = J^T J
+        for rix in range(15):
+            jru = ju[rix]
+            jrv = jv[rix]
+            for cix in range(rix, 15):
+                LtL[rix, cix] += jru * ju[cix] + jrv * jv[cix]
+
+    # symmetrize
+    for rix in range(15):
+        for cix in range(rix + 1, 15):
+            LtL[cix, rix] = LtL[rix, cix]
+
+    front_frac = front / float(max(1, N))
+    return LtL, Lty, y2, front_frac
+
+
+def opt_pose_and_intrinsics(
+        img_pts: NDArray,
+        object_pts: NDArray,
+        cal: Calibration,
+        return_stats: bool,
+        seed_q: q = None,
+        seed_t: NDArray = None,
+        prior_mean9: np.ndarray | None = None,   # [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+        prior_cov9: np.ndarray | None = None,
+        prior_info9: np.ndarray | None = None,
+        robust_kind: robust_cost = robust_cost.none,
+        robust_param: float = 2.0,
+        sigma_2N=None,
+        sigma_floor_px: float = 1.0,
+        max_iters: int = 20,
+        pose_only_warmstart_iters: int = 3):
+    """
+    Joint LM refinement of pose + intrinsics + Brown-Conrady distortion.
+
+    Solver state:
+      [drx, dry, drz, tx, ty, tz,
+       dlog_fx, dlog_fy, dcx, dcy,
+       dk1, dk2, dk3, dp1, dp2]
+    """
+
+    # ----------------- Initialization -----------------
+    if seed_q is None or seed_t is None:
+        est_q, est_t = DLT(object_pts, img_pts, cal)
+    else:
+        est_q = seed_q.copy()
+        est_t = np.asarray(seed_t, dtype=np.float64).copy()
+
+    meas_pix = np.ascontiguousarray(img_pts.reshape(-1), dtype=np.float64)
+    object_pts64 = np.ascontiguousarray(object_pts, dtype=np.float64)
+    N = int(img_pts.shape[0])
+
+    inv_sigma_2N = _inv_sigma_2N_from_sigma(sigma_2N, N)
+    if inv_sigma_2N is not None:
+        sf = float(sigma_floor_px)
+        if (not np.isfinite(sf)) or (sf <= 0.0):
+            sf = 1.0
+        inv_sigma_2N = np.minimum(inv_sigma_2N, 1.0 / sf)
+
+    kind_int = 0
+    if robust_kind == robust_cost.huber:
+        kind_int = 1
+    elif robust_kind == robust_cost.cauchy:
+        kind_int = 2
+    elif robust_kind == robust_cost.tukey:
+        kind_int = 3
+
+    qw, qx, qy, qz = float(est_q.s), float(est_q.vec[0]), float(est_q.vec[1]), float(est_q.vec[2])
+    tx, ty, tz = float(est_t[0]), float(est_t[1]), float(est_t[2])
+
+    theta9 = _intr_dist_state_from_cal(cal) if prior_mean9 is None else np.asarray(prior_mean9, dtype=np.float64).reshape(9).copy()
+    prior_mean9_use = theta9.copy() if prior_mean9 is None else np.asarray(prior_mean9, dtype=np.float64).reshape(9).copy()
+    prior_info9_use = _prior_info_from_cov_or_info(prior_cov=prior_cov9, prior_info=prior_info9, state_dim=9)
+
+    lam = 1e-1
+
+    # ----------------- LM Loop -----------------
+    for iter_num in range(1, max_iters + 1):
+        LtL, Lty, meas_old_y2, front_frac = _project_accum_joint_irls_dist_numba(
+            object_pts64, meas_pix,
+            qw, qx, qy, qz, tx, ty, tz,
+            float(theta9[0]), float(theta9[1]), float(theta9[2]), float(theta9[3]),
+            float(theta9[4]), float(theta9[5]), float(theta9[6]), float(theta9[7]), float(theta9[8]),
+            int(kind_int), float(robust_param),
+            inv_sigma_2N
+        )
+
+        if front_frac < 0.9:
+            lam *= 3.0
+            continue
+
+        H_prior9, g_prior9, prior_old_y2 = _prior_cost_and_rhs(theta9, prior_mean9_use, prior_info9_use)
+
+        H = LtL.copy()
+        g = Lty.copy()
+        H[6:15, 6:15] += H_prior9
+        g[6:15] += g_prior9
+
+        total_old_y2 = float(meas_old_y2 + prior_old_y2)
+
+        dx = np.zeros(15, dtype=np.float64)
+
+        # warmstart the basin with pose-only updates for a few iterations
+        if iter_num <= int(max(0, pose_only_warmstart_iters)):
+            A6 = H[:6, :6].copy()
+            for k in range(6):
+                A6[k, k] += lam
+            g6 = g[:6]
+            dx6 = np.linalg.solve(A6, g6)
+            dx[:6] = dx6
+            pred = 0.5 * float(dx6.dot(lam * dx6 + g6))
+        else:
+            A = H.copy()
+            for k in range(15):
+                A[k, k] += lam
+            dx = np.linalg.solve(A, g)
+            pred = 0.5 * float(dx.dot(lam * dx + g))
+
+        if pred <= 0.0 or (not np.isfinite(pred)):
+            lam *= 3.0
+            continue
+
+        drx, dry, drz = float(dx[0]), float(dx[1]), float(dx[2])
+        dtx, dty, dtz = float(dx[3]), float(dx[4]), float(dx[5])
+
+        tqw, tqx, tqy, tqz = _apply_delta_q(qw, qx, qy, qz, drx, dry, drz)
+        ttx, tty, ttz = tx + dtx, ty + dty, tz + dtz
+
+        ttheta9 = theta9.copy()
+        ttheta9 += dx[6:15]
+
+        # keep focal lengths sane in log space
+        ttheta9[0] = np.clip(ttheta9[0], np.log(1.0), np.log(1e6))
+        ttheta9[1] = np.clip(ttheta9[1], np.log(1.0), np.log(1e6))
+
+        _LtL2, _Lty2, meas_new_y2, front2 = _project_accum_joint_irls_dist_numba(
+            object_pts64, meas_pix,
+            tqw, tqx, tqy, tqz, ttx, tty, ttz,
+            float(ttheta9[0]), float(ttheta9[1]), float(ttheta9[2]), float(ttheta9[3]),
+            float(ttheta9[4]), float(ttheta9[5]), float(ttheta9[6]), float(ttheta9[7]), float(ttheta9[8]),
+            int(kind_int), float(robust_param),
+            inv_sigma_2N
+        )
+
+        if front2 < 0.9:
+            lam *= 3.0
+            continue
+
+        _, _, prior_new_y2 = _prior_cost_and_rhs(ttheta9, prior_mean9_use, prior_info9_use)
+        total_new_y2 = float(meas_new_y2 + prior_new_y2)
+
+        rho = float((total_old_y2 - total_new_y2) / pred)
+
+        if rho > 0.25 and total_new_y2 < total_old_y2:
+            qw, qx, qy, qz = tqw, tqx, tqy, tqz
+            tx, ty, tz = ttx, tty, ttz
+            theta9 = ttheta9
+            lam *= 0.3
+        else:
+            lam *= 3.0
+
+        if np.linalg.norm(dx) < 1e-7:
+            break
+        if abs(total_old_y2 - total_new_y2) / max(1e-12, total_old_y2) < 1e-6:
+            break
+
+    # ----------------- Finalize -----------------
+    est_q = q(qw, np.array([qx, qy, qz], dtype=np.float64))
+    est_q.force_s_pos()
+    est_t = np.array([tx, ty, tz], dtype=np.float64)
+
+    fx, fy, cx, cy, k1, k2, k3, p1, p2 = _intr_dist_from_state(theta9)
+    cal_out = _clone_cal_with_intrinsics_and_distortion(cal, fx, fy, cx, cy, k1, k2, k3, p1, p2)
+
+    if not return_stats:
+        return est_q, est_t, cal_out
+
+    LtL_meas, _, meas_y2, _ = _project_accum_joint_irls_dist_numba(
+        object_pts64, meas_pix,
+        float(est_q.s), float(est_q.vec[0]), float(est_q.vec[1]), float(est_q.vec[2]),
+        float(est_t[0]), float(est_t[1]), float(est_t[2]),
+        float(theta9[0]), float(theta9[1]), float(theta9[2]), float(theta9[3]),
+        float(theta9[4]), float(theta9[5]), float(theta9[6]), float(theta9[7]), float(theta9[8]),
+        int(kind_int), float(robust_param),
+        inv_sigma_2N
+    )
+
+    H_prior9, _, prior_y2 = _prior_cost_and_rhs(theta9, prior_mean9_use, prior_info9_use)
+
+    Htot = LtL_meas.copy()
+    Htot[6:15, 6:15] += H_prior9
+
+    dof = 2 * N - 15
+    if dof < 1:
+        dof = 1
+
+    s2 = float(meas_y2) / float(dof)
+
+    I15 = np.eye(15, dtype=np.float64)
+    cov15 = s2 * np.linalg.solve(Htot, I15)
+    cov9 = cov15[6:15, 6:15].copy()
+
+    return est_q, est_t, cal_out, JointPnPStats(
+        N=int(N),
+        dof=int(dof),
+        sse_meas_w=float(meas_y2),
+        sse_prior=float(prior_y2),
+        sse_total=float(meas_y2 + prior_y2),
+        s2=float(s2),
+        cov15=cov15,
+        cov9=cov9,
+        cal_state=theta9.copy(),
+        cov10=None,
+        cov4=cov9[:4, :4].copy(),
+        intr_state=theta9[:4].copy(),
+    )
+
+############################################ SUPER OPT PATH WITH ONLINE CAL END #######################################
 
 
 def enforce_chirality(q_est, t_est, object_pts):
@@ -1403,33 +2080,37 @@ def solveQnP(
     robust_param: float = 2.0,
     seed_cfg: SeedConfig | None = None,
     use_solvePnP_as_seed: bool = False,
+    online_calibration: bool = False,
 ):
     """
     QnP solver:
       1) seed selection (user seed OR robust initializer)
       2) enforce chirality
-      3) nonlinear refinement with opt()
+      3) nonlinear refinement
+      4) optional online calibration of intrinsics + Brown-Conrady distortion
     """
 
     # ----------------------------
     # 1) Choose a good initial seed
     # ----------------------------
-
     if (user_seed_q is not None) and (user_seed_t is not None):
         seed_q = user_seed_q.copy()
-        seed_t = user_seed_t.copy()
+        seed_t = np.asarray(user_seed_t, dtype=np.float64).copy()
+
     elif use_solvePnP_as_seed:
         import cv2
+
         ret, rvec, tvec, inliers = cv2.solvePnPRansac(
             objectPoints=object_pts,
             imagePoints=img_pts,
             cameraMatrix=cal.getCameraMatrix(),
-            distCoeffs=np.zeros((5,)),
+            distCoeffs=_opencv_dist_coeffs_from_cal(cal),
             confidence=0.99,
             flags=cv2.SOLVEPNP_ITERATIVE
         )
         seed_q = q().from_rodrigues(rvec)
         seed_t = np.squeeze(tvec)
+
     else:
         if seed_cfg is None:
             seed_cfg = SeedConfig()
@@ -1447,26 +2128,90 @@ def solveQnP(
         else:
             seed_q, seed_t = DLT(object_pts, img_pts, cal)
 
-
     _, seed_q, seed_t = enforce_chirality(seed_q, seed_t, object_pts)
 
     # ----------------------------
-    # 2) Full nonlinear refinement (called ONCE)
+    # 2) Refinement
     # ----------------------------
-    out = opt(
+    if not online_calibration:
+        return opt(
+            img_pts,
+            object_pts,
+            cal,
+            return_stats=return_stats,
+            seed_q=seed_q,
+            seed_t=seed_t,
+            sigma_2N=sigma_2N,
+            robust_kind=robust_kind,
+            robust_param=robust_param,
+            sigma_floor_px=1.0,
+            max_iters=20,
+        )
+
+    # Build solver-space prior for [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+    prior_mean9, prior_cov9 = _build_prior_mean_cov9_from_cal(cal)
+
+    est_q, est_t, cal_est, stats = opt_pose_and_intrinsics(
         img_pts,
         object_pts,
         cal,
-        return_stats=return_stats,
+        return_stats=True,
         seed_q=seed_q,
         seed_t=seed_t,
         sigma_2N=sigma_2N,
+        prior_mean9=prior_mean9,
+        prior_cov9=prior_cov9,
         robust_kind=robust_kind,
         robust_param=robust_param,
         sigma_floor_px=1.0,
         max_iters=20,
     )
-    return out
+
+    # IMPORTANT:
+    # opt_pose_and_intrinsics already used the prior internally, so cal_est/stats
+    # are already posterior-ish results. Do NOT apply a second KF update here.
+
+    # Copy estimated calibration back into the live object.
+    cal.fx = float(cal_est.fx)
+    cal.fy = float(cal_est.fy)
+    cal.cx = float(cal_est.cx)
+    cal.cy = float(cal_est.cy)
+    cal.k1 = float(getattr(cal_est, "k1", 0.0))
+    cal.k2 = float(getattr(cal_est, "k2", 0.0))
+    cal.k3 = float(getattr(cal_est, "k3", 0.0))
+    cal.p1 = float(getattr(cal_est, "p1", 0.0))
+    cal.p2 = float(getattr(cal_est, "p2", 0.0))
+
+    # Convert posterior covariance from solver state
+    #   [log_fx, log_fy, cx, cy, k1, k2, k3, p1, p2]
+    # back to raw state
+    #   [fx, fy, cx, cy, k1, k2, k3, p1, p2]
+    J9 = np.eye(9, dtype=np.float64)
+    J9[0, 0] = float(cal.fx)  # d fx / d log_fx = fx
+    J9[1, 1] = float(cal.fy)  # d fy / d log_fy = fy
+
+    raw_cov9 = J9 @ stats.cov9 @ J9.T
+
+    # Keep old field for compatibility with existing code that expects 4x4 intrinsics covariance
+    cal.cov = raw_cov9[:4, :4].copy()
+
+    # New fields
+    cal.cov_intr_dist = raw_cov9.copy()
+    cal.dist_cov = raw_cov9[4:, 4:].copy()
+
+    from support.io.my_logging import LOG
+    LOG.info(f'Old Cal Matrix Prior-ish: \n{cal.getCameraMatrix()}')
+    LOG.info(f'Est Cal Matrix: \n{cal_est.getCameraMatrix()}\n')
+    LOG.info(
+        f'Est Distortion [k1, k2, k3, p1, p2]: '
+        f'[{cal.k1:.6g}, {cal.k2:.6g}, {cal.k3:.6g}, {cal.p1:.6g}, {cal.p2:.6g}]'
+    )
+    LOG.info(f'Posterior P raw [fx, fy, cx, cy, k1, k2, k3, p1, p2]: \n{raw_cov9}\n\n')
+
+    if return_stats:
+        return est_q, est_t, stats
+    return est_q, est_t
+
 
 
 if __name__ == '__main__':

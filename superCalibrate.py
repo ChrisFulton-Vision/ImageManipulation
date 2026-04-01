@@ -1037,7 +1037,7 @@ class CalibrateGui(CTkFrame):
         button.grid_forget()
         clearCacheButton = CTkButton(master=master_frame, text='Really Clear Cache', fg_color='green',
                                      command=lambda f=master_frame: self.clearCache(f, rowID))
-        clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+        clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
         self.after(2000, self.protectClearCache, master_frame, rowID)
         self.after(2000, clearCacheButton.grid_forget)
 
@@ -1284,7 +1284,7 @@ class CalibrateGui(CTkFrame):
         else:
             dispImg = copy.copy(img)
 
-        cv2.namedWindow(imgClass.imageName)
+        cv2.namedWindow(imgClass.imageName, cv2.WINDOW_NORMAL)
 
         cv2.imshow(imgClass.imageName, dispImg)
 
@@ -1383,9 +1383,11 @@ class CalibrateGui(CTkFrame):
 
         if self.imageConfig.calMode == CalibrationType.Chessboard:
             if self.imageConfig.screen_based_checkerboard:
+                flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
                 ret, corners = cv2.findChessboardCornersSB(gray,
                                                            (self.imageConfig.num_inner_corners_W,
-                                                            self.imageConfig.num_inner_corners_H))
+                                                            self.imageConfig.num_inner_corners_H),
+                                                           flags)
             else:
                 ret, corners = cv2.findChessboardCorners(gray,
                                                          (self.imageConfig.num_inner_corners_W,

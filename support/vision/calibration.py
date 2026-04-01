@@ -39,6 +39,8 @@ class Calibration:
 
         self.remapK = None
 
+        self.cov = np.eye(4).astype(dtype=np.float32) * 10.0
+
         self.scale = 1.0
 
         if filepath is not None:
@@ -357,7 +359,10 @@ class Calibration:
 
         return calStr
 
-    def copy(self, calToCopy):
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def copy_from(self, calToCopy):
         self.__init__()
         for obj in calToCopy.__dict__:
             try:
@@ -403,7 +408,7 @@ class Calibration:
                 f.seek(0)
                 obj = pkl.load(f)
 
-        self.copy(obj)
+        self.copy_from(obj)
         return True
 
     def toFile(self, fileDirectory):

@@ -5,10 +5,17 @@ import sys
 import threading
 import enum
 from collections import deque
+from threading import Lock
 from dataclasses import dataclass
 
-# import vmbpy.c_binding
-# from vmbpy import *
+try:
+    from vmbpy import VmbSystem, PixelFormat, VmbTimeout, AllocationMode
+    HAVE_VMBPY = True
+except Exception:
+    VmbSystem = None
+    PixelFormat = None
+    VmbTimeout = Exception
+    HAVE_VMBPY = False
 
 import numpy as np
 
@@ -108,20 +115,26 @@ class CameraGui(ctk.CTkFrame):
         self.curr_r_T_d = None
         self._pb_frame_label = None
         self._pb_frame_text = None
+
+        self.gpu_slider = None
+
         self._dp_runner = None
         self._dp_cancel_btn = None
         self._dp_pnp_btn = None
         self._dp_kalman_btn = None
         self._dp_run_btn = None
-        self.gpu_slider = None
         self._dp_progress = None
-        self._dp_gpu_var = None
         self._dp_gpu_var = None
         self._dp_progress_label = None
         self._dp_prefetch = None
         self._dp_ckptN = None
         self._dp_conf_list = None
         self._dp_img_dir_var = None
+
+        self._latest_raw_frame = None
+        self._latest_raw_time = None
+        self._latest_lock = threading.Lock()
+
         self._loading_config = True
 
         self.func_that_refits = None
@@ -347,25 +360,42 @@ class CameraGui(ctk.CTkFrame):
         import tkinter as tk
         root = self.winfo_toplevel()
 
+        self.shutting_down = True
+
         if self.gpu_monitor is not None:
             self.gpu_monitor.stop()
 
         try:
             root.after_cancel("all")
         except tk.TclError:
-            # root already destroyed / interpreter gone
             pass
 
         self._plotter_close_plot_alias()
 
-        try:
-            root.quit()
-        except tk.TclError:
-            pass
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
+        # Signal live worker to stop before tearing down Tk.
+        self.startStreamOff()
+
+        def _finish_close():
+            try:
+                root.quit()
+            except tk.TclError:
+                pass
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+
+        def _poll_worker_then_close():
+            t = self._thread
+            if t is not None and t.is_alive():
+                try:
+                    root.after(50, _poll_worker_then_close)
+                except tk.TclError:
+                    pass
+                return
+            _finish_close()
+
+        _poll_worker_then_close()
 
     def func_to_refit(self, func):
         """Register a callback used to resize or refit the parent layout.
@@ -558,7 +588,8 @@ class CameraGui(ctk.CTkFrame):
 
         return rebuilt
 
-    def _serialize_queue_arg(self, v):
+    @staticmethod
+    def _serialize_queue_arg(v):
         """Convert a queue argument into a cache-safe scalar representation.
 
         Enum values are stored by value; all other types are passed through
@@ -568,7 +599,8 @@ class CameraGui(ctk.CTkFrame):
             return v.value
         return v
 
-    def _deserialize_queue_arg(self, spec, raw_val):
+    @staticmethod
+    def _deserialize_queue_arg(spec, raw_val):
         """Reconstruct a typed queue argument from cached data.
 
         Uses the argument spec's default value to infer the desired runtime type
@@ -2303,27 +2335,28 @@ class CameraGui(ctk.CTkFrame):
     def startStreamOffBool(self):
         self.showWindow = False
         self.stream_running_var.set(False)
+        try:
+            self.threadStopper.set()
+        except Exception:
+            pass
 
     def startStreamOff(self):
-        cv2.waitKey(1)
-
-        self.threadStopper.set()
+        # UI thread only signals stop. The worker owns stream/window teardown.
         try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass  # Window not yet open
+            self.threadStopper.set()
+        except Exception:
+            pass
 
+        self.showWindow = False
+        self.stream_running_var.set(False)
+
+        # OpenCV backend can still be nudged here safely.
         if self.vc is not None and self.vc.isOpened():
-            self.vc.release()
+            try:
+                self.vc.release()
+            except Exception:
+                pass
             self.vc = None
-
-        # Only join if we're on a different thread than the worker.
-        if self._thread and self._thread.is_alive() and threading.current_thread() != self._thread:
-            self._thread.join(timeout=1.0)
-        self._thread = None
-
-        if not self.shutting_down:
-            self.showWindow = False
 
     def run_detectSingleImage(self):
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
@@ -2354,10 +2387,305 @@ class CameraGui(ctk.CTkFrame):
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
+    # --- inside CameraGui ---
+
+    def _select_vimba_camera(self, vmb):
+        cams = list(vmb.get_all_cameras())
+        if not cams:
+            raise RuntimeError("No Vimba cameras detected.")
+
+        wanted = str(getattr(self.camConfig, "vimba_camera_id", "") or "").strip()
+        if not wanted:
+            return cams[0]
+
+        for cam in cams:
+            try:
+                if wanted in {cam.get_id(), cam.get_serial(), cam.get_name()}:
+                    return cam
+            except Exception:
+                pass
+
+        available = []
+        for cam in cams:
+            try:
+                available.append(f"{cam.get_id()} / {cam.get_serial()} / {cam.get_name()}")
+            except Exception:
+                pass
+
+        raise RuntimeError(
+            "Requested Vimba camera was not found.\nAvailable cameras:\n" + "\n".join(available)
+        )
+
+    @staticmethod
+    def _normalize_vimba_auto_mode(value: Any) -> str:
+        text = str(value or "Off").strip().lower()
+        mapping = {
+            "off": "Off",
+            "once": "Once",
+            "continuous": "Continuous",
+            "manual": "Off",
+            "false": "Off",
+            "true": "Continuous",
+        }
+        return mapping.get(text, "Off")
+
+    @staticmethod
+    def _try_get_vimba_feature(cam, *feature_names: str):
+        for feature_name in feature_names:
+            try:
+                feature = getattr(cam, feature_name)
+            except Exception:
+                feature = None
+            if feature is not None:
+                return feature, feature_name
+        return None, None
+
+    def _set_vimba_enum_feature(self, cam, feature_names: tuple[str, ...], value: str) -> bool:
+        for feature_name in feature_names:
+            feature, actual_name = self._try_get_vimba_feature(cam, feature_name)
+            if feature is None:
+                continue
+            try:
+                feature.set(value)
+                LOG.info(f"Vimba {actual_name} <- {value}")
+                return True
+            except Exception as e:
+                LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
+        return False
+
+    def _set_vimba_float_feature(self, cam, feature_names: tuple[str, ...], value: float) -> bool:
+        for feature_name in feature_names:
+            feature, actual_name = self._try_get_vimba_feature(cam, feature_name)
+            if feature is None:
+                continue
+            try:
+                value_to_set = float(value)
+                try:
+                    lo, hi = feature.get_range()
+                    value_to_set = min(max(value_to_set, float(lo)), float(hi))
+                except Exception:
+                    pass
+                feature.set(value_to_set)
+                LOG.info(f"Vimba {actual_name} <- {value_to_set}")
+                return True
+            except Exception as e:
+                LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
+        return False
+
+    def _configure_vimba_camera(self, cam):
+        settings_xml = str(getattr(self.camConfig, "vimba_settings_xml", "") or "").strip()
+        if settings_xml:
+            cam.load_settings(settings_xml)
+
+        # Force free-run
+        for feat_name, val in (
+                ("TriggerSelector", "FrameStart"),
+                ("TriggerMode", "Off"),
+                ("AcquisitionMode", "Continuous"),
+                ("ExposureMode", "Timed"),
+        ):
+            try:
+                getattr(cam, feat_name).set(val)
+            except Exception:
+                pass
+
+        gain_auto = self._normalize_vimba_auto_mode(getattr(self.camConfig, "vimba_gain_auto", "Off"))
+        exposure_auto = self._normalize_vimba_auto_mode(getattr(self.camConfig, "vimba_exposure_auto", "Off"))
+
+        try:
+            gain_value = float(getattr(self.camConfig, "vimba_gain", 0.0) or 0.0)
+        except Exception:
+            gain_value = 0.0
+
+        try:
+            exposure_value = float(getattr(self.camConfig, "vimba_exposure_us", 10000.0) or 10000.0)
+        except Exception:
+            exposure_value = 10000.0
+
+        self._set_vimba_enum_feature(cam, ("GainAuto",), gain_auto)
+        if gain_auto == "Off":
+            self._set_vimba_float_feature(cam, ("Gain",), gain_value)
+
+        self._set_vimba_enum_feature(cam, ("ExposureAuto",), exposure_auto)
+        if exposure_auto == "Off":
+            self._set_vimba_float_feature(cam, ("ExposureTime", "ExposureTimeAbs"), exposure_value)
+
+        # GigE packet negotiation / transport tuning
+        try:
+            if hasattr(cam, "GVSPAdjustPacketSize"):
+                LOG.info("Running GVSPAdjustPacketSize...")
+                cam.GVSPAdjustPacketSize.run()
+
+                # Wait for completion if the feature exposes status
+                for _ in range(50):
+                    try:
+                        if cam.GVSPAdjustPacketSize.is_done():
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.1)
+        except Exception as e:
+            LOG.warning(f"GVSPAdjustPacketSize failed: {e}")
+
+        # Log packet size / throughput if available
+        for feat_name in ("GevSCPSPacketSize", "DeviceThroughputLimit"):
+            try:
+                LOG.info(f"Vimba {feat_name} = {getattr(cam, feat_name).get()}")
+            except Exception:
+                pass
+
+        # Prefer camera-side BGR/Mono
+        try:
+            fmts = set(cam.get_pixel_formats())
+            for name in ("Bgr8", "Mono8"):
+                pf = getattr(PixelFormat, name, None)
+                if pf is not None and pf in fmts:
+                    cam.set_pixel_format(pf)
+                    break
+        except Exception as e:
+            LOG.warning(f"Could not set pixel format: {e}")
+
+        for feat_name in ("TriggerMode", "AcquisitionMode", "ExposureMode", "GainAuto", "Gain", "ExposureAuto",
+                          "ExposureTime"):
+            try:
+                LOG.info(f"Vimba {feat_name} = {getattr(cam, feat_name).get()}")
+            except Exception:
+                pass
+        try:
+            LOG.info(f"Vimba PixelFormat = {cam.get_pixel_format()}")
+        except Exception:
+            pass
+
+    def _vmbpy_frame_to_bgr(self, frame) -> NDArray:
+        # If the camera isn't already producing Bgr8/Mono8, try to convert.
+        bgr8 = getattr(PixelFormat, "Bgr8", None)
+        mono8 = getattr(PixelFormat, "Mono8", None)
+
+        if bgr8 is not None:
+            try:
+                frame.convert_pixel_format(bgr8)
+            except Exception:
+                if mono8 is not None:
+                    try:
+                        frame.convert_pixel_format(mono8)
+                    except Exception:
+                        pass
+
+        img = frame.as_opencv_image()
+        if img is None:
+            raise RuntimeError("Failed to export Vimba frame as OpenCV image.")
+
+        img = np.ascontiguousarray(img)
+
+        # Your pipeline generally behaves best with a 3-channel image.
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img = img.copy()
+
+        return img
+
+    def run_vimba_stream(self):
+        if not HAVE_VMBPY:
+            LOG.error("VmbPy is not installed or could not be imported.")
+            self.after(0, self._on_worker_exit)
+            return
+
+        def handler(cam, stream, frame):
+            if self.threadStopper.is_set() or not self.showWindow:
+                try:
+                    cam.queue_frame(frame)
+                except Exception:
+                    pass
+                return
+
+            try:
+                img = self._vmbpy_frame_to_bgr(frame)
+                ts = time.time()
+                with self._latest_lock:
+                    self._latest_raw_frame = img
+                    self._latest_raw_time = ts
+            finally:
+                try:
+                    cam.queue_frame(frame)
+                except Exception:
+                    pass
+
+        try:
+            cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
+
+            with VmbSystem.get_instance() as vmb:
+                cam = self._select_vimba_camera(vmb)
+
+                with cam:
+                    self._configure_vimba_camera(cam)
+
+                    stream_started = False
+                    try:
+                        cam.start_streaming(
+                            handler,
+                            buffer_count=8,
+                            allocation_mode=AllocationMode.AllocAndAnnounceFrame,
+                        )
+                        stream_started = True
+
+                        while (not self.threadStopper.is_set()
+                               and self.showWindow
+                               and not self.making_gifOrVid):
+
+                            frame = None
+                            img_time = None
+
+                            with self._latest_lock:
+                                if self._latest_raw_frame is not None:
+                                    frame = self._latest_raw_frame
+                                    img_time = self._latest_raw_time
+                                    self._latest_raw_frame = None
+                                    self._latest_raw_time = None
+
+                            if frame is not None:
+                                self.curr_frame = frame
+                                self.analyze_image(frame, img_time=img_time)
+
+                            key = cv2.waitKey(1)
+                            if key == 27:
+                                self.threadStopper.set()
+                                self.showWindow = False
+                                break
+
+                            if not self._window_is_open():
+                                self.threadStopper.set()
+                                self.showWindow = False
+                                break
+
+                    finally:
+                        if stream_started:
+                            try:
+                                cam.stop_streaming()
+                            except Exception as e:
+                                LOG.warning(f"cam.stop_streaming() during teardown raised: {e}")
+
+        except Exception as e:
+            LOG.exception(f"Vimba stream failed: {e}")
+
+        finally:
+            with self._latest_lock:
+                self._latest_raw_frame = None
+                self._latest_raw_time = None
+
+            try:
+                cv2.destroyWindow(self.windowName)
+            except cv2.error:
+                pass
+
+            self.after(0, self._on_worker_exit)
+
     def run_video_stream(self):
+        if bool(getattr(self.camConfig, "use_vimba", False)):
+            self.run_vimba_stream()
+            return
 
         self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
-
         self.vc.set(cv2.CAP_PROP_FPS, 60)
 
         cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
@@ -2379,7 +2707,7 @@ class CameraGui(ctk.CTkFrame):
             self.analyze_image(frame)
             key = cv2.waitKey(1)
 
-            if key == 27:  # exit on ESC
+            if key == 27:
                 self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                 self.threadStopper.set()
                 break
@@ -2390,14 +2718,12 @@ class CameraGui(ctk.CTkFrame):
 
             if stop_display_time is not None and time.monotonic() > stop_display_time:
                 stop_display_time = None
-                print('Time out')
 
             if not self._window_is_open():
                 self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
                 self.threadStopper.set()
                 break
 
-        # Minimal teardown in the worker; the UI thread will handle buttons/state.
         if self.vc is not None and self.vc.isOpened():
             self.vc.release()
             self.vc = None
@@ -2408,12 +2734,11 @@ class CameraGui(ctk.CTkFrame):
             pass
 
         self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-        return
 
     def _on_worker_exit(self):
-        # Mark no live worker and reset run-state
         self._thread = None
         self.showWindow = False
+        self.stream_running_var.set(False)
 
     def getEntryValue(self):
         """Parse and validate the export frame-spacing entry from the UI."""
@@ -2597,6 +2922,7 @@ class CameraGui(ctk.CTkFrame):
             self.draw_name(frame, markup_frame, ctx, ())
             if not self.screenshot_impending and not self.making_gifOrVid:
                 self.draw_playbackStats(frame, markup_frame, ctx, ())
+
         self.draw_time(frame, markup_frame, ctx, ())
 
         if display_in_realtime:
@@ -2677,8 +3003,9 @@ class CameraGui(ctk.CTkFrame):
 
     @staticmethod
     def draw_time(frame, markupFrame, ctx: GuiQueue.FrameCtx, args):
-        if ctx.img_time is None:
+        if ctx.img_time is None or ctx.img_time > 1_000_000:  # Alvium
             return
+
         time_str = f"Flight Time: {ctx.img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
         from support.viz.HUD_draw import draw_time_on_image
         draw_time_on_image(markupFrame, time_str)
@@ -2803,7 +3130,7 @@ class CameraGui(ctk.CTkFrame):
                         small_text(markupFrame.shape[0]), color, 2)
 
     def potentialResize(self, markupFrame):
-        if not self._window_is_open():
+        if not self._window_is_open() or markupFrame.shape[0] == 0:
             return
         x, y, width, height = cv2.getWindowImageRect(self.windowName)
         aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]

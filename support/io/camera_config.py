@@ -36,6 +36,17 @@ class CameraConfig:
     playback_mode: enums.PlaybackSpeed = None
     processingKernel: enums.ImageKernel = None
 
+    # Vimba Usage
+    use_vimba: bool = False
+    vimba_camera_id: str = ""
+    vimba_settings_xml: str = ""
+
+    # Vimba camera controls
+    vimba_gain_auto: str = "Off"
+    vimba_gain: float = 0.0
+    vimba_exposure_auto: str = "Off"
+    vimba_exposure_us: float = 10000.0
+
     # Data Processing tab defaults
     dp_img_dir: str = ''
     dp_conf_list: str = "0.80"

@@ -249,9 +249,7 @@ class pnp_qnp_draw:
             newBoxes,
             newClass_ids,
             newScores,
-            yoloSize,
             draw_as_circles=circles_not_features,
-            img_scale=img_scale
         )
 
         if len(set(indices)) <= 5:
@@ -336,10 +334,8 @@ class pnp_qnp_draw:
     @staticmethod
     def _drawBoxes(image: NDArray, newCenters: NDArray, newBoxes: NDArray,
                    newClass_ids: list, newScores: list,
-                   yoloSize: tuple[float, float],
                    draw_as_circles: bool = True,
-                   circle_radius_px: int | None = None,
-                   img_scale: float = 1.0) -> None:
+                   circle_radius_px: int | None = None,) -> None:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -351,18 +347,16 @@ class pnp_qnp_draw:
         :return:
         '''
         h, w, _ = image.shape
-        y_h, y_w = yoloSize
-        s_x, s_y = w/y_w, h/y_h
 
         for (centers, box, class_id, score) in zip(newCenters, newBoxes, newClass_ids, newScores):
             x, y = centers
             x1, y1, x2, y2 = box
-            x = int(round(x * s_x))
-            y = int(round(y * s_y))
-            x1 = int(round(x1 * s_x))
-            y1 = int(round(y1 * s_y))
-            x2 = int(round( x2 * s_x))
-            y2 = int(round( y2 * s_y))
+            x = int(round(x))
+            y = int(round(y))
+            x1 = int(round(x1))
+            y1 = int(round(y1))
+            x2 = int(round(x2))
+            y2 = int(round(y2))
 
             if draw_as_circles:
                 r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.002 * w)))

@@ -46,6 +46,8 @@ class FilepathController(Protocol):
 
     def startStreamToggle(self) -> bool: ...
 
+    def queue_live_vimba_update(self, settings: dict[str, Any]) -> bool: ...
+
 
 class Filepath_page(ctk.CTkFrame):
     def __init__(
@@ -197,14 +199,35 @@ class Filepath_page(ctk.CTkFrame):
         self.vimba_exposure_entry = ctk.CTkEntry(self.vimba_controls_frame, textvariable=self.vimba_exposure_var)
         self.vimba_exposure_entry.grid(row=2, column=3, padx=5, pady=5, sticky='ew')
 
+        self.vimba_gain_entry.bind("<Return>", lambda *_: self.save_vimba_controls())
+        self.vimba_gain_entry.bind("<FocusOut>", lambda *_: self.save_vimba_controls())
+
+        self.vimba_exposure_entry.bind("<Return>", lambda *_: self.save_vimba_controls())
+        self.vimba_exposure_entry.bind("<FocusOut>", lambda *_: self.save_vimba_controls())
+
+        self.vimba_profile_var = ctk.StringVar(
+            value=str(getattr(self.ctrl.camConfig, "vimba_profile", "Full Res"))
+        )
+
+        ctk.CTkLabel(self.vimba_controls_frame, text="Profile").grid(
+            row=3, column=0, padx=5, pady=5, sticky='w'
+        )
+        self.vimba_profile_combo = ctk.CTkComboBox(
+            self.vimba_controls_frame,
+            values=["Full Res", "Zoom 1440", "Bin To 1440", "Zoom 864", "Bin To 864"],
+            variable=self.vimba_profile_var,
+            command=lambda *_: self._on_vimba_profile_changed(),
+        )
+        self.vimba_profile_combo.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+
         self.vimba_read_button = ctk.CTkButton(self.vimba_controls_frame, text="Read Camera", command=self.read_vimba_controls)
-        self.vimba_read_button.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+        self.vimba_read_button.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
 
         self.vimba_save_button = ctk.CTkButton(self.vimba_controls_frame, text="Save Settings", command=self.save_vimba_controls)
-        self.vimba_save_button.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
+        self.vimba_save_button.grid(row=4, column=1, padx=5, pady=5, sticky='ew')
 
         ctk.CTkLabel(self.vimba_controls_frame, textvariable=self.vimba_status_text, justify='left').grid(
-            row=3, column=2, columnspan=2, padx=5, pady=5, sticky='w')
+            row=4, column=2, columnspan=2, padx=5, pady=5, sticky='w')
         self._refresh_vimba_manual_widgets()
 
         self.streamOrImgCombo.set(self.ctrl.camConfig.imageSource.value)
@@ -356,8 +379,21 @@ class Filepath_page(ctk.CTkFrame):
         self.ctrl.saveToCache()
 
     ### HELPERS ########################
+    def _on_vimba_profile_changed(self):
+        profile = str(self.vimba_profile_var.get() or "Full Res")
+        blurbs = {
+            "Full Res": "Full sensor, no preview downscale.",
+            "Zoom 1440": "Centered 1440 ROI. Applies on next stream start.",
+            "Bin To 1440": "Binned full-frame preview near 1440-class output. Applies on next stream start.",
+            "Zoom 864": "Centered 864 ROI. Applies on next stream start.",
+            "Bin To 864": "Heavier binning for fast preview near 864-class output. Applies on next stream start.",
+        }
+        self.vimba_status_text.set(blurbs.get(profile, "Vimba profile updated."))
+        self.save_vimba_controls()
+
     def _ensure_vimba_control_defaults(self):
         defaults = {
+            "vimba_profile": "Full Res",
             "vimba_gain_auto": "Off",
             "vimba_gain": 0.0,
             "vimba_exposure_auto": "Off",
@@ -387,25 +423,38 @@ class Filepath_page(ctk.CTkFrame):
         )
 
     def _set_vimba_controls_enabled(self, enabled: bool):
-        state = 'normal' if enabled else 'disabled'
+        # Always allow hot tuning widgets
+        hot_state = 'normal'
+
         for widget_name in (
             'vimba_gain_auto_combo',
             'vimba_gain_entry',
             'vimba_exposure_auto_combo',
             'vimba_exposure_entry',
-            'vimba_read_button',
             'vimba_save_button',
         ):
             widget = getattr(self, widget_name, None)
             if widget is None:
                 continue
             try:
-                widget.configure(state=state)
+                widget.configure(state=hot_state)
             except Exception:
                 pass
 
-        if enabled:
-            self._refresh_vimba_manual_widgets()
+        # Keep camera-read disabled while running if you want to avoid contention
+        cold_state = 'normal' if enabled else 'disabled'
+        for widget_name in (
+            'vimba_read_button',
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=cold_state)
+            except Exception:
+                pass
+
+        self._refresh_vimba_manual_widgets()
 
     def _refresh_vimba_manual_widgets(self):
         gain_state = 'normal' if self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get()) == 'Off' else 'disabled'
@@ -421,14 +470,15 @@ class Filepath_page(ctk.CTkFrame):
 
     def _on_vimba_mode_changed(self):
         self._refresh_vimba_manual_widgets()
+        self.save_vimba_controls()
 
     def _sync_vimba_controls_from_model(self):
         self._ensure_vimba_control_defaults()
 
-        # Constructor-order guard: this may be called before Vimba widgets exist.
         if not hasattr(self, "vimba_gain_auto_var"):
             return
 
+        self.vimba_profile_var.set(str(getattr(self.ctrl.camConfig, "vimba_profile", "Full Res")))
         self.vimba_gain_auto_var.set(
             self._normalize_vimba_auto_mode(
                 getattr(self.ctrl.camConfig, "vimba_gain_auto", "Off")
@@ -446,6 +496,7 @@ class Filepath_page(ctk.CTkFrame):
     def save_vimba_controls(self):
         self._ensure_vimba_control_defaults()
 
+        self.ctrl.camConfig.vimba_profile = str(self.vimba_profile_var.get() or "Full Res")
         self.ctrl.camConfig.vimba_gain_auto = self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get())
         self.ctrl.camConfig.vimba_exposure_auto = self._normalize_vimba_auto_mode(self.vimba_exposure_auto_var.get())
 
@@ -460,7 +511,23 @@ class Filepath_page(ctk.CTkFrame):
             self.vimba_exposure_var.set(str(getattr(self.ctrl.camConfig, "vimba_exposure_us", 10000.0)))
 
         self.ctrl.saveToCache(immediate=True)
-        self.vimba_status_text.set("Alvium settings saved. They will apply on the next Vimba stream start.")
+
+        live_applied = self.ctrl.queue_live_vimba_update({
+            "vimba_gain_auto": self.ctrl.camConfig.vimba_gain_auto,
+            "vimba_gain": self.ctrl.camConfig.vimba_gain,
+            "vimba_exposure_auto": self.ctrl.camConfig.vimba_exposure_auto,
+            "vimba_exposure_us": self.ctrl.camConfig.vimba_exposure_us,
+        })
+
+        if live_applied:
+            self.vimba_status_text.set(
+                f"Gain/exposure sent live. Profile '{self.ctrl.camConfig.vimba_profile}' will apply on next stream start."
+            )
+        else:
+            self.vimba_status_text.set(
+                f"Alvium settings saved. Profile '{self.ctrl.camConfig.vimba_profile}' will apply on the next Vimba stream start."
+            )
+
         self._refresh_vimba_manual_widgets()
 
     @staticmethod

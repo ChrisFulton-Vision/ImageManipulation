@@ -47,8 +47,10 @@ class UndistortOpts:
 @dataclass(slots=True)
 class ResizeOpts:
     scale: float = 1.0
+    pixelNum: int = 864
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("Exp Scale Image", "scale", float, 1.0, 0.05, 1.5),
+        ArgBinding("Maximum Pixel Number", "pixelNum", int, 864, 1, 2848),
     )
 
     # Derived, guaranteed consistent

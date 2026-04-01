@@ -38,6 +38,7 @@ class CameraConfig:
 
     # Vimba Usage
     use_vimba: bool = False
+    vimba_profile: str = "Full Res"
     vimba_camera_id: str = ""
     vimba_settings_xml: str = ""
 

@@ -135,6 +135,11 @@ class CameraGui(ctk.CTkFrame):
         self._latest_raw_time = None
         self._latest_lock = threading.Lock()
 
+        self._live_vimba_cmds = deque()
+        self._live_vimba_cmd_lock = threading.Lock()
+        self._live_vimba_cam = None
+        self._live_vimba_enabled = False
+
         self._loading_config = True
 
         self.func_that_refits = None
@@ -2387,7 +2392,62 @@ class CameraGui(ctk.CTkFrame):
         elif self.camConfig.imageSource == ImageSource.Static_Image:
             self.run_detectSingleImage()
 
-    # --- inside CameraGui ---
+    def queue_live_vimba_update(self, settings: dict[str, Any]) -> bool:
+        """
+        Thread-safe: UI calls this to request a live camera change.
+        Returns True if the request was queued for a running Vimba stream.
+        """
+        if not bool(getattr(self.camConfig, "use_vimba", False)):
+            return False
+        if not bool(self.stream_running_var.get()):
+            return False
+
+        with self._live_vimba_cmd_lock:
+            # newest wins: collapse pending updates instead of queueing forever
+            self._live_vimba_cmds.clear()
+            self._live_vimba_cmds.append(dict(settings))
+        return True
+
+    def _drain_live_vimba_updates(self):
+        cam = self._live_vimba_cam
+        if cam is None or not self._live_vimba_enabled:
+            return
+
+        pending = None
+        with self._live_vimba_cmd_lock:
+            if self._live_vimba_cmds:
+                pending = self._live_vimba_cmds.pop()
+                self._live_vimba_cmds.clear()
+
+        if pending is None:
+            return
+
+        gain_auto = self._normalize_vimba_auto_mode(
+            pending.get("vimba_gain_auto", getattr(self.camConfig, "vimba_gain_auto", "Off"))
+        )
+        exposure_auto = self._normalize_vimba_auto_mode(
+            pending.get("vimba_exposure_auto", getattr(self.camConfig, "vimba_exposure_auto", "Off"))
+        )
+
+        try:
+            gain_value = float(pending.get("vimba_gain", getattr(self.camConfig, "vimba_gain", 0.0)))
+        except Exception:
+            gain_value = float(getattr(self.camConfig, "vimba_gain", 0.0))
+
+        try:
+            exposure_value = float(pending.get("vimba_exposure_us", getattr(self.camConfig, "vimba_exposure_us", 10000.0)))
+        except Exception:
+            exposure_value = float(getattr(self.camConfig, "vimba_exposure_us", 10000.0))
+
+        self._set_vimba_enum_feature(cam, ("GainAuto",), gain_auto)
+        if gain_auto == "Off":
+            self._set_vimba_float_feature(cam, ("Gain",), gain_value)
+
+        self._set_vimba_enum_feature(cam, ("ExposureAuto",), exposure_auto)
+        if exposure_auto == "Off":
+            self._set_vimba_float_feature(cam, ("ExposureTime", "ExposureTimeAbs"), exposure_value)
+
+        LOG.info("Applied live Vimba tuning update.")
 
     def _select_vimba_camera(self, vmb):
         cams = list(vmb.get_all_cameras())
@@ -2447,7 +2507,6 @@ class CameraGui(ctk.CTkFrame):
                 continue
             try:
                 feature.set(value)
-                LOG.info(f"Vimba {actual_name} <- {value}")
                 return True
             except Exception as e:
                 LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
@@ -2466,11 +2525,128 @@ class CameraGui(ctk.CTkFrame):
                 except Exception:
                     pass
                 feature.set(value_to_set)
-                LOG.info(f"Vimba {actual_name} <- {value_to_set}")
                 return True
             except Exception as e:
                 LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
         return False
+
+    def _set_vimba_int_feature(self, cam, feature_names: tuple[str, ...], value: int) -> bool:
+        for feature_name in feature_names:
+            feature, actual_name = self._try_get_vimba_feature(cam, feature_name)
+            if feature is None:
+                continue
+            try:
+                value_to_set = int(round(value))
+                try:
+                    lo, hi = feature.get_range()
+                    value_to_set = min(max(value_to_set, int(lo)), int(hi))
+                except Exception:
+                    lo = 0
+
+                try:
+                    inc = int(feature.get_increment())
+                    if inc > 1:
+                        value_to_set = lo + ((value_to_set - lo) // inc) * inc
+                except Exception:
+                    pass
+
+                feature.set(value_to_set)
+                return True
+            except Exception as e:
+                LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
+        return False
+
+    def _get_vimba_profile_spec(self) -> dict[str, int | str]:
+        profile = str(getattr(self.camConfig, "vimba_profile", "Full Res") or "Full Res")
+
+        profiles = {
+            "Full Res": {
+                "name": "Full Res",
+                "bin_x": 1,
+                "bin_y": 1,
+                "roi_w": 0,      # 0 => full sensor
+                "roi_h": 0,
+                "preview_max_dim": 0,   # 0 => no forced preview downscale
+                "buffer_count": 2,
+            },
+            "Zoom 1440": {
+                "name": "Fast Preview",
+                "bin_x": 0,
+                "bin_y": 0,
+                "roi_w": 1440,
+                "roi_h": 1440,
+                "preview_max_dim": 1440,
+                "buffer_count": 2,
+            },
+            "Bin To 1440": {
+                "name": "Tracking",
+                "bin_x": 2,
+                "bin_y": 2,
+                "roi_w": 0, # example: 864, captures center 864 columns of image
+                "roi_h": 0,
+                "preview_max_dim": 1440,
+                "buffer_count": 2,
+            },
+            "Zoom 864": {
+                "name": "Tracking",
+                "bin_x": 0,
+                "bin_y": 0,
+                "roi_w": 864, # example: 864, captures center 864 columns of image
+                "roi_h": 864,
+                "preview_max_dim": 864,
+                "buffer_count": 2,
+            },
+            "Bin To 864": {
+                "name": "Tracking",
+                "bin_x": 3,
+                "bin_y": 3,
+                "roi_w": 0, # example: 864, captures center 864 columns of image
+                "roi_h": 0,
+                "preview_max_dim": 864,
+                "buffer_count": 2,
+            },
+        }
+
+        return profiles.get(profile, profiles["Full Res"])
+
+    def _apply_vimba_profile(self, cam):
+        spec = self._get_vimba_profile_spec()
+
+        # 1) Binning first
+        self._set_vimba_int_feature(cam, ("BinningHorizontal",), int(spec["bin_x"]))
+        self._set_vimba_int_feature(cam, ("BinningVertical",), int(spec["bin_y"]))
+
+        width_feature, _ = self._try_get_vimba_feature(cam, "Width")
+        height_feature, _ = self._try_get_vimba_feature(cam, "Height")
+        offset_x_feature, _ = self._try_get_vimba_feature(cam, "OffsetX")
+        offset_y_feature, _ = self._try_get_vimba_feature(cam, "OffsetY")
+
+        if width_feature is None or height_feature is None:
+            return
+
+        # 2) Reset offsets before changing ROI size
+        if offset_x_feature is not None:
+            self._set_vimba_int_feature(cam, ("OffsetX",), 0)
+        if offset_y_feature is not None:
+            self._set_vimba_int_feature(cam, ("OffsetY",), 0)
+
+        full_w = int(width_feature.get_range()[1])
+        full_h = int(height_feature.get_range()[1])
+
+        desired_w = int(spec["roi_w"]) if int(spec["roi_w"]) > 0 else full_w
+        desired_h = int(spec["roi_h"]) if int(spec["roi_h"]) > 0 else full_h
+
+        self._set_vimba_int_feature(cam, ("Width",), desired_w)
+        self._set_vimba_int_feature(cam, ("Height",), desired_h)
+
+        actual_w = int(width_feature.get())
+        actual_h = int(height_feature.get())
+
+        # 3) Center the ROI if we are not using full sensor
+        if actual_w < full_w and offset_x_feature is not None:
+            self._set_vimba_int_feature(cam, ("OffsetX",), (full_w - actual_w) // 2)
+        if actual_h < full_h and offset_y_feature is not None:
+            self._set_vimba_int_feature(cam, ("OffsetY",), (full_h - actual_h) // 2)
 
     def _configure_vimba_camera(self, cam):
         settings_xml = str(getattr(self.camConfig, "vimba_settings_xml", "") or "").strip()
@@ -2488,6 +2664,9 @@ class CameraGui(ctk.CTkFrame):
                 getattr(cam, feat_name).set(val)
             except Exception:
                 pass
+
+        # Apply profile-driven binning / ROI first
+        self._apply_vimba_profile(cam)
 
         gain_auto = self._normalize_vimba_auto_mode(getattr(self.camConfig, "vimba_gain_auto", "Off"))
         exposure_auto = self._normalize_vimba_auto_mode(getattr(self.camConfig, "vimba_exposure_auto", "Off"))
@@ -2510,13 +2689,10 @@ class CameraGui(ctk.CTkFrame):
         if exposure_auto == "Off":
             self._set_vimba_float_feature(cam, ("ExposureTime", "ExposureTimeAbs"), exposure_value)
 
-        # GigE packet negotiation / transport tuning
         try:
             if hasattr(cam, "GVSPAdjustPacketSize"):
-                LOG.info("Running GVSPAdjustPacketSize...")
                 cam.GVSPAdjustPacketSize.run()
 
-                # Wait for completion if the feature exposes status
                 for _ in range(50):
                     try:
                         if cam.GVSPAdjustPacketSize.is_done():
@@ -2527,14 +2703,6 @@ class CameraGui(ctk.CTkFrame):
         except Exception as e:
             LOG.warning(f"GVSPAdjustPacketSize failed: {e}")
 
-        # Log packet size / throughput if available
-        for feat_name in ("GevSCPSPacketSize", "DeviceThroughputLimit"):
-            try:
-                LOG.info(f"Vimba {feat_name} = {getattr(cam, feat_name).get()}")
-            except Exception:
-                pass
-
-        # Prefer camera-side BGR/Mono
         try:
             fmts = set(cam.get_pixel_formats())
             for name in ("Bgr8", "Mono8"):
@@ -2544,17 +2712,6 @@ class CameraGui(ctk.CTkFrame):
                     break
         except Exception as e:
             LOG.warning(f"Could not set pixel format: {e}")
-
-        for feat_name in ("TriggerMode", "AcquisitionMode", "ExposureMode", "GainAuto", "Gain", "ExposureAuto",
-                          "ExposureTime"):
-            try:
-                LOG.info(f"Vimba {feat_name} = {getattr(cam, feat_name).get()}")
-            except Exception:
-                pass
-        try:
-            LOG.info(f"Vimba PixelFormat = {cam.get_pixel_format()}")
-        except Exception:
-            pass
 
     def _vmbpy_frame_to_bgr(self, frame) -> NDArray:
         # If the camera isn't already producing Bgr8/Mono8, try to convert.
@@ -2591,6 +2748,10 @@ class CameraGui(ctk.CTkFrame):
             self.after(0, self._on_worker_exit)
             return
 
+        profile_spec = self._get_vimba_profile_spec()
+        preview_max_dim = int(profile_spec["preview_max_dim"])
+        stream_buffer_count = int(profile_spec["buffer_count"])
+
         def handler(cam, stream, frame):
             if self.threadStopper.is_set() or not self.showWindow:
                 try:
@@ -2601,6 +2762,16 @@ class CameraGui(ctk.CTkFrame):
 
             try:
                 img = self._vmbpy_frame_to_bgr(frame)
+
+                if preview_max_dim > 0:
+                    h, w = img.shape[:2]
+                    max_dim = max(h, w)
+                    if max_dim > preview_max_dim:
+                        s = preview_max_dim / float(max_dim)
+                        new_w = max(1, int(round(w * s)))
+                        new_h = max(1, int(round(h * s)))
+                        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
                 ts = time.time()
                 with self._latest_lock:
                     self._latest_raw_frame = img
@@ -2619,12 +2790,14 @@ class CameraGui(ctk.CTkFrame):
 
                 with cam:
                     self._configure_vimba_camera(cam)
+                    self._live_vimba_cam = cam
+                    self._live_vimba_enabled = True
 
                     stream_started = False
                     try:
                         cam.start_streaming(
                             handler,
-                            buffer_count=8,
+                            buffer_count=stream_buffer_count,
                             allocation_mode=AllocationMode.AllocAndAnnounceFrame,
                         )
                         stream_started = True
@@ -2643,6 +2816,8 @@ class CameraGui(ctk.CTkFrame):
                                     self._latest_raw_frame = None
                                     self._latest_raw_time = None
 
+                            self._drain_live_vimba_updates()
+
                             if frame is not None:
                                 self.curr_frame = frame
                                 self.analyze_image(frame, img_time=img_time)
@@ -2658,12 +2833,18 @@ class CameraGui(ctk.CTkFrame):
                                 self.showWindow = False
                                 break
 
+
                     finally:
                         if stream_started:
                             try:
                                 cam.stop_streaming()
                             except Exception as e:
                                 LOG.warning(f"cam.stop_streaming() during teardown raised: {e}")
+
+                        self._live_vimba_enabled = False
+                        self._live_vimba_cam = None
+                        with self._live_vimba_cmd_lock:
+                            self._live_vimba_cmds.clear()
 
         except Exception as e:
             LOG.exception(f"Vimba stream failed: {e}")
@@ -2884,7 +3065,7 @@ class CameraGui(ctk.CTkFrame):
         returns a processed image buffer for export.
         """
 
-        if frame is None:
+        if frame is None or frame.size == 0:
             return
 
         ctx = GuiQueue.FrameCtx(img_time=img_time,
@@ -2905,8 +3086,8 @@ class CameraGui(ctk.CTkFrame):
         # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
         calSize = (self.calibration.height, self.calibration.width)
         frameSize = frame.shape[:2]
-        if self.calibration.validCal and frameSize != calSize:
-            LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
+        # if self.calibration.validCal and frameSize != calSize:
+        #     LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
 
         ######################################################
         for func, args in self.list_of_image_process_functors:
@@ -3300,10 +3481,15 @@ class CameraGui(ctk.CTkFrame):
                      markupFrame: NDArray,
                      ctx: GuiQueue.FrameCtx,
                      args):
+
         opts: GuiQueue.ResizeOpts = self.parse_args(args, GuiQueue.ResizeOpts())
         scale = (10.0 ** opts.scale) / 10.0
         h, w, _ = markupFrame.shape
         newShape = (scale * np.array([h, w])).astype(np.int32)
+        if newShape[0] > opts.pixelNum:
+            newShape[0] = opts.pixelNum
+        if newShape[1] > opts.pixelNum:
+            newShape[1] = opts.pixelNum
 
         tmp = cv2.resize(markupFrame, newShape, interpolation=cv2.INTER_LINEAR)
 

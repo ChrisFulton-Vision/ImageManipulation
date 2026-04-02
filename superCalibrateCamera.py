@@ -2570,7 +2570,7 @@ class CameraGui(ctk.CTkFrame):
                 "buffer_count": 2,
             },
             "Zoom 1440": {
-                "name": "Fast Preview",
+                "name": "Zoom 1440",
                 "bin_x": 0,
                 "bin_y": 0,
                 "roi_w": 1440,
@@ -2579,7 +2579,7 @@ class CameraGui(ctk.CTkFrame):
                 "buffer_count": 2,
             },
             "Bin To 1440": {
-                "name": "Tracking",
+                "name": "Bin To 1440",
                 "bin_x": 2,
                 "bin_y": 2,
                 "roi_w": 0, # example: 864, captures center 864 columns of image
@@ -2588,7 +2588,7 @@ class CameraGui(ctk.CTkFrame):
                 "buffer_count": 2,
             },
             "Zoom 864": {
-                "name": "Tracking",
+                "name": "Zoom 864",
                 "bin_x": 0,
                 "bin_y": 0,
                 "roi_w": 864, # example: 864, captures center 864 columns of image
@@ -2597,7 +2597,7 @@ class CameraGui(ctk.CTkFrame):
                 "buffer_count": 2,
             },
             "Bin To 864": {
-                "name": "Tracking",
+                "name": "Bin to 864",
                 "bin_x": 3,
                 "bin_y": 3,
                 "roi_w": 0, # example: 864, captures center 864 columns of image

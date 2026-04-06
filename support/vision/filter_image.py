@@ -4,6 +4,7 @@ from numpy.typing import NDArray
 import customtkinter as ctk
 from support.core.enums import ImageKernel
 
+
 class GaborGUI:
     def __init__(self):
         self.pop_up = ctk.CTkToplevel()
@@ -99,8 +100,13 @@ class GaborGUI:
                                   self.gaborFilter.psi)
 
     def close(self):
-        self.pop_up.destroy()
-        self.pop_up.update()
+        try:
+            if self.pop_up is not None and self.pop_up.winfo_exists():
+                self.pop_up.destroy()
+                self.pop_up.update()
+        except Exception:
+            pass
+
 
 class Gabor:
     def __init__(self):
@@ -135,12 +141,27 @@ class Gabor:
                                   self.psi)
 
 
-def applyConvolutionFilter(img: NDArray,
-                           kernel: ImageKernel,
-                           gabor: None | Gabor = None,
-                           gain: float = 1.0,
-                           brightness: int = 0) -> None:
+def ensure_gabor_gui(gabor_gui: None | GaborGUI) -> GaborGUI:
+    """
+    Return a usable GaborGUI instance, creating or reviving one as needed.
+    """
+    if gabor_gui is None:
+        return GaborGUI()
 
+    try:
+        if gabor_gui.pop_up is None or not gabor_gui.pop_up.winfo_exists():
+            return GaborGUI()
+    except Exception:
+        return GaborGUI()
+
+    return gabor_gui
+
+
+def _apply_convolution_filter(img: NDArray,
+                              kernel: ImageKernel,
+                              gabor: None | GaborGUI = None,
+                              gain: float = 1.0,
+                              brightness: int = 0) -> None:
     match kernel:
         case ImageKernel.Unfiltered:
             return
@@ -150,6 +171,8 @@ def applyConvolutionFilter(img: NDArray,
             cv2.addWeighted(img, 2.0, gaussian_3, -1.0, 0, dst=img)
 
         case ImageKernel.Gabor:
+            if gabor is None:
+                raise ValueError("Gabor filter requested but no GaborGUI was provided.")
             convolution = gabor.filter_kernel()
             cv2.filter2D(img, -1, convolution, dst=img)
 
@@ -166,3 +189,30 @@ def applyConvolutionFilter(img: NDArray,
             convolution = ImageKernel.get_convolution(kernel)
             cv2.filter2D(img, -1, convolution, dst=img)
 
+
+def apply_filter(img: NDArray,
+                 kernel: ImageKernel,
+                 gabor_gui: None | GaborGUI = None,
+                 gain: float = 1.0,
+                 brightness: int = 0) -> None | GaborGUI:
+    """
+    Apply the requested filter and manage Gabor GUI lifecycle policy.
+
+    Returns:
+        - GaborGUI instance when the Gabor filter is active
+        - None when a non-Gabor filter is active
+    """
+    if not isinstance(kernel, ImageKernel):
+        raise ValueError(f"Image Kernel should be ImageKernel Enum class, but is instead {type(kernel)}")
+
+    if kernel == ImageKernel.Gabor:
+        gabor_gui = ensure_gabor_gui(gabor_gui)
+        _apply_convolution_filter(img, kernel, gabor_gui, gain, brightness)
+        return gabor_gui
+
+    if gabor_gui is not None:
+        gabor_gui.close()
+        gabor_gui = None
+
+    _apply_convolution_filter(img, kernel, None, gain, brightness)
+    return None

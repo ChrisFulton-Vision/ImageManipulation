@@ -1,232 +1,298 @@
 import cv2
 import numpy as np
-import scipy.linalg as la
-from pupil_apriltags import Detector
-from math import sqrt, acos
-from support.io.ThreeD_truth import TruthPoints
+from dataclasses import dataclass
+from typing import Any
 
-tag_size = 0.168
-scale = 2848.0 / 1424
-aprilImage = "C:\\repos\\aburn\\usr\\24WintCalspanFltTest\\AlviumLJAprilTags\\1.bmp"
+from numpy.typing import NDArray
 
-paramsOnCalibration = True
-paramsOnDistortion = True
-applyDistortion = True
-
-sss = np.zeros((3, 3, 3))  # Create basis function for skew symmetric matrices
-sss[0, 1, 2] = 1
-sss[0, 2, 1] = -1
-sss[1, 0, 2] = -1
-sss[1, 2, 0] = 1
-sss[2, 0, 1] = 1
-sss[2, 1, 0] = -1
+import support.gui.UserSelectQueue as GuiQueue
+import support.viz.colors as clr
+from support.viz.CVFontScaling import small_text
 
 
-def v2SS(v):
-    """
-    Take in a 3 vector and convert it to a skew-symmetric matrix
-    """
-    return np.tensordot(v, sss, axes=([0], [0]))
+@dataclass(slots=True)
+class AprilTagDetectionResult:
+    ids: list[np.ndarray]
+    centers: NDArray | None
+    corners_small: list[np.ndarray] | None
+    refined_corners_per_marker: list[np.ndarray]
+    gray_full: NDArray
+    small_gray: NDArray
 
+def inpaint_apriltags(markupFrame,
+                      gray,
+                      corners,
+                      radius_px: int = 3,
+                      dilate_px: int = 2,
+                      method: int = cv2.INPAINT_TELEA,
+                      feather: bool = True) -> None:
+    mh, mw = markupFrame.shape[:2]
+    gh, gw = gray.shape[:2]
 
-def v2DCM(v):
-    """
-    Take in a 3 vector and use the matrix exponential to create
-    a DCM
-    """
-    return la.expm(v2SS(v))
+    # scale factors from detection image to markup image
+    sx = mw / float(gw)
+    sy = mh / float(gh)
 
+    # how much to pad each ROI beyond the exact tag corners
+    pad = dilate_px + radius_px + 3
 
-def DCM2v(C):
-    """
-    Take in a 3x3 DCM and convert it into a Rodrigues vector
-    (axis angle where the axis is scaled by the angle of rotation)
-    """
-    trace_C = np.trace(C)
-    # Rather than explicitly pull out elements of C, I use sss & sum to get out the elements I want
-    # This makes the code more portable in case I change sss later on.  :)
-    off_diags = np.array([np.sum(SS * C) for SS in sss])
-    if trace_C > 2.999995:  # assume theta/sin_theta = 1
-        return off_diags / 2
-    if trace_C < -.999999:
-        # First, need to determine the magnitude of each element of the vector...
-        S = C + C.T + (1 - np.trace(C)) * np.eye(3)
-        if (3 - np.trace(C)) <= 0.000001:
-            mag_vals = np.sqrt((np.diag(S) / (3 - np.trace(C))))
+    for c in corners:
+        pts = c.reshape(-1, 2).astype(np.float32)
+
+        # scale detected corners from gray-space to markup-space
+        pts_scaled = pts.copy()
+        pts_scaled[:, 0] *= sx
+        pts_scaled[:, 1] *= sy
+
+        x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
+        x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
+        y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
+        y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
+
+        x_min = max(x_min, 0)
+        y_min = max(y_min, 0)
+        x_max = min(x_max, mw - 1)
+        y_max = min(y_max, mh - 1)
+
+        if x_max <= x_min or y_max <= y_min:
+            continue
+
+        roi_w = x_max - x_min + 1
+        roi_h = y_max - y_min + 1
+        mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
+
+        pts_roi = pts_scaled.copy()
+        pts_roi[:, 0] -= x_min
+        pts_roi[:, 1] -= y_min
+        pts_int = pts_roi.astype(np.int32)
+
+        cv2.fillConvexPoly(mask_roi, pts_int, 255)
+
+        if dilate_px > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+            )
+            mask_roi = cv2.dilate(mask_roi, k)
+
+        frame_roi = markupFrame[y_min:y_max + 1, x_min:x_max + 1]
+        inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
+
+        if feather:
+            blur_ks = max(3, 2 * radius_px + 1)
+            soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
+            soft = soft[..., None]
+
+            base = frame_roi.astype(np.float32)
+            inp = inpainted_roi.astype(np.float32)
+            blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
+
+            markupFrame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
         else:
-            mag_vals = np.sqrt((np.diag(np.abs(S)) / 0.00001))
-        # Second, need to figure out the sign for each of the mag_vals
-        # Start with getting the relative signs
-        main_ax = np.argmax(mag_vals)
-        for i in range(3):
-            if S[main_ax, i] < 0:
-                mag_vals[i] = -mag_vals[i]
-        # The axis is now fixed up to a universal sign.  Figure out the universal sign
-        if off_diags[main_ax] < 0:
-            mag_vals = -mag_vals
-        # This part is pretty normal ... how big is theta?
-        if np.trace(C) < -1:
-            theta = acos(-1.0)
+            markupFrame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
+
+def parse_apriltag_args(args: Any) -> GuiQueue.AprilTagDetectOpts:
+    opts = GuiQueue.AprilTagDetectOpts()
+
+    if args is None:
+        return opts
+
+    def set_scale(v: Any) -> None:
+        if isinstance(v, bool):
+            raise TypeError("AprilTag args: 'scale' must be numeric, not bool")
+        if not isinstance(v, (int, float)):
+            raise TypeError(f"AprilTag args: 'scale' must be int/float, got {type(v)}")
+        opts.scale = float(v)
+
+    def set_bool(name: str, v: Any) -> None:
+        if isinstance(v, bool):
+            setattr(opts, name, v)
+            return
+        if isinstance(v, int) and v in (0, 1):
+            setattr(opts, name, bool(v))
+            return
+        raise TypeError(f"AprilTag args: '{name}' must be bool (or 0/1), got {type(v)}")
+
+    if isinstance(args, dict):
+        # Accept either GUI labels or internal field names.
+        normalized = {}
+        for k, v in args.items():
+            key = GuiQueue.AprilTagDetectOpts.KEYMAP.get(str(k), str(k))
+            normalized[key] = v
+
+        if "scale" in normalized:
+            set_scale(normalized["scale"])
+        if "inpaint" in normalized:
+            set_bool("inpaint", normalized["inpaint"])
+        if "pnp" in normalized:
+            set_bool("pnp", normalized["pnp"])
+        if "qnp" in normalized:
+            set_bool("qnp", normalized["qnp"])
+
+        return opts
+
+    raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
+
+
+def detect_apriltags_refined(
+    detector,
+    markup_frame: NDArray,
+    scale: float,
+) -> AprilTagDetectionResult:
+    """
+    Detect AprilTags on a downscaled grayscale image, then refine corners
+    at full resolution using cornerSubPix.
+    """
+    if detector is None:
+        raise ValueError("detector must not be None")
+
+    gray_full = cv2.cvtColor(markup_frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray_full.shape[:2]
+
+    if not (0.05 <= float(scale) <= 1.0):
+        scale = 0.6
+
+    sw = max(1, int(w * scale))
+    sh = max(1, int(h * scale))
+    small_gray = cv2.resize(gray_full, (sw, sh), interpolation=cv2.INTER_AREA)
+
+    corners_small, ids, _rejected = detector.detectMarkers(small_gray)
+
+    if corners_small is None or ids is None or len(corners_small) == 0:
+        return AprilTagDetectionResult(
+            ids=[],
+            centers=None,
+            corners_small=None,
+            refined_corners_per_marker=[],
+            gray_full=gray_full,
+            small_gray=small_gray,
+        )
+
+    all_pts = []
+    marker_lengths = []
+
+    for c in corners_small:
+        pts = c.reshape(-1, 2).astype(np.float32) / float(scale)
+        marker_lengths.append(len(pts))
+        all_pts.append(pts)
+
+    all_pts = np.concatenate(all_pts, axis=0).reshape(-1, 1, 2)
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        20,
+        0.01,
+    )
+    cv2.cornerSubPix(gray_full, all_pts, (5, 5), (-1, -1), criteria)
+
+    refined_corners_per_marker = []
+    idx0 = 0
+    for length in marker_lengths:
+        refined_corners_per_marker.append(
+            all_pts[idx0:idx0 + length].reshape(-1, 2).copy()
+        )
+        idx0 += length
+
+    centers = None
+    ids_out: list[np.ndarray] = []
+
+    for corners, idx in zip(refined_corners_per_marker, ids):
+        pix_center = np.mean(corners, axis=0).astype(np.int32)
+        ids_out.append(idx)
+
+        if centers is None:
+            centers = np.array(pix_center, dtype=np.float32)
         else:
-            theta = acos((np.trace(C) - 1) / 2)
-        return theta * mag_vals
-    sin_theta = sqrt((3 - trace_C) * (1 + trace_C)) / 2.0
-    theta = acos((trace_C - 1) / 2.0)
-    return theta / (2. * sin_theta) * off_diags
+            centers = np.vstack((centers, pix_center.astype(np.float32)))
+
+    return AprilTagDetectionResult(
+        ids=ids_out,
+        centers=centers,
+        corners_small=list(corners_small),
+        refined_corners_per_marker=refined_corners_per_marker,
+        gray_full=gray_full,
+        small_gray=small_gray,
+    )
 
 
-def plotOnImg(img, points, names, color):
-    for idx, pxPt in enumerate(points):
-        cv2.circle(img, (int(pxPt[0]), int(pxPt[1])), 5, color, 5)
-        textLoc = (int(pxPt[0]) - 30, int(pxPt[1] - 30))
-        cv2.putText(img, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 12,
-                    cv2.LINE_AA)
-        cv2.putText(img, str(names[idx]), textLoc, cv2.FONT_HERSHEY_SIMPLEX, 2, color, 3, cv2.LINE_AA)
+def draw_apriltag_detections(
+    markup_frame: NDArray,
+    refined_corners_per_marker: list[np.ndarray],
+    ids: list[np.ndarray],
+) -> None:
+    for corners, idx in zip(refined_corners_per_marker, ids):
+        polyline = [corners.astype(np.int32).reshape((-1, 1, 2))]
+        pix_center = np.mean(corners, axis=0).astype(np.int32)
+
+        cv2.polylines(markup_frame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
+        cv2.putText(markup_frame, str(idx[0]), tuple(pix_center),
+                    cv2.FONT_HERSHEY_SIMPLEX, small_text(markup_frame.shape[0]), clr.HUD_GREEN, 4)
+        cv2.putText(markup_frame, str(idx[0]), tuple(pix_center),
+                    cv2.FONT_HERSHEY_SIMPLEX, small_text(markup_frame.shape[0]), (0, 0, 0), 1)
 
 
-def project(rvec, tvec, objectPoints, cameraMatrix, distCoeffs):
-    projectedPoints, _ = cv2.projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix,
-                                           distCoeffs=distCoeffs)
-    return projectedPoints
+def inpaint_apriltags(markup_frame: NDArray,
+                      gray_small: NDArray,
+                      corners_small,
+                      radius_px: int = 3,
+                      dilate_px: int = 2,
+                      method: int = cv2.INPAINT_TELEA,
+                      feather: bool = True) -> None:
+    mh, mw = markup_frame.shape[:2]
+    gh, gw = gray_small.shape[:2]
 
+    sx = mw / float(gw)
+    sy = mh / float(gh)
 
-#  Camera matrix
-if paramsOnCalibration:
-    # Fix Principle point, aspect ratio, zero tangent distance ON
-    orig_fx = 1624.4683879211
-    orig_fy = 1624.4683879211
-    orig_cx = 711.5000000000
-    orig_cy = 711.5000000000
-else:
-    # Fix Principle point, aspect ratio, zero tangent distance OFF
-    orig_fx = 1547.143
-    orig_fy = 1534.587
-    orig_cx = 970.5381732523
-    orig_cy = 791.7311706726
+    pad = dilate_px + radius_px + 3
 
-fx = scale * orig_fx
-fy = scale * orig_fy
-cx = scale * (orig_cx + 0.5) - 0.5
-cy = scale * (orig_cy + 0.5) - 0.5
+    for c in corners_small:
+        pts = c.reshape(-1, 2).astype(np.float32)
 
-#  Distortion coefficients
-if paramsOnDistortion:
-    # Fix Principle point, aspect ratio, zero tangent distance ON
-    k1 = -0.1991660878
-    k2 = 0.2248626435
-    p1 = 0.0000000000
-    p2 = 0.0000000000
-    k3 = 0.4556142974
-else:
-    # Fix Principle point, aspect ratio, zero tangent distance OFF
-    k1 = -0.1166279524
-    k2 = 0.0256347102
-    p1 = 0.0233343086
-    p2 = 0.0184426060
-    k3 = 0.0175813388
+        pts_scaled = pts.copy()
+        pts_scaled[:, 0] *= sx
+        pts_scaled[:, 1] *= sy
 
-cameraMatrix = np.eye(3)
-cameraMatrix[0, 0] = fx
-cameraMatrix[1, 1] = fy
-cameraMatrix[0, 2] = cx
-cameraMatrix[1, 2] = cy
+        x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
+        x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
+        y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
+        y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
 
-if applyDistortion:
-    distCoeffs = np.array([k1, k2, p1, p2, k3])
-else:
-    distCoeffs = np.zeros((5,))
+        x_min = max(x_min, 0)
+        y_min = max(y_min, 0)
+        x_max = min(x_max, mw - 1)
+        y_max = min(y_max, mh - 1)
+        if x_max <= x_min or y_max <= y_min:
+            continue
 
-detector = Detector()
+        roi_w = x_max - x_min + 1
+        roi_h = y_max - y_min + 1
+        mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
 
-img = cv2.imread(aprilImage)
-gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        pts_roi = pts_scaled.copy()
+        pts_roi[:, 0] -= x_min
+        pts_roi[:, 1] -= y_min
+        pts_int = pts_roi.astype(np.int32)
 
-detections = detector.detect(gray, estimate_tag_pose=True, camera_params=([fx, fy, cx, cy]), tag_size=tag_size)
-centers = None
+        cv2.fillConvexPoly(mask_roi, pts_int, 255)
 
-validPoints = {}
-aprilTagPoints = None
+        if dilate_px > 0:
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
+            )
+            mask_roi = cv2.dilate(mask_roi, k)
 
-# Draw bounding boxes around the detected tags
+        frame_roi = markup_frame[y_min:y_max + 1, x_min:x_max + 1]
+        inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
 
-for detection in detections:
-    proj = cameraMatrix @ detection.pose_t
-    if aprilTagPoints is None:
-        aprilTagPoints = detection.pose_t
-    else:
-        aprilTagPoints = np.append(aprilTagPoints, detection.pose_t, axis=1)
+        if feather:
+            blur_ks = max(3, 2 * radius_px + 1)
+            soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
+            soft = soft[..., None]
 
-    pixCenter = (int(detection.center[0]), int(detection.center[1]))
+            base = frame_roi.astype(np.float32)
+            inp = inpainted_roi.astype(np.float32)
+            blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
 
-    cv2.polylines(img, [detection.corners.astype(int)], True, (0, 255, 0), 2)
-    cv2.putText(img, str(detection.tag_id), pixCenter,
-                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 6)
-
-    if centers is None:
-        centers = np.array(pixCenter)
-    else:
-        centers = np.vstack((centers, np.array(pixCenter)))
-
-    validPoints[detection.tag_id] = np.array(pixCenter)
-
-truthPointsClass = TruthPoints()
-truthPoints = truthPointsClass.getTruthPointsDict()
-
-# objectPoints = objectPoints.astype('float32')
-centers = centers.astype('float32')
-
-imagePoints = None
-
-for validPt in validPoints.values():
-    if imagePoints is None:
-        imagePoints = validPt
-    else:
-        imagePoints = np.vstack((imagePoints, validPt))
-
-objectPoints = np.zeros((imagePoints.shape[0], 3))
-for idx, valID in enumerate(validPoints.keys()):
-    objectPoints[idx, :] = truthPoints[str(valID)]
-
-np.set_printoptions(suppress=True)
-
-print('OP: \n', objectPoints.T)
-print('Ap Points: \n', aprilTagPoints)
-print('IP: \n', centers)
-print('CM: \n', cameraMatrix)
-print('DP: \n', distCoeffs)
-
-ret, rvec, tvec = cv2.solvePnP(objectPoints=objectPoints, imagePoints=centers, cameraMatrix=cameraMatrix,
-                               distCoeffs=distCoeffs, flags=cv2.SOLVEPNP_ITERATIVE)
-
-print('\nRvec: \n', rvec)
-print('Rvec as DCM: \n', cv2.Rodrigues(rvec)[0])
-print('Tvec: \n', tvec)
-print('T-norm: \n', la.norm(tvec))
-
-projectedPoints_orig, _ = cv2.projectPoints(objectPoints, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix,
-                                            distCoeffs=distCoeffs)
-
-probeTip_3d = np.array([[4.27289], [-2.50055], [-0.25204]])
-probeTip_pix, _ = cv2.projectPoints(probeTip_3d, rvec=rvec, tvec=tvec, cameraMatrix=cameraMatrix, distCoeffs=distCoeffs)
-
-plotOnImg(img, projectedPoints_orig[:, 0, :].astype(int), list(validPoints.keys()), (255, 255, 0))
-plotOnImg(img, probeTip_pix[:, 0, :].astype(int), ['Probe Tip'], (0, 255, 0))
-
-cv2.putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 2,
-            (0, 0, 0), 15)
-cv2.putText(img, f'Params On for Calibration: {paramsOnCalibration}', (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 2,
-            (255, 255, 255), 6)
-
-cv2.putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100, 200), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0),
-            15)
-cv2.putText(img, f'Params On for Distortion: {paramsOnDistortion}', (100, 200), cv2.FONT_HERSHEY_SIMPLEX, 2,
-            (255, 255, 255), 6)
-
-cv2.putText(img, f'Distortion applied: {applyDistortion}', (100, 300), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 15)
-cv2.putText(img, f'Distortion applied: {applyDistortion}', (100, 300), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 6)
-
-small_img = cv2.resize(img, (848, 848))
-
-cv2.imshow("Reproject", small_img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+            markup_frame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
+        else:
+            markup_frame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi

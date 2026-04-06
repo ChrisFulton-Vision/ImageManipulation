@@ -630,12 +630,16 @@ def _get_cal_distortion(cal: Calibration) -> tuple[float, float, float, float, f
 
     Missing attributes default to zero so old Calibration objects still work.
     """
+
+    def safe_float_attr(obj, name, default=0.0):
+        v = getattr(obj, name, default)
+        return float(default if v is None else v)
     return (
-        float(getattr(cal, "k1", 0.0)),
-        float(getattr(cal, "k2", 0.0)),
-        float(getattr(cal, "k3", 0.0)),
-        float(getattr(cal, "p1", 0.0)),
-        float(getattr(cal, "p2", 0.0)),
+        safe_float_attr(cal, "k1", 0.0),
+        safe_float_attr(cal, "k2", 0.0),
+        safe_float_attr(cal, "k3", 0.0),
+        safe_float_attr(cal, "p1", 0.0),
+        safe_float_attr(cal, "p2", 0.0),
     )
 
 

@@ -3,6 +3,9 @@ from collections import deque
 from typing import Any
 from support.io.my_logging import LOG
 import time
+import cv2
+import numpy as np
+from numpy.typing import NDArray
 
 try:
     from vmbpy import VmbSystem, PixelFormat, VmbTimeout, AllocationMode
@@ -77,12 +80,12 @@ class VimbaController:
 
         LOG.info("Applied live Vimba tuning update.")
 
-    def select_vimba_camera(self, vmb, camConfig):
+    def select_vimba_camera(self, vmb, cam_id):
         cams = list(vmb.get_all_cameras())
         if not cams:
             raise RuntimeError("No Vimba cameras detected.")
 
-        wanted = str(getattr(camConfig, "vimba_camera_id", "") or "").strip()
+        wanted = str(cam_id or "").strip()
         if not wanted:
             return cams[0]
 
@@ -184,8 +187,8 @@ class VimbaController:
                 LOG.warning(f"Could not set Vimba {actual_name} to {value}: {e}")
         return False
 
-    def get_vimba_profile_spec(self, camConfig) -> dict[str, int | str]:
-        profile = str(getattr(camConfig, "vimba_profile", "Full Res") or "Full Res")
+    def get_vimba_profile_spec(self, vimba_profile) -> dict[str, int | str]:
+        profile = str(vimba_profile or "Full Res")
 
         profiles = {
             "Full Res": {
@@ -237,8 +240,8 @@ class VimbaController:
 
         return profiles.get(profile, profiles["Full Res"])
 
-    def _apply_vimba_profile(self, cam, camConfig):
-        spec = self.get_vimba_profile_spec(camConfig)
+    def _apply_vimba_profile(self, cam, vimba_profile):
+        spec = self.get_vimba_profile_spec(vimba_profile)
 
         # 1) Binning first
         self._set_vimba_int_feature(cam, ("BinningHorizontal",), int(spec["bin_x"]))
@@ -294,7 +297,7 @@ class VimbaController:
                 pass
 
         # Apply profile-driven binning / ROI first
-        self._apply_vimba_profile(cam, camConfig)
+        self._apply_vimba_profile(cam, camConfig.vimba_profile)
 
         gain_auto = self._normalize_vimba_auto_mode(getattr(camConfig, "vimba_gain_auto", "Off"))
         exposure_auto = self._normalize_vimba_auto_mode(getattr(camConfig, "vimba_exposure_auto", "Off"))
@@ -354,7 +357,10 @@ class VimbaController:
         self._live_vimba_cam = cam
         self._live_vimba_enabled = True
 
-    def start_stream(self, handler, stream_buffer_count):
+    def start_stream(self, handler, vimba_profile):
+
+        profile_spec = self.get_vimba_profile_spec(vimba_profile)
+        stream_buffer_count = int(profile_spec["buffer_count"])
         self._live_vimba_cam.start_streaming(handler,
                                              buffer_count=stream_buffer_count,
                                              allocation_mode=AllocationMode.AllocAndAnnounceFrame,)
@@ -376,7 +382,50 @@ class VimbaController:
             return frame, img_time
         return None, None
 
-    def update_frame(self, img, ts):
+    def _vmbpy_frame_to_bgr(self, frame) -> NDArray:
+        # If the camera isn't already producing Bgr8/Mono8, try to convert.
+        bgr8, mono8 = self.get_PixelFormats()
+
+        if bgr8 is not None:
+            try:
+                frame.convert_pixel_format(bgr8)
+            except Exception:
+                if mono8 is not None:
+                    try:
+                        frame.convert_pixel_format(mono8)
+                    except Exception:
+                        pass
+
+        img = frame.as_opencv_image()
+        if img is None:
+            raise RuntimeError("Failed to export Vimba frame as OpenCV image.")
+
+        img = np.ascontiguousarray(img)
+
+        # Your pipeline generally behaves best with a 3-channel image.
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        else:
+            img = img.copy()
+
+        return img
+
+    def update_frame(self, frame, vimba_profile):
+        profile_spec = self.get_vimba_profile_spec(vimba_profile)
+        preview_max_dim = int(profile_spec["preview_max_dim"])
+
+        img = self._vmbpy_frame_to_bgr(frame)
+
+        if preview_max_dim > 0:
+            h, w = img.shape[:2]
+            max_dim = max(h, w)
+            if max_dim > preview_max_dim:
+                s = preview_max_dim / float(max_dim)
+                new_w = max(1, int(round(w * s)))
+                new_h = max(1, int(round(h * s)))
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        ts = time.time()
         with self._latest_lock:
             self._latest_raw_frame = img
             self._latest_raw_time = ts

@@ -39,6 +39,19 @@ from support.io.my_logging import LOG
 from support.vision.calibration import Calibration, undistort_points_px
 from support.vision.draw_circle_and_mask import dim_except_circle
 from support.vision.vimba_controller import VimbaController as VimbaCam, HAVE_VMBPY
+from support.vision.fisheye_to_cubemap import (
+    DEFAULT_CUBEMAP_FACES,
+    DEFAULT_CUBEMAP_LAYOUT,
+    DEFAULT_CUBEMAP_FACESIZE,
+    FisheyeCubemapManager)
+
+from support.runtime.fg_singleTarget import (
+    FactorGraph,
+    build_factor_graph_output,
+    factor_graph_projection_matrix,
+    run_factor_graph_step,
+)
+from support.runtime.fg_singleTarget import build_hyper_focus_plan
 
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text, med_thick, lrg_thick
@@ -69,20 +82,6 @@ class YoloOutput:
     last_yolo_center: tuple[float, float] = None
     last_yolo_3d_estimate: NDArray = None
     pose: PoseOutput | None = None
-
-
-class FgOutput:
-    """Container for the most recent factor-graph state estimate.
-
-    Holds the current pixel projection, relative pose/velocity estimates,
-    and per-axis variances produced by the fusion pipeline.
-    """
-    curr_FG_pixel: tuple[int, int] = None
-    curr_r_T_d: NDArray = None
-    curr_r_V_d: NDArray = None
-    curr_var_x: float = None
-    curr_var_z: float = None
-    curr_var_y: float = None
 
 
 class CameraGui(ctk.CTkFrame):
@@ -122,13 +121,7 @@ class CameraGui(ctk.CTkFrame):
         self._dp_conf_list = None
         self._dp_img_dir_var = None
 
-
-
         self.vimbaCam = VimbaCam()
-        # self._live_vimba_cmds = deque()
-        # self._live_vimba_cmd_lock = threading.Lock()
-        # self._live_vimba_cam = None
-        # self._live_vimba_enabled = False
 
         self._loading_config = True
 
@@ -231,11 +224,7 @@ class CameraGui(ctk.CTkFrame):
         self.current_var_z = 10.0
         self.print3DTruthOnce = False
         self.screenshot_impending = False
-        self.face_size = None
-        self.faces_dirs = None
-        self.cubemap_faces = None
-        self.cubemap_x = None
-        self.cubemap_y = None
+        self.fisheye_mgr = FisheyeCubemapManager()
         self.hud_marker = None
         self.lowPassFPS = 20.0
         self.ThreeDTruthPoints = None
@@ -703,6 +692,7 @@ class CameraGui(ctk.CTkFrame):
         """Reload HUD attitude/log data from the configured source path."""
         if self.hud_marker is not None:
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
+            self.load_offset_csv(self.camConfig.hud_data_filepath)
         self.saveToCache()
 
     def updateYOLOModel(self):
@@ -758,16 +748,21 @@ class CameraGui(ctk.CTkFrame):
         if self.yoloSession is not None:
             self.yoloSession.set_calibration(self.calibration)
 
-        w, h = self.calibration.width, self.calibration.height
-        K = self.calibration.getCameraMatrix()
-        D = self.calibration.getDistortion()
+        # New owner for remap caches
+        self.fisheye_mgr.clear()
 
-        newK, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=0)
-
-        self.calibration.remapK = newK
-        self.map1, self.map2 = cv2.initUndistortRectifyMap(
-            K, D, None, newK, (w, h), cv2.CV_32FC1
+        # Always compute a remapK so downstream code can rely on it existing.
+        newK, std_map1, std_map2 = self.fisheye_mgr.ensure_standard_undistort_maps(
+            self.calibration,
+            alpha=0.0,
         )
+        self.calibration.remapK = newK
+
+        # Only the non-fisheye path uses map1/map2 in this class.
+        if self.calibration.fisheye:
+            self.map1, self.map2 = None, None
+        else:
+            self.map1, self.map2 = std_map1, std_map2
 
         self.saveToCache()
 
@@ -1944,11 +1939,22 @@ class CameraGui(ctk.CTkFrame):
             return
 
         self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
-        out_csv = Path(self.camConfig.hud_data_filepath)
+
+        hud_path = Path(self.camConfig.hud_data_filepath)
+
+        # If user/config points at a directory, write the offset file inside it.
+        # If it points at a file, write alongside that file.
+        if hud_path.is_dir():
+            out_csv = hud_path / "__TIME_OFFSET.csv"
+        else:
+            out_csv = hud_path.parent / "__TIME_OFFSET.csv"
+
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+
         import pandas as pd
         pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
 
-        LOG.info(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to __TIME_OFFSET.csv")
+        LOG.info(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to {out_csv}")
         self.camConfig.cam_to_log_time_offset = 0.0
 
     @staticmethod
@@ -1997,11 +2003,11 @@ class CameraGui(ctk.CTkFrame):
                 self.ImageTimeReader.idsTimes.append([image, None])
 
     @staticmethod
-    def load_time_offset(directory):
+    def load_time_offset(directory) -> float:
         try:
             import pandas as pd
             offset_dict = pd.read_csv(directory / "__TIME_OFFSET.csv")
-            return float(offset_dict['offset'][0])
+            return float(offset_dict["offset"][0])
         except FileNotFoundError:
             return 0.0
 
@@ -2013,9 +2019,16 @@ class CameraGui(ctk.CTkFrame):
             p = Path(rec[0])
             paths.append(p if p.is_absolute() else (directory / p))
 
+        base_offset = 0.0
+        if self.hud_marker is not None:
+            base_offset = float(getattr(self.hud_marker, "offset", 0.0) or 0.0)
+
+        delta_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0) or 0.0)
+        total_offset = base_offset + delta_offset
+
         ts_raw = []
         for name, ts in self.ImageTimeReader.idsTimes:
-            ts_raw.append(None if ts is None else float(ts) + float(self.camConfig.cam_to_log_time_offset))
+            ts_raw.append(None if ts is None else float(ts) + total_offset)
 
         t = self._make_timebase(ts_raw, self.camConfig.target_fps, len(paths))
 
@@ -2079,8 +2092,13 @@ class CameraGui(ctk.CTkFrame):
         # --- PAUSED CACHE: keep 1 frame while paused to avoid refetch spam ---
         self.pauseCache.clear()
 
-        # time offset
-        self.camConfig.cam_to_log_time_offset = self.load_time_offset(directory)
+        # Load persisted/base offset, but keep UI delta at zero on startup.
+        loaded_offset = self.load_time_offset(directory)
+
+        if self.hud_marker is not None:
+            self.hud_marker.offset = loaded_offset
+
+        self.camConfig.cam_to_log_time_offset = 0.0
 
         from support.runtime.buffer_image_loader import BufferedImageLoader as imgBuf
 
@@ -2396,43 +2414,13 @@ class CameraGui(ctk.CTkFrame):
 
         return True
 
-    def _vmbpy_frame_to_bgr(self, frame) -> NDArray:
-        # If the camera isn't already producing Bgr8/Mono8, try to convert.
-        bgr8, mono8 = self.vimbaCam.get_PixelFormats()
 
-        if bgr8 is not None:
-            try:
-                frame.convert_pixel_format(bgr8)
-            except Exception:
-                if mono8 is not None:
-                    try:
-                        frame.convert_pixel_format(mono8)
-                    except Exception:
-                        pass
-
-        img = frame.as_opencv_image()
-        if img is None:
-            raise RuntimeError("Failed to export Vimba frame as OpenCV image.")
-
-        img = np.ascontiguousarray(img)
-
-        # Your pipeline generally behaves best with a 3-channel image.
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        else:
-            img = img.copy()
-
-        return img
 
     def run_vimba_stream(self, camConfig):
         if not HAVE_VMBPY:
             LOG.error("VmbPy is not installed or could not be imported.")
             self.after(0, self._on_worker_exit)
             return
-
-        profile_spec = self.vimbaCam.get_vimba_profile_spec(camConfig)
-        preview_max_dim = int(profile_spec["preview_max_dim"])
-        stream_buffer_count = int(profile_spec["buffer_count"])
 
         def handler(cam, stream, frame):
             if self.threadStopper.is_set() or not self.showWindow:
@@ -2443,20 +2431,9 @@ class CameraGui(ctk.CTkFrame):
                 return
 
             try:
-                img = self._vmbpy_frame_to_bgr(frame)
+                self.vimbaCam.update_frame(frame,
+                                           self.camConfig.vimba_profile)
 
-                if preview_max_dim > 0:
-                    h, w = img.shape[:2]
-                    max_dim = max(h, w)
-                    if max_dim > preview_max_dim:
-                        s = preview_max_dim / float(max_dim)
-                        new_w = max(1, int(round(w * s)))
-                        new_h = max(1, int(round(h * s)))
-                        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
-                ts = time.time()
-
-                self.vimbaCam.update_frame(img, ts)
             finally:
                 try:
                     cam.queue_frame(frame)
@@ -2467,17 +2444,16 @@ class CameraGui(ctk.CTkFrame):
             cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
 
             with self.vimbaCam.vmbSystem_getInstance() as vmb:
-                cam = self.vimbaCam.select_vimba_camera(vmb, self.camConfig)
+                cam = self.vimbaCam.select_vimba_camera(vmb,
+                                                        self.camConfig.vimba_camera_id)
 
                 with cam:
                     self.vimbaCam.configure_stream(cam, self.camConfig)
 
-                    stream_started = False
                     try:
                         self.vimbaCam.start_stream(
                             handler,
-                            stream_buffer_count)
-                        stream_started = True
+                            self.camConfig.vimba_profile)
 
                         while (not self.threadStopper.is_set()
                                and self.showWindow
@@ -2606,8 +2582,17 @@ class CameraGui(ctk.CTkFrame):
         try:
             import pandas as pd
             offset_dict = pd.read_csv(directory / '__TIME_OFFSET.csv')
-            self.camConfig.cam_to_log_time_offset = float(offset_dict['offset'][0])
+            loaded_offset = float(offset_dict['offset'][0])
+
+            if self.hud_marker is not None:
+                self.hud_marker.offset = loaded_offset
+
+            # UI delta should always start at zero after loading persisted offset.
+            self.camConfig.cam_to_log_time_offset = 0.0
+
         except FileNotFoundError:
+            if self.hud_marker is not None:
+                self.hud_marker.offset = 0.0
             self.camConfig.cam_to_log_time_offset = 0.0
 
         cv_imgs = []
@@ -3042,75 +3027,77 @@ class CameraGui(ctk.CTkFrame):
                   ctx: GuiQueue.FrameCtx,
                   args):
 
-        if self.calibration.fisheye:
+        if not self.calibration.validCal:
+            raise ValueError("No calibration loaded!")
 
-            def _paste_into(frame_dst: np.ndarray, img_src: np.ndarray) -> None:
-                """Paste src into dst. If same shape, full copy.
-                If src is smaller, center it with black padding.
-                Otherwise, resize src to dst size.
-                """
-                h, w = frame_dst.shape[:2]
-                hs, ws = img_src.shape[:2]
-
-                if (h, w) == (hs, ws):
-                    frame_dst[:] = img_src
-                    return
-
-                # If src fits inside dst, center-blit with padding (no distortion)
-                if hs <= h and ws <= w:
-                    frame_dst[:] = 0
-                    y0 = (h - hs) // 2
-                    x0 = (w - ws) // 2
-                    frame_dst[y0:y0 + hs, x0:x0 + ws] = img_src
-                    return
-
-                # Otherwise resize to fit (may distort)
-                resized = cv2.resize(img_src, (w, h), interpolation=cv2.INTER_LINEAR)
-                frame_dst[:] = resized
-
-            opts: GuiQueue.UndistortOpts = self.parse_args(args, GuiQueue.UndistortOpts())
-            if opts.cubemap:
-                if self.face_size is None or self.face_size != 600:
-                    self.face_size = 600
-                    self.update_cube_map_vectors()
-
-                self.apply_fisheye_faces(markupFrame)
-                layout = {
-                    'bottom': (2, 1),
-                    'left': (1, 0),
-                    'front': (1, 1),
-                    'right': (1, 2),
-                    # 'back': (1, 0),
-                    'top': (0, 1)}
-                stitched = self.stitch_cubemap_faces(layout, cells=3)
-                _paste_into(markupFrame, stitched)
-
-            else:
-                if self.face_size is None or self.face_size != min(markupFrame.shape[:2]):
-                    self.face_size = min(markupFrame.shape[:2])
-                    self.update_frontFace_vector()
-
-                self.apply_fisheye_faces(markupFrame)
-
-                front = self.cubemap_faces['front']
-                _paste_into(markupFrame, front)
-        else:
-            if self.map1 is None or self.map2 is None:
-                raise ValueError("No calibration loaded!")
-            tmp = cv2.remap(markupFrame,
-                            self.map1,
-                            self.map2,
-                            interpolation=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT)
-
-            # Faster to assign value, but error if incorrect size
-
-            self._replace_array_in_place(markupFrame, tmp)
-
+        def _mark_undistorted() -> None:
             if not ctx.undistorted.is_set():
                 ctx.undistorted.set(True)  # One undistort has been run
             else:
                 ctx.undistorted.set(False)  # Multiple undistorts, invalid
+
+        def _paste_into(frame_dst: np.ndarray, img_src: np.ndarray) -> None:
+            """Paste src into dst. If same shape, full copy.
+            If src is smaller, center it with black padding.
+            Otherwise, resize src to dst size.
+            """
+            h, w = frame_dst.shape[:2]
+            hs, ws = img_src.shape[:2]
+
+            if (h, w) == (hs, ws):
+                frame_dst[:] = img_src
+                return
+
+            # If src fits inside dst, center-blit with padding (no distortion)
+            if hs <= h and ws <= w:
+                frame_dst[:] = 0
+                y0 = (h - hs) // 2
+                x0 = (w - ws) // 2
+                frame_dst[y0:y0 + hs, x0:x0 + ws] = img_src
+                return
+
+            # Otherwise resize to fit (may distort)
+            resized = cv2.resize(img_src, (w, h), interpolation=cv2.INTER_LINEAR)
+            frame_dst[:] = resized
+
+        opts: GuiQueue.UndistortOpts = self.parse_args(args, GuiQueue.UndistortOpts())
+
+        if self.calibration.fisheye:
+            if opts.cubemap:
+                stitched = self.fisheye_mgr.render_cubemap(
+                    frame=markupFrame,
+                    calibration=self.calibration,
+                    face_size=DEFAULT_CUBEMAP_FACESIZE,
+                    layout=DEFAULT_CUBEMAP_LAYOUT,
+                    faces=DEFAULT_CUBEMAP_FACES,
+                    cells=3,
+                )
+                _paste_into(markupFrame, stitched)
+            else:
+                face_size = min(markupFrame.shape[:2])
+                front = self.fisheye_mgr.render_front_face(
+                    frame=markupFrame,
+                    calibration=self.calibration,
+                    face_size=face_size,
+                )
+                _paste_into(markupFrame, front)
+
+            _mark_undistorted()
+            return
+
+        if self.map1 is None or self.map2 is None:
+            raise ValueError("No calibration loaded!")
+
+        tmp = cv2.remap(
+            markupFrame,
+            self.map1,
+            self.map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+        )
+
+        self._replace_array_in_place(markupFrame, tmp)
+        _mark_undistorted()
 
     @staticmethod
     def _replace_array_in_place(dst: np.ndarray, src: np.ndarray) -> None:
@@ -3175,30 +3162,18 @@ class CameraGui(ctk.CTkFrame):
         if 'Filter' not in args:
             return
 
-        processKernel: ImageKernel = args['Filter']
-
-        if not isinstance(processKernel, ImageKernel):
-            raise ValueError(f'Image Kernel should be ImageKernel Enum class, but is instead {type(processKernel)}')
-
-        #  TODO Move ownership of whether GaborGui is open to owning function queue
-        if processKernel != ImageKernel.Gabor and self.GaborGUI is not None:
-            self.GaborGUI.close()
-            self.GaborGUI = None
-
-        from support.vision.filter_image import applyConvolutionFilter
-        if processKernel == ImageKernel.Gabor:
-            from support.vision.filter_image import GaborGUI
-            if self.GaborGUI is None:
-                self.GaborGUI = GaborGUI()
-
+        processKernel = args['Filter']
         gain = float(args.get('Gain', 1.0))
         brightness = int(args.get('Brightness', 0))
 
-        applyConvolutionFilter(markupFrame,
-                               processKernel,
-                               self.GaborGUI,
-                               gain,
-                               brightness)
+        from support.vision.filter_image import apply_filter
+        self.GaborGUI = apply_filter(
+            markupFrame,
+            processKernel,
+            self.GaborGUI,
+            gain,
+            brightness,
+        )
 
     def detect_corners(self,
                        frame: NDArray,
@@ -3214,228 +3189,51 @@ class CameraGui(ctk.CTkFrame):
 
     def detectAprilTags(self,
                         frame: NDArray,
-                        markupFrame: NDArray, ctx: GuiQueue.FrameCtx,
+                        markupFrame: NDArray,
+                        ctx: GuiQueue.FrameCtx,
                         args) -> None:
-        """
-        Faster AprilTag detection:
-          - detect on downscaled image
-          - upscale corners
-          - refine on full-res gray image with cornerSubPix
-        """
-
-        def parse_apriltag_args(args: Any) -> GuiQueue.AprilTagDetectOpts:
-            opts = GuiQueue.AprilTagDetectOpts()
-
-            if args is None:
-                return opts
-
-            def set_scale(v: Any) -> None:
-                if isinstance(v, bool):
-                    raise TypeError("AprilTag args: 'scale' must be numeric, not bool")
-                if not isinstance(v, (int, float)):
-                    raise TypeError(f"AprilTag args: 'scale' must be int/float, got {type(v)}")
-                opts.scale = float(v)
-
-            def set_bool(name: str, v: Any) -> None:
-                # allow 0/1 if they come in (but reject other ints)
-                if isinstance(v, bool):
-                    setattr(opts, name, v)
-                    return
-                if isinstance(v, int) and v in (0, 1):
-                    setattr(opts, name, bool(v))
-                    return
-                raise TypeError(f"AprilTag args: '{name}' must be bool (or 0/1), got {type(v)}")
-
-            # --- Preferred: mapping by name (unambiguous) ---
-            if isinstance(args, dict):
-                if "scale" in args:
-                    set_scale(args["scale"])
-                if "inpaint" in args:
-                    set_bool("inpaint", args["inpaint"])
-                if "pnp" in args:
-                    set_bool("pnp", args["pnp"])
-                if "qnp" in args:
-                    set_bool("qnp", args["qnp"])
-                return opts
-
-            raise TypeError(f"AprilTag args: unsupported args type {type(args)}")
+        from support.vision.aprilTag_detection_and_aligment import (
+            detect_apriltags_refined,
+            draw_apriltag_detections,
+            parse_apriltag_args,
+        )
 
         opts = parse_apriltag_args(args)
-
-        scale = opts.scale
-        inpaint = opts.inpaint
-        pnp_points = opts.pnp
-        qnp_points = opts.qnp
 
         if self.detector is None:
             self.createDetector()
 
-        gray_full = cv2.cvtColor(markupFrame, cv2.COLOR_BGR2GRAY)
-        h, w = gray_full.shape[:2]
+        result = detect_apriltags_refined(
+            detector=self.detector,
+            markup_frame=markupFrame,
+            scale=opts.scale,
+        )
 
-        # 1) Downscale for detection
-        # if not (0.1 <= scale <= 1.0):
-        #     scale = 0.6
-        small_gray = cv2.resize(gray_full, (int(w * scale), int(h * scale)),
-                                interpolation=cv2.INTER_AREA)
+        self.centers = result.centers
+        self.detectIDS = result.ids
 
-        # 2) Detect on smaller image
-        corners_small, ids, rejected = self.detector.detectMarkers(small_gray)
-
-        self.centers = None
-        self.detectIDS = []
-
-        if corners_small is None or ids is None or len(corners_small) == 0:
+        if not result.ids:
             return
 
-        # 3) Upscale corners to full-res and pack into a single array
-        all_pts = []
-        marker_lengths = []
-        for c in corners_small:
-            # c: (4,1,2) or (N,1,2)
-            pts = c.reshape(-1, 2).astype(np.float32) / scale
-            marker_lengths.append(len(pts))
-            all_pts.append(pts)
-
-        all_pts = np.concatenate(all_pts, axis=0).reshape(-1, 1, 2)
-
-        # 4) Subpixel refine on full-res gray image
-        #    (this is what gives you precise centers back)
-        criteria = (
-            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-            20,  # max iterations
-            0.01  # epsilon
-        )
-        cv2.cornerSubPix(gray_full, all_pts, (5, 5), (-1, -1), criteria)
-
-        # 5) Split back per marker and draw / accumulate centers
-        refined_corners_per_marker = []
-        idx0 = 0
-        for length in marker_lengths:
-            refined_corners_per_marker.append(
-                all_pts[idx0:idx0 + length].reshape(-1, 2).copy()
+        if opts.inpaint:
+            from support.vision.aprilTag_detection_and_aligment import inpaint_apriltags
+            inpaint_apriltags(
+                markup_frame=markupFrame,
+                gray_small=result.small_gray,
+                corners_small=result.corners_small,
             )
-            idx0 += length
+        else:
+            draw_apriltag_detections(
+                markup_frame=markupFrame,
+                refined_corners_per_marker=result.refined_corners_per_marker,
+                ids=result.ids,
+            )
 
-        for corners, idx in zip(refined_corners_per_marker, ids):
-            # corners: (4,2)
-            polyline = [corners.astype(np.int32).reshape((-1, 1, 2))]
-            pixCenter = np.mean(corners, axis=0).astype(np.int32)
+        if opts.pnp:
+            self.pnp3DTruthPoints(frame, markupFrame, ctx, ())
 
-            if not inpaint:
-                cv2.polylines(markupFrame, polyline, True, clr.HUD_GREEN, 4, lineType=cv2.FILLED)
-                cv2.putText(markupFrame, str(idx[0]), tuple(pixCenter),
-                            cv2.FONT_HERSHEY_SIMPLEX, small_text(markupFrame.shape[0]), clr.HUD_GREEN, 4)
-                cv2.putText(markupFrame, str(idx[0]), tuple(pixCenter),
-                            cv2.FONT_HERSHEY_SIMPLEX, small_text(markupFrame.shape[0]), (0, 0, 0), 1)
-
-            self.detectIDS.append(idx)
-
-            if self.centers is None:
-                self.centers = np.array(pixCenter, dtype=np.float32)
-            else:
-                self.centers = np.vstack((self.centers, pixCenter.astype(np.float32)))
-
-        if inpaint:
-            self.inpaint_apriltags(markupFrame,
-                                   small_gray,
-                                   corners_small)
-
-        if pnp_points:
-            self.pnp3DTruthPoints(frame,
-                                  markupFrame,
-                                  ctx,
-                                  ())
-        if qnp_points:
-            self.qnp3DTruthPoints(frame,
-                                  markupFrame,
-                                  ctx,
-                                  ())
-
-        return
-
-    @staticmethod
-    def inpaint_apriltags(markupFrame: NDArray,
-                          gray: NDArray,
-                          corners,
-                          radius_px: int = 3,
-                          dilate_px: int = 2,
-                          method: int = cv2.INPAINT_TELEA,
-                          feather: bool = True) -> None:
-
-        mh, mw = markupFrame.shape[:2]
-        gh, gw = gray.shape[:2]
-
-        # scale factors from detection image to markup image
-        sx = mw / float(gw)
-        sy = mh / float(gh)
-
-        # how much to pad each ROI beyond the exact tag corners
-        pad = dilate_px + radius_px + 3
-
-        for c in corners:
-            # c shape ~ (1, 4, 2) -> (4, 2)
-            pts = np.asarray(c).squeeze().reshape(-1, 2).astype(np.float32)
-
-            # scale to markup_frame coords
-            pts_scaled = np.empty_like(pts, dtype=np.float32)
-            pts_scaled[:, 0] = pts[:, 0] * sx
-            pts_scaled[:, 1] = pts[:, 1] * sy
-
-            # tight bounding box around the tag
-            x_min = int(np.floor(pts_scaled[:, 0].min())) - pad
-            x_max = int(np.ceil(pts_scaled[:, 0].max())) + pad
-            y_min = int(np.floor(pts_scaled[:, 1].min())) - pad
-            y_max = int(np.ceil(pts_scaled[:, 1].max())) + pad
-
-            # clamp to image
-            x_min = max(x_min, 0)
-            y_min = max(y_min, 0)
-            x_max = min(x_max, mw - 1)
-            y_max = min(y_max, mh - 1)
-            if x_max <= x_min or y_max <= y_min:
-                continue  # degenerate ROI
-
-            roi_w = x_max - x_min + 1
-            roi_h = y_max - y_min + 1
-
-            # build local mask for this tag only
-            mask_roi = np.zeros((roi_h, roi_w), dtype=np.uint8)
-
-            # shift tag points into ROI coordinates
-            pts_roi = pts_scaled.copy()
-            pts_roi[:, 0] -= x_min
-            pts_roi[:, 1] -= y_min
-            pts_int = pts_roi.astype(np.int32)
-
-            cv2.fillConvexPoly(mask_roi, pts_int, 255)
-
-            # optional dilation to cover borders
-            if dilate_px > 0:
-                k = cv2.getStructuringElement(
-                    cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)
-                )
-                mask_roi = cv2.dilate(mask_roi, k)
-
-            # slice out the ROI from the big frame
-            frame_roi = markupFrame[y_min:y_max + 1, x_min:x_max + 1]
-
-            # inpaint only this small region
-            inpainted_roi = cv2.inpaint(frame_roi, mask_roi, radius_px, method)
-
-            if feather:
-                blur_ks = max(3, 2 * radius_px + 1)
-                soft = cv2.GaussianBlur(mask_roi, (blur_ks, blur_ks), 0).astype(np.float32) / 255.0
-                soft = soft[..., None]  # (H,W,1)
-
-                base = frame_roi.astype(np.float32)
-                inp = inpainted_roi.astype(np.float32)
-                blended_roi = (soft * inp + (1.0 - soft) * base).astype(np.uint8)
-
-                markupFrame[y_min:y_max + 1, x_min:x_max + 1] = blended_roi
-            else:
-                markupFrame[y_min:y_max + 1, x_min:x_max + 1] = inpainted_roi
-        return
+        if opts.qnp:
+            self.qnp3DTruthPoints(frame, markupFrame, ctx, ())
 
     def pnp3DTruthPoints(self,
                          frame: NDArray,
@@ -3641,60 +3439,43 @@ class CameraGui(ctk.CTkFrame):
         return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
 
     def hyper_focus(self,
-                    frame: NDArray,
                     markupFrame: NDArray,
-                    ctx: GuiQueue.FrameCtx, args) -> None:
+                    ctx: GuiQueue.FrameCtx) -> None:
 
-        if not (yolo := ctx.yolo.get_or(False)):
+        plan = build_hyper_focus_plan(
+            ctx=ctx,
+            radius=float(self.radius),
+            min_radius=float(self.min_radius),
+            frame_shape=markupFrame.shape,
+        )
+
+        if plan is None:
             return
 
-        if not ctx.fg.is_set():
+        if plan.next_radius is not None:
+            self.radius = float(plan.next_radius)
 
-            if yolo.last_bounding_box_size is not None:
-                self.radius = (yolo.last_bounding_box_size[0] +
-                               yolo.last_bounding_box_size[1] +
-                               self.radius * 4.0) / 5.0
+        if plan.next_min_radius is not None:
+            self.min_radius = float(plan.next_min_radius)
 
+        if self.yoloSession is not None and plan.desired_yolo_conf is not None:
+            self.yoloSession.conf = float(plan.desired_yolo_conf)
+
+        self._apply_hyper_focus_plan(markupFrame, plan)
+
+    @staticmethod
+    def _apply_hyper_focus_plan(markupFrame: NDArray, plan) -> None:
+        if plan is None or plan.center is None:
+            return
+
+        center = (int(plan.center[0]), int(plan.center[1]))
+
+        for p in plan.passes:
             dim_except_circle(markupFrame,
-                              yolo.last_yolo_center,
-                              3.0 * self.radius, 0.00)
-            dim_except_circle(markupFrame,
-                              yolo.last_yolo_center,
-                              1.5 * self.radius, 0.50)
-
-            self.radius = min(800.0, self.radius + 12.0)
-            if self.yoloSession is not None:
-                self.yoloSession.conf = (0.8 - 0.5) * self.radius / 800.0 + 0.5
-        else:
-            if yolo.last_bounding_box_size is not None:
-                # 1.0 for single feature, 1.5 for drogue
-                self.min_radius = (yolo.last_bounding_box_size[0] +
-                                   yolo.last_bounding_box_size[1]) * 1.0
-
-            fg = ctx.fg.get()
-
-            # 5.0 for single feature, 50.0 for drogue
-            ellipse_width = 5.0 * fg.curr_var_y + self.min_radius
-            ellipse_height = 5.0 * fg.curr_var_z + self.min_radius
-
-            if (fg.curr_FG_pixel[0] < 0 or
-                    fg.curr_FG_pixel[1] < 0 or
-                    fg.curr_FG_pixel[0] > markupFrame.shape[1] or
-                    fg.curr_FG_pixel[1] > markupFrame.shape[0]):
-                return
-
-            dim_except_circle(markupFrame,
-                              fg.curr_FG_pixel,
-                              x_axes=ellipse_width,
-                              y_axes=ellipse_height,
-                              dim_factor=0.10)
-            dim_except_circle(markupFrame,
-                              fg.curr_FG_pixel,
-                              x_axes=ellipse_width * 2.0,
-                              y_axes=ellipse_height * 2.0,
-                              dim_factor=0.00)
-
-        return
+                              center,
+                              x_axes=float(p.x_axes),
+                              y_axes=float(p.y_axes),
+                              dim_factor=float(p.dim_factor))
 
     def run_yolo(self,
                  frame: NDArray,
@@ -3817,117 +3598,100 @@ class CameraGui(ctk.CTkFrame):
         if opts.factor_graph:
             self.factor_graph(frame, markupFrame, ctx, opts.hyper_focus)
 
+    def _draw_factor_graph_overlay(self,
+                                   markupFrame: NDArray,
+                                   fg_output,
+                                   color) -> None:
+        if fg_output is None or fg_output.curr_FG_pixel is None:
+            return
+
+        pixel = (
+            int(fg_output.curr_FG_pixel[0]),
+            int(fg_output.curr_FG_pixel[1]),
+        )
+
+        h, w, _ = markupFrame.shape
+        size = int(0.025 * h)
+        thickness = lrg_thick(h)
+        text = 'Factor Graph Solution'
+        (_txt_width, txt_height), _base = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            med_text(w),
+            thickness,
+        )
+        pad = int(0.3 * txt_height)
+        txt_height_perRow = txt_height + pad
+        loc = (pad, h - 4 * txt_height_perRow - pad)
+
+        cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
+        cv2.line(markupFrame,
+                 [pixel[0] + size, pixel[1]],
+                 [pixel[0] - size, pixel[1]],
+                 (0, 0, 0), thickness)
+        cv2.line(markupFrame,
+                 [pixel[0], pixel[1] + size],
+                 [pixel[0], pixel[1] - size],
+                 (0, 0, 0), thickness)
+
+        thickness = med_thick(h)
+        cv2.circle(markupFrame, pixel, size, color, thickness)
+        cv2.line(markupFrame,
+                 [pixel[0] + size, pixel[1]],
+                 [pixel[0] - size, pixel[1]],
+                 color, thickness)
+        cv2.line(markupFrame,
+                 [pixel[0], pixel[1] + size],
+                 [pixel[0], pixel[1] - size],
+                 color, thickness)
+
+        cv2.putText(markupFrame, text,
+                    loc, cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(markupFrame.shape[0]), (0, 0, 0), lrg_thick(h))
+        cv2.putText(markupFrame, text,
+                    loc, cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(markupFrame.shape[0]), color, med_thick(h))
+
     def factor_graph(self,
                      frame: NDArray,
                      markupFrame: NDArray,
                      ctx: GuiQueue.FrameCtx,
-                     args) -> None:
+                     hyper_focus: bool) -> None:
 
-        hyper_focus = args
-
-        from support.runtime.fg_singleTarget import FactorGraph
-        if self.FG is None:
-            self.FG = FactorGraph()
-
-        color = clr.YELLOWGREEN
         yolo = ctx.yolo.get_or()
-        meas_3d = None
+        color = clr.YELLOWGREEN if yolo is not None else clr.RED
 
-        if yolo is not None:
-            pose = getattr(yolo, "pose", None)
+        R_wr = (
+            self.own_attitude.rotmat_wr()
+            if self.own_attitude is not None and self.own_attitude.valid
+            else None
+        )
 
-            if pose is not None:
-                if pose.qnp_tvec is not None:
-                    meas_3d = np.asarray(pose.qnp_tvec, dtype=float).reshape(3)
-                elif pose.pnp_tvec is not None:
-                    meas_3d = np.asarray(pose.pnp_tvec, dtype=float).reshape(3)
+        self.FG, self.last_time_update, has_measurement, pred = run_factor_graph_step(
+            fg=self.FG,
+            yolo=yolo,
+            img_time=ctx.img_time,
+            last_time_update=self.last_time_update,
+            R_wr=R_wr,
+        )
 
-            if meas_3d is None and yolo.last_yolo_3d_estimate is not None:
-                meas_3d = np.asarray(yolo.last_yolo_3d_estimate, dtype=float).reshape(3)
+        if not has_measurement:
+            color = clr.RED
 
-            if meas_3d is None:
-                color = clr.RED
+        if pred is not None and pred.r_T_d is not None:
+            K = factor_graph_projection_matrix(
+                calibration=self.calibration,
+                markup_frame=markupFrame,
+                yolo=yolo,
+            )
 
-        R_wr = self.own_attitude.rotmat_wr() if self.own_attitude is not None and self.own_attitude.valid else None
-        if meas_3d is not None:
-            if ctx.img_time is None or ctx.img_time < self.last_time_update:
-                self.FG.reset()
-
-            self.FG.addRecvMeas(meas_3d, t=ctx.img_time, R_wr=R_wr)
-            self.last_time_update = ctx.img_time
-
-        if ctx.img_time is not None and self.FG.numMeas > 2:
-            pred = self.FG.predict(ctx.img_time, R_wr=R_wr)
-
-            if pred is not None and pred.r_T_d is not None:
-                fg_output = FgOutput()
-
-                K = self.calibration.getCameraMatrix()
-                if yolo.last_yolo_3d_estimate is None:
-                    curr_scale = np.copy(self.calibration.scale)
-                    self.calibration.scaleCalibration(markupFrame.shape[0])
-                    K = self.calibration.getCameraMatrix()
-                    self.calibration.scale = curr_scale
-
-                threeD_proj = K.dot(pred.r_T_d)
-
-                if threeD_proj[2] != 0:
-                    fg_output.curr_FG_pixel = threeD_proj[:2] / threeD_proj[2]
-                    pixel = (
-                        int(fg_output.curr_FG_pixel[0]),
-                        int(fg_output.curr_FG_pixel[1]),
-                    )
-
-                    h, w, _ = markupFrame.shape
-                    size = int(0.025*h)
-                    thickness = lrg_thick(h)
-                    text = 'Factor Graph Solution'
-                    (txt_width, txt_height), base = cv2.getTextSize(text,
-                                                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                                                    med_text(w), thickness)
-                    pad = int(0.3 * txt_height)
-                    txt_height_perRow = txt_height + pad
-                    loc = (pad, h - 4 * txt_height_perRow - pad)
-
-                    cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
-                    cv2.line(markupFrame,
-                             [pixel[0] + size, pixel[1]],
-                             [pixel[0] - size, pixel[1]],
-                             (0, 0, 0), thickness)
-                    cv2.line(markupFrame,
-                             [pixel[0], pixel[1] + size],
-                             [pixel[0], pixel[1] - size],
-                             (0, 0, 0), thickness)
-
-                    thickness = med_thick(h)
-                    cv2.circle(markupFrame, pixel, size, color, thickness)
-                    cv2.line(markupFrame,
-                             [pixel[0] + size, pixel[1]],
-                             [pixel[0] - size, pixel[1]],
-                             color, thickness)
-                    cv2.line(markupFrame,
-                             [pixel[0], pixel[1] + size],
-                             [pixel[0], pixel[1] - size],
-                             color, thickness)
-
-                    cv2.putText(markupFrame, 'Factor Graph Solution',
-                                loc, cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), (0, 0, 0), lrg_thick(h))
-                    cv2.putText(markupFrame, 'Factor Graph Solution',
-                                loc, cv2.FONT_HERSHEY_SIMPLEX,
-                                med_text(markupFrame.shape[0]), color, med_thick(h))
-
-                fg_output.curr_r_T_d = pred.r_T_d
-                fg_output.curr_r_V_d = pred.r_V_d
-                fg_output.curr_r_A_d = pred.r_A_d
-                fg_output.curr_var_x = pred.var_x
-                fg_output.curr_var_y = pred.var_y
-                fg_output.curr_var_z = pred.var_z
-
+            fg_output = build_factor_graph_output(pred, K)
+            if fg_output is not None:
                 ctx.fg.set(fg_output)
+                self._draw_factor_graph_overlay(markupFrame, fg_output, color)
 
         if hyper_focus:
-            self.hyper_focus(frame, markupFrame, ctx, ())
+            self.hyper_focus(markupFrame, ctx)
 
     def phase_correlation(self,
                           frame: NDArray,
@@ -3969,159 +3733,12 @@ class CameraGui(ctk.CTkFrame):
         t_ours = C_CV_TO_OURS @ t_cv
         return mat2quat(R_ours.T), t_ours
 
-    def update_cube_map_vectors(self):
-        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
-        axes = {
-            'right': ([1, 0, 0], [0, -1, 0]),
-            'left': ([-1, 0, 0], [0, -1, 0]),
-            'top': ([0, -1, 0], [0, 0, -1]),
-            'bottom': ([0, 1, 0], [0, 0, 1]),
-            'front': ([0, 0, 1], [0, -1, 0]),
-            # 'back': ([0, 0, -1], [0, -1, 0]),
-        }
-
-        self.faces_dirs = {}
-        rng = np.linspace(-1, 1, self.face_size)
-        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
-
-        for name, (center, up) in axes.items():
-            center = np.array(center)
-            up = np.array(up)
-            # noinspection PyUnreachableCode
-            right = np.cross(center, up)
-
-            dirs = (
-                    center[None, None, :]
-                    + xx[..., None] * right[None, None, :]
-                    + yy[..., None] * up[None, None, :]
-            )
-            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
-            self.faces_dirs[name] = dirs.astype(np.float32)
-
-        # return faces
-        self.fisheye_to_cubemap_vectorized()
-
-    def update_frontFace_vector(self):
-        """Compute and store direction vectors for each cube face, shape: (6, H, W, 3)"""
-        axes = {
-            'front': ([0, 0, 1], [0, -1, 0])
-        }
-
-        self.faces_dirs = {}
-        rng = np.linspace(-1, 1, self.face_size)
-        xx, yy = np.meshgrid(rng, -rng)  # Flip Y for image coordinates
-
-        for name, (center, up) in axes.items():
-            center = np.array(center)
-            up = np.array(up)
-            # noinspection PyUnreachableCode
-            right = np.cross(center, up)
-
-            dirs = (
-                    center[None, None, :]
-                    + xx[..., None] * right[None, None, :]
-                    + yy[..., None] * up[None, None, :]
-            )
-            dirs /= np.linalg.norm(dirs, axis=2, keepdims=True)
-            self.faces_dirs[name] = dirs.astype(np.float32)
-
-        # return faces
-        self.fisheye_to_cubemap_vectorized()
-
-    def fisheye_to_cubemap_vectorized(self):
-
-        self.cubemap_x = {}
-        self.cubemap_y = {}
-
-        for face, dirs in self.faces_dirs.items():
-            dirs_reshaped = dirs.reshape(-1, 1, 3)
-
-            # Only keep directions roughly facing the front hemisphere
-            forward_mask = dirs_reshaped[:, 0, 2] > 0  # Z > 0 means forward
-            valid_dirs = dirs_reshaped[forward_mask]
-
-            if valid_dirs.size > 0:
-                # Project valid directions
-                img_points, _ = cv2.fisheye.projectPoints(
-                    valid_dirs, np.zeros(3), np.zeros(3),
-                    self.calibration.getCameraMatrix(),
-                    self.calibration.getDistortion()
-                )
-                img_points = img_points.reshape(-1, 2)
-
-                # Prepare remap coordinates
-                full_img_points = np.full((self.face_size * self.face_size, 2), -1, dtype=np.float32)
-                full_img_points[forward_mask] = img_points
-
-                self.cubemap_x[face] = full_img_points[:, 0].reshape(self.face_size, self.face_size)
-                self.cubemap_y[face] = full_img_points[:, 1].reshape(self.face_size, self.face_size)
-
-    def apply_fisheye_faces(self, frame):
-        self.cubemap_faces = {}
-
-        for face in self.faces_dirs:
-            self.cubemap_faces[face] = self.remap(face, frame)
-
-    def remap(self, face, frame):
-        return cv2.remap(
-            frame, self.cubemap_x[face], self.cubemap_y[face],
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0))
-
-    def stitch_cubemap_faces(self, layout, cells=3):
-        """
-        Arrange the 6 cubemap faces into a 2x3 stitched layout.
-        Layout:
-            +--------+--------+--------+
-            |        |   top  |        |
-            +--------+--------+--------+
-            |  left   | front |  right |
-            +--------+--------+--------+
-            |        | bottom |        |
-            +--------+--------+--------+
-        """
-        stitched = np.zeros((cells * self.face_size, cells * self.face_size, 3), dtype=np.uint8)
-
-        for face, (row, col) in layout.items():
-            if face in self.cubemap_faces:
-                y, x = row * self.face_size, col * self.face_size
-                stitched[y:y + self.face_size, x:x + self.face_size] = self.cubemap_faces[face]
-
-        return stitched
-
     def run_folder_reader_profiled(self):
-        import cProfile
-        import pstats
+        from support.io.profiler import make_profile, print_stats
 
-        prof = cProfile.Profile()
+        prof = make_profile()
         try:
             prof.enable()
             self.run_folder_reader()
         finally:
-            prof.disable()
-            prof.dump_stats("run_folder_reader.prof")
-
-            stats = pstats.Stats(prof).strip_dirs().sort_stats("cumtime")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            print("\n=== superCalibrateCamera functions ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== run_folder_reader / analyze_image ===")
-            stats.print_stats("run_folder_reader")
-            stats.print_stats("analyze_image")
-
-            print("\n=== Top 40 functions overall (cumtime) ===")
-            stats.print_stats(40)
-
-            # Narrow view: only functions from your GUI modules
-            print("\n=== GUI-ish functions (superCalibrateCamera) ===")
-            stats.print_stats("superCalibrateCamera")
-
-            print("\n=== CustomTkinter / Tk wrappers ===")
-            stats.print_stats("customtkinter")
-            stats.print_stats("ctk")
-            stats.print_stats("tkinter")
+            print_stats(prof)

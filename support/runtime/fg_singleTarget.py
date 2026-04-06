@@ -24,6 +24,249 @@ class PredictedState:
     is_extrapolated: bool = False
 
 
+
+@dataclass(slots=True)
+class FactorGraphFrameOutput:
+    curr_FG_pixel: np.ndarray | None = None
+    curr_r_T_d: np.ndarray | None = None
+    curr_r_V_d: np.ndarray | None = None
+    curr_r_A_d: np.ndarray | None = None
+
+    curr_var_x: float | None = None
+    curr_var_y: float | None = None
+    curr_var_z: float | None = None
+
+
+@dataclass(slots=True)
+class HyperFocusPass:
+    x_axes: float
+    y_axes: float
+    dim_factor: float
+
+
+@dataclass(slots=True)
+class HyperFocusPlan:
+    center: tuple[float, float] | np.ndarray | None = None
+    passes: tuple[HyperFocusPass, ...] = ()
+
+    next_radius: float | None = None
+    next_min_radius: float | None = None
+    desired_yolo_conf: float | None = None
+
+def build_hyper_focus_plan(ctx,
+                           radius: float,
+                           min_radius: float,
+                           frame_shape) -> HyperFocusPlan | None:
+    """
+    Build the policy/state-update plan for hyper focus.
+
+    This owns:
+      - mode selection (YOLO-only vs FG-guided)
+      - radius / min_radius state evolution
+      - desired YOLO confidence schedule
+
+    The GUI still owns:
+      - actually drawing the dimmed regions
+      - writing yoloSession.conf
+    """
+    yolo = ctx.yolo.get_or(False)
+    if not yolo:
+        return None
+
+    # --- Mode 1: YOLO-only spotlight ---
+    if not ctx.fg.is_set():
+        smoothed_radius = float(radius)
+
+        if getattr(yolo, "last_bounding_box_size", None) is not None:
+            bbox_w, bbox_h = yolo.last_bounding_box_size
+            smoothed_radius = (float(bbox_w) + float(bbox_h) + float(radius) * 4.0) / 5.0
+
+        next_radius = min(800.0, smoothed_radius + 12.0)
+        desired_yolo_conf = (0.8 - 0.5) * next_radius / 800.0 + 0.5
+
+        center = getattr(yolo, "last_yolo_center", None)
+        if center is None:
+            return HyperFocusPlan(
+                center=None,
+                passes=(),
+                next_radius=next_radius,
+                next_min_radius=min_radius,
+                desired_yolo_conf=desired_yolo_conf,
+            )
+
+        return HyperFocusPlan(
+            center=center,
+            passes=(
+                HyperFocusPass(x_axes=3.0 * smoothed_radius,
+                               y_axes=3.0 * smoothed_radius,
+                               dim_factor=0.00),
+                HyperFocusPass(x_axes=1.5 * smoothed_radius,
+                               y_axes=1.5 * smoothed_radius,
+                               dim_factor=0.50),
+            ),
+            next_radius=next_radius,
+            next_min_radius=min_radius,
+            desired_yolo_conf=desired_yolo_conf,
+        )
+
+    # --- Mode 2: FG-guided ellipse ---
+    fg = ctx.fg.get()
+
+    next_min_radius = float(min_radius)
+    if getattr(yolo, "last_bounding_box_size", None) is not None:
+        bbox_w, bbox_h = yolo.last_bounding_box_size
+        # 1.0 for single feature, 1.5 for drogue
+        next_min_radius = (float(bbox_w) + float(bbox_h)) * 1.0
+
+    center = getattr(fg, "curr_FG_pixel", None)
+    if center is None:
+        return HyperFocusPlan(
+            center=None,
+            passes=(),
+            next_radius=radius,
+            next_min_radius=next_min_radius,
+            desired_yolo_conf=None,
+        )
+
+    x = float(center[0])
+    y = float(center[1])
+    h, w = frame_shape[:2]
+
+    if x < 0 or y < 0 or x > w or y > h:
+        return HyperFocusPlan(
+            center=None,
+            passes=(),
+            next_radius=radius,
+            next_min_radius=next_min_radius,
+            desired_yolo_conf=None,
+        )
+
+    var_y = 0.0 if getattr(fg, "curr_var_y", None) is None else float(fg.curr_var_y)
+    var_z = 0.0 if getattr(fg, "curr_var_z", None) is None else float(fg.curr_var_z)
+
+    # 5.0 for single feature, 50.0 for drogue
+    ellipse_width = 5.0 * var_y + next_min_radius
+    ellipse_height = 5.0 * var_z + next_min_radius
+
+    return HyperFocusPlan(
+        center=center,
+        passes=(
+            HyperFocusPass(x_axes=ellipse_width,
+                           y_axes=ellipse_height,
+                           dim_factor=0.10),
+            HyperFocusPass(x_axes=ellipse_width * 2.0,
+                           y_axes=ellipse_height * 2.0,
+                           dim_factor=0.00),
+        ),
+        next_radius=radius,
+        next_min_radius=next_min_radius,
+        desired_yolo_conf=None,
+    )
+
+def extract_measurement_from_yolo(yolo) -> np.ndarray | None:
+    """
+    Prefer QnP tvec, then PnP tvec, then the legacy YOLO width-based 3D estimate.
+    """
+    if yolo is None:
+        return None
+
+    pose = getattr(yolo, "pose", None)
+    if pose is not None:
+        if getattr(pose, "qnp_tvec", None) is not None:
+            return np.asarray(pose.qnp_tvec, dtype=float).reshape(3)
+        if getattr(pose, "pnp_tvec", None) is not None:
+            return np.asarray(pose.pnp_tvec, dtype=float).reshape(3)
+
+    last_est = getattr(yolo, "last_yolo_3d_estimate", None)
+    if last_est is not None:
+        return np.asarray(last_est, dtype=float).reshape(3)
+
+    return None
+
+
+def run_factor_graph_step(fg,
+                          yolo,
+                          img_time,
+                          last_time_update: float,
+                          q_wr=None,
+                          R_wr=None):
+    """
+    Owns:
+      - lazy FG creation
+      - measurement extraction
+      - reset-on-time-regression behavior
+      - addRecvMeas
+      - predict
+
+    Returns:
+      fg, last_time_update, has_measurement, pred
+    """
+    if fg is None:
+        fg = FactorGraph()
+
+    meas_3d = extract_measurement_from_yolo(yolo)
+    has_measurement = meas_3d is not None
+
+    if has_measurement:
+        if img_time is None or img_time < last_time_update:
+            fg.reset()
+
+        fg.addRecvMeas(meas_3d, t=img_time, q_wr=q_wr, R_wr=R_wr)
+
+        # Avoid poisoning last_time_update with None.
+        if img_time is not None:
+            last_time_update = float(img_time)
+
+    pred = None
+    if img_time is not None and fg.numMeas > 2:
+        pred = fg.predict(img_time, q_wr=q_wr, R_wr=R_wr)
+
+    return fg, last_time_update, has_measurement, pred
+
+
+def factor_graph_projection_matrix(calibration, markup_frame: np.ndarray, yolo=None) -> np.ndarray:
+    """
+    Match the old behavior:
+      - use current calibration K directly when YOLO already produced a native 3D estimate
+      - otherwise temporarily scale calibration to the markup frame height
+    """
+    K = calibration.getCameraMatrix()
+
+    last_yolo_3d_estimate = None if yolo is None else getattr(yolo, "last_yolo_3d_estimate", None)
+    if last_yolo_3d_estimate is None:
+        curr_scale = copy.deepcopy(getattr(calibration, "scale", None))
+        try:
+            calibration.scaleCalibration(markup_frame.shape[0])
+            K = calibration.getCameraMatrix()
+        finally:
+            if curr_scale is not None:
+                calibration.scale = curr_scale
+
+    return np.asarray(K, dtype=float)
+
+
+def build_factor_graph_output(pred: PredictedState | None,
+                              K: np.ndarray) -> FactorGraphFrameOutput | None:
+    if pred is None or pred.r_T_d is None:
+        return None
+
+    r_T_d = np.asarray(pred.r_T_d, dtype=float).reshape(3)
+    threeD_proj = np.asarray(K, dtype=float).dot(r_T_d)
+
+    pixel = None
+    if abs(float(threeD_proj[2])) > 1e-12:
+        pixel = threeD_proj[:2] / threeD_proj[2]
+
+    return FactorGraphFrameOutput(
+        curr_FG_pixel=pixel,
+        curr_r_T_d=r_T_d,
+        curr_r_V_d=None if pred.r_V_d is None else np.asarray(pred.r_V_d, dtype=float).reshape(3),
+        curr_r_A_d=None if pred.r_A_d is None else np.asarray(pred.r_A_d, dtype=float).reshape(3),
+        curr_var_x=pred.var_x,
+        curr_var_y=pred.var_y,
+        curr_var_z=pred.var_z,
+    )
+
 class SolutionData:
     def __init__(self, numMeas):
         self.numMeas = numMeas

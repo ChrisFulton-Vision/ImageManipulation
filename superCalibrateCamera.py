@@ -4,7 +4,6 @@ import time
 import sys
 import threading
 import enum
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -12,7 +11,6 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import List, Any, Callable
 from pathlib import Path
-from tkinter import filedialog
 
 import customtkinter as ctk
 import cv2
@@ -20,23 +18,22 @@ import cv2
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 
-from support.core.enums import ExportQuality, ImageKernel, ImageSource, PlaybackSpeed
+from support.core.enums import ExportQuality, ImageKernel, ImageSource
 
 import support.gui.CTKCamFilepathPage as Filepath_page
 import support.gui.CTKCamImageProcessingPage as Image_processing_page
 import support.gui.CTKHotkeyPage as Hotkey_page
 import support.gui.utils as utils
 from support.gui.checkerboard_launcher import CheckerboardLauncher, CheckerboardLaunchState
-from support.gui.gpu_monitor import GpuMonitor, GpuSample
 import support.gui.UserSelectQueue as GuiQueue
 
-import support.io.data_processing as data
 from support.io.camera_config import CameraConfig as CamConfig
 from support.io.config_store import ConfigStore
 from support.io.image_time_reader import ImageTimeReader
 from support.io.my_logging import LOG
+from support.io.BatchController import BatchController
 
-from support.vision.calibration import Calibration, undistort_points_px
+from support.vision.calibration import Calibration
 from support.vision.draw_circle_and_mask import dim_except_circle
 from support.vision.vimba_controller import VimbaController as VimbaCam, HAVE_VMBPY
 from support.vision.fisheye_to_cubemap import (
@@ -46,12 +43,12 @@ from support.vision.fisheye_to_cubemap import (
     FisheyeCubemapManager)
 
 from support.runtime.fg_singleTarget import (
-    FactorGraph,
     build_factor_graph_output,
     factor_graph_projection_matrix,
     run_factor_graph_step,
 )
 from support.runtime.fg_singleTarget import build_hyper_focus_plan
+from support.runtime.PlaybackController import PlaybackController
 
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text, med_thick, lrg_thick
@@ -59,10 +56,6 @@ from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
 from support.viz.draw_pnp_qnp import PoseOutput
 
 from copy import deepcopy
-from math import pow
-
-SPEED_STEP = pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
-SPEED_STEP_INV = 1.0 / SPEED_STEP
 
 # cv2.setNumThreads(0)
 cv2.setUseOptimized(True)
@@ -103,8 +96,6 @@ class CameraGui(ctk.CTkFrame):
         self._playback_allowed = None
         self.curr_r_V_d = None
         self.curr_r_T_d = None
-        self._pb_frame_label = None
-        self._pb_frame_text = None
 
         self.gpu_slider = None
 
@@ -165,9 +156,9 @@ class CameraGui(ctk.CTkFrame):
                                 fn=self.resize_image,
                                 arg_specs=GuiQueue.ResizeOpts.ARG_SPECS),
             GuiQueue.StepOption(
-                                label="Apply Image Filter",
-                                fn=self.applyKernel,
-                                arg_specs_fn=self.image_filter_arg_specs),
+                label="Apply Image Filter",
+                fn=self.applyKernel,
+                arg_specs_fn=self.image_filter_arg_specs),
             GuiQueue.StepOption(label="Apply YOLO -> Q/PnP",
                                 fn=self.run_yolo,
                                 arg_specs=GuiQueue.YoloOpts.ARG_SPECS),
@@ -226,7 +217,7 @@ class CameraGui(ctk.CTkFrame):
         self.screenshot_impending = False
         self.fisheye_mgr = FisheyeCubemapManager()
         self.hud_marker = None
-        self.lowPassFPS = 20.0
+
         self.ThreeDTruthPoints = None
         self.selectCalibLabel = None
         self.pnpResult = None
@@ -254,24 +245,8 @@ class CameraGui(ctk.CTkFrame):
 
         self.gpu_monitor = None
 
-        self.pauseCache = utils.PausedCache()
-        self.playback = utils.PlaybackState()
-
         # Optimization for undistort
         self.map1, self.map2 = None, None
-
-        self._pb_cmds = deque()
-        self._pb_cmd_lock = threading.Lock()
-        self._pb_num_images = 0
-        self._pb_slider_dragging = False
-        self._pb_last_sent_idx = None
-        self._pb_slider_range_inited = False
-        self._pb_slider = None
-
-        self.fps_time_log = time.time()
-        self.curr_fps = 20.0
-        self.pause = False
-        self.last_nonzero_sign = 1
 
         self.imageProcessingKernelCombobox = None
 
@@ -286,16 +261,10 @@ class CameraGui(ctk.CTkFrame):
         self.screenshotButton = ctk.CTkButton(master=self.export_frame, text='Screenshot', fg_color='green',
                                               hover_color='navy', command=self.screenshot)
 
-        self.playbackModeText = ctk.StringVar(value='Playback Mode: FPS')
-
         self.exportQualityCombo = ctk.CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
                                                   command=self.updateQuality)
 
         self.making_gifOrVid = False
-
-        self.loadFromCache()
-
-        self.sync_flags_from_model()
 
         self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
@@ -319,6 +288,11 @@ class CameraGui(ctk.CTkFrame):
         self.filepath_page = Filepath_page.Filepath_page(master,
                                                          controller=self)
 
+        self.playback_controller = PlaybackController(self)
+        self.batch_controller = BatchController(self)
+
+        self.loadFromCache()
+
         self.setupFrame()
 
         self.image_processing_page.grid_columnconfigure(0, weight=1, minsize=400)
@@ -330,9 +304,9 @@ class CameraGui(ctk.CTkFrame):
             on_change=self._on_queue_changed,
         )
         self.imgProcQueue_editor.grid(row=20, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
-        self._sync_queue_from_model()
 
         self._loading_config = False
+        self.update_post_newCamConfig()
 
     def on_app_close(self):
         """Shut down background activity and destroy the application cleanly.
@@ -433,29 +407,7 @@ class CameraGui(ctk.CTkFrame):
                 self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
 
     def _sync_dp_from_model(self):
-        """Resync batch-processing (DP) UI controls from camConfig.
-
-        This makes DP settings loadable from the YAML config, not just whatever
-        was last typed into the UI.
-        """
-
-        # strings
-        if hasattr(self, "_dp_img_dir_var") and self._dp_img_dir_var is not None:
-            self._dp_img_dir_var.set(str(getattr(self.camConfig, "dp_img_dir", "") or ""))
-
-        # floats / ints
-        if hasattr(self, "_dp_conf_list") and self._dp_conf_list is not None:
-            self._dp_conf_list.set(str(getattr(self.camConfig, "dp_conf_list", "") or ""))
-
-        if hasattr(self, "_dp_ckptN") and self._dp_ckptN is not None:
-            self._dp_ckptN.set(str(getattr(self.camConfig, "dp_ckptN", 200) or 200))
-
-        if hasattr(self, "_dp_prefetch") and self._dp_prefetch is not None:
-            self._dp_prefetch.set(str(getattr(self.camConfig, "dp_prefetch", 4) or 4))
-
-        # gpu checkbox
-        if hasattr(self, "_dp_gpu_var") and self._dp_gpu_var is not None:
-            self._dp_gpu_var.set(bool(getattr(self.camConfig, "dp_gpu", False)))
+        self.batch_controller.sync_from_model()
 
     def _on_queue_changed(self, new_queue):
         """Accept a queue edit from the GUI editor and persist it to the model.
@@ -623,18 +575,18 @@ class CameraGui(ctk.CTkFrame):
 
         return raw_val
 
-    def loadFromCache(self):
+    def loadFromCache(self) -> bool:
         """Load cached configuration into the active camera config object.
 
-        If a YAML-backed config is restored successfully, performs the full
-        post-load synchronization path to refresh dependent runtime state.
+        Returns:
+            True if a YAML-backed config was restored, else False.
         """
         self._loading_config = True
         res = self.config_store.load_from_cache(self.camConfig)
-        if res.loaded_yaml:
-            self.update_post_newCamConfig()
-        else:
+        if not res.loaded_yaml:
             self._loading_config = False
+            return False
+        return True
 
     def update_post_newCamConfig(self):
         """Refresh runtime systems after loading or replacing the camera config.
@@ -664,6 +616,32 @@ class CameraGui(ctk.CTkFrame):
                 )
             if not bool(getattr(self.camConfig, "dp_gpu", False)):
                 self.gpu_slider.set(0.0)
+        except Exception:
+            pass
+
+        try:
+            if self.exportStartFrame is not None:
+                self.exportStartFrame.configure(text=f"Start Frame: {self.camConfig.start_export_idx}")
+            if self.exportEndFrame is not None:
+                self.exportEndFrame.configure(text=f"End Frame: {self.camConfig.end_export_idx}")
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "filepath_page") and self.filepath_page is not None:
+                self.filepath_page.sync_labels()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "playback_controller") and self.playback_controller is not None:
+                self.playback_controller.update_playback_menu()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "exportQualityCombo") and self.exportQualityCombo is not None:
+                self.exportQualityCombo.set(self.camConfig.export_quality.value)
         except Exception:
             pass
 
@@ -829,295 +807,17 @@ class CameraGui(ctk.CTkFrame):
         """Update the checkerboard launcher button state and text."""
         self.btn_checkerboard.configure(state=btn_state, text=btn_text)
 
-    def _on_gpu_sample(self, sample: GpuSample) -> None:
-        """Consume a GPU utilization sample and refresh the display widget."""
-        if sample.err:
-            #     self.gpuLabel.configure(text=f"GPU: {sample.err}")
-            return
-        if sample.util is not None:
-            self.gpu_slider.set(sample.util)
-            # self.gpuLabel.configure(text=f"GPU: {sample.util}%  MEM: {sample.mem}%")
+    def _on_gpu_sample(self, sample):
+        self.batch_controller.on_gpu_sample(sample)
 
     def _on_toggle_show_gpu(self):
-        """Enable or disable GPU utilization monitoring from the UI.
-
-        Updates config state, toggles the slider widget, and starts or stops the
-        background monitor as needed.
-        """
-        enabled = bool(self._dp_gpu_var.get())  # authoritative
-        self.camConfig.dp_gpu = enabled
-        self.saveToCache()
-
-        # UI state
-        if hasattr(self, "gpu_slider") and self.gpu_slider is not None:
-            self.gpu_slider.configure(state="normal" if enabled else "disabled")
-            if not enabled:
-                self.gpu_slider.set(0.0)
-
-        # monitor lifecycle
-        if self.gpu_monitor is None:
-            self.gpu_monitor = GpuMonitor(
-                scheduler=self,
-                on_sample=self._on_gpu_sample,
-                device_index=0,
-                poll_ms=250,
-            )
-        self.gpu_monitor.set_enabled(enabled)
+        self.batch_controller.toggle_show_gpu()
 
     def setup_dataFrame(self):
-        """Build the batch-processing page for folder-based offline analysis.
-
-        Creates controls for image-folder selection, confidence sweeps,
-        checkpointing, prefetch count, progress display, GPU monitoring, and
-        batch actions for YOLO, Kalman, SolvePnP/QnP, and plotting.
-        """
-        f = self.data_frame
-        for w in f.winfo_children():
-            w.destroy()
-
-        f.grid_rowconfigure(99, weight=1)
-        f.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
-            row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
-        )
-
-        # --- Select image folder ---
-        img_dir_default = (
-                getattr(self.camConfig, "dp_img_dir", None)
-                or self.camConfig.imageFilepath
-                or ""
-        )
-        self._dp_img_dir_var = ctk.StringVar(value=str(img_dir_default))
-
-        def _choose_dir():
-            d = filedialog.askdirectory(title="Select image folder")
-            if d:
-                self._dp_img_dir_var.set(d)
-
-        ctk.CTkLabel(f, text="Folder:").grid(row=1, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._dp_img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
-        ctk.CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
-
-        # --- Confidence sweep controls ---
-        conf_default = getattr(self.camConfig, "dp_conf_list", "0.80")
-        self._dp_conf_list = ctk.StringVar(value=str(conf_default))
-
-        ctk.CTkLabel(f, text="YOLO conf values (comma-separated):").grid(
-            row=3, column=0, padx=12, pady=6, sticky="w"
-        )
-        ctk.CTkEntry(f, textvariable=self._dp_conf_list).grid(
-            row=3, column=1, padx=12, pady=6, sticky="ew"
-        )
-
-        # Small hint below the entry
-        ctk.CTkLabel(
-            f,
-            text="Example: 0.50, 0.65, 0.80   (defaults to 0.80 on bad input)",
-            font=("Segoe UI", 10, "italic")
-        ).grid(
-            row=4, column=0, columnspan=3, padx=12, pady=(0, 6), sticky="w"
-        )
-
-        # --- Checkpoint controls ---
-        ckpt_default = getattr(self.camConfig, "dp_ckptN", 200)
-        self._dp_ckptN = ctk.StringVar(value=str(ckpt_default))
-        ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._dp_ckptN, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
-
-        # --- Prefetch controls ---
-        prefetch_default = getattr(self.camConfig, "dp_prefetch", 32)
-        self._dp_prefetch = ctk.StringVar(value=str(prefetch_default))
-        ctk.CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._dp_prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
-
-        # --- Progress UI ---
-        self._dp_progress_label = ctk.CTkLabel(f, text="Idle")
-        self._dp_progress_label.grid(row=20, column=0, columnspan=3, padx=12, pady=(8, 4), sticky="w")
-
-        self._dp_progress = ctk.CTkProgressBar(f)  # determinate
-        self._dp_progress.grid(row=21, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
-        self._dp_progress.set(0.0)
-
-        gpu_display = bool(getattr(self.camConfig, "dp_gpu", False))
-        # Keep a handle to the Tk var so config-load can resync the checkbox (no desync).
-        self._dp_gpu_var = ctk.BooleanVar(value=gpu_display)
-        gpu_checkbox = ctk.CTkCheckBox(
-            f,
-            text='Show GPU Util',
-            variable=self._dp_gpu_var,
-            command=self._on_toggle_show_gpu)
-        gpu_checkbox.grid(row=25, column=0, columnspan=1, padx=5, pady=5, sticky='ew')
-
-        self.gpu_slider = ctk.CTkSlider(f, from_=0, to=100)
-        self.gpu_slider.grid(row=25, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
-        self.gpu_slider.configure(state='disabled')
-        self.gpu_slider.set(0)
-
-        # Cleanly initializes GPU monitor, resets to user position
-        self._on_toggle_show_gpu()
-        self._on_toggle_show_gpu()
-
-        def _bind_dp_str(var, attr_name):
-            if var is None:
-                return
-
-            def _on_change(*_):
-                try:
-                    setattr(self.camConfig, attr_name, var.get())
-                    self.saveToCache()
-                except Exception:
-                    # On parse error etc., just keep the text; _get_dp_conf_values()
-                    # will fall back to [0.80] when it’s actually used.
-                    pass
-
-            var.trace_add("write", _on_change)
-
-        _bind_dp_str(self._dp_img_dir_var, "dp_img_dir")
-        _bind_dp_str(self._dp_conf_list, "dp_conf_list")
-        _bind_dp_str(self._dp_ckptN, "dp_ckptN")
-        _bind_dp_str(self._dp_prefetch, "dp_prefetch")
-
-        # --- Batch action buttons row ---
-        # Left: YOLO batch
-        self._dp_run_btn = ctk.CTkButton(
-            f,
-            text="Run YOLO Batch",
-            fg_color=clr.CTK_BUTTON_GREEN,
-            command=self._run_yolo_batch_start,
-        )
-        self._dp_run_btn.grid(row=10, column=0, padx=12, pady=(16, 12), sticky="ew")
-
-        self._dp_kalman_btn = ctk.CTkButton(
-            f,
-            text="Kalman Batch",
-            command=self._run_kalman_batch_start,
-        )
-        self._dp_kalman_btn.grid(row=10, column=1, padx=12, pady=(16, 12), sticky="ew")
-
-        # Center: SolvePnP/QnP batch (uses existing threaded worker)
-        self._dp_pnp_btn = ctk.CTkButton(
-            f,
-            text="SolvePnP/QnP Batch",
-            command=self.runPnP_QnP_on_folders_threaded,
-        )
-        self._dp_pnp_btn.grid(row=10, column=2, padx=12, pady=(16, 12), sticky="ew")
-
-        # Cancel button in its own full-width row below
-        self._dp_cancel_btn = ctk.CTkButton(
-            f,
-            text="Cancel",
-            command=self._dp_cancel,
-            state="disabled",  # until a run starts
-        )
-        self._dp_cancel_btn.grid(row=11, column=0, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
-
-        # Cancel button in its own full-width row below
-        def plot_sequential():
-            from support.viz.Plotting import Plotter
-            if self.plotter is None:
-                self.plotter = Plotter()
-            parse_vars = data.parse_conf_list(getattr(self, "_dp_conf_list", None))
-            img_dir = Path(str(os.path.dirname(getattr(self.camConfig, "imageFilepath", "")) or "")) / "_ProcessedData"
-            for var in parse_vars:
-                self.plotter.plot(var, img_dir, False, True)
-                try:
-                    self.winfo_exists()
-                except:
-                    self._plotter_close_plot_alias()
-                    return
-
-        dp_plotter_btn = ctk.CTkButton(
-            f,
-            text="Plot",
-            command=plot_sequential, )
-        dp_plotter_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
-
-        dp_close_plot_btn = ctk.CTkButton(
-            f,
-            text="Close Plots",
-            command=self._plotter_close_plot_alias, )
-        dp_close_plot_btn.grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+        self.batch_controller.setup_frame()
 
     def setup_playbackFrame(self):
-        """Construct the playback controls section of the GUI.
-
-        Builds the frame slider, transport controls, and speed/overlay/export
-        boundary controls used during folder playback.
-        """
-        f = self.playback_frame
-
-        for w in f.winfo_children():
-            w.destroy()
-
-        rowID = 0
-        self.update_playbackMenu()
-
-        playbackLabel = ctk.CTkLabel(f, textvariable=self.playbackModeText)
-        playbackLabel.grid(row=rowID, column=0, sticky='w', padx=8, pady=(8, 4))
-        rowID += 1
-
-        # --- Frame slider ---
-        self._pb_frame_text = ctk.StringVar(value="Frame: — / —")
-        self._pb_slider_dragging = False
-
-        self._pb_frame_label = ctk.CTkLabel(f, textvariable=self._pb_frame_text)
-        self._pb_frame_label.grid(row=rowID, column=0, sticky="w", padx=8, pady=(4, 2))
-        rowID += 1
-
-        # Start with a safe dummy range; worker will update range once it knows num_images
-        self._pb_slider = ctk.CTkSlider(
-            f,
-            from_=0,
-            to=1,
-            number_of_steps=1,
-            command=self._on_pb_slider_drag,  # live label only
-        )
-        self._pb_slider.grid(row=rowID, column=0, sticky="ew", padx=8, pady=(0, 8))
-        rowID += 1
-
-        # Only seek on release (prevents seek spam while dragging)
-        self._pb_slider.bind("<ButtonPress-1>", lambda *_: self._set_pb_slider_dragging(True))
-        self._pb_slider.bind("<ButtonRelease-1>", self._on_pb_slider_release)
-
-        f.grid_columnconfigure(0, weight=1)
-
-        rowID += 1
-
-        # --- Primary playback controls (mirror hotkeys) ---
-        btn_frame = ctk.CTkFrame(self.playback_frame)
-        btn_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
-
-        def mk(text, action, *args, col=0):
-            b = ctk.CTkButton(
-                btn_frame,
-                text=text,
-                command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar), )
-            b.grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
-            return b
-
-        # Order roughly like a transport bar
-        mk("⟲ Rev (r)", "reverse", col=0)
-        mk("⟸ Back (z)", "step_back", col=1)
-        mk("⏯ Pause (space)", "toggle_pause", col=2)
-        mk("Fwd (c) ⟹", "step_forward", col=3)
-        mk("Mode (f)", "toggle_fps_mode", col=4)
-
-        rowID += 1
-        speed_frame = ctk.CTkFrame(self.playback_frame)
-        speed_frame.grid(row=rowID, column=0, padx=5, pady=5, sticky="nsew")
-
-        mk2 = lambda text, action, *args, col=0: ctk.CTkButton(
-            speed_frame,
-            text=text,
-            command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
-        ).grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
-
-        mk2("Slower (a)", "speed_down", col=0)
-        mk2("Faster (d)", "speed_up", col=1)
-        mk2("Overlays (w)", "toggle_overlays", col=2)
-        mk2("Mark Start (s)", "mark_start", col=3)
-        mk2("Mark End (e)", "mark_end", col=4)
+        self.playback_controller.setup_frame()
 
     def set_ui_active(self, active: bool):
         """Enable or disable this page's active runtime behavior.
@@ -1149,295 +849,31 @@ class CameraGui(ctk.CTkFrame):
             self.func_that_refits()
 
     def _plotter_close_plot_alias(self):
-        """Close any open plotting windows through the plotting helper."""
-        if self.plotter is None:
-            return False
-
-        from support.viz.Plotting import Plotter
-        self.plotter = Plotter()
-        self.plotter.close_plot()
-        return True
+        return self.batch_controller.close_plots()
 
     def _get_dp_conf_text(self) -> str:
-        try:
-            return str(self._dp_conf_list.get()).strip()
-        except Exception:
-            return str(getattr(self.camConfig, "dp_conf_list", "0.80") or "0.80")
+        return self.batch_controller.get_conf_text()
 
     def _get_dp_ckpt_n(self) -> int:
-        try:
-            return int(str(self._dp_ckptN.get()).strip())
-        except Exception:
-            try:
-                return int(getattr(self.camConfig, "dp_ckptN", 200) or 200)
-            except Exception:
-                return 200
+        return self.batch_controller.get_ckpt_n()
 
     def _get_dp_prefetch_n(self) -> int:
-        try:
-            return int(str(self._dp_prefetch.get()).strip())
-        except Exception:
-            try:
-                return int(getattr(self.camConfig, "dp_prefetch", 32) or 32)
-            except Exception:
-                return 32
+        return self.batch_controller.get_prefetch_n()
 
     def _get_dp_gpu_enabled(self) -> bool:
-        try:
-            return bool(self._dp_gpu_var.get())
-        except Exception:
-            return bool(getattr(self.camConfig, "dp_gpu", False))
+        return self.batch_controller.get_gpu_enabled()
 
     def runPnP_QnP_on_folders_threaded(self):
-        """Launch SolvePnP/QnP batch processing on a background thread.
-
-        Builds UI-safe progress callbacks and delegates the actual folder sweep
-        to the data-processing runner.
-        """
-        img_dir_str = (
-                (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
-                or (getattr(self.camConfig, "imageFilepath", "") or "")
-        )
-        img_dir = Path(img_dir_str)
-
-        if hasattr(self, "_dp_progress_label"):
-            self._dp_progress_label.configure(text="Starting SolvePnP/QnP…")
-
-        # ensure runner
-        if not hasattr(self, "_dp_runner") or self._dp_runner is None:
-            self._dp_runner = data.DataProcessorRunner()
-        self._dp_runner.reset_cancel()
-        self._dp_runner.cancel_event.clear()
-
-        conf_list_var = getattr(self, "_dp_conf_list", None)
-
-        def post_status(text: str):
-            def _ui(*_):
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def post_progress(frac: float, text: str):
-            def _ui(*_):
-                if hasattr(self, "_dp_progress"):
-                    self._dp_progress.set(float(frac))
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def _worker():
-            try:
-                self._dp_runner.run_pnp_qnp_conf_sweep(
-                    img_dir=img_dir,
-                    conf_list_var=conf_list_var,
-                    run_pnp_qnp_from_detection_csv=self.run_pnp_qnp_from_detection_csv,
-                    post_progress=post_progress,
-                    post_status=post_status,
-                    sweep_timer=utils.SweepTimer(),
-                    fmt_mmss=utils.fmt_mmss,
-                )
-            except Exception as e:
-                post_status(f"SolvePnP/QnP failed: {e}")
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self.batch_controller.run_pnp_qnp_on_folders_threaded()
 
     def _run_kalman_batch_start(self):
-        """Start a Kalman-filter confidence sweep in a worker thread.
-
-        Prepares UI state, validates prerequisites, constructs progress/status
-        callbacks, and launches the configured batch operation.
-        """
-        if getattr(self, "_dp_worker", None) and self._dp_worker.is_alive():
-            return
-
-        # UI reset
-        if hasattr(self, "_dp_progress_label"):
-            self._dp_progress_label.configure(text="Starting KF…")
-        if hasattr(self, "_dp_progress"):
-            self._dp_progress.set(0.0)
-        if hasattr(self, "_dp_run_btn"):
-            self._dp_run_btn.configure(state="disabled")
-        if hasattr(self, "_dp_cancel_btn"):
-            self._dp_cancel_btn.configure(state="normal")
-
-        if not hasattr(self, "_dp_runner") or self._dp_runner is None:
-            self._dp_runner = data.DataProcessorRunner()
-        self._dp_runner.reset_cancel()
-
-        img_dir = Path(
-            (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
-            or (getattr(self.camConfig, "imageFilepath", "") or "")
-        )
-
-        def progress_cb(frac: float, text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress"):
-                    self._dp_progress.set(float(frac))
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def status_cb(text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def _finish(text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-                if hasattr(self, "_dp_run_btn"):
-                    self._dp_run_btn.configure(state="normal")
-                if hasattr(self, "_dp_cancel_btn"):
-                    self._dp_cancel_btn.configure(state="normal")
-
-            self.after(0, _ui, ())
-
-        def _worker():
-            try:
-                if self.calibration is None or not getattr(self.calibration, "validCal", False):
-                    _finish("No calibration loaded; cannot run KF.")
-                    return
-
-                self._dp_runner.run_kalman_conf_sweep(
-                    img_dir=img_dir,
-                    conf_list_var=getattr(self, "_dp_conf_list", None),
-                    calibration=self.calibration,
-                    progress_cb=progress_cb,
-                    status_cb=status_cb,
-                )
-                _finish("KF sweep done.")
-            except Exception as e:
-                _finish(f"KF sweep failed: {e}")
-
-        self._dp_worker = threading.Thread(target=_worker, daemon=True)
-        self._dp_worker.start()
+        self.batch_controller.run_kalman_batch_start()
 
     def _dp_cancel(self):
-        """Request cancellation of the active batch-processing job.
-
-        Signals the runner's cancel event and updates the UI to indicate that
-        the current step is being allowed to finish cleanly.
-        """
-        # 1) Signal cancel
-        runner = getattr(self, "_dp_runner", None)
-        if runner is not None:
-            try:
-                self._dp_runner.cancel_event.set()
-            except Exception:
-                pass
-
-        # 2) UI feedback
-        if hasattr(self, "_dp_progress_label"):
-            self._dp_progress_label.configure(text="Canceling… (finishing current step)")
-        if hasattr(self, "_dp_cancel_btn"):
-            self._dp_cancel_btn.configure(state="disabled")  # prevent double-cancel spam
-        if hasattr(self, "_dp_run_btn"):
-            self._dp_run_btn.configure(state="disabled")  # optional, but usually correct
+        self.batch_controller.cancel()
 
     def _run_yolo_batch_start(self):
-        """Start a YOLO confidence sweep over the selected image folder.
-
-        Initializes the YOLO session if needed, builds the input timebase, wires
-        UI-thread callbacks, and launches the worker that writes detection CSVs.
-        """
-        if getattr(self, "_dp_worker", None) and self._dp_worker.is_alive():
-            return
-
-        # UI reset
-        if hasattr(self, "_dp_progress_label"):
-            self._dp_progress_label.configure(text="Starting…")
-        if hasattr(self, "_dp_progress"):
-            self._dp_progress.set(0.0)
-        if hasattr(self, "_dp_run_btn"):
-            self._dp_run_btn.configure(state="disabled")
-        if hasattr(self, "_dp_cancel_btn"):
-            self._dp_cancel_btn.configure(state="normal")
-
-        # ensure runner
-        if not hasattr(self, "_dp_runner") or self._dp_runner is None:
-            self._dp_runner = data.DataProcessorRunner()
-        self._dp_runner.reset_cancel()
-
-        # lazy import yolo
-        from support.vision import yolo
-        if self.yoloSession is None:
-            self.yoloSession = yolo.YOLO()
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
-            self.yoloSession.set_calibration(self.calibration)
-            self.yoloSession.iou = self.camConfig.yolo_iou
-
-        # build ids/times
-        img_dir = Path(
-            (getattr(self, "_dp_img_dir_var", None) and self._dp_img_dir_var.get().strip())
-            or (getattr(self.camConfig, "imageFilepath", "") or "")
-        )
-        self.populate_idsTimes(str(img_dir))
-        pairs = list(getattr(self.ImageTimeReader, "idsTimes", []))  # [(path, time), ...]
-
-        # callbacks (UI thread)
-        def post_progress(frac: float, text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress"):
-                    self._dp_progress.set(float(frac))
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def post_status(text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-
-            self.after(0, _ui, ())
-
-        def post_finish(text: str) -> None:
-            def _ui(*_):
-                if hasattr(self, "_dp_progress_label"):
-                    self._dp_progress_label.configure(text=text)
-                if hasattr(self, "_dp_run_btn"):
-                    self._dp_run_btn.configure(state="normal")
-                if hasattr(self, "_dp_cancel_btn"):
-                    self._dp_cancel_btn.configure(state="normal")
-
-            self.after(0, _ui, ())
-
-        # run worker
-        def _worker():
-            try:
-                out_csv_base = img_dir / "_ProcessedData" / "1_yolo_detections.csv"
-                params = data.YoloSweepParams(
-                    img_dir=img_dir,
-                    out_csv_base=out_csv_base,
-                    conf_list_var=self._get_dp_conf_text(), # getattr(self, "_dp_conf_list", None),
-                    ckpt_every_var=self._get_dp_ckpt_n(), # getattr(self, "_dp_ckptN", None),
-                    prefetch_var=self._get_dp_prefetch_n(), # getattr(self, "_dp_prefetch", None),
-                    cam_to_log_time_offset=float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0)),
-                )
-
-                self._dp_runner.run_yolo_conf_sweep(
-                    yolo_session=self.yoloSession,
-                    calibration=self.calibration,
-                    ids_times_pairs=pairs,
-                    params=params,
-                    sweep_timer=utils.SweepTimer(),
-                    fmt_mmss=utils.fmt_mmss,
-                    post_progress=post_progress,
-                    post_status=post_status,
-                    post_finish=post_finish,
-                    undistort_points_px=undistort_points_px,
-                )
-            except Exception as e:
-                post_finish(f"YOLO batch failed: {e}")
-
-        self._dp_worker = threading.Thread(target=_worker, daemon=True)
-        self._dp_worker.start()
+        self.batch_controller.run_yolo_batch_start()
 
     def run_pnp_qnp_from_detection_csv(
             self,
@@ -1447,57 +883,12 @@ class CameraGui(ctk.CTkFrame):
             progress_cb=None,
             cancel_cb=False,
     ) -> None:
-        """Run SolvePnP/QnP over an existing detection CSV using GUI state.
-
-        This thin wrapper injects calibration, truth metadata, checkpoint cadence,
-        cancel support, and progress forwarding before delegating to the runner.
-        """
-
-        # ---- checkpoint cadence ----
-        checkpoint_every = 0
-        try:
-            if hasattr(self, "_dp_ckptN"):
-                v = self._dp_ckptN.get()
-                if isinstance(v, str):
-                    v = v.strip()
-                checkpoint_every = int(v) if v else 0
-        except Exception:
-            checkpoint_every = 0
-
-        if checkpoint_every <= 0:
-            try:
-                checkpoint_every = int(getattr(self.camConfig, "dp_ckptN", 0) or 0)
-            except Exception:
-                checkpoint_every = 0
-
-        # ---- truth_dict from metaYolo via yoloSession ----
-        # This keeps your “inextricably linked to metaYolo” requirement.
-        if getattr(self, "yoloSession", None) is None:
-            from support.vision import yolo
-            self.yoloSession = yolo.YOLO()
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
-            self.yoloSession.set_calibration(self.calibration)
-            self.yoloSession.iou = self.camConfig.yolo_iou
-
-        truth_dict = getattr(getattr(self.yoloSession, "reader", None), "idsNamesLocs", None)
-        if truth_dict is None:
-            raise ValueError("yoloSession.reader.idsNamesLocs is missing (metaYolo not loaded?).")
-
-        # ---- cancel_event (runner owns it) ----
-        cancel_event = None
-        if hasattr(self, "_dp_runner") and getattr(self._dp_runner, "cancel_event", None) is not None:
-            cancel_event = self._dp_runner.cancel_event
-
-        # ---- delegate to module ----
-        self._dp_runner.run_pnp_qnp_from_detection_csv(
-            csv_path=str(csv_path),
-            calibration=self.calibration,
-            truth_dict=truth_dict,
-            checkpoint_every=checkpoint_every,
+        self.batch_controller.run_pnp_qnp_from_detection_csv(
+            csv_path=csv_path,
             out_pnp=out_pnp,
             out_qnp=out_qnp,
             progress_cb=progress_cb,
-            cancel_event=cancel_event,
+            cancel_cb=cancel_cb,
         )
 
     def launch_checkerboard(self):
@@ -1505,828 +896,37 @@ class CameraGui(ctk.CTkFrame):
         self.checkerboard_launcher.toggle()
 
     # --- Playback slider helpers ---
-    def _set_pb_slider_dragging(self, dragging: bool):
-        """Record whether the playback slider is actively being dragged."""
-        self._pb_slider_dragging = bool(dragging)
-
-    def _on_pb_slider_drag(self, value):
-        """ UI thread: user is dragging slider.
-            We DO NOT seek here; we only update label."""
-        try:
-            v = int(round(float(value)))
-        except Exception:
-            return
-        n = int(getattr(self, "_pb_num_images", 0) or 0)
-
-        if n > 0:
-            v = max(0, min(v, n - 1))
-            self._pb_frame_text.set(f"Frame: {v} / {n - 1}")
-        else:
-            self._pb_frame_text.set(f"Frame: {v} / —")
-
-    def _on_pb_slider_release(self, _evt=None):
-        """ UI thread: mouse released -> enqueue ONE seek command. """
-
-        self._set_pb_slider_dragging(False)
-        try:
-            v = int(round(float(self._pb_slider.get())))
-        except Exception:
-            return
-        self._enqueue_playback_cmd("seek_idx", v)
-
-    def _pb_ui_set_slider_range(self, n: int):
-        """ UI thread: update slider bounds when worker learns the dataset length. """
-
-        n = int(n)
-
-        if n <= 1:
-            self._pb_slider.configure(from_=0, to=1, number_of_steps=1)
-            self._pb_frame_text.set("Frame: — / —")
-            return
-
-        self._pb_slider.configure(from_=0, to=n - 1, number_of_steps=n - 1)
-        self._pb_frame_text.set(f"Frame: 0 / {n - 1}")
-
-    def _pb_ui_set_slider_pos(self, idx: int, n: int):
-        """
-        UI thread: update slider position during playback.
-        Avoid fighting the user while dragging.
-        """
-
-        if getattr(self, "_pb_slider_dragging", False):
-            return
-
-        if not hasattr(self, "_pb_slider") or self._pb_slider is None:
-            return
-
-        idx = int(max(0, min(int(idx), int(n) - 1)))
-        self._pb_slider.set(idx)
-        self._pb_frame_text.set(f"Frame: {idx} / {int(n) - 1}")
-
-    # --- Playback command queue (UI thread safe) ---
-    def _enqueue_playback_cmd(self, action: str, *args):
-        """UI-thread safe: enqueue a playback action for the worker thread to apply."""
-        with self._pb_cmd_lock:
-            self._pb_cmds.append((action, args))
-
-    def _drain_playback_cmds(self):
-        """Worker-thread: pull all queued playback actions."""
-        out = []
-        with self._pb_cmd_lock:
-            while self._pb_cmds:
-                out.append(self._pb_cmds.popleft())
-        return out
-
-    # --- Single authoritative action dispatcher ---
-    def _apply_playback_action(self,
-                               action: str,
-                               args, *,
-                               loader,
-                               curr_idx: int,
-                               t,
-                               wall_start: float):
-        """
-        Apply ONE playback action. This is the only place that is allowed to mutate:
-           - curr_idx
-           - wall_start
-           - loader seek/stride
-           - pauseCache clear
-           - playback mode / speed changes
-         Returns (curr_idx, wall_start).
-         """
-
-        num_images = len(t)
-
-        if action == "toggle_fps_mode":
-            self.pause = False
-            self._on_toggle_fps_mode()
-            wall_start = self._reanchor_on_mode_change(self.camConfig.playback_mode, curr_idx, t)
-            self.update_playbackMenu()
-            self.saveToCache()
-
-        elif action == "step_forward":
-            curr_idx = self._on_step_forward(curr_idx, num_images)
-            self.pause = True
-            self.pauseCache.clear()
-            self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-            loader.seek(curr_idx, clear_buffer=True)
-            self.update_playbackMenu()
-
-        elif action == "step_back":
-            curr_idx = self._on_step_back(curr_idx)
-            self.pause = True
-            self.pauseCache.clear()
-            self.camConfig.playback_mode = PlaybackSpeed.Fixed_fps
-            loader.seek(curr_idx, clear_buffer=True)
-            self.update_playbackMenu()
-
-        elif action == "toggle_pause":
-            wall_start = self._on_toggle_pause(curr_idx, t, wall_start)
-            self.update_playbackMenu()
-
-        elif action == "speed_up":
-            wall_start = self._on_speed_up(curr_idx=curr_idx, t=t)
-            self.update_playbackMenu()
-
-        elif action == "speed_down":
-            wall_start = self._on_speed_down(curr_idx=curr_idx, t=t)
-            self.update_playbackMenu()
-
-        elif action == "mark_start":
-            self._on_mark_start(curr_idx)
-
-        elif action == "mark_end":
-            self._on_mark_end(curr_idx)
-
-        elif action == "reverse":
-            wall_start = self._on_reverse(loader=loader, curr_idx=curr_idx, t=t)
-            self.update_playbackMenu()
-
-        elif action == "seek_idx":
-            # args: (target_idx, )
-            (target_idx,) = args
-            target_idx = int(max(0, min(int(target_idx), len(t) - 1)))
-
-            # Seek once, clear pause cache
-            curr_idx = target_idx
-            loader.seek(curr_idx, clear_buffer=True)
-            self.pauseCache.clear()
-
-            wall_start = self._reanchor_on_mode_change(self.camConfig.playback_mode, curr_idx, t)
-            self.update_playbackMenu()
-
-        # HUD bank offsets (optional buttons)
-        elif action == "bank_minus" and self.hud_marker is not None:
-            self.hud_marker.cam_bank_offset -= 0.1
-        elif action == "bank_plus" and self.hud_marker is not None:
-            self.hud_marker.cam_bank_offset += 0.1
-
-        # Time offset adjustments (optional buttons)
-        elif action == "offset":
-            # args: (delta,)
-            (delta,) = args
-            self._on_adjust_offset(float(delta))
-        elif action == "persist_offset":
-            self.write_offset_csv()
-
-        return curr_idx, wall_start
-
-    @staticmethod
-    def _key_to_playback_action(key: int):
-        """Map a cv2.waitKey code to an action string + args."""
-
-        if key == ord('f'):
-            return "toggle_fps_mode", ()
-        if key == ord('c'):
-            return "step_forward", ()
-        if key == ord('z'):
-            return "step_back", ()
-        if key == ord(' '):
-            return "toggle_pause", ()
-        if key == ord('d'):
-            return "speed_up", ()
-        if key == ord('a'):
-            return "speed_down", ()
-        if key == ord('s'):
-            return "mark_start", ()
-        if key == ord('e'):
-            return "mark_end", ()
-        if key == ord('r'):
-            return "reverse", ()
-        if key == ord('b'):
-            return "bank_minus", ()
-        if key == ord('n'):
-            return "bank_plus", ()
-
-        # offset hotkeys
-        if key == ord(";"):
-            return "offset", (-0.01,)
-        if key == ord("'"):
-            return "offset", (+0.01,)
-        if key == ord(':'):
-            return "offset", (-0.10,)
-        if key == ord('"'):
-            return "offset", (+0.10,)
-        if key == ord('['):
-            return "offset", (-1.00,)
-        if key == ord(']'):
-            return "offset", (+1.00,)
-
-        if key == ord('{'):
-            return "offset", (-10.00,)
-        if key == ord('}'):
-            return "offset", (+10.00,)
-        if key == ord('p'):
-            return "persist_offset", ()
-        return None, None
-
     def update_playbackMenu(self):
-        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps:
-            def mode(pauseStatus, playbackSpeed):
-                if pauseStatus:
-                    return 'Pause'
-                if playbackSpeed < 0:
-                    return "Rewind"
-                return "Play"
-
-            self.playbackModeText.set(
-                value=f"Playback Mode: FPS\n \
-                    Target FPS: {self.camConfig.target_fps:.2f}\n{mode(self.pause, self.playback.speed)}")
-        else:
-            self.playbackModeText.set(value=f'Playback Mode: Realtime\nPlayback Speed: {self.camConfig.rt_speed:.2f}')
-
-    def _reanchor_on_mode_change(self, new_mode, curr_idx: int, t) -> float:
-        """
-        Re-anchor wall_start so the current frame stays fixed when switching modes,
-        including while reversing. Uses time.monotonic() to match the main loop.
-        """
-        now = time.monotonic()
-
-        if new_mode == PlaybackSpeed.Real_time:
-            # Map wall clock to log time (direction-aware)
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
-                return now - (tN - t[curr_idx]) / rs
-            else:
-                # forward: (now - wall_start)*rs == t[curr_idx] - t0
-                return now - (t[curr_idx] - t0) / rs
-
-        else:
-            # Fixed-FPS: anchor to the correct phase for direction
-            fps = max(0.001, float(self.camConfig.target_fps))
-            num_images = len(t)
-            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            return now - (phase / fps)
-
-    @staticmethod
-    def _rt_reanchor(now: float, curr_idx: int, t, rt_rate: float, sign: int) -> float:
-        """Return a new wall_start so that the effective RT timeline still maps to t[curr_idx]."""
-        rt_rate = max(1e-6, float(rt_rate))
-        t0, tN = t[0], t[-1]
-        if sign < 0:
-            # reverse: tN - (now - wall_start)*rt_rate == t[curr_idx]
-            return now - (tN - t[curr_idx]) / rt_rate
-        else:
-            # forward: (now - wall_start)*rt_rate == t[curr_idx] - t0
-            return now - (t[curr_idx] - t0) / rt_rate
-
-    def _on_reverse(self, loader, curr_idx: int, t):
-        """
-        Toggle playback direction without jumping the current frame.
-        Returns: (new_wall_start)
-        """
-        # New direction (+1 forward, -1 reverse)
-        self.last_nonzero_sign = -1 if self.last_nonzero_sign > 0 else 1
-
-        # If actively playing, flip speed sign and update stride, then realign buffer at current index.
-        if self.playback.speed != 0:
-            self.playback.speed = -self.playback.speed
-            s_abs = self._stride_for_speed(abs(self.playback.speed))
-            if s_abs > 0:
-                loader.set_stride(self.last_nonzero_sign * s_abs)
-                loader.seek(curr_idx, clear_buffer=True)
-
-        now = time.monotonic()
-
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            # --- Real-time: direction-aware re-anchor on the log timeline ---
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse:  tN - (now - wall_start)*rs == t[curr_idx]
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                # forward:  (now - wall_start)*rs == t[curr_idx] - t0
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            # --- Fixed-FPS: anchor MUST match the phase used in the loop ---
-            # In forward, phase = curr_idx; in reverse, phase = num_images - curr_idx.
-            fps = max(0.001, float(self.camConfig.target_fps))
-            period = 1.0 / fps
-            num_images = len(t)  # or use your existing num_images variable if already in scope
-            phase = (num_images - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = now - period * phase
-
-        return wall_start
-
-    def _on_toggle_fps_mode(self):
-        """Swap Fixed_fps <-> Real_time, preserving perceived position."""
-        self.camConfig.playback_mode = self.camConfig.playback_mode.next()
-        if self.camConfig.playback_mode == PlaybackSpeed.Real_time:
-            self.camConfig.rt_speed = 1.0
-
-    def _on_step_forward(self, curr_idx: int, num_images: int) -> int:
-        curr_idx = min(curr_idx + 1, num_images - 1)
-        self.playback.speed = 0.0
-        return curr_idx
-
-    def _on_step_back(self, curr_idx: int) -> int:
-        curr_idx = max(curr_idx - 1, 0)
-        self.playback.speed = 0.0
-        return curr_idx
-
-    def _on_toggle_pause(self, curr_idx: int, t, wall_start: float) -> float:
-        self.pause = not self.pause
-        playing = (self.playback.speed != 0)
-        if playing:
-            self._resume_speed_mag = max(1.0, abs(self.playback.speed))
-            self.playback.speed = 0.0
-            return wall_start
-
-        prev_mag = getattr(self, "_resume_speed_mag", 1.0)
-        self.playback.speed = float(self.last_nonzero_sign or 1) * prev_mag
-
-        now = time.monotonic()
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
-
-    def _on_speed_up(self, curr_idx: int, t) -> float:
-        """
-        Increase playback speed.
-        - RT mode: multiply rt_speed, then re-anchor so current frame stays put.
-        - Fixed-FPS: increase target_fps, then re-anchor to current frame index.
-        Returns new wall_start.
-        """
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            # adjust rate
-            prev_rt = self.camConfig.rt_speed
-            self.camConfig.rt_speed = min(float(self.camConfig.rt_speed) * SPEED_STEP, 128.0)
-            if prev_rt < 0.99 and self.camConfig.rt_speed > 1.0:
-                self.camConfig.rt_speed = 1.0
-            # direction-aware reanchor
-            now = time.monotonic()
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                # reverse: tN - (now - wall_start)*rs == t[curr_idx]
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                # forward: (now - wall_start)*rs == t[curr_idx] - t0
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            # Fixed-FPS
-            prev_tgt = self.camConfig.target_fps
-            self.camConfig.target_fps = min(float(self.camConfig.target_fps) * SPEED_STEP, 320.0)
-            if prev_tgt < 19.9 and self.camConfig.target_fps > 20.0:
-                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
-
-    def _on_speed_down(self, curr_idx: int, t) -> float:
-        """
-        Decrease playback speed.
-        - RT mode: divide rt_speed, then re-anchor so current frame stays put.
-        - Fixed-FPS: decrease target_fps, then re-anchor to current frame index.
-        Returns new wall_start.
-        """
-        if getattr(self.camConfig, "playback_mode", None) == PlaybackSpeed.Real_time:
-            prev_rt = self.camConfig.rt_speed
-            self.camConfig.rt_speed = max(float(self.camConfig.rt_speed) * SPEED_STEP_INV, 0.01)
-            if prev_rt > 1.01 and self.camConfig.rt_speed < 1.0:
-                self.camConfig.rt_speed = 1.0
-            now = time.monotonic()
-            rs = max(1e-6, float(self.camConfig.rt_speed))
-            t0, tN = t[0], t[-1]
-            if self.last_nonzero_sign < 0:
-                wall_start = now - (tN - t[curr_idx]) / rs
-            else:
-                wall_start = now - (t[curr_idx] - t0) / rs
-        else:
-            prev_tgt = self.camConfig.target_fps
-            self.camConfig.target_fps = max(float(self.camConfig.target_fps) * SPEED_STEP_INV, 0.1)
-            if prev_tgt > 20.1 and self.camConfig.target_fps < 20.0:
-                self.camConfig.target_fps = 20.0  # Rebaseline for numerical error
-            fps = max(0.001, float(self.camConfig.target_fps))
-            phase = (len(t) - curr_idx) if self.last_nonzero_sign < 0 else curr_idx
-            wall_start = time.monotonic() - (phase / fps)
-        return wall_start
-
-    def _on_mark_start(self, curr_idx: int):
-        self.camConfig.start_export_idx = curr_idx
-        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-            self.camConfig.end_export_idx = self.camConfig.start_export_idx + 1
-        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-        self.saveToCache()
-
-    def _on_mark_end(self, curr_idx):
-        self.camConfig.end_export_idx = curr_idx
-        if self.camConfig.end_export_idx < self.camConfig.start_export_idx:
-            self.camConfig.end_export_idx = max(0, self.camConfig.end_export_idx - 1)
-        self.exportStartFrame.configure(text=f'Start Frame: {self.camConfig.start_export_idx}')
-        self.exportEndFrame.configure(text=f'End Frame: {self.camConfig.end_export_idx}')
-        self.saveToCache()
-
-    def _on_adjust_offset(self, delta: float):
-        self.camConfig.cam_to_log_time_offset += float(delta)
-
-    def write_offset_csv(self):
-        if self.hud_marker is None:
-            return
-
-        self.hud_marker.update_offset(self.camConfig.cam_to_log_time_offset)
-
-        hud_path = Path(self.camConfig.hud_data_filepath)
-
-        # If user/config points at a directory, write the offset file inside it.
-        # If it points at a file, write alongside that file.
-        if hud_path.is_dir():
-            out_csv = hud_path / "__TIME_OFFSET.csv"
-        else:
-            out_csv = hud_path.parent / "__TIME_OFFSET.csv"
-
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-        import pandas as pd
-        pd.DataFrame({"offset": [self.hud_marker.offset]}).to_csv(out_csv, index=False)
-
-        LOG.info(f"Saved offset {self.camConfig.cam_to_log_time_offset:+.3f}s to {out_csv}")
-        self.camConfig.cam_to_log_time_offset = 0.0
-
-    @staticmethod
-    def _make_timebase(ts_raw, fallback_fps, n):
-        t = np.array([np.nan if v is None else float(v) for v in ts_raw], dtype='float64')
-        if n == 0:  # <-- guard
-            return t
-        if np.all(np.isnan(t)):
-            step = 1.0 / max(1e-6, float(fallback_fps))
-            t = np.arange(n, dtype='float64') * step
-        else:
-            nans = np.isnan(t)
-            if nans.any():
-                notn = ~nans
-                t[nans] = np.interp(np.flatnonzero(nans), np.flatnonzero(notn), t[notn])
-        t -= float(t[0])
-        return t
-
-    @staticmethod
-    def _stride_for_speed(speed_abs: float) -> float:
-        s = max(0, int(speed_abs))
-        if s == 0:
-            return 0
-        if s == 1:
-            return 1
-        return min(8.0, s)
-
-    @staticmethod
-    def _poll_keys(max_ms: int = 8) -> list[int]:
-        # One-shot poll: wait up to max_ms for a key
-        k = cv2.waitKey(max_ms) & 0xFF
-        if k not in (0, 0xFF, 255, -1):
-            return [k]
-        return []
+        self.playback_controller.update_playback_menu()
 
     def populate_idsTimes(self, directory):
-        d = Path(directory)
-        # load logs (keep API: list[str])
-        log_list = [str(p) for p in d.glob("*.log")]
-        if not self.ImageTimeReader.loadLog(log_list):
-            self.ImageTimeReader.idsTimes = []
-            image_list = list(d.glob("*.bmp")) + list(d.glob("*.png"))
-            # natural_sort expects strings:
-            image_list = data.natural_sort([str(p) for p in image_list])
-            for image in image_list:
-                self.ImageTimeReader.idsTimes.append([image, None])
+        self.playback_controller.populate_ids_times(directory)
 
-    @staticmethod
-    def load_time_offset(directory) -> float:
-        try:
-            import pandas as pd
-            offset_dict = pd.read_csv(directory / "__TIME_OFFSET.csv")
-            return float(offset_dict["offset"][0])
-        except FileNotFoundError:
-            return 0.0
-
-    def _build_sequence_and_timebase(self, directory):
-        self.populate_idsTimes(str(directory))
-
-        paths = []
-        for rec in self.ImageTimeReader.idsTimes:
-            p = Path(rec[0])
-            paths.append(p if p.is_absolute() else (directory / p))
-
-        base_offset = 0.0
-        if self.hud_marker is not None:
-            base_offset = float(getattr(self.hud_marker, "offset", 0.0) or 0.0)
-
-        delta_offset = float(getattr(self.camConfig, "cam_to_log_time_offset", 0.0) or 0.0)
-        total_offset = base_offset + delta_offset
-
-        ts_raw = []
-        for name, ts in self.ImageTimeReader.idsTimes:
-            ts_raw.append(None if ts is None else float(ts) + total_offset)
-
-        t = self._make_timebase(ts_raw, self.camConfig.target_fps, len(paths))
-
-        return paths, t
 
     def _window_is_open(self) -> bool:
+        return self.playback_controller.window_is_open()
+
+    def reset_runtime_state(self, *, reset_fg: bool = True) -> None:
+        """Reset per-run tracking state before starting a new playback/stream/export pass."""
+        self.last_image = None
+        self.curr_frame_gray = None
+
         try:
-            return cv2.getWindowProperty(self.windowName, cv2.WND_PROP_VISIBLE) >= 1
-        except cv2.error:
-            return False
+            self.pauseCache.clear()
+        except Exception:
+            pass
+
+        if reset_fg:
+            self.FG = None
+            self.last_time_update = 0.0
+            self.curr_FG_pixel = (400, 400)
+
+            # Optional, but sensible if hyper-focus / FG-adjacent state has been sticky
+            self.curr_r_V_d = None
+            self.curr_r_T_d = None
 
     def run_folder_reader(self):
-        """Run the main folder-based playback and analysis loop.
-
-        Supports real-time and fixed-FPS playback, queued UI commands, frame
-        seeking, export bounds, overlays, and cached pause behavior.
-        """
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-
-        directory = Path(self.camConfig.imageFilepath).parent
-
-        paths, t = self._build_sequence_and_timebase(directory)
-
-        num_images = len(paths)
-
-        self.playback.speed = 1  # negative=rewind, 0=freeze, positive=forward
-        self.pause = False
-        self.last_nonzero_sign = 1
-        last_speed = self.playback.speed
-
-        if num_images > 0:
-            self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
-        else:
-            self.playback.curr_idx = 0
-
-        # ---- Playback slider: update range when dataset length changes ----
-        prev_n = int(getattr(self, "_pb_num_images", 0) or 0)
-        need_range_update = (not getattr(self, "_pb_slider_range_inited", False)) or (prev_n != int(num_images))
-
-        if need_range_update:
-            self._pb_slider_range_inited = True
-            self._pb_num_images = int(num_images)
-
-            # Clamp curr_idx to new bounds
-            if num_images > 0:
-                self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
-            else:
-                self.playback.curr_idx = 0
-
-            # UI-thread update
-            try:
-                self.after(0, self._pb_ui_set_slider_range, int(num_images))
-                self.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
-            except Exception:
-                pass
-
-        # --- PAUSED CACHE: keep 1 frame while paused to avoid refetch spam ---
-        self.pauseCache.clear()
-
-        # Load persisted/base offset, but keep UI delta at zero on startup.
-        loaded_offset = self.load_time_offset(directory)
-
-        if self.hud_marker is not None:
-            self.hud_marker.offset = loaded_offset
-
-        self.camConfig.cam_to_log_time_offset = 0.0
-
-        from support.runtime.buffer_image_loader import BufferedImageLoader as imgBuf
-
-        # --- start background loader ---
-        loader = imgBuf(
-            filepaths=[str(p) for p in paths],
-            max_buffer=96,
-            preprocess=None,
-            start_index=self.playback.curr_idx,
-            loop=True,
-            read_flags=cv2.IMREAD_COLOR,
-        ).start()
-
-        # one-shot key handling
-        pending_keys = []
-
-        wall_start = time.monotonic()
-
-        # If resuming mid-sequence in Real_time mode, align wall_start so elapsed maps to curr_idx
-        if self.camConfig.playback_mode == PlaybackSpeed.Real_time and num_images > 0 and len(t) > 0:
-            rs = float(self.camConfig.rt_speed) or 1e-6
-            # Make elapsed_ref ~= t[curr_idx] at start (for forward play)
-            wall_start = time.monotonic() - (t[self.playback.curr_idx] / rs)
-
-        # Align wall_start so Fixed_fps starts immediately when resuming mid-sequence
-        if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and num_images > 0:
-            period = 1.0 / max(0.001, float(self.camConfig.target_fps))
-            # Forward play: make target_time for curr_idx approximately "now"
-            wall_start = time.monotonic() - period * float(self.playback.curr_idx)
-
-        self.update_playbackMenu()
-
-        def sleep_until(deadline) -> list[int]:
-            keys = []
-            while True:
-                remain = deadline - time.monotonic()
-                if remain <= 0:
-                    break
-                slice_ms = int(min(8, max(1, remain * 1000)))
-                keys.extend(self._poll_keys(slice_ms))
-            return keys
-
-        try:
-            while (not self.threadStopper.is_set()
-                   and self.showWindow
-                   and not self.making_gifOrVid
-                   and self._window_is_open()):
-
-                curr_time = time.time()
-                if (curr_time - self.fps_time_log) > 0.000001:
-                    self.curr_fps = 1.0 / abs(curr_time - self.fps_time_log)
-                else:
-                    self.curr_fps = 0.0
-                self.fps_time_log = curr_time
-
-                # ===== react to speed changes (incl. direction) =====
-                if self.playback.speed != last_speed:
-                    s_abs = self._stride_for_speed(abs(self.playback.speed))
-
-                    if self.playback.speed != 0:
-                        self.last_nonzero_sign = (1 if self.playback.speed > 0 else -1)
-
-                    if s_abs == 0:
-                        self.pause = True
-                    else:
-                        self.pause = False
-                        signed_stride = self.last_nonzero_sign * s_abs
-                        if signed_stride != self.playback.stride:
-                            loader.set_stride(signed_stride)
-                            self.playback.stride = int(signed_stride)
-
-                        self.playback.curr_idx = max(0, min(self.playback.curr_idx, num_images - 1))
-                        loader.seek(self.playback.curr_idx, clear_buffer=True)
-                        self.pauseCache.clear()
-
-                    last_speed = self.playback.speed
-
-                # ===== fetch a frame =====
-                if not self.pause:
-                    # streaming mode: loader drives index
-                    got = loader.get_next(timeout=0.02)
-
-                    # if skipping (|stride|>1), drain extras so we show freshest
-                    if abs(self.playback.stride) > 1 and got is not None:
-                        latest = got
-                        while True:
-                            nxt = loader.get_next(timeout=0.0)
-                            if nxt is None:
-                                break
-                            latest = nxt
-                        got = latest
-
-                    frame = None
-                    if got is not None:
-                        got_idx, frame = got
-                        self.playback.curr_idx = got_idx
-
-                    # leaving pause → invalidate paused cache
-                    self.pauseCache.clear()
-
-                else:
-                    # ===== PAUSED MODE with CACHE =====
-                    target_idx = max(0, min(self.playback.curr_idx, num_images - 1))
-
-                    # If cache is invalid or user moved (z/c), fetch once; otherwise reuse cached frame
-                    if self.pauseCache.frame is None or self.pauseCache.idx != target_idx:
-                        # Seek ONCE; do NOT keep seeking every loop
-                        loader.seek(target_idx, clear_buffer=True)
-
-                        got = loader.get_next(timeout=0.5)  # give worker a bit more time while paused
-                        if got is not None:
-                            got_idx, frame = got
-                            self.pauseCache.set(got_idx, frame)
-                            self.playback.curr_idx = got_idx
-                        else:
-                            # If file truly missing, print once; otherwise keep last cached frame (if any)
-                            p = paths[target_idx]
-                            if not Path(p).exists():
-                                self.pauseCache.clear()
-                            # If file exists but frame not ready yet, DON'T print; keep previous cached frame
-                    frame = self.pauseCache.frame
-
-                # ===== display / HUD =====
-                if (frame is not None and Path(paths[self.playback.curr_idx]).exists() and
-                        len(self.ImageTimeReader.idsTimes) > 0):
-
-                    if self.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not self.pause:
-                        period = 1.0 / self.camConfig.target_fps
-
-                        if not self.last_nonzero_sign < 0:
-                            img_idx = self.playback.curr_idx
-                        else:
-                            img_idx = num_images - self.playback.curr_idx
-                        target_time = wall_start + period * img_idx
-
-                        if target_time < time.monotonic():
-                            wall_start = time.monotonic() - 1.0 / max(0.001, self.camConfig.target_fps) * img_idx
-                        pending_keys.extend(sleep_until(target_time))
-
-                    elif self.camConfig.playback_mode == PlaybackSpeed.Real_time and not self.pause:
-                        rs = float(self.camConfig.rt_speed) or 1e-6
-                        elapsed = (time.monotonic() - wall_start) * rs
-                        elapsed_ref = (t[-1] - elapsed) if self.last_nonzero_sign < 0 else elapsed
-
-                        if elapsed_ref < t[0]:
-                            idx_target = num_images - 1
-                            wall_start = time.monotonic() - (
-                                (t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
-                                else ((t[-1] - t[idx_target]) / rs))
-                        elif elapsed_ref > t[-1]:
-                            idx_target = 0
-                            wall_start = time.monotonic() - (
-                                (t[idx_target] - t[0]) / rs if not self.last_nonzero_sign < 0
-                                else ((t[-1] - t[idx_target]) / rs))
-                        else:
-                            idx_target = int(np.searchsorted(t, elapsed_ref, side='right') - 1)
-
-                        idx_target = max(0, min(idx_target, num_images - 1))
-                        if idx_target != self.playback.curr_idx:
-                            loader.seek(idx_target, clear_buffer=True)
-                            got = loader.get_next(timeout=0.02)
-                            if got is not None:
-                                self.playback.curr_idx, frame = got
-
-                        pending_keys.extend(self._poll_keys(1))
-
-                    ts = self.ImageTimeReader.idsTimes[self.playback.curr_idx][1]
-                    boxAround = False
-                    if self.camConfig.start_export_idx <= self.playback.curr_idx <= self.camConfig.end_export_idx:
-                        boxAround = True
-                    if not self._window_is_open():
-                        self.threadStopper.set()
-                        break
-                    if ts is None:
-                        self.analyze_image(frame, None, self.ImageTimeReader.idsTimes[self.playback.curr_idx][0],
-                                           box_around=boxAround)
-                    else:
-                        self.analyze_image(frame, ts + self.camConfig.cam_to_log_time_offset,
-                                           self.ImageTimeReader.idsTimes[self.playback.curr_idx][0],
-                                           box_around=boxAround)
-                elif frame is None:
-                    # Nothing to draw this iteration; just keep window responsive
-                    pass
-
-                pending_keys.extend(self._poll_keys(1))
-
-                for (action, args) in self._drain_playback_cmds():
-                    self.playback.curr_idx, wall_start = self._apply_playback_action(
-                        action, args, loader=loader, curr_idx=self.playback.curr_idx, t=t, wall_start=wall_start
-                    )
-                while pending_keys:
-                    key = pending_keys.pop(0)
-                    if key == 27:  # ESC
-                        self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                        self.threadStopper.set()
-                        break
-
-                    action, args = self._key_to_playback_action(key)
-                    if action is not None:
-                        self.playback.curr_idx, wall_start = self._apply_playback_action(
-                            action, args, loader=loader, curr_idx=self.playback.curr_idx, t=t, wall_start=wall_start
-                        )
-
-                    while self.making_gifOrVid:
-                        time.sleep(0.1)
-
-                # ---- Playback slider: publish position when idx changes ----
-                if getattr(self, "_pb_num_images", 0):
-                    if getattr(self, "_pb_last_sent_idx", None) != self.playback.curr_idx:
-                        self._pb_last_sent_idx = self.playback.curr_idx
-                        try:
-                            self.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
-                        except Exception:
-                            pass
-
-                pending_keys.extend(self._poll_keys(1))
-                if not self._window_is_open():
-                    self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                    self.threadStopper.set()
-                    break
-
-        finally:
-            try:
-                cv2.destroyWindow(self.windowName)
-            except cv2.error:
-                pass
-            self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-            loader.stop()
+        self.playback_controller.run_folder_reader()
 
     def startStreamToggle(self):
         if self._thread is None or not self._thread.is_alive():  # thread not running
@@ -2339,6 +939,7 @@ class CameraGui(ctk.CTkFrame):
         return False
 
     def startStreamOn(self):
+        self.reset_runtime_state(reset_fg=True)
         self.showWindow = True
         self.threadStopper = utils.ThreadStopper()
         self.stream_running_var.set(True)
@@ -2413,8 +1014,6 @@ class CameraGui(ctk.CTkFrame):
         self.vimbaCam.live_update(settings)
 
         return True
-
-
 
     def run_vimba_stream(self, camConfig):
         if not HAVE_VMBPY:
@@ -2571,6 +1170,7 @@ class CameraGui(ctk.CTkFrame):
         Loads each source frame, applies the configured analysis pipeline, and
         returns a list of processed images suitable for GIF or video export.
         """
+        self.reset_runtime_state(reset_fg=True)
         directory = Path(self.camConfig.imageFilepath).parent
         self.populate_idsTimes(str(directory))
 
@@ -2585,14 +1185,14 @@ class CameraGui(ctk.CTkFrame):
             loaded_offset = float(offset_dict['offset'][0])
 
             if self.hud_marker is not None:
-                self.hud_marker.offset = loaded_offset
+                self.hud_marker.update_offset(loaded_offset)
 
             # UI delta should always start at zero after loading persisted offset.
             self.camConfig.cam_to_log_time_offset = 0.0
 
         except FileNotFoundError:
             if self.hud_marker is not None:
-                self.hud_marker.offset = 0.0
+                self.hud_marker.update_offset(0.0)
             self.camConfig.cam_to_log_time_offset = 0.0
 
         cv_imgs = []
@@ -2723,12 +1323,6 @@ class CameraGui(ctk.CTkFrame):
         else:
             np.copyto(markup_frame, frame)
 
-        # Sets self.curr_frame to (potentially undistorted) frame, and makes a copy onto self.markup_frame
-        calSize = (self.calibration.height, self.calibration.width)
-        frameSize = frame.shape[:2]
-        # if self.calibration.validCal and frameSize != calSize:
-        #     LOG.warning(f'Warning! Image and Calibration are not the same size!\nImg: {frameSize}\nCal: {calSize}')
-
         ######################################################
         for func, args in self.list_of_image_process_functors:
             step_args = args if isinstance(args, dict) else {}
@@ -2810,17 +1404,7 @@ class CameraGui(ctk.CTkFrame):
                            markupFrame,
                            ctx: GuiQueue.FrameCtx,
                            args):
-        from support.viz.HUD_draw import HUD_Marker
-        if self.hud_marker is None:
-            self.hud_marker = HUD_Marker()
-            self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-        self.lowPassFPS = 0.925 * self.lowPassFPS + 0.075 * self.curr_fps
-        self.hud_marker.draw_playbackStats(markupFrame,
-                                           self.lowPassFPS,
-                                           self.camConfig.target_fps,
-                                           self.camConfig.playback_mode,
-                                           self.camConfig.rt_speed,
-                                           self.camConfig.cam_to_log_time_offset)
+        self.playback_controller.draw_playback_stats(frame, markupFrame, ctx, args)
 
     @staticmethod
     def draw_time(frame, markupFrame, ctx: GuiQueue.FrameCtx, args):

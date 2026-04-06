@@ -782,10 +782,26 @@ class Plotter:
                     good = np.isfinite(cg)
                     if np.count_nonzero(good) > 10:
                         # pick top 5 spikes
-                        idxs = np.array([49, 125, 200, 240, 375, 430])
-                        tg = np.asarray(t[good])
-                        for xv in tg[idxs]:
-                            ax.axvline(float(xv), linestyle=":", linewidth=1, color='red')
+                        # Optional: mark top-K confidence-gain spikes with vertical lines
+                        # Helps visually align "pollution field" with "brittleness"
+                        cg = np.asarray(conf_gain_rz, dtype=float)
+                        t_arr = np.asarray(t, dtype=float)
+                        good = np.isfinite(cg) & np.isfinite(t_arr)
+
+                        if np.count_nonzero(good) > 10:
+                            cg_good = cg[good]
+                            t_good = t_arr[good]
+
+                            # Pick up to 6 largest gain spikes from this run, regardless of run length
+                            k = min(6, cg_good.size)
+                            spike_local_idxs = np.argpartition(cg_good, -k)[-k:]
+                            spike_local_idxs = spike_local_idxs[np.argsort(cg_good[spike_local_idxs])[::-1]]
+
+                            # Draw in time order so the overlay looks neat
+                            spike_times = np.sort(t_good[spike_local_idxs])
+
+                            for xv in spike_times:
+                                ax.axvline(float(xv), linestyle=":", linewidth=1, color="red")
 
                     # Legends
                     h1, l1 = ax2.get_legend_handles_labels()

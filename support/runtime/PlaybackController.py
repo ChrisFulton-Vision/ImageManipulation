@@ -9,6 +9,7 @@ from typing import Any
 import customtkinter as ctk
 import cv2
 import numpy as np
+from tkinter import TclError
 
 import support.gui.utils as utils
 import support.io.data_processing as data
@@ -162,7 +163,9 @@ class PlaybackController:
             last_speed = self.playback.speed
 
             if num_images > 0:
-                self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
+                self.playback.curr_idx = int(
+                    max(0, min(int(self.playback.curr_idx), num_images - 1))
+                )
             else:
                 self.playback.curr_idx = 0
 
@@ -172,13 +175,20 @@ class PlaybackController:
                 self._pb_slider_range_inited = True
                 self._pb_num_images = int(num_images)
                 if num_images > 0:
-                    self.playback.curr_idx = int(max(0, min(int(self.playback.curr_idx), num_images - 1)))
+                    self.playback.curr_idx = int(
+                        max(0, min(int(self.playback.curr_idx), num_images - 1))
+                    )
                 else:
                     self.playback.curr_idx = 0
                 try:
                     self.owner.after(0, self._pb_ui_set_slider_range, int(num_images))
-                    self.owner.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
-                except Exception:
+                    self.owner.after(
+                        0,
+                        self._pb_ui_set_slider_pos,
+                        int(self.playback.curr_idx),
+                        int(num_images),
+                    )
+                except TclError:
                     pass
 
             self.pause_cache.clear()
@@ -205,7 +215,11 @@ class PlaybackController:
             pending_keys: list[int] = []
             wall_start = time.monotonic()
 
-            if self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time and num_images > 0 and len(t) > 0:
+            if (
+                self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time
+                and num_images > 0
+                and len(t) > 0
+            ):
                 rs = float(self.owner.camConfig.rt_speed) or 1e-6
                 wall_start = time.monotonic() - (t[self.playback.curr_idx] / rs)
 
@@ -221,7 +235,7 @@ class PlaybackController:
                     remain = deadline - time.monotonic()
                     if remain <= 0:
                         break
-                    slice_ms = int(min(8, max(1, remain * 1000)))
+                    slice_ms = min(8, max(1, int(remain * 1000)))
                     keys.extend(self._poll_keys(slice_ms))
                 return keys
 
@@ -292,8 +306,15 @@ class PlaybackController:
                                 self.pause_cache.clear()
                     frame = self.pause_cache.frame
 
-                if frame is not None and Path(paths[self.playback.curr_idx]).exists() and len(self.owner.ImageTimeReader.idsTimes) > 0:
-                    if self.owner.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and not self.pause:
+                if (
+                    frame is not None
+                    and Path(paths[self.playback.curr_idx]).exists()
+                    and len(self.owner.ImageTimeReader.idsTimes) > 0
+                ):
+                    if (
+                        self.owner.camConfig.playback_mode == PlaybackSpeed.Fixed_fps
+                        and not self.pause
+                    ):
                         period = 1.0 / self.owner.camConfig.target_fps
                         if self.last_nonzero_sign >= 0:
                             img_idx = self.playback.curr_idx
@@ -301,10 +322,16 @@ class PlaybackController:
                             img_idx = num_images - self.playback.curr_idx
                         target_time = wall_start + period * img_idx
                         if target_time < time.monotonic():
-                            wall_start = time.monotonic() - (1.0 / max(0.001, self.owner.camConfig.target_fps)) * img_idx
+                            wall_start = (
+                                time.monotonic()
+                                - (1.0 / max(0.001, self.owner.camConfig.target_fps)) * img_idx
+                            )
                         pending_keys.extend(sleep_until(target_time))
 
-                    elif self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time and not self.pause:
+                    elif (
+                        self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time
+                        and not self.pause
+                    ):
                         rs = float(self.owner.camConfig.rt_speed) or 1e-6
                         elapsed = (time.monotonic() - wall_start) * rs
                         elapsed_ref = (t[-1] - elapsed) if self.last_nonzero_sign < 0 else elapsed
@@ -334,7 +361,11 @@ class PlaybackController:
                         pending_keys.extend(self._poll_keys(1))
 
                     ts = self.owner.ImageTimeReader.idsTimes[self.playback.curr_idx][1]
-                    box_around = self.owner.camConfig.start_export_idx <= self.playback.curr_idx <= self.owner.camConfig.end_export_idx
+                    box_around = (
+                        self.owner.camConfig.start_export_idx
+                        <= self.playback.curr_idx
+                        <= self.owner.camConfig.end_export_idx
+                    )
                     if not self.window_is_open():
                         self.owner.threadStopper.set()
                         break
@@ -385,8 +416,13 @@ class PlaybackController:
                 if self._pb_num_images and self._pb_last_sent_idx != self.playback.curr_idx:
                     self._pb_last_sent_idx = self.playback.curr_idx
                     try:
-                        self.owner.after(0, self._pb_ui_set_slider_pos, int(self.playback.curr_idx), int(num_images))
-                    except Exception:
+                        self.owner.after(
+                            0,
+                            self._pb_ui_set_slider_pos,
+                            int(self.playback.curr_idx),
+                            int(num_images),
+                        )
+                    except TclError:
                         pass
 
                 pending_keys.extend(self._poll_keys(1))
@@ -400,7 +436,7 @@ class PlaybackController:
                 cv2.destroyWindow(self.owner.windowName)
             except cv2.error:
                 pass
-            self.owner.after(0, self.owner._on_worker_exit)
+            self.owner.after(0, self.owner.on_worker_exit)
             if loader is not None:
                 loader.stop()
 
@@ -409,7 +445,9 @@ class PlaybackController:
 
         if self.owner.hud_marker is None:
             self.owner.hud_marker = HUD_Marker()
-            self.owner.hud_marker.read_attitude_files(self.owner.camConfig.hud_data_filepath)
+            self.owner.hud_marker.read_attitude_files(
+                self.owner.camConfig.hud_data_filepath
+            )
 
         self.low_pass_fps = 0.925 * self.low_pass_fps + 0.075 * self.curr_fps
         self.owner.hud_marker.draw_playbackStats(
@@ -439,7 +477,10 @@ class PlaybackController:
             )
         else:
             self.playback_mode_text.set(
-                value=f"Playback Mode: Realtime\nPlayback Speed: {self.owner.camConfig.rt_speed:.2f}"
+                value=(
+                    "Playback Mode: Realtime\n"
+                    f"Playback Speed: {self.owner.camConfig.rt_speed:.2f}"
+                )
             )
 
     def window_is_open(self) -> bool:
@@ -457,7 +498,7 @@ class PlaybackController:
     def _on_pb_slider_drag(self, value) -> None:
         try:
             v = int(round(float(value)))
-        except Exception:
+        except (TypeError, ValueError):
             return
         n = int(self._pb_num_images or 0)
 
@@ -471,7 +512,7 @@ class PlaybackController:
         self._set_pb_slider_dragging(False)
         try:
             v = int(round(float(self._pb_slider.get())))
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return
         self._enqueue_playback_cmd("seek_idx", v)
 
@@ -512,13 +553,23 @@ class PlaybackController:
     # ------------------------------------------------------------------
     # Action mapping and application
     # ------------------------------------------------------------------
-    def _apply_playback_action(self, action: str, args, *, loader, curr_idx: int, t, wall_start: float):
+    def _apply_playback_action(
+            self,
+            action: str,
+            args,
+            *,
+            loader,
+            curr_idx: int,
+            t,
+            wall_start: float):
         num_images = len(t)
 
         if action == "toggle_fps_mode":
             self.pause = False
             self._on_toggle_fps_mode()
-            wall_start = self._reanchor_on_mode_change(self.owner.camConfig.playback_mode, curr_idx, t)
+            wall_start = self._reanchor_on_mode_change(
+                self.owner.camConfig.playback_mode, curr_idx, t
+            )
             self.update_playback_menu()
             self.owner.saveToCache()
 
@@ -566,7 +617,9 @@ class PlaybackController:
             curr_idx = target_idx
             loader.seek(curr_idx, clear_buffer=True)
             self.pause_cache.clear()
-            wall_start = self._reanchor_on_mode_change(self.owner.camConfig.playback_mode, curr_idx, t)
+            wall_start = self._reanchor_on_mode_change(
+                self.owner.camConfig.playback_mode, curr_idx, t
+            )
             self.update_playback_menu()
 
         elif action == "bank_minus" and self.owner.hud_marker is not None:
@@ -719,7 +772,9 @@ class PlaybackController:
     def _on_speed_up(self, curr_idx: int, t) -> float:
         if self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time:
             prev_rt = self.owner.camConfig.rt_speed
-            self.owner.camConfig.rt_speed = min(float(self.owner.camConfig.rt_speed) * SPEED_STEP, 128.0)
+            self.owner.camConfig.rt_speed = min(
+                float(self.owner.camConfig.rt_speed) * SPEED_STEP, 128.0
+            )
             if prev_rt < 0.99 and self.owner.camConfig.rt_speed > 1.0:
                 self.owner.camConfig.rt_speed = 1.0
             now = time.monotonic()
@@ -731,7 +786,9 @@ class PlaybackController:
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
             prev_tgt = self.owner.camConfig.target_fps
-            self.owner.camConfig.target_fps = min(float(self.owner.camConfig.target_fps) * SPEED_STEP, 320.0)
+            self.owner.camConfig.target_fps = min(
+                float(self.owner.camConfig.target_fps) * SPEED_STEP, 320.0
+            )
             if prev_tgt < 19.9 and self.owner.camConfig.target_fps > 20.0:
                 self.owner.camConfig.target_fps = 20.0
             fps = max(0.001, float(self.owner.camConfig.target_fps))
@@ -742,7 +799,9 @@ class PlaybackController:
     def _on_speed_down(self, curr_idx: int, t) -> float:
         if self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time:
             prev_rt = self.owner.camConfig.rt_speed
-            self.owner.camConfig.rt_speed = max(float(self.owner.camConfig.rt_speed) * SPEED_STEP_INV, 0.01)
+            self.owner.camConfig.rt_speed = max(
+                float(self.owner.camConfig.rt_speed) * SPEED_STEP_INV, 0.01
+            )
             if prev_rt > 1.01 and self.owner.camConfig.rt_speed < 1.0:
                 self.owner.camConfig.rt_speed = 1.0
             now = time.monotonic()
@@ -754,7 +813,9 @@ class PlaybackController:
                 wall_start = now - (t[curr_idx] - t0) / rs
         else:
             prev_tgt = self.owner.camConfig.target_fps
-            self.owner.camConfig.target_fps = max(float(self.owner.camConfig.target_fps) * SPEED_STEP_INV, 0.1)
+            self.owner.camConfig.target_fps = max(
+                float(self.owner.camConfig.target_fps) * SPEED_STEP_INV, 0.1
+            )
             if prev_tgt > 20.1 and self.owner.camConfig.target_fps < 20.0:
                 self.owner.camConfig.target_fps = 20.0
             fps = max(0.001, float(self.owner.camConfig.target_fps))
@@ -766,16 +827,24 @@ class PlaybackController:
         self.owner.camConfig.start_export_idx = curr_idx
         if self.owner.camConfig.end_export_idx < self.owner.camConfig.start_export_idx:
             self.owner.camConfig.end_export_idx = self.owner.camConfig.start_export_idx + 1
-        self.owner.exportStartFrame.configure(text=f"Start Frame: {self.owner.camConfig.start_export_idx}")
-        self.owner.exportEndFrame.configure(text=f"End Frame: {self.owner.camConfig.end_export_idx}")
+        self.owner.exportStartFrame.configure(
+            text=f"Start Frame: {self.owner.camConfig.start_export_idx}"
+        )
+        self.owner.exportEndFrame.configure(
+            text=f"End Frame: {self.owner.camConfig.end_export_idx}"
+        )
         self.owner.saveToCache()
 
     def _on_mark_end(self, curr_idx: int) -> None:
         self.owner.camConfig.end_export_idx = curr_idx
         if self.owner.camConfig.end_export_idx < self.owner.camConfig.start_export_idx:
             self.owner.camConfig.end_export_idx = max(0, self.owner.camConfig.end_export_idx - 1)
-        self.owner.exportStartFrame.configure(text=f"Start Frame: {self.owner.camConfig.start_export_idx}")
-        self.owner.exportEndFrame.configure(text=f"End Frame: {self.owner.camConfig.end_export_idx}")
+        self.owner.exportStartFrame.configure(
+            text=f"Start Frame: {self.owner.camConfig.start_export_idx}"
+        )
+        self.owner.exportEndFrame.configure(
+            text=f"End Frame: {self.owner.camConfig.end_export_idx}"
+        )
         self.owner.saveToCache()
 
     def _on_adjust_offset(self, delta: float) -> None:

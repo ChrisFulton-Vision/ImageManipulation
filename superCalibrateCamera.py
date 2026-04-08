@@ -15,9 +15,6 @@ from pathlib import Path
 import customtkinter as ctk
 import cv2
 
-from support.mathHelpers.twoD_to_threeD import solveQnP
-from support.mathHelpers.quaternions import Quaternion as q, mat2quat
-
 from support.core.enums import ExportQuality, ImageKernel, ImageSource
 
 import support.gui.CTKCamFilepathPage as Filepath_page
@@ -34,21 +31,17 @@ from support.io.my_logging import LOG
 from support.io.BatchController import BatchController
 
 from support.vision.calibration import Calibration
-from support.vision.draw_circle_and_mask import dim_except_circle
-from support.vision.vimba_controller import VimbaController as VimbaCam, HAVE_VMBPY
+from support.vision.vimba_controller import VimbaController as VimbaCam
 from support.vision.fisheye_to_cubemap import (
     DEFAULT_CUBEMAP_FACES,
     DEFAULT_CUBEMAP_LAYOUT,
     DEFAULT_CUBEMAP_FACESIZE,
     FisheyeCubemapManager)
 
-from support.runtime.fg_singleTarget import (
-    build_factor_graph_output,
-    factor_graph_projection_matrix,
-    run_factor_graph_step,
-)
-from support.runtime.fg_singleTarget import build_hyper_focus_plan
+from support.runtime.frame_processor import FrameProcessor
 from support.runtime.PlaybackController import PlaybackController
+from support.runtime.pose_runtime import PoseRuntime
+from support.runtime.stream_runner import StreamRunner
 
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text, med_text, med_thick, lrg_thick
@@ -96,6 +89,7 @@ class CameraGui(ctk.CTkFrame):
         self._playback_allowed = None
         self.curr_r_V_d = None
         self.curr_r_T_d = None
+        self.last_fg_output = None
 
         self.gpu_slider = None
 
@@ -288,6 +282,10 @@ class CameraGui(ctk.CTkFrame):
         self.filepath_page = Filepath_page.Filepath_page(master,
                                                          controller=self)
 
+        self.yolo_output_type = YoloOutput
+        self.frame_processor = FrameProcessor(self)
+        self.pose_runtime = PoseRuntime(self)
+        self.stream_runner = StreamRunner(self)
         self.playback_controller = PlaybackController(self)
         self.batch_controller = BatchController(self)
 
@@ -347,7 +345,7 @@ class CameraGui(ctk.CTkFrame):
             t = self._thread
             if t is not None and t.is_alive():
                 try:
-                    root.after(50, _poll_worker_then_close)
+                    root.after(50, _poll_worker_then_close)  # type: ignore[call-arg]
                 except tk.TclError:
                     pass
                 return
@@ -549,7 +547,7 @@ class CameraGui(ctk.CTkFrame):
             enum_type = type(default)
             try:
                 return enum_type(raw_val)
-            except Exception:
+            except (TypeError, ValueError):
                 LOG.warning(
                     "Failed to parse enum arg '%s' from cached value %r; using default %r",
                     spec.name, raw_val, default
@@ -566,10 +564,10 @@ class CameraGui(ctk.CTkFrame):
                 return float(raw_val)
             if isinstance(default, str):
                 return str(raw_val)
-        except Exception:
+        except TypeError as e:
             LOG.warning(
-                "Failed to parse arg '%s' from cached value %r; using default %r",
-                spec.name, raw_val, default
+                "Failed to parse arg '%s' from cached value %r; using default %r. \nError: %s",
+                spec.name, raw_val, default, e
             )
             return default
 
@@ -616,34 +614,22 @@ class CameraGui(ctk.CTkFrame):
                 )
             if not bool(getattr(self.camConfig, "dp_gpu", False)):
                 self.gpu_slider.set(0.0)
-        except Exception:
+        except TypeError:
             pass
 
-        try:
-            if self.exportStartFrame is not None:
-                self.exportStartFrame.configure(text=f"Start Frame: {self.camConfig.start_export_idx}")
-            if self.exportEndFrame is not None:
-                self.exportEndFrame.configure(text=f"End Frame: {self.camConfig.end_export_idx}")
-        except Exception:
-            pass
+        if self.exportStartFrame is not None:
+            self.exportStartFrame.configure(text=f"Start Frame: {self.camConfig.start_export_idx}")
+        if self.exportEndFrame is not None:
+            self.exportEndFrame.configure(text=f"End Frame: {self.camConfig.end_export_idx}")
 
-        try:
-            if hasattr(self, "filepath_page") and self.filepath_page is not None:
-                self.filepath_page.sync_labels()
-        except Exception:
-            pass
+        if hasattr(self, "filepath_page") and self.filepath_page is not None:
+            self.filepath_page.sync_labels()
 
-        try:
-            if hasattr(self, "playback_controller") and self.playback_controller is not None:
-                self.playback_controller.update_playback_menu()
-        except Exception:
-            pass
+        if hasattr(self, "playback_controller") and self.playback_controller is not None:
+            self.playback_controller.update_playback_menu()
 
-        try:
-            if hasattr(self, "exportQualityCombo") and self.exportQualityCombo is not None:
-                self.exportQualityCombo.set(self.camConfig.export_quality.value)
-        except Exception:
-            pass
+        if hasattr(self, "exportQualityCombo") and self.exportQualityCombo is not None:
+            self.exportQualityCombo.set(self.camConfig.export_quality.value)
 
         self.saveToCache()
 
@@ -670,7 +656,7 @@ class CameraGui(ctk.CTkFrame):
         """Reload HUD attitude/log data from the configured source path."""
         if self.hud_marker is not None:
             self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-            self.load_offset_csv(self.camConfig.hud_data_filepath)
+            self.playback_controller.load_time_offset(self.camConfig.hud_data_filepath)
         self.saveToCache()
 
     def updateYOLOModel(self):
@@ -902,7 +888,6 @@ class CameraGui(ctk.CTkFrame):
     def populate_idsTimes(self, directory):
         self.playback_controller.populate_ids_times(directory)
 
-
     def _window_is_open(self) -> bool:
         return self.playback_controller.window_is_open()
 
@@ -911,13 +896,9 @@ class CameraGui(ctk.CTkFrame):
         self.last_image = None
         self.curr_frame_gray = None
 
-        try:
-            self.pauseCache.clear()
-        except Exception:
-            pass
-
         if reset_fg:
             self.FG = None
+            self.last_fg_output = None
             self.last_time_update = 0.0
             self.curr_FG_pixel = (400, 400)
 
@@ -951,14 +932,14 @@ class CameraGui(ctk.CTkFrame):
         self.stream_running_var.set(False)
         try:
             self.threadStopper.set()
-        except Exception:
+        except AttributeError:
             pass
 
     def startStreamOff(self):
         # UI thread only signals stop. The worker owns stream/window teardown.
         try:
             self.threadStopper.set()
-        except Exception:
+        except AttributeError:
             pass
 
         self.showWindow = False
@@ -968,185 +949,30 @@ class CameraGui(ctk.CTkFrame):
         if self.vc is not None and self.vc.isOpened():
             try:
                 self.vc.release()
-            except Exception:
+            except cv2.error:
                 pass
             self.vc = None
 
     def run_detectSingleImage(self):
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        frame = cv2.imread(str(Path(self.camConfig.imageFilepath)))
-        while (not self.threadStopper.is_set()
-               and self._window_is_open()
-               and self.showWindow):
-
-            self.analyze_image(frame)
-
-            key = cv2.waitKey(1)
-            if key == 27:
-                self.threadStopper.set()
-                break
-
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass
-        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
+        self.stream_runner.run_detect_single_image()
 
     def run(self):
-
-        if self.camConfig.imageSource == ImageSource.Camera_Stream:
-            self.run_video_stream()
-        elif self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.run_folder_reader()
-        elif self.camConfig.imageSource == ImageSource.Static_Image:
-            self.run_detectSingleImage()
+        self.stream_runner.run()
 
     def queue_live_vimba_update(self, settings: dict[str, Any]) -> bool:
         """
         Thread-safe: UI calls this to request a live camera change.
         Returns True if the request was queued for a running Vimba stream.
         """
-        if not bool(getattr(self.camConfig, "use_vimba", False)):
-            return False
-        if not bool(self.stream_running_var.get()):
-            return False
+        return self.stream_runner.queue_live_vimba_update(settings)
 
-        self.vimbaCam.live_update(settings)
-
-        return True
-
-    def run_vimba_stream(self, camConfig):
-        if not HAVE_VMBPY:
-            LOG.error("VmbPy is not installed or could not be imported.")
-            self.after(0, self._on_worker_exit)
-            return
-
-        def handler(cam, stream, frame):
-            if self.threadStopper.is_set() or not self.showWindow:
-                try:
-                    cam.queue_frame(frame)
-                except Exception:
-                    pass
-                return
-
-            try:
-                self.vimbaCam.update_frame(frame,
-                                           self.camConfig.vimba_profile)
-
-            finally:
-                try:
-                    cam.queue_frame(frame)
-                except Exception:
-                    pass
-
-        try:
-            cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-
-            with self.vimbaCam.vmbSystem_getInstance() as vmb:
-                cam = self.vimbaCam.select_vimba_camera(vmb,
-                                                        self.camConfig.vimba_camera_id)
-
-                with cam:
-                    self.vimbaCam.configure_stream(cam, self.camConfig)
-
-                    try:
-                        self.vimbaCam.start_stream(
-                            handler,
-                            self.camConfig.vimba_profile)
-
-                        while (not self.threadStopper.is_set()
-                               and self.showWindow
-                               and not self.making_gifOrVid):
-
-                            frame, img_time = self.vimbaCam.update_stream(self.camConfig)
-
-                            if frame is not None:
-                                self.curr_frame = frame
-                                self.analyze_image(frame, img_time=img_time)
-
-                            key = cv2.waitKey(1)
-                            if key == 27:
-                                self.threadStopper.set()
-                                self.showWindow = False
-                                break
-
-                            if not self._window_is_open():
-                                self.threadStopper.set()
-                                self.showWindow = False
-                                break
-
-                    finally:
-                        self.vimbaCam.stop_stream()
-
-        except Exception as e:
-            LOG.exception(f"Vimba stream failed: {e}")
-
-        finally:
-            self.vimbaCam.stop_lock()
-
-            try:
-                cv2.destroyWindow(self.windowName)
-            except cv2.error:
-                pass
-
-            self.after(0, self._on_worker_exit)
+    def run_vimba_stream(self):
+        self.stream_runner.run_vimba_stream()
 
     def run_video_stream(self):
-        if bool(getattr(self.camConfig, "use_vimba", False)):
-            self.run_vimba_stream(self.camConfig)
-            return
+        self.stream_runner.run_video_stream()
 
-        self.vc = cv2.VideoCapture(self.camConfig.cam_index, cv2.CAP_DSHOW)
-        self.vc.set(cv2.CAP_PROP_FPS, 60)
-
-        cv2.namedWindow(self.windowName, cv2.WINDOW_NORMAL)
-        rval, self.curr_frame = self.vc.read()
-        if rval:
-            cv2.resizeWindow(self.windowName, self.curr_frame.shape[1], self.curr_frame.shape[0])
-            self.lastHeight = self.curr_frame.shape[0]
-            self.lastWidth = self.curr_frame.shape[1]
-
-        stop_display_time = None
-
-        while (rval and not self.threadStopper.is_set() and
-               self.showWindow and not self.making_gifOrVid):
-            rval, frame = self.vc.read()
-
-            if stop_display_time is not None:
-                self._draw_chessboard_state(frame)
-
-            self.analyze_image(frame)
-            key = cv2.waitKey(1)
-
-            if key == 27:
-                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                self.threadStopper.set()
-                break
-
-            new_time = self._handle_chessboard_hotkeys(key)
-            if new_time is not None:
-                stop_display_time = new_time
-
-            if stop_display_time is not None and time.monotonic() > stop_display_time:
-                stop_display_time = None
-
-            if not self._window_is_open():
-                self.after(0, self.filepath_page.toggle_stream)  # type: ignore[call-arg]
-                self.threadStopper.set()
-                break
-
-        if self.vc is not None and self.vc.isOpened():
-            self.vc.release()
-            self.vc = None
-
-        try:
-            cv2.destroyWindow(self.windowName)
-        except cv2.error:
-            pass
-
-        self.after(0, self._on_worker_exit)  # type: ignore[call-arg]
-
-    def _on_worker_exit(self):
+    def on_worker_exit(self):
         self._thread = None
         self.showWindow = False
         self.stream_running_var.set(False)
@@ -1297,69 +1123,16 @@ class CameraGui(ctk.CTkFrame):
                       name=None,
                       display_in_realtime=True,
                       box_around=False) -> NDArray | None:
-
-        """Run the queued processing pipeline on a frame and optionally display it.
-
-        Creates a per-frame context object, applies enabled image-processing
-        steps in order, adds fixed overlays, and either displays the result or
-        returns a processed image buffer for export.
-        """
-
-        if frame is None or frame.size == 0:
-            return
-
-        ctx = GuiQueue.FrameCtx(img_time=img_time,
-                                name=name,
-                                display_in_realtime=display_in_realtime)
-
-        self.pnpResult = None
-        self.qnpResult = None
-        self.curr_frame_gray = None
-
-        markup_frame = self.markup_frame
-        # np.copyto is faster (doesn't reallocate), but requires destination to match shape
-        if markup_frame is None or markup_frame.shape != frame.shape:
-            markup_frame = frame.copy()
-        else:
-            np.copyto(markup_frame, frame)
-
-        ######################################################
-        for func, args in self.list_of_image_process_functors:
-            step_args = args if isinstance(args, dict) else {}
-            if not bool(step_args.get("state", True)):
-                continue
-            func(frame, markup_frame, ctx, step_args)
-
-        if box_around and not self.screenshot_impending:
-            self.draw_boxAround(frame, markup_frame, ctx, ())
-
-        if self.camConfig.imageSource == ImageSource.Stream_from_Folder:
-            self.draw_name(frame, markup_frame, ctx, ())
-            if not self.screenshot_impending and not self.making_gifOrVid:
-                self.draw_playbackStats(frame, markup_frame, ctx, ())
-
-        self.draw_time(frame, markup_frame, ctx, ())
-
-        if display_in_realtime:
-            self.cleanup(markup_frame, )
-        else:
-            return np.ascontiguousarray(markup_frame).copy()
-        ######################################################
+        return self.frame_processor.analyze_image(
+            frame,
+            img_time=img_time,
+            name=name,
+            display_in_realtime=display_in_realtime,
+            box_around=box_around,
+        )
 
     def cleanup(self, markupFrame, name=None):
-
-        self.potentialResize(markupFrame)
-
-        cv2.imshow(self.windowName if name is None else name,
-                   cv2.resize(markupFrame, (self.lastWidth, self.lastHeight)))
-
-        if ((self.recording and time.time() - self.lastImageTime > self.camConfig.secondsBetweenImages) or
-                self.screenshot_impending):
-            cv2.imwrite(os.path.join(self.camConfig.saveFolder, str(self.img_idx) + '.png'), markupFrame)
-            self.img_idx += 1
-            self.lastImageTime = time.time()
-            self.recordButton.configure(text=f'Saving Imagery: #{self.img_idx}')
-            self.screenshot_impending = False
+        self.frame_processor.cleanup(markupFrame, name=name)
 
     @staticmethod
     def parse_args(args: dict, obj, *, ignore_unknown=True):
@@ -1408,20 +1181,14 @@ class CameraGui(ctk.CTkFrame):
 
     @staticmethod
     def draw_time(frame, markupFrame, ctx: GuiQueue.FrameCtx, args):
-        if ctx.img_time is None or ctx.img_time > 1_000_000:  # Alvium
-            return
-
-        time_str = f"Flight Time: {ctx.img_time:.2f}"  # + 173.11338 - 11.658461:.2f}"
-        from support.viz.HUD_draw import draw_time_on_image
-        draw_time_on_image(markupFrame, time_str)
+        FrameProcessor.draw_time(frame, markupFrame, ctx, args)
 
     @staticmethod
     def draw_name(frame,
                   markupFrame,
                   ctx: GuiQueue.FrameCtx,
                   args) -> None:
-        from support.viz.HUD_draw import draw_name_on_image
-        draw_name_on_image(os.path.basename(ctx.name), markupFrame)
+        FrameProcessor.draw_name(frame, markupFrame, ctx, args)
 
     def draw_HUD(self, frame: NDArray,
                  markupFrame: NDArray,
@@ -1451,12 +1218,12 @@ class CameraGui(ctk.CTkFrame):
         if opts.store_attitude:
             self.own_attitude = attitude
 
-    def draw_boxAround(self, frame,
+    @staticmethod
+    def draw_boxAround(frame,
                        markupFrame,
                        ctx: GuiQueue.FrameCtx,
                        args) -> None:
-        h, w, _ = markupFrame.shape
-        cv2.rectangle(markupFrame, (0, 0), (w - 1, h - 1), clr.HUD_YELLOW, med_thick(h))
+        FrameProcessor.draw_box_around(frame, markupFrame, ctx, args)
 
     def draw_chessboard(self, frame: NDArray,
                         markupFrame: NDArray,
@@ -1535,21 +1302,7 @@ class CameraGui(ctk.CTkFrame):
                         small_text(markupFrame.shape[0]), color, 2)
 
     def potentialResize(self, markupFrame):
-        if not self._window_is_open() or markupFrame.shape[0] == 0:
-            return
-        x, y, width, height = cv2.getWindowImageRect(self.windowName)
-        aspectRatio = markupFrame.shape[1] / markupFrame.shape[0]
-        if not self._window_is_open():
-            return
-
-        if not self.lastHeight == height and height != 0:
-            cv2.resizeWindow(self.windowName, int(height * aspectRatio), height)
-            self.lastHeight = height
-            self.lastWidth = int(height * aspectRatio)
-        elif not self.lastWidth == width and width != 0:
-            cv2.resizeWindow(self.windowName, width, int(width / aspectRatio))
-            self.lastWidth = width
-            self.lastHeight = int(width / aspectRatio)
+        self.frame_processor.potential_resize(markupFrame)
 
     def print_pnp_results(self):
         np.set_printoptions(precision=5, threshold=sys.maxsize, suppress=True)
@@ -1723,7 +1476,8 @@ class CameraGui(ctk.CTkFrame):
 
         ctx.resize.set(scale)
 
-    def image_filter_arg_specs(self, args):
+    @staticmethod
+    def image_filter_arg_specs(args):
         filt = args.get("Filter", ImageKernel.Unfiltered)
 
         specs = [
@@ -1776,199 +1530,21 @@ class CameraGui(ctk.CTkFrame):
                         markupFrame: NDArray,
                         ctx: GuiQueue.FrameCtx,
                         args) -> None:
-        from support.vision.aprilTag_detection_and_aligment import (
-            detect_apriltags_refined,
-            draw_apriltag_detections,
-            parse_apriltag_args,
-        )
-
-        opts = parse_apriltag_args(args)
-
-        if self.detector is None:
-            self.createDetector()
-
-        result = detect_apriltags_refined(
-            detector=self.detector,
-            markup_frame=markupFrame,
-            scale=opts.scale,
-        )
-
-        self.centers = result.centers
-        self.detectIDS = result.ids
-
-        if not result.ids:
-            return
-
-        if opts.inpaint:
-            from support.vision.aprilTag_detection_and_aligment import inpaint_apriltags
-            inpaint_apriltags(
-                markup_frame=markupFrame,
-                gray_small=result.small_gray,
-                corners_small=result.corners_small,
-            )
-        else:
-            draw_apriltag_detections(
-                markup_frame=markupFrame,
-                refined_corners_per_marker=result.refined_corners_per_marker,
-                ids=result.ids,
-            )
-
-        if opts.pnp:
-            self.pnp3DTruthPoints(frame, markupFrame, ctx, ())
-
-        if opts.qnp:
-            self.qnp3DTruthPoints(frame, markupFrame, ctx, ())
+        self.pose_runtime.detect_april_tags(frame, markupFrame, ctx, args)
 
     def pnp3DTruthPoints(self,
                          frame: NDArray,
                          markupFrame: NDArray,
                          ctx: GuiQueue.FrameCtx,
                          args) -> None:
-
-        if self.ThreeDTruthPoints is None:
-            self.loadTruthPoints()
-
-        if self.centers is not None and len(self.centers) >= 6:
-            truthPoints = deepcopy(self.ThreeDTruthPoints.truthPoints)
-            points = []
-            distParams = np.zeros((5,))  # use image undistort instead
-
-            removeIDs = []
-            for idx, detectID in enumerate(self.detectIDS):
-                try:
-                    points.append(truthPoints[str(detectID[0])])
-                except KeyError:
-                    removeIDs.append(idx)
-
-            centers = deepcopy(self.centers)
-            for idx in reversed(removeIDs):
-                centers = np.delete(centers, idx, axis=0)
-            points = np.array(points)
-
-            if len(points) < 6:
-                return
-
-            ret, rvec, tvec, *_ = cv2.solvePnPRansac(objectPoints=points,
-                                                     imagePoints=centers,
-                                                     cameraMatrix=self.calibration.getCameraMatrix(),
-                                                     distCoeffs=distParams,
-                                                     flags=cv2.SOLVEPNP_ITERATIVE)
-
-            if ret:
-                projectedPoints_orig, _ = cv2.projectPoints(self.ThreeDTruthPoints.getTruthPointsNumpy(),
-                                                            rvec=rvec,
-                                                            tvec=tvec,
-                                                            cameraMatrix=self.calibration.getCameraMatrix(),
-                                                            distCoeffs=distParams)
-
-                self.plotOnImg(markupFrame, projectedPoints_orig[:, 0, :].astype(int),
-                               list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), clr.LIGHTBLUE)
-
-                # quatCV = q.from_rodrigues(rvec)
-                # tCV = np.squeeze(tvec)
-                quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
-
-                self.pnpResult = (quatPnP, vectPnP)
-                orient_text = 'Orientation (quat) From Truth Points: ' + format(quatPnP, 'ijk.6f')
-                (txt_w, txt_h), _ = cv2.getTextSize(orient_text, cv2.FONT_HERSHEY_SIMPLEX,
-                                                    small_text(markupFrame.shape[0]),
-                                                    4)
-
-                cv2.putText(markupFrame, orient_text,
-                            (50, txt_h + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            small_text(markupFrame.shape[0]),
-                            clr.BLACK, 4)
-                cv2.putText(markupFrame, orient_text,
-                            (50, txt_h + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            small_text(markupFrame.shape[0]),
-                            clr.LIGHTBLUE, 2)
-                cv2.putText(markupFrame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
-                            (50, 2 * txt_h + 15), cv2.FONT_HERSHEY_SIMPLEX,
-                            small_text(markupFrame.shape[0]),
-                            clr.BLACK, 4)
-                cv2.putText(markupFrame, 'Location From Truth Frame: ' + np.array2string(vectPnP),
-                            (50, 2 * txt_h + 15), cv2.FONT_HERSHEY_SIMPLEX,
-                            small_text(markupFrame.shape[0]),
-                            clr.LIGHTBLUE, 2)
-                # LOG.info(f"SE3,Aftr Cam in Truth Frame: \n{quatPnP.T.to_SE3_given_position(quatPnP.T * -vectPnP)}")
-        return
+        self.pose_runtime.pnp_3d_truth_points(frame, markupFrame, ctx, args)
 
     def qnp3DTruthPoints(self,
                          frame: NDArray,
                          markupFrame: NDArray,
                          ctx: GuiQueue.FrameCtx,
                          args) -> None:
-
-        if self.ThreeDTruthPoints is None:
-            self.loadTruthPoints()
-
-        if self.centers is not None and len(self.centers) >= 6:
-            truthPoints = deepcopy(self.ThreeDTruthPoints.truthPoints)
-
-            points = []
-            # distParams = np.zeros((5,))  # use image undistort instead
-
-            removeIDs = []
-            for idx, detectID in enumerate(self.detectIDS):
-                try:
-                    points.append(truthPoints[str(detectID[0])])
-                except KeyError:
-                    removeIDs.append(idx)
-
-            centers = deepcopy(self.centers)
-            for idx in reversed(removeIDs):
-                centers = np.delete(centers, idx, axis=0)
-            points = np.array(points)
-
-            if len(points) < 6:
-                return
-
-            quat, vect, *_ = solveQnP(points, centers, self.calibration, True)
-            xyz_proj = quat * self.ThreeDTruthPoints.getTruthPointsNumpy() + vect
-
-            q_aftr_from_cv = mat2quat(np.array([[0., 0., 1.],
-                                                [-1., 0., 0.],
-                                                [0., -1., 0.]], float))
-
-            vect = q_aftr_from_cv * vect
-
-            quat = q_aftr_from_cv * quat
-
-            us_vs_s_proj = np.zeros((xyz_proj.shape[0], 2))
-            us_vs_s_proj[:, 0] = self.calibration.fx * xyz_proj[:, 0] / xyz_proj[:, 2] + self.calibration.cx
-            us_vs_s_proj[:, 1] = self.calibration.fy * xyz_proj[:, 1] / xyz_proj[:, 2] + self.calibration.cy
-
-            self.plotOnImg(markupFrame, us_vs_s_proj.astype(int),
-                           list(self.ThreeDTruthPoints.getTruthPointsDict().keys()), (255, 255, 255))
-            self.qnpResult = (quat, vect)
-
-            orient_text = 'Orientation (quat) From Truth Points: ' + format(quat, 'ijk.6f')
-            pos_text = 'Location From Truth Frame: ' + np.array2string(vect)
-            (txt_w, txt_h), _ = cv2.getTextSize(orient_text, cv2.FONT_HERSHEY_SIMPLEX,
-                                                small_text(markupFrame.shape[0]),
-                                                4)
-            cv2.putText(markupFrame, orient_text,
-                        (50, 3 * txt_h + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]),
-                        clr.BLACK, 4)
-            cv2.putText(markupFrame, orient_text,
-                        (50, 3 * txt_h + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]),
-                        clr.LIGHTBLUE, 2)
-            cv2.putText(markupFrame, pos_text, (50, 4 * txt_h + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]),
-                        clr.BLACK, 4)
-            cv2.putText(markupFrame, pos_text, (50, 4 * txt_h + 25),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        small_text(markupFrame.shape[0]),
-                        clr.LIGHTBLUE, 2)
-
-        return
+        self.pose_runtime.qnp_3d_truth_points(frame, markupFrame, ctx, args)
 
     def detectHorizon(self, frame: NDArray,
                       markupFrame: NDArray,
@@ -2016,266 +1592,36 @@ class CameraGui(ctk.CTkFrame):
         return
 
     def check_above_horizon(self, pt):
-        if self.horizon_line is None:
-            return True
-
-        x1, y1, x2, y2 = self.horizon_line
-        return np.cross(np.array([x2 - x1, y2 - y1]), np.array([pt[0] - x1, pt[1] - y1])) < 0
+        return self.pose_runtime.check_above_horizon(pt)
 
     def hyper_focus(self,
                     markupFrame: NDArray,
                     ctx: GuiQueue.FrameCtx) -> None:
-
-        plan = build_hyper_focus_plan(
-            ctx=ctx,
-            radius=float(self.radius),
-            min_radius=float(self.min_radius),
-            frame_shape=markupFrame.shape,
-        )
-
-        if plan is None:
-            return
-
-        if plan.next_radius is not None:
-            self.radius = float(plan.next_radius)
-
-        if plan.next_min_radius is not None:
-            self.min_radius = float(plan.next_min_radius)
-
-        if self.yoloSession is not None and plan.desired_yolo_conf is not None:
-            self.yoloSession.conf = float(plan.desired_yolo_conf)
-
-        self._apply_hyper_focus_plan(markupFrame, plan)
+        self.pose_runtime.hyper_focus(markupFrame, ctx)
 
     @staticmethod
     def _apply_hyper_focus_plan(markupFrame: NDArray, plan) -> None:
-        if plan is None or plan.center is None:
-            return
-
-        center = (int(plan.center[0]), int(plan.center[1]))
-
-        for p in plan.passes:
-            dim_except_circle(markupFrame,
-                              center,
-                              x_axes=float(p.x_axes),
-                              y_axes=float(p.y_axes),
-                              dim_factor=float(p.dim_factor))
+        PoseRuntime.apply_hyper_focus_plan(markupFrame, plan)
 
     def run_yolo(self,
                  frame: NDArray,
                  markupFrame: NDArray,
                  ctx: GuiQueue.FrameCtx,
                  args) -> None:
-        """
-        Runs YOLO on subsequent images. If the yolo model is single featured, and the object is estimated less than
-        100 meters away, then it updates this class's estimation of the solution.
-        :return: None, but does adjust
-        """
+        self.pose_runtime.run_yolo(frame, markupFrame, ctx, args)
 
-        opts = self.parse_args(args, GuiQueue.YoloOpts())
-
-        from support.vision import yolo
-        if self.yoloSession is None:
-            self.yoloSession = yolo.YOLO()
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
-            self.yoloSession.set_calibration(self.calibration)
-            self.yoloSession.iou = self.camConfig.yolo_iou
-            self.yoloSession.conf = self.camConfig.yolo_conf
-
-        import support.viz.draw_pnp_qnp as pnpDrw
-        if self.pnpDrawer is None:
-            self.pnpDrawer = pnpDrw.pnp_qnp_draw()
-        # TODO Clean-up bias tracking logic, second input here
-        output = self.yoloSession.inferOnImage(frame,
-                                               False)
-
-        algos = pnpDrw.twoToThreeSelectedAlgorithms()
-        algos.use_pnp = opts.want_pnp
-        algos.use_qnp = opts.want_qnp
-        algos.use_wqnp = opts.want_wqnp
-
-        scale = ctx.resize.get_or(1.0)
-
-        pose_output = self.pnpDrawer.markUpImage(
-            image=markupFrame,
-            output=output,
-            markup_is_undistorted=ctx.undistorted.get_or(False),
-            calibration=self.calibration,
-            conf=self.camConfig.yolo_conf,
-            iou=self.camConfig.yolo_iou,
-            yoloSize=self.yoloSession.yoloSize,
-            idsNamesLocs=self.yoloSession.reader.idsNamesLocs,
-            usedAlgos=algos,
-            originalSize=frame.shape[:2],
-            circles_not_features=opts.feature_circles,
-            img_scale=scale
-        )
-
-        if pose_output is not None:
-            self.pnpResult = {
-                "rvec": pose_output.pnp_rvec,
-                "tvec": pose_output.pnp_tvec,
-                "object_points": pose_output.object_points,
-                "image_points": pose_output.image_points,
-                "class_ids": pose_output.class_ids,
-            } if pose_output.pnp_rvec is not None and pose_output.pnp_tvec is not None else None
-
-            self.qnpResult = {
-                "q": pose_output.qnp_q,
-                "tvec": pose_output.qnp_tvec,
-                "object_points": pose_output.object_points,
-                "image_points": pose_output.image_points,
-                "class_ids": pose_output.class_ids,
-            } if pose_output.qnp_q is not None and pose_output.qnp_tvec is not None else None
-        else:
-            self.pnpResult = None
-            self.qnpResult = None
-
-        centers, boxes, scores, class_ids, img_time = output
-        last_yolo_center = None
-        last_bounding_box_size = None
-        last_yolo_3d_estimate = None
-        if len(centers) > 0 and self.yoloSession.reader.numClasses == 1:
-
-            best_idx = scores.index(max(scores))
-            img_yolo_x_correction = markupFrame.shape[0] / self.yoloSession.reader.imageSize
-            img_yolo_y_correction = markupFrame.shape[1] / self.yoloSession.reader.imageSize
-
-            last_bounding_box_size = ((boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
-                                      (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction)
-            last_yolo_center = (int(
-                centers[best_idx][0] * img_yolo_x_correction), int(
-                centers[best_idx][1] * img_yolo_y_correction))
-
-            self.calibration.scaleCalibration(markupFrame.shape[0])
-            K = self.calibration.getCameraMatrix()
-            # d = self.calibration.getDistortion()  # Presume undistorted image
-            twoD_points = np.array([last_yolo_center[0], last_yolo_center[1], 1.0]) * scale
-            dist_est = self.calibration.fx * 4.07 / (last_bounding_box_size[0])
-
-            if self.check_above_horizon(last_yolo_center):
-                last_yolo_3d_estimate = np.linalg.inv(K).dot(twoD_points) * dist_est
-                w, h, _ = markupFrame.shape
-                (txt_width, txt_height), base = cv2.getTextSize('I',
-                                                                cv2.FONT_HERSHEY_SIMPLEX,
-                                                                med_text(w), med_thick(h))
-                pad = int(0.3 * txt_height)
-                cv2.putText(markupFrame, 'BB-Width Solution',
-                            (pad, w - 2 * pad - txt_height),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            med_text(markupFrame.shape[0]), (50, 255, 255), med_thick(h))
-                cv2.putText(markupFrame,
-                            f'x:{last_yolo_3d_estimate[0]:+.3f}, y:{last_yolo_3d_estimate[1]:+.3f}, ' +
-                            f'z:{last_yolo_3d_estimate[2]:+.3f}',
-                            (pad, h - pad),
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(markupFrame.shape[0]), (50, 255, 255), med_thick(h))
-            else:
-                last_yolo_3d_estimate = None
-
-        ctx.yolo.set(YoloOutput(
-            last_bounding_box_size=last_bounding_box_size,
-            last_yolo_center=last_yolo_center,
-            last_yolo_3d_estimate=last_yolo_3d_estimate,
-            pose=pose_output
-        ))
-
-        if opts.factor_graph:
-            self.factor_graph(frame, markupFrame, ctx, opts.hyper_focus)
-
-    def _draw_factor_graph_overlay(self,
-                                   markupFrame: NDArray,
+    @staticmethod
+    def _draw_factor_graph_overlay(markupFrame: NDArray,
                                    fg_output,
                                    color) -> None:
-        if fg_output is None or fg_output.curr_FG_pixel is None:
-            return
-
-        pixel = (
-            int(fg_output.curr_FG_pixel[0]),
-            int(fg_output.curr_FG_pixel[1]),
-        )
-
-        h, w, _ = markupFrame.shape
-        size = int(0.025 * h)
-        thickness = lrg_thick(h)
-        text = 'Factor Graph Solution'
-        (_txt_width, txt_height), _base = cv2.getTextSize(
-            text,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            med_text(w),
-            thickness,
-        )
-        pad = int(0.3 * txt_height)
-        txt_height_perRow = txt_height + pad
-        loc = (pad, h - 4 * txt_height_perRow - pad)
-
-        cv2.circle(markupFrame, pixel, size, (0, 0, 0), thickness)
-        cv2.line(markupFrame,
-                 [pixel[0] + size, pixel[1]],
-                 [pixel[0] - size, pixel[1]],
-                 (0, 0, 0), thickness)
-        cv2.line(markupFrame,
-                 [pixel[0], pixel[1] + size],
-                 [pixel[0], pixel[1] - size],
-                 (0, 0, 0), thickness)
-
-        thickness = med_thick(h)
-        cv2.circle(markupFrame, pixel, size, color, thickness)
-        cv2.line(markupFrame,
-                 [pixel[0] + size, pixel[1]],
-                 [pixel[0] - size, pixel[1]],
-                 color, thickness)
-        cv2.line(markupFrame,
-                 [pixel[0], pixel[1] + size],
-                 [pixel[0], pixel[1] - size],
-                 color, thickness)
-
-        cv2.putText(markupFrame, text,
-                    loc, cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(markupFrame.shape[0]), (0, 0, 0), lrg_thick(h))
-        cv2.putText(markupFrame, text,
-                    loc, cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(markupFrame.shape[0]), color, med_thick(h))
+        PoseRuntime.draw_factor_graph_overlay(markupFrame, fg_output, color)
 
     def factor_graph(self,
                      frame: NDArray,
                      markupFrame: NDArray,
                      ctx: GuiQueue.FrameCtx,
                      hyper_focus: bool) -> None:
-
-        yolo = ctx.yolo.get_or()
-        color = clr.YELLOWGREEN if yolo is not None else clr.RED
-
-        R_wr = (
-            self.own_attitude.rotmat_wr()
-            if self.own_attitude is not None and self.own_attitude.valid
-            else None
-        )
-
-        self.FG, self.last_time_update, has_measurement, pred = run_factor_graph_step(
-            fg=self.FG,
-            yolo=yolo,
-            img_time=ctx.img_time,
-            last_time_update=self.last_time_update,
-            R_wr=R_wr,
-        )
-
-        if not has_measurement:
-            color = clr.RED
-
-        if pred is not None and pred.r_T_d is not None:
-            K = factor_graph_projection_matrix(
-                calibration=self.calibration,
-                markup_frame=markupFrame,
-                yolo=yolo,
-            )
-
-            fg_output = build_factor_graph_output(pred, K)
-            if fg_output is not None:
-                ctx.fg.set(fg_output)
-                self._draw_factor_graph_overlay(markupFrame, fg_output, color)
-
-        if hyper_focus:
-            self.hyper_focus(markupFrame, ctx)
+        self.pose_runtime.factor_graph(frame, markupFrame, ctx, hyper_focus)
 
     def phase_correlation(self,
                           frame: NDArray,
@@ -2307,15 +1653,7 @@ class CameraGui(ctk.CTkFrame):
 
     @staticmethod
     def _cv_pose_to_ours(R_cv: np.ndarray, t_cv: np.ndarray):
-        """Convert OpenCV camera pose to your convention (proper rotation)."""
-        S_MODEL = np.diag([1., -1., 1.])  # det = -1
-        C_OURS_TO_CV = np.array([[0., -1., 0.],
-                                 [0., 0., 1.],
-                                 [1., 0., 0.]], dtype=float)
-        C_CV_TO_OURS = C_OURS_TO_CV.T
-        R_ours = C_CV_TO_OURS @ R_cv @ S_MODEL
-        t_ours = C_CV_TO_OURS @ t_cv
-        return mat2quat(R_ours.T), t_ours
+        return PoseRuntime.cv_pose_to_ours(R_cv, t_cv)
 
     def run_folder_reader_profiled(self):
         from support.io.profiler import make_profile, print_stats

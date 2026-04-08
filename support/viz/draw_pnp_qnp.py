@@ -385,12 +385,14 @@ class pnp_qnp_draw:
                                                         med_text(w), med_thick(h))
         pad = int(0.3 * txt_height)
         txt_height_perRow = txt_height + pad
+        loc = (pad, h - 4 * txt_height_perRow - pad)
+
         cv2.putText(image, 'Direct Inference',
-                    (pad, h - 3 * txt_height_perRow - pad),
+                    loc,
                     cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(w), clr.BLACK, lrg_thick(h))
         cv2.putText(image, 'Direct Inference',
-                    (pad, h - 3 * txt_height_perRow - pad),
+                    loc,
                     cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(w), clr.LIGHTBLUE, med_thick(h))
 
@@ -439,7 +441,7 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'PNP: {tvec[0, 0]:+6.3f}, {tvec[1, 0]:+6.3f}, {tvec[2, 0]:+6.3f}',
+            title=f'PNP: {tvec[0, 0]:+6.3f}, {tvec[1, 0]:+6.3f}, {tvec[2, 0]:+6.3f} ({np.linalg.norm(tvec[:, 0]):6.3f})',
             rowIDX=idx,
             txt_scale=0.75,
             draw_as_circles=draw_as_circles,
@@ -481,7 +483,7 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
-            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f}',
+            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({np.linalg.norm(q_tvec):6.3f})',
             rowIDX=idx,
             txt_color=clr.ORANGE,
             draw_as_circles=draw_as_circles,

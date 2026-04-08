@@ -1,11 +1,11 @@
 from __future__ import annotations
-from typing import Callable, Optional, Protocol, Any
+from typing import Protocol, Any
 from support.io.camera_config import CameraConfig
 from support.viz.draw_pnp_qnp import pnp_qnp_draw
 from support.core.enums import ImageSource
 import support.viz.colors as clr
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, TclError
 from pathlib import Path
 from yaml import safe_load, dump
 import os
@@ -15,10 +15,12 @@ from support.io.my_logging import LOG
 
 try:
     from vmbpy import VmbSystem
+
     HAVE_VMBPY = True
 except ImportError:
     VmbSystem = None
     HAVE_VMBPY = False
+
 
 # This protocol class enforces typesafe appropriate usage of super-class functions
 # This list of functions is for things this page GUI does not control, but does update
@@ -160,7 +162,8 @@ class Filepath_page(ctk.CTkFrame):
         self._ensure_vimba_control_defaults()
         self.vimba_gain_auto_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_gain_auto", "Off")))
         self.vimba_gain_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_gain", 0.0)))
-        self.vimba_exposure_auto_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_exposure_auto", "Off")))
+        self.vimba_exposure_auto_var = ctk.StringVar(
+            value=str(getattr(self.ctrl.camConfig, "vimba_exposure_auto", "Off")))
         self.vimba_exposure_var = ctk.StringVar(value=str(getattr(self.ctrl.camConfig, "vimba_exposure_us", 10000.0)))
         self.vimba_status_text = ctk.StringVar(value="Alvium controls apply when the Vimba stream starts.")
 
@@ -220,10 +223,12 @@ class Filepath_page(ctk.CTkFrame):
         )
         self.vimba_profile_combo.grid(row=3, column=1, padx=5, pady=5, sticky='ew')
 
-        self.vimba_read_button = ctk.CTkButton(self.vimba_controls_frame, text="Read Camera", command=self.read_vimba_controls)
+        self.vimba_read_button = ctk.CTkButton(self.vimba_controls_frame, text="Read Camera",
+                                               command=self.read_vimba_controls)
         self.vimba_read_button.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
 
-        self.vimba_save_button = ctk.CTkButton(self.vimba_controls_frame, text="Save Settings", command=self.save_vimba_controls)
+        self.vimba_save_button = ctk.CTkButton(self.vimba_controls_frame, text="Save Settings",
+                                               command=self.save_vimba_controls)
         self.vimba_save_button.grid(row=4, column=1, padx=5, pady=5, sticky='ew')
 
         ctk.CTkLabel(self.vimba_controls_frame, textvariable=self.vimba_status_text, justify='left').grid(
@@ -418,8 +423,8 @@ class Filepath_page(ctk.CTkFrame):
 
     def _should_show_vimba_controls(self) -> bool:
         return (
-            self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream
-            and bool(getattr(self.ctrl.camConfig, "use_vimba", False))
+                self.ctrl.camConfig.imageSource == ImageSource.Camera_Stream
+                and bool(getattr(self.ctrl.camConfig, "use_vimba", False))
         )
 
     def _set_vimba_controls_enabled(self, enabled: bool):
@@ -427,45 +432,47 @@ class Filepath_page(ctk.CTkFrame):
         hot_state = 'normal'
 
         for widget_name in (
-            'vimba_gain_auto_combo',
-            'vimba_gain_entry',
-            'vimba_exposure_auto_combo',
-            'vimba_exposure_entry',
-            'vimba_save_button',
+                'vimba_gain_auto_combo',
+                'vimba_gain_entry',
+                'vimba_exposure_auto_combo',
+                'vimba_exposure_entry',
+                'vimba_save_button',
         ):
             widget = getattr(self, widget_name, None)
             if widget is None:
                 continue
             try:
                 widget.configure(state=hot_state)
-            except Exception:
+            except TclError:
                 pass
 
         # Keep camera-read disabled while running if you want to avoid contention
         cold_state = 'normal' if enabled else 'disabled'
         for widget_name in (
-            'vimba_read_button',
+                'vimba_read_button',
         ):
             widget = getattr(self, widget_name, None)
             if widget is None:
                 continue
             try:
                 widget.configure(state=cold_state)
-            except Exception:
+            except TclError:
                 pass
 
         self._refresh_vimba_manual_widgets()
 
     def _refresh_vimba_manual_widgets(self):
-        gain_state = 'normal' if self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get()) == 'Off' else 'disabled'
-        exp_state = 'normal' if self._normalize_vimba_auto_mode(self.vimba_exposure_auto_var.get()) == 'Off' else 'disabled'
+        gain_state = 'normal' if self._normalize_vimba_auto_mode(
+            self.vimba_gain_auto_var.get()) == 'Off' else 'disabled'
+        exp_state = 'normal' if self._normalize_vimba_auto_mode(
+            self.vimba_exposure_auto_var.get()) == 'Off' else 'disabled'
         try:
             self.vimba_gain_entry.configure(state=gain_state)
-        except Exception:
+        except TclError:
             pass
         try:
             self.vimba_exposure_entry.configure(state=exp_state)
-        except Exception:
+        except TclError:
             pass
 
     def _on_vimba_mode_changed(self):
@@ -521,11 +528,15 @@ class Filepath_page(ctk.CTkFrame):
 
         if live_applied:
             self.vimba_status_text.set(
-                f"Gain/exposure sent live. Profile '{self.ctrl.camConfig.vimba_profile}' will apply on next stream start."
+                "Gain/exposure sent live. "
+                f"Profile '{self.ctrl.camConfig.vimba_profile}' "
+                "will apply on next stream start."
             )
         else:
             self.vimba_status_text.set(
-                f"Alvium settings saved. Profile '{self.ctrl.camConfig.vimba_profile}' will apply on the next Vimba stream start."
+                "Alvium settings saved. "
+                f"Profile '{self.ctrl.camConfig.vimba_profile}' "
+                "will apply on the next Vimba stream start."
             )
 
         self._refresh_vimba_manual_widgets()
@@ -535,7 +546,7 @@ class Filepath_page(ctk.CTkFrame):
         for feature_name in feature_names:
             try:
                 feature = getattr(cam, feature_name)
-            except Exception:
+            except AttributeError:
                 feature = None
             if feature is not None:
                 return feature, feature_name
@@ -573,7 +584,7 @@ class Filepath_page(ctk.CTkFrame):
                         self.vimba_exposure_auto_var.set(self._normalize_vimba_auto_mode(exposure_auto_feat.get()))
                     if exposure_feat is not None:
                         self.vimba_exposure_var.set(str(exposure_feat.get()))
-        except Exception as e:
+        except (AttributeError, RuntimeError) as e:
             LOG.warning(f"Could not read Vimba camera controls: {e}")
             messagebox.showerror("Read Failed", f"Could not read Alvium controls.\n\n{e}")
             return
@@ -624,7 +635,8 @@ class Filepath_page(ctk.CTkFrame):
             finally:
                 self._suppress_camera_callback = False
 
-    def _probe_camera_choice(self, meta: dict[str, Any]) -> tuple[bool, str | None]:
+    @staticmethod
+    def _probe_camera_choice(meta: dict[str, Any]) -> tuple[bool, str | None]:
         backend = meta.get("backend")
 
         if backend == "opencv":
@@ -651,7 +663,7 @@ class Filepath_page(ctk.CTkFrame):
                     with cam:
                         pass
                 return True, None
-            except Exception as e:
+            except (AttributeError, RuntimeError) as e:
                 return False, f"Vimba camera could not be opened: {e}"
 
         return False, f"Unknown camera backend: {backend}"
@@ -669,7 +681,7 @@ class Filepath_page(ctk.CTkFrame):
                     "cam_index": int(camera_info.index),
                     "display_name": camera_info.name,
                 }
-        except Exception as e:
+        except (ImportError, cv2.error, OSError) as e:
             LOG.warning(f"Could not enumerate OpenCV cameras: {e}")
 
         # --- Vimba cameras ---
@@ -679,17 +691,17 @@ class Filepath_page(ctk.CTkFrame):
                     for cam in vmb.get_all_cameras():
                         try:
                             cam_id = cam.get_id()
-                        except Exception:
+                        except (AttributeError, RuntimeError):
                             cam_id = ""
 
                         try:
                             serial = cam.get_serial()
-                        except Exception:
+                        except (AttributeError, RuntimeError):
                             serial = ""
 
                         try:
                             name = cam.get_name()
-                        except Exception:
+                        except (AttributeError, RuntimeError):
                             name = cam_id or "Unknown Vimba Camera"
 
                         suffix = serial if serial else cam_id
@@ -701,7 +713,7 @@ class Filepath_page(ctk.CTkFrame):
                             "camera_serial": serial,
                             "display_name": name,
                         }
-            except Exception as e:
+            except (AttributeError, RuntimeError) as e:
                 LOG.warning(f"Could not enumerate Vimba cameras: {e}")
 
     @staticmethod
@@ -764,7 +776,8 @@ class Filepath_page(ctk.CTkFrame):
         if self.ctrl.camConfig.imageFilepath is None:
             initDir = str(Path(self.default_filepath).parent)
         else:
-            initDir = str(Path(self.ctrl.camConfig.imageFilepath).parent)  #os.path.normpath(self.camConfig.imageFilepath)
+            initDir = str(
+                Path(self.ctrl.camConfig.imageFilepath).parent)  #os.path.normpath(self.camConfig.imageFilepath)
 
         poss_file = filedialog.askopenfilename(initialdir=initDir, title="Select Image")
         if poss_file != '':

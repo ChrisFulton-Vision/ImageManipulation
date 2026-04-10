@@ -4,6 +4,7 @@ import datetime
 import glob
 import os
 import pickle
+import random
 import sys
 import time
 import tkinter
@@ -14,7 +15,7 @@ from threading import Thread
 from tkinter import filedialog
 
 from customtkinter import (CTkFrame, CTkImage, CTkEntry, CTkButton, CTkLabel, CTkComboBox, CTkCheckBox, CTkInputDialog,
-                           END, CTkToplevel)
+                           END, CTkToplevel, CTkRadioButton)
 import cv2
 import numpy as np
 from PIL.Image import open as pilOpen, fromarray
@@ -732,9 +733,13 @@ class CalibrateGui(CTkFrame):
                                      command=lambda fr=master_frame: self.removeUnused(fr))
         removeUnselected.grid(row=rowID, column=1, padx=5, pady=5, columnspan=2)
 
+        decimateButton = CTkButton(master=header, text='Decimate',
+                                   command=self._open_decimate_dialog)
+        decimateButton.grid(row=rowID, column=3, padx=5, pady=5)
+
         self.displayImagePointsButton = CTkButton(master=header, text='Display All Chessboard Points',
                                                   command=lambda fr=master_frame: self.displayImagePointsThread(fr))
-        self.displayImagePointsButton.grid(row=rowID, column=3, columnspan=2, padx=5, pady=5)
+        self.displayImagePointsButton.grid(row=rowID, column=4, columnspan=2, padx=5, pady=5)
 
         self.imgInvertProtectedButton = CTkButton(master=header, text='Invert All', hover_color='navy',
                                                   fg_color='blue', width=100, command=self.unprotectInvert)
@@ -1034,6 +1039,80 @@ class CalibrateGui(CTkFrame):
     def includeAll(self):
         for imgClass in self.imageConfig.img_collection:
             imgClass.include = True
+        self.saveToCache()
+        self.updateIncludeCheckboxes()
+
+    # ------------------------------------------------------------------
+    # Decimate: thin the selected image set to a target count
+    # ------------------------------------------------------------------
+    def _open_decimate_dialog(self):
+        """Open a popup that lets the user choose target count and selection mode, then deselect excess images."""
+        total = len(self.imageConfig.img_collection)
+
+        dialog = CTkToplevel(self)
+        dialog.title("Decimate Images")
+        dialog.geometry("340x220")
+        dialog.resizable(False, False)
+        dialog.grab_set()  # modal
+
+        CTkLabel(dialog, text=f"Total images: {total}").grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 2))
+
+        CTkLabel(dialog, text="Target # to keep:").grid(row=1, column=0, padx=10, pady=5, sticky="e")
+        target_entry = CTkEntry(dialog, width=80)
+        target_entry.insert(0, str(total))
+        target_entry.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        mode_var = tkinter.IntVar(value=0)  # 0 = uniform, 1 = random
+        CTkLabel(dialog, text="Selection mode:").grid(row=2, column=0, columnspan=2, padx=10, pady=(8, 0))
+        CTkRadioButton(dialog, text="Uniform (evenly spaced)", variable=mode_var, value=0
+                       ).grid(row=3, column=0, columnspan=2, padx=20, pady=2, sticky="w")
+        CTkRadioButton(dialog, text="Random", variable=mode_var, value=1
+                       ).grid(row=4, column=0, columnspan=2, padx=20, pady=2, sticky="w")
+
+        def on_apply():
+            try:
+                target = int(target_entry.get())
+            except ValueError:
+                return
+            target = max(0, min(target, total))
+            self._apply_decimation(target, mode_var.get())
+            dialog.destroy()
+
+        CTkButton(dialog, text="Apply", command=on_apply).grid(row=5, column=0, columnspan=2, padx=10, pady=12)
+
+    def _apply_decimation(self, target: int, mode: int):
+        """Deselect images so that only *target* remain selected.
+
+        Parameters
+        ----------
+        target : int
+            Number of images that should stay selected (``include=True``).
+        mode : int
+            0 – uniform (evenly spaced indices kept),
+            1 – random subset kept.
+        """
+        collection = self.imageConfig.img_collection
+        total = len(collection)
+
+        if target >= total:
+            # Nothing to deselect – select all
+            for img in collection:
+                img.include = True
+        elif target <= 0:
+            for img in collection:
+                img.include = False
+        else:
+            if mode == 0:  # uniform
+                # Evenly spaced indices across the collection
+                keep_indices = set(
+                    int(round(i * (total - 1) / (target - 1))) for i in range(target)
+                )
+            else:  # random
+                keep_indices = set(random.sample(range(total), target))
+
+            for idx, img in enumerate(collection):
+                img.include = idx in keep_indices
+
         self.saveToCache()
         self.updateIncludeCheckboxes()
 

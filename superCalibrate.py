@@ -18,7 +18,7 @@ from customtkinter import (CTkFrame, CTkImage, CTkEntry, CTkButton, CTkLabel, CT
                            END, CTkToplevel, CTkRadioButton)
 import cv2
 import numpy as np
-from PIL.Image import open as pilOpen, fromarray
+from PIL.Image import open as pil_open, fromarray
 
 from support.vision.calibration import Calibration
 
@@ -45,20 +45,34 @@ class ImageryCalibrationConfig:
         self.img_type = 'bmp'
         self.img_collection = []
         self.invert_image = False
-        self.num_inner_corners_W = 8
-        self.num_inner_corners_H = 11
-        self.SUB_num_inner_corners_W = 5
-        self.SUB_num_inner_corners_H = 5
-        self.calMode = CalibrationType.Chessboard
+        self.num_inner_corners_w = 8
+        self.num_inner_corners_h = 11
+        self.sub_num_inner_corners_w = 5
+        self.sub_num_inner_corners_h = 5
+        self.cal_mode = CalibrationType.Chessboard
         self.spacing = 30.0
-        self.maxIter = 100
-        self.minStepSize = 0.00001
-        self.camCal = Calibration()
-        self.zeroTangentDist = True
-        self.fixAspectRatio = True
-        self.fixPrincipalPoint = True
+        self.max_iter = 100
+        self.min_step_size = 0.00001
+        self.cam_cal = Calibration()
+        self.zero_tangent_dist = True
+        self.fix_aspect_ratio = True
+        self.fix_principal_point = True
         self.fisheye = False
         self.screen_based_checkerboard = False
+
+    LEGACY_ATTRS = {
+        'num_inner_corners_W': 'num_inner_corners_w',
+        'num_inner_corners_H': 'num_inner_corners_h',
+        'SUB_num_inner_corners_W': 'sub_num_inner_corners_w',
+        'SUB_num_inner_corners_H': 'sub_num_inner_corners_h',
+        'calMode': 'cal_mode',
+        'maxIter': 'max_iter',
+        'minStepSize': 'min_step_size',
+        'camCal': 'cam_cal',
+        'zeroTangentDist': 'zero_tangent_dist',
+        'fixAspectRatio': 'fix_aspect_ratio',
+        'fixPrincipalPoint': 'fix_principal_point',
+    }
 
     @property
     def num_valid_imgs(self):
@@ -75,20 +89,27 @@ class ImageryCalibrationConfig:
                 num_valid += 1
         return num_valid
 
-    def copy(self, configToCopy):
+    def copy(self, config_to_copy):
         """
         Caching helper function. When reading from binary, copy all named dictionary items in the CalibrationConfig.
         Changes to this class will cause version errors when reading in old configs IFF names are changed or removed.
         Adding NEW parameters does not create a version error, but the parameter will not change through the load.
-        :param configToCopy: Loaded value, typically from cache.
+        :param config_to_copy: Loaded value, typically from cache.
         :return:
         """
-        for obj in configToCopy.__dict__:
-            try:
-                self.__dict__[obj] = configToCopy.__dict__[obj]
-            except KeyError:
-                # Allows for versioning issues, changed naming conventions.
-                pass
+        for obj, value in config_to_copy.__dict__.items():
+            self.__dict__[self.LEGACY_ATTRS.get(obj, obj)] = value
+        self.normalize_legacy_attrs()
+
+    def normalize_legacy_attrs(self):
+        for old_name, new_name in self.LEGACY_ATTRS.items():
+            if hasattr(self, old_name) and not hasattr(self, new_name):
+                setattr(self, new_name, getattr(self, old_name))
+        for img in self.img_collection:
+            if hasattr(img, 'normalize_legacy_attrs'):
+                img.normalize_legacy_attrs()
+            else:
+                ImageData.normalize_object_legacy_attrs(img)
 
     @property
     def flags(self):
@@ -97,16 +118,16 @@ class ImageryCalibrationConfig:
         :return: cv2-style flags for calibration.
         """
         flags = None
-        if self.zeroTangentDist:
+        if self.zero_tangent_dist:
             flags = cv2.CALIB_ZERO_TANGENT_DIST
 
-        if self.fixAspectRatio:
+        if self.fix_aspect_ratio:
             if flags is not None:
                 flags += cv2.CALIB_FIX_ASPECT_RATIO
             else:
                 flags = cv2.CALIB_FIX_ASPECT_RATIO
 
-        if self.fixPrincipalPoint:
+        if self.fix_principal_point:
             if flags is not None:
                 flags += cv2.CALIB_FIX_PRINCIPAL_POINT
             else:
@@ -119,19 +140,33 @@ class ImageData:
     """
     This class stores information maintained by a single image. The image MUST have a name which is its filename.
     Include sets whether the image is part of the calibration.
-    imgPts stores 2d identified features (such as chessboard corners)
-    objPts stores 3d expected features (such as 3d coords for the chessboard)
+    img_pts stores 2d identified features (such as chessboard corners)
+    obj_pts stores 3d expected features (such as 3d coords for the chessboard)
     Residual characterizes the performance of the calibration. This is a good estimate for image quality.
     Sharpness characterizes the blurriness of the image. This is a rough estimate for image quality.
     """
 
     def __init__(self, name=''):
-        self.imageName = name
+        self.image_name = name
         self.include = True
-        self.imgPts = None
-        self.objPts = None
+        self.img_pts = None
+        self.obj_pts = None
         self.residual = None
         self.sharpness = None
+
+    def normalize_legacy_attrs(self):
+        self.normalize_object_legacy_attrs(self)
+
+    @staticmethod
+    def normalize_object_legacy_attrs(obj):
+        legacy_attrs = {
+            'imageName': 'image_name',
+            'imgPts': 'img_pts',
+            'objPts': 'obj_pts',
+        }
+        for old_name, new_name in legacy_attrs.items():
+            if hasattr(obj, old_name) and not hasattr(obj, new_name):
+                setattr(obj, new_name, getattr(obj, old_name))
 
 
 class CalibrateGui(CTkFrame):
@@ -146,19 +181,19 @@ class CalibrateGui(CTkFrame):
         super().__init__(master, *args, **kwargs)
 
         # Stores calibration configuration states
-        self.currImgClass = None
-        self.imageConfig = ImageryCalibrationConfig()
+        self.curr_img_class = None
+        self.image_config = ImageryCalibrationConfig()
 
         # Bool for calibration state
         self.calculating = False
 
         # Various helper variable NONE-initialization
-        self.displayImagePointsButton = None
-        self.currImg = None
-        self.firstClick = None
+        self.display_image_points_button = None
+        self.curr_img = None
+        self.first_click = None
         self.camera = None
-        self.initImageFrame = False
-        self.imageConfigWindowObjects = []
+        self.init_image_frame = False
+        self.image_config_window_objects = []
         self.scale = 1.0
 
         self.func_that_refits = None
@@ -175,57 +210,61 @@ class CalibrateGui(CTkFrame):
         ##########################################################################
         # Image Management Frame Setup
 
-        self.imageFrame = None
-        self.leftArrow = CTkImage(light_image=pilOpen('leftArrow.png'), size=(20, 20))
-        self.rightArrow = CTkImage(light_image=pilOpen('rightArrow.png'), size=(20, 20))
+        self.image_frame = None
+        self.left_arrow = CTkImage(light_image=pil_open('leftArrow.png'), size=(20, 20))
+        self.right_arrow = CTkImage(light_image=pil_open('rightArrow.png'), size=(20, 20))
+        self.arrow_button_size = 32
+        self.header_button_min_width = 32
+        self.header_button_padding = 24
+        self.header_button_char_width = 7
+        self.header_button_image_width = 20
+        self.display_image_points_label = 'Display All'
 
-        self.imgInvertProtectedButton = None
-        self.imgRotateCCWProtectedButton = None
-        self.imgRotateCWProtectedButton = None
-        self.imgGrayProtectedButton = None
+        self.img_invert_protected_button = None
+        self.img_rotate_ccw_protected_button = None
+        self.img_rotate_cw_protected_button = None
+        self.img_gray_protected_button = None
 
-        self.imageFrame = None
+        self.image_frame = None
         self._rows_holder = None
         self._page_start = 0
         self._page_size = 10
         self._page_label = None
 
-        self.firstPageBtn = None
-        self.prevPageBtn = None
-        self.nextPageBtn = None
-        self.lastPageBtn = None
+        self.first_page_btn = None
+        self.prev_page_btn = None
+        self.next_page_btn = None
+        self.last_page_btn = None
 
-        self.calFrame = None
-        self.saveCalButton = None
-        self.scale864Button = None
-        self.scale2848Button = None
-        self.scaleAnyButton = None
-        self.calLabel = None
+        self.cal_frame = None
+        self.save_cal_button = None
+        self.scale864_button = None
+        self.scale2848_button = None
+        self.scale_any_button = None
+        self.cal_label = None
 
         ##########################################################################
         # Now Initialize the buttons on the main frame
-        self.selectFolderButton = None
-        self.availImagesLabel = None
-        self.selectModeLabel = None
-        self.selectModeCombo = None
-        self.selectImgTypeLabel = None
-        self.selectImgTypeCombo = None
-        self.folderLabel = None
-        self.invertImagesCheckbox = None
-        self.fisheyeLensCheckbox = None
-        self.cornerInputLabel = None
-        self.widthLabel = self.heightLabel = self.widthComboEntry = self.heightComboEntry = None
-        self.SUBcornerInputLabel = None
-        self.SUBwidthLabel = self.SUBheightLabel = self.SUBwidthComboEntry = self.SUBheightComboEntry = None
-        self.calibrateButton = None
-        self.clearCacheButton = None
-        self.displayCal = None
+        self.select_folder_button = None
+        self.avail_images_label = None
+        self.select_mode_label = None
+        self.select_mode_combo = None
+        self.select_img_type_label = None
+        self.select_img_type_combo = None
+        self.folder_label = None
+        self.invert_images_checkbox = None
+        self.fisheye_lens_checkbox = None
+        self.corner_input_label = None
+        self.width_label = self.height_label = self.width_combo_entry = self.height_combo_entry = None
+        self.sub_corner_input_label = None
+        self.sub_width_label = self.sub_height_label = self.sub_width_combo_entry = self.sub_height_combo_entry = None
+        self.calibrate_button = None
+        self.clear_cache_button = None
+        self.display_cal = None
 
-        # # Once a calibration is active, allow user to display a window that manages the calibration
-        self.displayCal = None
+        self.display_cal = None
 
-        # # Once a calibration is active, allow user to display a window that manages the calibration
-        self.configWindowButton = None
+        self.config_window_button = None
 
         self._ui_active = True
         self._last_ui_tick = 0.0
@@ -243,120 +282,126 @@ class CalibrateGui(CTkFrame):
         if self.func_that_refits:
             self.func_that_refits()
 
+    def header_button_width(self, text, has_image=False):
+        width = self.header_button_padding + len(text) * self.header_button_char_width
+        if has_image:
+            width += self.header_button_image_width
+        return max(self.header_button_min_width, width)
+
     def setup_configFrame(self, master_frame):
         f = CTkFrame(master_frame)
-        rowID = 0
+        row_id = 0
 
         f.grid_rowconfigure([0, 1, 2], weight=1)  # configure grid system
         f.grid_columnconfigure([0, 1, 2], weight=1)
 
-        self.selectFolderButton = CTkButton(master=f, text='Select Folder', command=self.selectFolder,
-                                            fg_color="navy")
-        self.selectFolderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky="ew")
+        self.select_folder_button = CTkButton(master=f, text='Select Folder', command=self.selectFolder,
+                                              fg_color="navy")
+        self.select_folder_button.grid(row=row_id, column=0, padx=5, pady=5, sticky="ew")
 
-        self.availImagesLabel = CTkLabel(master=f, text='Not Selected', fg_color="black")
-        self.availImagesLabel.grid(row=rowID, column=1, padx=5, pady=5, sticky="ew")
+        self.avail_images_label = CTkLabel(master=f, text='Not Selected', fg_color="black")
+        self.avail_images_label.grid(row=row_id, column=1, padx=5, pady=5, sticky="ew")
 
-        rowID += 1
-        self.selectModeLabel = CTkLabel(master=f, text='Calibration Type')
-        self.selectModeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        modes = [calType.value for calType in CalibrationType]
-        self.selectModeCombo = CTkComboBox(master=f, values=modes, command=self.updateMode)
-        self.selectModeCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
+        row_id += 1
+        self.select_mode_label = CTkLabel(master=f, text='Calibration Type')
+        self.select_mode_label.grid(row=row_id, column=0, padx=5, pady=5, sticky='nsew')
+        modes = [cal_type.value for cal_type in CalibrationType]
+        self.select_mode_combo = CTkComboBox(master=f, values=modes, command=self.updateMode)
+        self.select_mode_combo.grid(row=row_id, column=1, padx=5, pady=5, sticky='ew')
 
-        rowID += 1
-        imgTypes = ['png', 'bmp', 'img', 'jpg']
-        self.selectImgTypeLabel = CTkLabel(master=f, text='File Type')
-        self.selectImgTypeLabel.grid(row=rowID, column=0, padx=5, pady=5, sticky='nsew')
-        self.selectImgTypeCombo = CTkComboBox(master=f, values=imgTypes, command=self.updateImgType)
-        self.selectImgTypeCombo.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
+        row_id += 1
+        img_types = ['png', 'bmp', 'img', 'jpg']
+        self.select_img_type_label = CTkLabel(master=f, text='File Type')
+        self.select_img_type_label.grid(row=row_id, column=0, padx=5, pady=5, sticky='nsew')
+        self.select_img_type_combo = CTkComboBox(master=f, values=img_types, command=self.updateImgType)
+        self.select_img_type_combo.grid(row=row_id, column=1, padx=5, pady=5, sticky='ew')
 
-        rowID += 1
-        folderPathLabel = CTkLabel(master=f,
-                                   text="Filepath:")
-        folderPathLabel.grid(row=rowID, column=0, sticky='nsw')
-        self.folderLabel = CTkLabel(master=f,
-                                    text="../" + os.path.basename(os.path.normpath(self.filepath)))
-        self.folderLabel.grid(row=rowID, column=1, columnspan=2, sticky='nsw')
+        row_id += 1
+        folder_path_label = CTkLabel(master=f,
+                                     text="Filepath:")
+        folder_path_label.grid(row=row_id, column=0, sticky='nsw')
+        self.folder_label = CTkLabel(master=f,
+                                     text="../" + os.path.basename(os.path.normpath(self.filepath)))
+        self.folder_label.grid(row=row_id, column=1, columnspan=2, sticky='nsw')
 
-        rowID += 1
-        self.invertImagesCheckbox = CTkCheckBox(master=f, text='Invert Image? (LWIR)',
-                                                command=self.invertImageToggle)
-        if self.imageConfig.invert_image:
-            self.invertImagesCheckbox.select()
-        self.invertImagesCheckbox.grid(row=rowID, columnspan=1, column=0, padx=5, pady=5, sticky='nsw')
+        row_id += 1
+        self.invert_images_checkbox = CTkCheckBox(master=f, text='Invert Image? (LWIR)',
+                                                  command=self.invertImageToggle)
+        if self.image_config.invert_image:
+            self.invert_images_checkbox.select()
+        self.invert_images_checkbox.grid(row=row_id, columnspan=1, column=0, padx=5, pady=5, sticky='nsw')
 
-        self.fisheyeLensCheckbox = CTkCheckBox(master=f, text='Fisheye Lens?',
-                                               command=self.toggleFisheye)
-        if self.imageConfig.fisheye:
-            self.fisheyeLensCheckbox.select()
-        self.fisheyeLensCheckbox.grid(row=rowID, columnspan=1, column=1, padx=5, pady=5, sticky='nsw')
-        rowID += 1
+        self.fisheye_lens_checkbox = CTkCheckBox(master=f, text='Fisheye Lens?',
+                                                 command=self.toggleFisheye)
+        if self.image_config.fisheye:
+            self.fisheye_lens_checkbox.select()
+        self.fisheye_lens_checkbox.grid(row=row_id, columnspan=1, column=1, padx=5, pady=5, sticky='nsw')
+        row_id += 1
 
         values = [str(num) for num in range(5, 21)]
-        self.cornerInputLabel = CTkLabel(f, text='# of Inner CB Corners')
-        self.cornerInputLabel.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        rowID += 1
+        self.corner_input_label = CTkLabel(f, text='# of Inner CB Corners')
+        self.corner_input_label.grid(row=row_id, column=0, columnspan=2, padx=5, pady=5)
+        row_id += 1
 
-        self.widthLabel = CTkLabel(f, text='Width')
-        self.widthLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.heightLabel = CTkLabel(f, text='Height')
-        self.heightLabel.grid(row=rowID, column=1, padx=5, pady=5)
-        self.widthComboEntry = CTkComboBox(master=f,
-                                           values=values,
-                                           command=self.widthInput)
-        self.widthComboEntry.grid(row=rowID, column=0, padx=5, pady=5)
-        self.heightComboEntry = CTkComboBox(master=f,
-                                            values=values,
-                                            command=self.heightInput)
-        self.heightComboEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        rowID += 1
-
-        self.SUBcornerInputLabel = CTkLabel(f, text='# for sub-Pixel Search')
-        self.SUBcornerInputLabel.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        rowID += 1
-
-        self.SUBwidthLabel = CTkLabel(f, text='Width')
-        self.SUBwidthLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        self.SUBheightLabel = CTkLabel(f, text='Height')
-        self.SUBheightLabel.grid(row=rowID, column=1, padx=5, pady=5)
-
-        self.SUBwidthComboEntry = CTkComboBox(master=f,
+        self.width_label = CTkLabel(f, text='Width')
+        self.width_label.grid(row=row_id, column=0, padx=5, pady=5)
+        self.height_label = CTkLabel(f, text='Height')
+        self.height_label.grid(row=row_id, column=1, padx=5, pady=5)
+        self.width_combo_entry = CTkComboBox(master=f,
+                                             values=values,
+                                             command=self.widthInput)
+        self.width_combo_entry.grid(row=row_id, column=0, padx=5, pady=5)
+        self.height_combo_entry = CTkComboBox(master=f,
                                               values=values,
-                                              command=self.SUBwidthInput)
-        self.SUBwidthComboEntry.grid(row=rowID, column=0, padx=5, pady=5)
+                                              command=self.heightInput)
+        self.height_combo_entry.grid(row=row_id, column=1, padx=5, pady=5)
+        row_id += 1
 
-        self.SUBheightComboEntry = CTkComboBox(master=f,
-                                               values=values,
-                                               command=self.SUBheightInput)
-        self.SUBheightComboEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        rowID += 1
+        self.sub_corner_input_label = CTkLabel(f, text='# for sub-Pixel Search')
+        self.sub_corner_input_label.grid(row=row_id, column=0, columnspan=2, padx=5, pady=5)
+        row_id += 1
 
-        self.calibrateButton = CTkButton(f, text="Calibrate!", state="disabled",
-                                         command=lambda fr=master_frame: self.calibrate(fr))
-        self.calibrateButton.grid(row=rowID, column=0, columnspan=1, padx=5, pady=5)
+        self.sub_width_label = CTkLabel(f, text='Width')
+        self.sub_width_label.grid(row=row_id, column=0, padx=5, pady=5)
+        self.sub_height_label = CTkLabel(f, text='Height')
+        self.sub_height_label.grid(row=row_id, column=1, padx=5, pady=5)
 
-        self.protectClearCache(f, rowID)
+        self.sub_width_combo_entry = CTkComboBox(master=f,
+                                                 values=values,
+                                                 command=self.SUBwidthInput)
+        self.sub_width_combo_entry.grid(row=row_id, column=0, padx=5, pady=5)
+
+        self.sub_height_combo_entry = CTkComboBox(master=f,
+                                                  values=values,
+                                                  command=self.SUBheightInput)
+        self.sub_height_combo_entry.grid(row=row_id, column=1, padx=5, pady=5)
+        row_id += 1
+
+        self.calibrate_button = CTkButton(f, text="Calibrate!", state="disabled",
+                                          command=lambda fr=master_frame: self.calibrate(fr))
+        self.calibrate_button.grid(row=row_id, column=0, columnspan=1, padx=5, pady=5)
+
+        self.protectClearCache(f, row_id)
 
         self.loadFromCache()
 
-        rowID += 1
+        row_id += 1
 
         return f
 
-    def updateMode(self, newMode):
+    def updateMode(self, new_mode):
         """
         Setter from button click
         """
-        self.imageConfig.calMode = CalibrationType(newMode)
+        self.image_config.cal_mode = CalibrationType(new_mode)
         self.saveToCache()
 
-    def updateImgType(self, newImgType):
+    def updateImgType(self, new_img_type):
         """
         Setter from button click
         """
-        self.imageConfig.img_type = newImgType
-        self.imageConfig.img_collection = []
+        self.image_config.img_type = new_img_type
+        self.image_config.img_collection = []
         self.loadImages()
 
     def fileName(self, idx):
@@ -364,15 +409,15 @@ class CalibrateGui(CTkFrame):
         :param idx: the number of the image in the collection
         :return: the filename with root filepath prepended
         """
-        return join(self.filepath, self.imageConfig.img_collection[idx].imageName)
+        return join(self.filepath, self.image_config.img_collection[idx].image_name)
 
     def displayImagePointsThread(self, master_frame):
         """
         This button spawns a thread that looks at all the existing chessboard corners (see displayImagePoints()).
         While the thread is spawned, the image menu is unavailable (as it is being consistently updated).
         """
-        self.displayImagePointsButton.configure(text='Calculating', fg_color='gray', state='disabled')
-        self.availImagesLabel.configure(fg_color='gray', state='disabled')
+        self.display_image_points_button.configure(text='Calculating', fg_color='gray', state='disabled')
+        self.avail_images_label.configure(fg_color='gray', state='disabled')
         self.t3 = Thread(target=lambda f=master_frame: self.displayImagePoints(f), daemon=True)
         self.t3.start()
 
@@ -389,123 +434,123 @@ class CalibrateGui(CTkFrame):
         width = img.shape[1]
         height = img.shape[0]
 
-        for imgClass in self.imageConfig.img_collection:
-            if imgClass.include:
-                self.findChessboardCorners(master_frame, imgClass, showImage=False)
+        for img_class in self.image_config.img_collection:
+            if img_class.include:
+                self.findChessboardCorners(master_frame, img_class, show_image=False)
 
         self.sortForCuration()
         # Create a blank, black image with 3 color channels (BGR)
         blank_image = np.zeros((height, width, 3), np.uint8)
 
         # Prepare boolean to confirm at least 1 image produced a chessboard
-        gotAtLeastOneImage = False
-        minVal = 10.0
-        maxVal = 0.0
-        for imageClass in self.imageConfig.img_collection:
-            if imageClass.include and imageClass.residual is not None:
-                minVal = min([minVal, imageClass.residual])
-                maxVal = max([maxVal, imageClass.residual])
+        got_at_least_one_image = False
+        min_val = 10.0
+        max_val = 0.0
+        for image_class in self.image_config.img_collection:
+            if image_class.include and image_class.residual is not None:
+                min_val = min([min_val, image_class.residual])
+                max_val = max([max_val, image_class.residual])
 
-        residual = copy.copy(minVal)
+        residual = copy.copy(min_val)
 
         #  Examine each image's chessboard solution. If the image has an associated residual, color code the image.
-        for idx, imageClass in enumerate(self.imageConfig.img_collection):
+        for idx, image_class in enumerate(self.image_config.img_collection):
 
-            if imageClass.include and imageClass.imgPts is not None:
-                gotAtLeastOneImage = True
+            if image_class.include and image_class.img_pts is not None:
+                got_at_least_one_image = True
 
-                if imageClass.residual is not None:
-                    residual = imageClass.residual
+                if image_class.residual is not None:
+                    residual = image_class.residual
 
-                for imgPt in imageClass.imgPts:
-                    b, g, r = colorsys.hsv_to_rgb(0.4 - 0.4 * (residual - minVal) / (maxVal - minVal), 1.0, 1.0)
+                for img_pt in image_class.img_pts:
+                    b, g, r = colorsys.hsv_to_rgb(0.4 - 0.4 * (residual - min_val) / (max_val - min_val), 1.0, 1.0)
                     cv2.circle(blank_image,
-                               (round(imgPt[0][0]), round(imgPt[0][1])), 2,
+                               (round(img_pt[0][0]), round(img_pt[0][1])), 2,
                                (int(255 * b), int(255 * g), int(255 * r)), 2)
 
         self.updateImageFrame(master_frame)
 
         # If we succeeded at at least one image, then display the image of all of the found corners
-        if gotAtLeastOneImage:
+        if got_at_least_one_image:
             # Draw Legend
             b, g, r = colorsys.hsv_to_rgb(0, 1.0, 1.0)
             cv2.circle(blank_image, (5, 20), 2, (int(255 * b), int(255 * g), int(255 * r)), 2)
-            cv2.putText(blank_image, 'Residual of: ' + str(round(maxVal, 2)), (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            cv2.putText(blank_image, 'Residual of: ' + str(round(max_val, 2)), (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (255, 255, 255))
             b, g, r = colorsys.hsv_to_rgb(0.4, 1.0, 1.0)
             cv2.circle(blank_image, (5, 40), 2, (int(255 * b), int(255 * g), int(255 * r)), 2)
             cv2.putText(blank_image,
-                        'Residual of: ' + str(round(minVal, 2)),
+                        'Residual of: ' + str(round(min_val, 2)),
                         (10, 45),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         (255, 255, 255))
             cv2.resize(blank_image, (1000, int(1000 / width * height)))
 
             # Convert the openCV object to an Image object, which is ingested by customtkinter
-            filledImage = fromarray(blank_image)
+            filled_image = fromarray(blank_image)
 
-            ctkImage = CTkImage(filledImage, size=(1000, int(1000 / width * height)))
-            imagePointWindow = CTkToplevel(self)
-            imagePointWindow.geometry('1000x' + str(int(1000 / width * height)))
-            imagePointWindow.title("Chessboard Corner Locations")
-            label = CTkLabel(master=imagePointWindow, image=ctkImage, text="")
+            ctk_image = CTkImage(filled_image, size=(1000, int(1000 / width * height)))
+            image_point_window = CTkToplevel(self)
+            image_point_window.geometry('1000x' + str(int(1000 / width * height)))
+            image_point_window.title("Chessboard Corner Locations")
+            label = CTkLabel(master=image_point_window, image=ctk_image, text="")
             label.pack()
 
-        self.displayImagePointsButton.configure(text='Display Image Points', fg_color=GREEN, state='normal')
+        self.display_image_points_button.configure(text=self.display_image_points_label, fg_color=GREEN, state='normal')
         self.saveToCache()
-        self.availImagesLabel.configure(fg_color=GREEN, state='normal')
+        self.avail_images_label.configure(fg_color=GREEN, state='normal')
 
     def saveCal(self, button):
-        if self.imageConfig.camCal.validCal:
-            self.imageConfig.camCal.toFile(self.filepath)
-            self.imageConfig.camCal.toBinFile(self.filepath)
+        if self.image_config.cam_cal.validCal:
+            self.image_config.cam_cal.toFile(self.filepath)
+            self.image_config.cam_cal.toBinFile(self.filepath)
             button.configure(fg_color='navy')
             return
         button.configure(fg_color='red')
 
     def setup_CalFrame(self, master_frame):
 
-        if self.calFrame is None:
-            self.calFrame = CTkFrame(master_frame)
+        if self.cal_frame is None:
+            self.cal_frame = CTkFrame(master_frame)
 
-            self.saveCalButton = CTkButton(master=self.calFrame, text='Save Calibration')
-            self.saveCalButton.configure(command=lambda btn=self.saveCalButton: self.saveCal(btn))
-            self.saveCalButton.grid(row=0, column=0, padx=5, pady=5)
+            self.save_cal_button = CTkButton(master=self.cal_frame, text='Save Calibration')
+            self.save_cal_button.configure(command=lambda btn=self.save_cal_button: self.saveCal(btn))
+            self.save_cal_button.grid(row=0, column=0, padx=5, pady=5)
 
-            self.calLabel = CTkLabel(master=self.calFrame, justify='center', anchor='w')
-            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+            self.cal_label = CTkLabel(master=self.cal_frame, justify='center', anchor='w')
+            self.cal_label.grid(row=1, column=0, padx=5, pady=5)
 
-            self.scale864Button = CTkButton(master=self.calFrame, text='Scale to 864x864',
-                                            command=lambda: self.scaleTo864(self.calFrame))
-            self.scale864Button.grid(row=3, column=0, padx=5, pady=5)
+            self.scale864_button = CTkButton(master=self.cal_frame, text='Scale to 864x864',
+                                             command=lambda: self.scaleTo864(self.cal_frame))
+            self.scale864_button.grid(row=3, column=0, padx=5, pady=5)
 
-            self.scale2848Button = CTkButton(master=self.calFrame, text='Scale to 2848x2848',
-                                             command=lambda: self.scaleTo2848(self.calFrame))
-            self.scale2848Button.grid(row=4, column=0, padx=5, pady=5)
+            self.scale2848_button = CTkButton(master=self.cal_frame, text='Scale to 2848x2848',
+                                              command=lambda: self.scaleTo2848(self.cal_frame))
+            self.scale2848_button.grid(row=4, column=0, padx=5, pady=5)
 
-            self.scaleAnyButton = CTkButton(master=self.calFrame, text='Scale to Input Size',
-                                            command=lambda: self.scaleToInput(self.calFrame))
-            self.scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
+            self.scale_any_button = CTkButton(master=self.cal_frame, text='Scale to Input Size',
+                                              command=lambda: self.scaleToInput(self.cal_frame))
+            self.scale_any_button.grid(row=5, column=0, padx=5, pady=5)
 
         self.updateCalFrameState()
-        return self.calFrame
+        return self.cal_frame
 
     def updateCalFrameState(self):
-        if self.calFrame is None:
+        if self.cal_frame is None:
             return
 
-        if self.imageConfig.camCal.validCal:
-            self.calLabel.configure(text=self.imageConfig.camCal.calStr)
-            self.saveCalButton.configure(state='normal')
-            self.scale864Button.configure(state='normal')
-            self.scale2848Button.configure(state='normal')
-            self.scaleAnyButton.configure(state='normal')
+        if self.image_config.cam_cal.validCal:
+            self.cal_label.configure(text=self.image_config.cam_cal.calStr)
+            self.save_cal_button.configure(state='normal')
+            self.scale864_button.configure(state='normal')
+            self.scale2848_button.configure(state='normal')
+            self.scale_any_button.configure(state='normal')
         else:
-            self.calLabel.configure(text="No calibration calculated yet.")
-            self.saveCalButton.configure(state='disabled')
-            self.scale864Button.configure(state='disabled')
-            self.scale2848Button.configure(state='disabled')
-            self.scaleAnyButton.configure(state='disabled')
+            self.cal_label.configure(text="No calibration calculated yet.")
+            self.save_cal_button.configure(state='disabled')
+            self.scale864_button.configure(state='disabled')
+            self.scale2848_button.configure(state='disabled')
+            self.scale_any_button.configure(state='disabled')
 
     def scaleTo864(self, master_frame):
         self.scaleCalibrationTo(864)
@@ -524,93 +569,94 @@ class CalibrateGui(CTkFrame):
             LOG.warning('Invalid input. Please input only an integer.')
 
     def scaleCalibrationTo(self, width):
-        self.imageConfig.camCal.scaleCalibration(width)
+        self.image_config.cam_cal.scaleCalibration(width)
         self.saveToCache()
         self.updateCalFrameState()
 
     def updateConfigWindow(self, master_frame):
-        rowID = 0
+        row_id = 0
         f = CTkFrame(master_frame)
 
-        stoppingIterationLabel = CTkLabel(master=f, text='Max Iterations: ')
-        stoppingIterationLabel.grid(row=rowID, column=0, padx=5, pady=5)
-        stoppingIterationEntry = CTkEntry(master=f, placeholder_text=str(self.imageConfig.maxIter))
-        stoppingIterationEntry.bind('<Return>', lambda event, x=stoppingIterationEntry: self.stoppingCritIterUpdate(x))
+        stopping_iteration_label = CTkLabel(master=f, text='Max Iterations: ')
+        stopping_iteration_label.grid(row=row_id, column=0, padx=5, pady=5)
+        stopping_iteration_entry = CTkEntry(master=f, placeholder_text=str(self.image_config.max_iter))
+        stopping_iteration_entry.bind('<Return>',
+                                      lambda event, x=stopping_iteration_entry: self.stoppingCritIterUpdate(x))
 
-        stoppingIterationEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        rowID += 1
+        stopping_iteration_entry.grid(row=row_id, column=1, padx=5, pady=5)
+        row_id += 1
 
-        stoppingMinStepSizeLabel = CTkLabel(master=f, text='Stopping Min Step Size: ')
-        stoppingMinStepSizeLabel.grid(row=rowID, column=0, padx=5, pady=5)
+        stopping_min_step_size_label = CTkLabel(master=f, text='Stopping Min Step Size: ')
+        stopping_min_step_size_label.grid(row=row_id, column=0, padx=5, pady=5)
 
-        stoppingMinStepSizeEntry = CTkEntry(master=f, placeholder_text=str(self.imageConfig.minStepSize))
-        stoppingMinStepSizeEntry.bind('<Return>',
-                                      lambda event, x=stoppingMinStepSizeEntry:
-                                      self.stoppingCritMinStepSizeUpdate(x))
-        stoppingMinStepSizeEntry.grid(row=rowID, column=1, padx=5, pady=5)
-        rowID += 1
+        stopping_min_step_size_entry = CTkEntry(master=f, placeholder_text=str(self.image_config.min_step_size))
+        stopping_min_step_size_entry.bind('<Return>',
+                                          lambda event, x=stopping_min_step_size_entry:
+                                          self.stoppingCritMinStepSizeUpdate(x))
+        stopping_min_step_size_entry.grid(row=row_id, column=1, padx=5, pady=5)
+        row_id += 1
 
-        fixPrincipalPointCB = CTkCheckBox(master=f, text='Fix Principle Point', checkbox_height=20)
-        if self.imageConfig.fixPrincipalPoint:
-            fixPrincipalPointCB.select()
+        fix_principal_point_cb = CTkCheckBox(master=f, text='Fix Principal Point', checkbox_height=20)
+        if self.image_config.fix_principal_point:
+            fix_principal_point_cb.select()
         else:
-            fixPrincipalPointCB.deselect()
-        fixPrincipalPointCB.configure(command=self.toggleFixPrincipalPoint)
-        fixPrincipalPointCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
-        rowID += 1
+            fix_principal_point_cb.deselect()
+        fix_principal_point_cb.configure(command=self.toggleFixPrincipalPoint)
+        fix_principal_point_cb.grid(row=row_id, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
+        row_id += 1
 
-        fixAspectRatioCB = CTkCheckBox(master=f, text='Fix Aspect Ratio', checkbox_height=20)
-        if self.imageConfig.fixAspectRatio:
-            fixAspectRatioCB.select()
+        fix_aspect_ratio_cb = CTkCheckBox(master=f, text='Fix Aspect Ratio', checkbox_height=20)
+        if self.image_config.fix_aspect_ratio:
+            fix_aspect_ratio_cb.select()
         else:
-            fixAspectRatioCB.deselect()
-        fixAspectRatioCB.configure(command=self.toggleFixAspectRatio)
-        fixAspectRatioCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
-        rowID += 1
+            fix_aspect_ratio_cb.deselect()
+        fix_aspect_ratio_cb.configure(command=self.toggleFixAspectRatio)
+        fix_aspect_ratio_cb.grid(row=row_id, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
+        row_id += 1
 
-        zeroTangentDistCB = CTkCheckBox(master=f, text='Zero Tangent Distance', checkbox_height=20)
-        if self.imageConfig.zeroTangentDist:
-            zeroTangentDistCB.select()
+        zero_tangent_dist_cb = CTkCheckBox(master=f, text='Zero Tangent Distance', checkbox_height=20)
+        if self.image_config.zero_tangent_dist:
+            zero_tangent_dist_cb.select()
         else:
-            zeroTangentDistCB.deselect()
-        zeroTangentDistCB.configure(command=self.toggleZeroTangentDist)
-        zeroTangentDistCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
-        rowID += 1
+            zero_tangent_dist_cb.deselect()
+        zero_tangent_dist_cb.configure(command=self.toggleZeroTangentDist)
+        zero_tangent_dist_cb.grid(row=row_id, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
+        row_id += 1
 
-        screen_based_checkerboardCB = CTkCheckBox(master=f, text="Screen Based Checkerboard", checkbox_height=20)
-        if self.imageConfig.screen_based_checkerboard:
-            screen_based_checkerboardCB.select()
+        screen_based_checkerboard_cb = CTkCheckBox(master=f, text="Screen Based Checkerboard", checkbox_height=20)
+        if self.image_config.screen_based_checkerboard:
+            screen_based_checkerboard_cb.select()
         else:
-            screen_based_checkerboardCB.deselect()
-        screen_based_checkerboardCB.configure(command=self.toggleScreenbasedCheckerboard)
-        screen_based_checkerboardCB.grid(row=rowID, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
+            screen_based_checkerboard_cb.deselect()
+        screen_based_checkerboard_cb.configure(command=self.toggleScreenbasedCheckerboard)
+        screen_based_checkerboard_cb.grid(row=row_id, column=0, columnspan=2, padx=0, pady=0, sticky='nsw')
 
         return f
 
     def stoppingCritMinStepSizeUpdate(self, entry=None):
         try:
-            newStep = float(entry.get())
+            new_step = float(entry.get())
         except ValueError:
             entry.delete(0, END)
-            entry.insert(0, str(self.imageConfig.maxIter))
+            entry.insert(0, str(self.image_config.max_iter))
             return
 
-        if isinstance(newStep, float) and newStep > 0:
-            self.imageConfig.minStepSize = newStep
+        if isinstance(new_step, float) and new_step > 0:
+            self.image_config.min_step_size = new_step
         else:
             entry.delete(0, END)
-            entry.insert(0, str(self.imageConfig.minStepSize))
+            entry.insert(0, str(self.image_config.min_step_size))
         self.saveToCache()
         self.flashEntrySaved(entry)
 
     def stoppingCritIterUpdate(self, entry=None):
         try:
-            newIter = int(entry.get())
+            new_iter = int(entry.get())
         except ValueError:
             entry.delete(0, END)
-            entry.insert(0, str(self.imageConfig.maxIter))
+            entry.insert(0, str(self.image_config.max_iter))
             return
-        self.imageConfig.maxIter = newIter
+        self.image_config.max_iter = new_iter
         self.saveToCache()
         self.flashEntrySaved(entry)
 
@@ -620,62 +666,62 @@ class CalibrateGui(CTkFrame):
         entry.after(500, lambda: entry.configure(fg_color=GREEN))
 
     def toggleZeroTangentDist(self):
-        self.imageConfig.zeroTangentDist = not self.imageConfig.zeroTangentDist
+        self.image_config.zero_tangent_dist = not self.image_config.zero_tangent_dist
 
     def toggleScreenbasedCheckerboard(self):
-        self.imageConfig.screen_based_checkerboard = not self.imageConfig.screen_based_checkerboard
+        self.image_config.screen_based_checkerboard = not self.image_config.screen_based_checkerboard
 
     def toggleFixPrincipalPoint(self):
-        self.imageConfig.fixPrincipalPoint = not self.imageConfig.fixPrincipalPoint
+        self.image_config.fix_principal_point = not self.image_config.fix_principal_point
 
     def toggleFixAspectRatio(self):
-        self.imageConfig.fixAspectRatio = not self.imageConfig.fixAspectRatio
+        self.image_config.fix_aspect_ratio = not self.image_config.fix_aspect_ratio
 
     def _render_row(self, idx, widgets, f):
         """Retitle + rebind one row from item idx (no new widgets)."""
-        (imgIncludeCheckbox,
-         imgNameButton,
-         imgRes,
-         imgShp,
-         imgRestoreButton,
-         imgFindCornersButton,
-         imgInvertButton,
-         imgGrayButton,
-         imgCCWRotateButton,
-         imgCWRotateButton) = widgets
+        (img_include_checkbox,
+         img_name_button,
+         img_res,
+         img_shp,
+         img_restore_button,
+         img_find_corners_button,
+         img_invert_button,
+         img_gray_button,
+         img_ccw_rotate_button,
+         img_cw_rotate_button) = widgets
 
-        imgClass = self.imageConfig.img_collection[idx]
+        img_class = self.image_config.img_collection[idx]
 
         # checkbox state
-        (imgIncludeCheckbox.select() if imgClass.include else imgIncludeCheckbox.deselect())
-        imgIncludeCheckbox.configure(command=partial(self.updateInclusion, idx),
-                                     state="normal")
+        (img_include_checkbox.select() if img_class.include else img_include_checkbox.deselect())
+        img_include_checkbox.configure(command=partial(self.updateInclusion, idx),
+                                       state="normal")
 
         # labels
-        if imgClass.residual is None:
-            currRes = ''
-        elif imgClass.residual == 10000.0:
-            currRes = 'Disabled'
+        if img_class.residual is None:
+            curr_res = ''
+        elif img_class.residual == 10000.0:
+            curr_res = 'Disabled'
         else:
-            currRes = f'Res: {round(imgClass.residual, 3)}'
-        imgRes.configure(text=currRes)
+            curr_res = f'Res: {round(img_class.residual, 3)}'
+        img_res.configure(text=curr_res)
 
-        currShrp = '' if imgClass.sharpness is None else f'Shrp: {round(imgClass.sharpness, 3)}'
-        imgShp.configure(text=currShrp)
+        curr_shrp = '' if img_class.sharpness is None else f'Shrp: {round(img_class.sharpness, 3)}'
+        img_shp.configure(text=curr_shrp)
 
         # commands
-        imgNameButton.configure(text=imgClass.imageName,
-                                command=partial(self.showBasicImage, imgClass), state="normal")
-        imgRestoreButton.configure(command=partial(self.restore, imgClass), state="normal")
-        imgFindCornersButton.configure(command=partial(self.findChessboardCorners, f, imgClass, True, True),
-                                       state="normal")
-        imgInvertButton.configure(command=partial(self.invertIndividualImage, imgClass), state="normal")
-        imgGrayButton.configure(command=partial(self.grayscaleIndividualImage, imgClass), state="normal")
-        imgCCWRotateButton.configure(command=partial(self.rotateCCWIndividualImage, imgClass), state="normal")
-        imgCWRotateButton.configure(command=partial(self.rotateCWIndividualImage, imgClass), state="normal")
+        img_name_button.configure(text=img_class.image_name,
+                                  command=partial(self.showBasicImage, img_class), state="normal")
+        img_restore_button.configure(command=partial(self.restore, img_class), state="normal")
+        img_find_corners_button.configure(command=partial(self.findChessboardCorners, f, img_class, True, True),
+                                          state="normal")
+        img_invert_button.configure(command=partial(self.invertIndividualImage, img_class), state="normal")
+        img_gray_button.configure(command=partial(self.grayscaleIndividualImage, img_class), state="normal")
+        img_ccw_rotate_button.configure(command=partial(self.rotateCCWIndividualImage, img_class), state="normal")
+        img_cw_rotate_button.configure(command=partial(self.rotateCWIndividualImage, img_class), state="normal")
 
     def _page_bounds(self):
-        total = len(self.imageConfig.img_collection)
+        total = len(self.image_config.img_collection)
         start = max(0, min(self._page_start, max(0, total - 1)))
         end = min(total, start + self._page_size)
         return start, end, total
@@ -683,12 +729,12 @@ class CalibrateGui(CTkFrame):
     def _refresh_all_rows(self, f):
         start, end, total = self._page_bounds()
         needed = end - start
-        while len(self.imageConfigWindowObjects) < needed:
-            self.createNewRow(self._rows_holder, len(self.imageConfigWindowObjects))
+        while len(self.image_config_window_objects) < needed:
+            self.createNewRow(self._rows_holder, len(self.image_config_window_objects))
 
         for i in range(needed):
             idx = start + i
-            widgets = self.imageConfigWindowObjects[i]
+            widgets = self.image_config_window_objects[i]
             self._render_row(idx, widgets, f)
             for w in widgets:
                 try:
@@ -696,8 +742,8 @@ class CalibrateGui(CTkFrame):
                 except tkinter.TclError:
                     pass
 
-        for i in range(needed, len(self.imageConfigWindowObjects)):
-            for w in self.imageConfigWindowObjects[i]:
+        for i in range(needed, len(self.image_config_window_objects)):
+            for w in self.image_config_window_objects[i]:
                 try:
                     w.grid_remove()
                 except tkinter.TclError:
@@ -720,35 +766,48 @@ class CalibrateGui(CTkFrame):
         # Rows container (row 1)
         self._rows_holder = CTkFrame(f, fg_color="transparent")
         self._rows_holder.grid(row=1, column=0, sticky="nsew")
-        self._rows_holder.grid_columnconfigure(list(range(10)), weight=1)
+        self._rows_holder.grid_columnconfigure(list(range(10)), weight=0)
 
         # --- put all header buttons in `header` (NOT in f) ---
-        rowID = 0
-        selectAllButton = CTkButton(master=header, text='Include All', command=self.includeAll)
-        selectAllButton.grid(row=rowID, column=0, padx=5, pady=5)
+        row_id = 0
+        select_all_button = CTkButton(master=header, text='Include All',
+                                      width=self.header_button_width('Include All'),
+                                      command=self.includeAll)
+        select_all_button.grid(row=row_id, column=0, padx=5, pady=5)
 
-        removeUnselected = CTkButton(master=header, text='Remove Unselected',
-                                     command=lambda fr=master_frame: self.removeUnused(fr))
-        removeUnselected.grid(row=rowID, column=1, padx=5, pady=5, columnspan=2)
+        remove_unselected = CTkButton(master=header, text='Hide Unchecked',
+                                      width=self.header_button_width('Hide Unchecked'),
+                                      command=lambda fr=master_frame: self.removeUnused(fr))
+        remove_unselected.grid(row=row_id, column=1, padx=5, pady=5, columnspan=2)
 
-        decimateButton = CTkButton(master=header, text='Decimate',
-                                   command=self._open_decimate_dialog)
-        decimateButton.grid(row=rowID, column=3, padx=5, pady=5)
+        decimate_button = CTkButton(master=header, text='Decimate',
+                                    width=self.header_button_width('Decimate'),
+                                    command=self._open_decimate_dialog)
+        decimate_button.grid(row=row_id, column=3, padx=5, pady=5)
 
-        self.displayImagePointsButton = CTkButton(master=header, text='Display All Chessboard Points',
-                                                  command=lambda fr=master_frame: self.displayImagePointsThread(fr))
-        self.displayImagePointsButton.grid(row=rowID, column=4, columnspan=2, padx=5, pady=5)
+        self.display_image_points_button = CTkButton(master=header, text=self.display_image_points_label,
+                                                     width=self.header_button_width(self.display_image_points_label),
+                                                     command=lambda fr=master_frame: self.displayImagePointsThread(fr))
+        self.display_image_points_button.grid(row=row_id, column=4, columnspan=2, padx=5, pady=5)
 
-        self.imgInvertProtectedButton = CTkButton(master=header, text='Invert All', hover_color='navy',
-                                                  fg_color='blue', width=100, command=self.unprotectInvert)
-        self.imgRotateCCWProtectedButton = CTkButton(master=header, image=self.leftArrow, text='All',
-                                                     hover_color='navy', fg_color='blue', width=100,
-                                                     command=self.unprotectRotateCCW)
-        self.imgRotateCWProtectedButton = CTkButton(master=header, image=self.rightArrow, text='All',
-                                                    hover_color='navy', fg_color='blue', width=100,
-                                                    command=self.unprotectRotateCW)
-        self.imgGrayProtectedButton = CTkButton(master=header, text='Grayscale All', hover_color='navy',
-                                                fg_color='blue', width=100, command=self.unprotectAllGrayscale)
+        self.img_invert_protected_button = CTkButton(master=header, text='Invert All', hover_color='navy',
+                                                     fg_color='blue',
+                                                     width=self.header_button_width('Invert All'),
+                                                     command=self.unprotectInvert)
+        self.img_rotate_ccw_protected_button = CTkButton(master=header, image=self.left_arrow, text='All',
+                                                         hover_color='navy', fg_color='blue',
+                                                         width=self.header_button_width('All', has_image=True),
+                                                         height=self.arrow_button_size,
+                                                         command=self.unprotectRotateCCW)
+        self.img_rotate_cw_protected_button = CTkButton(master=header, image=self.right_arrow, text='All',
+                                                        hover_color='navy', fg_color='blue',
+                                                        width=self.header_button_width('All', has_image=True),
+                                                        height=self.arrow_button_size,
+                                                        command=self.unprotectRotateCW)
+        self.img_gray_protected_button = CTkButton(master=header, text='Grayscale All', hover_color='navy',
+                                                   fg_color='blue',
+                                                   width=self.header_button_width('Grayscale All'),
+                                                   command=self.unprotectAllGrayscale)
 
         self.protectInvert(row=0)
         self.protectRotateCCW(row=0)
@@ -757,65 +816,70 @@ class CalibrateGui(CTkFrame):
 
         # Pager controls in the header
         self._page_label = CTkLabel(header, text="1/1")
-        self._page_label.grid(row=rowID, column=12, padx=6, pady=6, sticky="e")
+        self._page_label.grid(row=row_id, column=12, padx=6, pady=6, sticky="e")
 
-        self.firstPageBtn = CTkButton(header, text="◀◀", command=self._first_page, width=70)
-        self.prevPageBtn = CTkButton(header, text="◀ Prev", command=self._page_prev, width=70)
-        self.nextPageBtn = CTkButton(header, text="Next ▶", command=self._page_next, width=70)
-        self.lastPageBtn = CTkButton(header, text="▶▶", command=self._last_page, width=70)
-        self.firstPageBtn.grid(row=rowID, column=10, padx=6, pady=6, sticky='w')
-        self.prevPageBtn.grid(row=rowID, column=11, padx=6, pady=6, sticky="w")
-        self.nextPageBtn.grid(row=rowID, column=13, padx=6, pady=6, sticky="w")
-        self.lastPageBtn.grid(row=rowID, column=14, padx=6, pady=6, sticky='w')
+        self.first_page_btn = CTkButton(header, text="◀◀", command=self._first_page, width=70)
+        self.prev_page_btn = CTkButton(header, text="◀ Prev", command=self._page_prev, width=70)
+        self.next_page_btn = CTkButton(header, text="Next ▶", command=self._page_next, width=70)
+        self.last_page_btn = CTkButton(header, text="▶▶", command=self._last_page, width=70)
+        for page_button in (self.first_page_btn, self.prev_page_btn, self.next_page_btn, self.last_page_btn):
+            page_button.configure(width=self.header_button_width(page_button.cget("text")))
+        self.first_page_btn.grid(row=row_id, column=10, padx=6, pady=6, sticky='w')
+        self.prev_page_btn.grid(row=row_id, column=11, padx=6, pady=6, sticky="w")
+        self.next_page_btn.grid(row=row_id, column=13, padx=6, pady=6, sticky="w")
+        self.last_page_btn.grid(row=row_id, column=14, padx=6, pady=6, sticky='w')
 
         # fresh paging state
         self._page_start = 0
-        self.imageConfigWindowObjects = []
+        self.image_config_window_objects = []
         for child in list(self._rows_holder.winfo_children()):
             child.destroy()
 
-        self.imageFrame = f
+        self.image_frame = f
         self._refresh_all_rows(f)  # render only current page
         self.updateImageFrame(f)
         return f
 
-    def createNewRow(self, f, rowID):
-        imgIncludeCheckbox = CTkCheckBox(master=f, text='')
-        imgIncludeCheckbox.grid(row=rowID, column=0)
+    def createNewRow(self, f, row_id):
+        img_include_checkbox = CTkCheckBox(master=f, text='', width=24)
+        img_include_checkbox.grid(row=row_id, column=0)
 
-        imgNameButton = CTkButton(master=f, text='')
-        imgNameButton.grid(row=rowID, column=1, padx=5, pady=5)
+        img_name_button = CTkButton(master=f, text='')
+        img_name_button.grid(row=row_id, column=1, padx=5, pady=5)
 
-        imgRes = CTkLabel(master=f, text='')
-        imgRes.grid(row=rowID, column=2, padx=5, pady=5)
+        img_res = CTkLabel(master=f, text='')
+        img_res.grid(row=row_id, column=2, padx=5, pady=5)
 
-        imgShp = CTkLabel(master=f, text='')
-        imgShp.grid(row=rowID, column=3, padx=5, pady=5)
+        img_shp = CTkLabel(master=f, text='')
+        img_shp.grid(row=row_id, column=3, padx=5, pady=5)
 
-        imgRestoreButton = CTkButton(master=f, text='Restore')
-        imgRestoreButton.grid(row=rowID, column=4, padx=5, pady=5)
+        img_restore_button = CTkButton(master=f, text='Restore')
+        img_restore_button.grid(row=row_id, column=4, padx=5, pady=5)
 
-        imgFindCornersButton = CTkButton(master=f, text='Find Corners')
-        imgFindCornersButton.grid(row=rowID, column=5, padx=5, pady=5)
+        img_find_corners_button = CTkButton(master=f, text='Find Corners')
+        img_find_corners_button.grid(row=row_id, column=5, padx=5, pady=5)
 
-        imgInvertButton = CTkButton(master=f, text='Invert Image')
-        imgInvertButton.grid(row=rowID, column=6, padx=5, pady=5)
+        img_invert_button = CTkButton(master=f, text='Invert Image')
+        img_invert_button.grid(row=row_id, column=6, padx=5, pady=5)
 
-        imgGrayButton = CTkButton(master=f, text='Grayscale Image')
-        imgGrayButton.grid(row=rowID, column=7, padx=5, pady=5)
+        img_gray_button = CTkButton(master=f, text='Grayscale Image')
+        img_gray_button.grid(row=row_id, column=7, padx=5, pady=5)
 
-        imgCCWRotateButton = CTkButton(master=f, text='', image=self.leftArrow)
-        imgCCWRotateButton.grid(row=rowID, column=8, padx=5, pady=5)
+        img_ccw_rotate_button = CTkButton(master=f, text='', image=self.left_arrow,
+                                          width=self.arrow_button_size, height=self.arrow_button_size)
+        img_ccw_rotate_button.grid(row=row_id, column=8, padx=5, pady=5)
 
-        imgCWRotateButton = CTkButton(master=f, text='', image=self.rightArrow)
-        imgCWRotateButton.grid(row=rowID, column=9, padx=5, pady=5)
+        img_cw_rotate_button = CTkButton(master=f, text='', image=self.right_arrow,
+                                         width=self.arrow_button_size, height=self.arrow_button_size)
+        img_cw_rotate_button.grid(row=row_id, column=9, padx=5, pady=5)
 
-        self.imageConfigWindowObjects.append([imgIncludeCheckbox, imgNameButton, imgRes, imgShp, imgRestoreButton,
-                                              imgFindCornersButton, imgInvertButton, imgGrayButton,
-                                              imgCCWRotateButton, imgCWRotateButton])
+        self.image_config_window_objects.append(
+            [img_include_checkbox, img_name_button, img_res, img_shp, img_restore_button,
+             img_find_corners_button, img_invert_button, img_gray_button,
+             img_ccw_rotate_button, img_cw_rotate_button])
 
     def _update_page_label_and_buttons(self):
-        total = len(self.imageConfig.img_collection)
+        total = len(self.image_config.img_collection)
         pages = max(1, (total + self._page_size - 1) // self._page_size)
         curr = min(pages, (self._page_start // self._page_size) + 1)
         if self._page_label:
@@ -850,7 +914,7 @@ class CalibrateGui(CTkFrame):
         self.updateImageFrame()
 
     def _last_page(self):
-        total = len(self.imageConfig.img_collection)
+        total = len(self.image_config.img_collection)
         if total <= 0:
             self._page_start = 0
             self.updateImageFrame()
@@ -867,7 +931,7 @@ class CalibrateGui(CTkFrame):
         self.updateImageFrame()
 
     def updateImageFrame(self, f=None):
-        f = f or self.imageFrame
+        f = f or self.image_frame
         if not f:
             return
         self._refresh_all_rows(f)
@@ -875,35 +939,36 @@ class CalibrateGui(CTkFrame):
     def removeUnused(self, master_frame):
         if not os.path.exists(join(self.filepath, 'Removed')):
             os.makedirs(join(self.filepath, 'Removed'))
-        removeIds = []
-        for idx, imgClass in enumerate(self.imageConfig.img_collection):
+        remove_ids = []
+        for idx, img_class in enumerate(self.image_config.img_collection):
 
-            if not imgClass.include and os.path.exists(join(self.filepath, imgClass.imageName)):
-                os.replace(join(self.filepath, imgClass.imageName), join(self.filepath, 'Removed', imgClass.imageName))
+            if not img_class.include and os.path.exists(join(self.filepath, img_class.image_name)):
+                os.replace(join(self.filepath, img_class.image_name),
+                           join(self.filepath, 'Removed', img_class.image_name))
 
-            if not imgClass.include:
-                removeIds.append(idx)
+            if not img_class.include:
+                remove_ids.append(idx)
 
-        for idx in reversed(removeIds):
-            self.imageConfig.img_collection.pop(idx)
+        for idx in reversed(remove_ids):
+            self.image_config.img_collection.pop(idx)
         self.saveToCache()
         self.updateImageFrame(master_frame)
         self.updateImageAvailabilityState()
 
-    def copyToRemovedFolder(self, imgClass):
+    def copyToRemovedFolder(self, img_class):
         if not os.path.exists(join(self.filepath, 'Removed')):
             os.makedirs(join(self.filepath, 'Removed'))
 
-        src_path = join(self.filepath, imgClass.imageName)
-        dst_path = join(self.filepath, 'Removed', imgClass.imageName)
+        src_path = join(self.filepath, img_class.image_name)
+        dst_path = join(self.filepath, 'Removed', img_class.image_name)
 
         if not os.path.exists(dst_path):
             self.writeFile(src_path, dst_path)
 
-    def restore(self, imgClass):
-        if os.path.exists(join(self.filepath, 'Removed', imgClass.imageName)):
-            src_path = join(self.filepath, 'Removed', imgClass.imageName)
-            dst_path = join(self.filepath, imgClass.imageName)
+    def restore(self, img_class):
+        if os.path.exists(join(self.filepath, 'Removed', img_class.image_name)):
+            src_path = join(self.filepath, 'Removed', img_class.image_name)
+            dst_path = join(self.filepath, img_class.image_name)
 
             self.writeFile(src_path, dst_path)
 
@@ -927,24 +992,24 @@ class CalibrateGui(CTkFrame):
                 print(f"An unexpected error occurred: {e}")
 
     def updateIncludeCheckboxes(self):
-        for idx, allGuiItems in enumerate(self.imageConfigWindowObjects):
-            checkbox, *_ = allGuiItems
-            if self.imageConfig.img_collection[idx].include:
+        for idx, all_gui_items in enumerate(self.image_config_window_objects):
+            checkbox, *_ = all_gui_items
+            if self.image_config.img_collection[idx].include:
                 checkbox.select()
             else:
                 checkbox.deselect()
 
     def unprotectInvert(self):
-        self.unprotectImageActionButton(self.imgInvertProtectedButton, self.invertAll, self.protectInvert)
+        self.unprotectImageActionButton(self.img_invert_protected_button, self.invertAll, self.protectInvert)
 
     def unprotectAllGrayscale(self):
-        self.unprotectImageActionButton(self.imgGrayProtectedButton, self.grayscaleAll, self.protectAllGrayscale)
+        self.unprotectImageActionButton(self.img_gray_protected_button, self.grayscaleAll, self.protectAllGrayscale)
 
     def unprotectRotateCCW(self):
-        self.unprotectImageActionButton(self.imgRotateCCWProtectedButton, self.rotateAllCCW, self.protectRotateCCW)
+        self.unprotectImageActionButton(self.img_rotate_ccw_protected_button, self.rotateAllCCW, self.protectRotateCCW)
 
     def unprotectRotateCW(self):
-        self.unprotectImageActionButton(self.imgRotateCWProtectedButton, self.rotateAllCW, self.protectRotateCW)
+        self.unprotectImageActionButton(self.img_rotate_cw_protected_button, self.rotateAllCW, self.protectRotateCW)
 
     def unprotectImageActionButton(self, button, action, protect):
         button.configure(command=action, fg_color=GREEN, hover_color='dark green')
@@ -952,16 +1017,16 @@ class CalibrateGui(CTkFrame):
         self.after(2000, protect, 1)
 
     def protectInvert(self, row=1):
-        self.protectImageActionButton(self.imgInvertProtectedButton, self.unprotectInvert, row, 6)
+        self.protectImageActionButton(self.img_invert_protected_button, self.unprotectInvert, row, 6)
 
     def protectAllGrayscale(self, row=1):
-        self.protectImageActionButton(self.imgGrayProtectedButton, self.unprotectAllGrayscale, row, 7)
+        self.protectImageActionButton(self.img_gray_protected_button, self.unprotectAllGrayscale, row, 7)
 
     def protectRotateCCW(self, row=1):
-        self.protectImageActionButton(self.imgRotateCCWProtectedButton, self.unprotectRotateCCW, row, 8)
+        self.protectImageActionButton(self.img_rotate_ccw_protected_button, self.unprotectRotateCCW, row, 8)
 
     def protectRotateCW(self, row=1):
-        self.protectImageActionButton(self.imgRotateCWProtectedButton, self.unprotectRotateCW, row, 9)
+        self.protectImageActionButton(self.img_rotate_cw_protected_button, self.unprotectRotateCW, row, 9)
 
     @staticmethod
     def protectImageActionButton(button, command, row, column):
@@ -970,54 +1035,56 @@ class CalibrateGui(CTkFrame):
             button.grid(row=row, column=column, padx=5, pady=5, sticky='nsew')
 
     def invertAll(self):
-        self.applyToAllImages(self.imgInvertProtectedButton, self.invertIndividualImage, self.protectInvert)
+        self.applyToAllImages(self.img_invert_protected_button, self.invertIndividualImage, self.protectInvert)
 
     def grayscaleAll(self):
-        self.applyToAllImages(self.imgGrayProtectedButton, self.grayscaleIndividualImage, self.protectAllGrayscale)
+        self.applyToAllImages(self.img_gray_protected_button, self.grayscaleIndividualImage, self.protectAllGrayscale)
 
     def rotateAllCW(self):
-        self.applyToAllImages(self.imgRotateCWProtectedButton, self.rotateCWIndividualImage, self.protectRotateCW)
+        self.applyToAllImages(self.img_rotate_cw_protected_button, self.rotateCWIndividualImage, self.protectRotateCW)
 
     def rotateAllCCW(self):
-        self.applyToAllImages(self.imgRotateCCWProtectedButton, self.rotateCCWIndividualImage, self.protectRotateCCW)
+        self.applyToAllImages(self.img_rotate_ccw_protected_button, self.rotateCCWIndividualImage,
+                              self.protectRotateCCW)
 
     def applyToAllImages(self, button, action, protect):
         button.configure(fg_color='black')
         button.update_idletasks()
-        for imgClass in self.imageConfig.img_collection:
-            action(imgClass)
+        for img_class in self.image_config.img_collection:
+            action(img_class)
         protect()
 
-    def invertIndividualImage(self, imgClass):
-        self.transformIndividualImage(imgClass, cv2.bitwise_not)
+    def invertIndividualImage(self, img_class):
+        self.transformIndividualImage(img_class, cv2.bitwise_not)
 
-    def grayscaleIndividualImage(self, imgClass):
-        self.copyToRemovedFolder(imgClass)
-        self.transformIndividualImage(imgClass, lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+    def grayscaleIndividualImage(self, img_class):
+        self.copyToRemovedFolder(img_class)
+        self.transformIndividualImage(img_class, lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
 
-    def rotateCWIndividualImage(self, imgClass):
-        self.transformIndividualImage(imgClass, lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
+    def rotateCWIndividualImage(self, img_class):
+        self.transformIndividualImage(img_class, lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
 
-    def rotateCCWIndividualImage(self, imgClass):
-        self.transformIndividualImage(imgClass, lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
+    def rotateCCWIndividualImage(self, img_class):
+        self.transformIndividualImage(img_class, lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
 
-    def transformIndividualImage(self, imgClass, transform):
-        filepath = join(self.filepath, imgClass.imageName)
+    def transformIndividualImage(self, img_class, transform):
+        filepath = join(self.filepath, img_class.image_name)
         img = cv2.imread(filepath)
         cv2.imwrite(filepath, transform(img))
 
     def includeAll(self):
-        for imgClass in self.imageConfig.img_collection:
-            imgClass.include = True
+        for img_class in self.image_config.img_collection:
+            img_class.include = True
         self.saveToCache()
         self.updateIncludeCheckboxes()
+        self.updateImageAvailabilityState()
 
     # ------------------------------------------------------------------
     # Decimate: thin the selected image set to a target count
     # ------------------------------------------------------------------
     def _open_decimate_dialog(self):
         """Open a popup that lets the user choose target count and selection mode, then deselect excess images."""
-        total = len(self.imageConfig.img_collection)
+        total = len(self.image_config.img_collection)
 
         dialog = CTkToplevel(self)
         dialog.title("Decimate Images")
@@ -1061,7 +1128,7 @@ class CalibrateGui(CTkFrame):
             0 – uniform (evenly spaced indices kept),
             1 – random subset kept.
         """
-        collection = self.imageConfig.img_collection
+        collection = self.image_config.img_collection
         total = len(collection)
 
         if target >= total:
@@ -1085,76 +1152,78 @@ class CalibrateGui(CTkFrame):
 
         self.saveToCache()
         self.updateIncludeCheckboxes()
+        self.updateImageAvailabilityState()
 
-    def unprotectClearCache(self, master_frame, rowID):
-        self.clearCacheButton.configure(text='Really Clear Cache', fg_color='green', hover_color='dark green',
-                                        text_color='white',
-                                        command=lambda f=master_frame: self.clearCache(f, rowID))
-        self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
-        self.after(2000, self.protectClearCache, master_frame, rowID)
+    def unprotectClearCache(self, master_frame, row_id):
+        self.clear_cache_button.configure(text='Really Clear Cache', fg_color='green', hover_color='dark green',
+                                          text_color='white',
+                                          command=lambda f=master_frame: self.clearCache(f, row_id))
+        self.clear_cache_button.grid(row=row_id, column=1, columnspan=1, padx=5, pady=5)
+        self.after(2000, self.protectClearCache, master_frame, row_id)
 
-    def protectClearCache(self, master_frame, rowID):
-        if self.clearCacheButton is None:
-            self.clearCacheButton = CTkButton(master=master_frame, text='Clear Cache')
-        self.clearCacheButton.configure(text='Clear Cache', fg_color='blue', hover_color='navy', text_color='white',
-                                        command=lambda f=master_frame, rid=rowID: self.unprotectClearCache(f, rid))
-        self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
+    def protectClearCache(self, master_frame, row_id):
+        if self.clear_cache_button is None:
+            self.clear_cache_button = CTkButton(master=master_frame, text='Clear Cache')
+        self.clear_cache_button.configure(text='Clear Cache', fg_color='blue', hover_color='navy', text_color='white',
+                                          command=lambda f=master_frame, rid=row_id: self.unprotectClearCache(f, rid))
+        self.clear_cache_button.grid(row=row_id, column=1, columnspan=1, padx=5, pady=5)
 
-    def clearCache(self, master_frame, rowID):
+    def clearCache(self, master_frame, row_id):
         if os.path.exists(join(self.filepath, IMAGE_CACHE)):
             filepath = copy.copy(self.filepath)
             os.remove(join(self.filepath, IMAGE_CACHE))
 
-            self.clearCacheButton.configure(text='Clearing', fg_color='yellow', text_color='black',
-                                            hover_color='yellow')
-            self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
-            self.imageConfig.camCal = Calibration()
-            self.imageConfig = ImageryCalibrationConfig()
+            self.clear_cache_button.configure(text='Clearing', fg_color='yellow', text_color='black',
+                                              hover_color='yellow')
+            self.clear_cache_button.grid(row=row_id, column=1, columnspan=1, padx=5, pady=5)
+            self.image_config.cam_cal = Calibration()
+            self.image_config = ImageryCalibrationConfig()
             self.filepath = filepath
             self.restoreFromWindowState()
             self.loadImages()
             self.updateImageFrame(master_frame)
             self.updateCalFrameState()
         else:
-            self.clearCacheButton.configure(text='No cache!', fg_color='red', text_color='white', hover_color='red')
-            self.clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
-        self.after(2000, self.protectClearCache, master_frame, rowID)
+            self.clear_cache_button.configure(text='No cache!', fg_color='red', text_color='white', hover_color='red')
+            self.clear_cache_button.grid(row=row_id, column=0, columnspan=2, padx=5, pady=5)
+        self.after(2000, self.protectClearCache, master_frame, row_id)
 
     def updateInclusion(self, idx):
-        self.imageConfig.img_collection[idx].include = not self.imageConfig.img_collection[idx].include
+        self.image_config.img_collection[idx].include = not self.image_config.img_collection[idx].include
         self.saveToCache()
+        self.updateImageAvailabilityState()
 
     def restoreFromImageConfig(self):
-        if self.imageConfig.invert_image:
-            self.invertImagesCheckbox.select()
+        if self.image_config.invert_image:
+            self.invert_images_checkbox.select()
         else:
-            self.invertImagesCheckbox.deselect()
-        if self.imageConfig.fisheye:
-            self.fisheyeLensCheckbox.select()
+            self.invert_images_checkbox.deselect()
+        if self.image_config.fisheye:
+            self.fisheye_lens_checkbox.select()
         else:
-            self.fisheyeLensCheckbox.deselect()
-        self.widthComboEntry.set(str(self.imageConfig.num_inner_corners_W))
-        self.heightComboEntry.set(str(self.imageConfig.num_inner_corners_H))
-        self.SUBwidthComboEntry.set(str(self.imageConfig.SUB_num_inner_corners_W))
-        self.SUBheightComboEntry.set(str(self.imageConfig.SUB_num_inner_corners_H))
-        self.folderLabel.configure(text="../" + os.path.basename(os.path.normpath(self.filepath)))
-        self.selectImgTypeCombo.set(self.imageConfig.img_type)
-        self.selectModeCombo.set(self.imageConfig.calMode.value)
+            self.fisheye_lens_checkbox.deselect()
+        self.width_combo_entry.set(str(self.image_config.num_inner_corners_w))
+        self.height_combo_entry.set(str(self.image_config.num_inner_corners_h))
+        self.sub_width_combo_entry.set(str(self.image_config.sub_num_inner_corners_w))
+        self.sub_height_combo_entry.set(str(self.image_config.sub_num_inner_corners_h))
+        self.folder_label.configure(text="../" + os.path.basename(os.path.normpath(self.filepath)))
+        self.select_img_type_combo.set(self.image_config.img_type)
+        self.select_mode_combo.set(self.image_config.cal_mode.value)
 
     def restoreFromWindowState(self):
-        self.imageConfig.invert_image = self.invertImagesCheckbox.get()
-        self.imageConfig.num_inner_corners_W = int(self.widthComboEntry.get())
-        self.imageConfig.num_inner_corners_H = int(self.heightComboEntry.get())
-        self.imageConfig.SUB_num_inner_corners_W = int(self.SUBwidthComboEntry.get())
-        self.imageConfig.SUB_num_inner_corners_H = int(self.SUBheightComboEntry.get())
-        self.imageConfig.img_type = self.selectImgTypeCombo.get()
-        self.imageConfig.calMode = CalibrationType(self.selectModeCombo.get())
+        self.image_config.invert_image = self.invert_images_checkbox.get()
+        self.image_config.num_inner_corners_w = int(self.width_combo_entry.get())
+        self.image_config.num_inner_corners_h = int(self.height_combo_entry.get())
+        self.image_config.sub_num_inner_corners_w = int(self.sub_width_combo_entry.get())
+        self.image_config.sub_num_inner_corners_h = int(self.sub_height_combo_entry.get())
+        self.image_config.img_type = self.select_img_type_combo.get()
+        self.image_config.cal_mode = CalibrationType(self.select_mode_combo.get())
 
     def saveToCache(self):
 
-        if len(self.imageConfig.img_collection) > 0:
+        if len(self.image_config.img_collection) > 0:
             with open(join(self.filepath, IMAGE_CACHE), 'wb') as f:
-                pickle.dump(self.imageConfig, f)
+                pickle.dump(self.image_config, f)
 
         if not os.path.exists(os.path.dirname(FILEPATH_CACHE)):
             os.makedirs(os.path.dirname(FILEPATH_CACHE))
@@ -1169,34 +1238,34 @@ class CalibrateGui(CTkFrame):
                 self.filepath = os.getcwd()
                 return
 
-            with open(FILEPATH_CACHE, 'rb') as filepathOpen:
-                self.filepath = pickle.load(filepathOpen)
+            with open(FILEPATH_CACHE, 'rb') as filepath_open:
+                self.filepath = pickle.load(filepath_open)
                 return
 
         if os.path.exists(join(self.filepath, IMAGE_CACHE)):
             try:
-                with open(join(self.filepath, IMAGE_CACHE), 'rb') as imageConfigOpen:
-                    self.imageConfig.copy(pickle.load(imageConfigOpen))
+                with open(join(self.filepath, IMAGE_CACHE), 'rb') as image_config_open:
+                    self.image_config.copy(pickle.load(image_config_open))
             except ModuleNotFoundError:
                 pass
         else:
-            self.imageConfig = ImageryCalibrationConfig()
-            if not self.imageConfig.camCal.fromFile(self.filepath):
-                success = self.imageConfig.camCal.fromBinFile(self.filepath)
+            self.image_config = ImageryCalibrationConfig()
+            if not self.image_config.cam_cal.fromFile(self.filepath):
+                success = self.image_config.cam_cal.fromBinFile(self.filepath)
 
         self.restoreFromImageConfig()
         self.loadImages()
 
     def calibrate_buttonCallback(self, master_frame, btn: CTkButton):
         self.calculating = True
-        self.calibrateButton.configure(state='disabled', text='Calibrating...', fg_color='gray')
+        self.calibrate_button.configure(state='disabled', text='Calibrating...', fg_color='gray')
         self.t1 = Thread(target=lambda f=master_frame: self.threadedCalWithButtonCallback(f, btn))
         self.t1.start()
 
     def threadedCalWithButtonCallback(self, master_frame, btn: CTkButton):
-        for imgClass in self.imageConfig.img_collection:
-            if imgClass.include is True:
-                self.findChessboardCorners(master_frame, imgClass, False)
+        for img_class in self.image_config.img_collection:
+            if img_class.include is True:
+                self.findChessboardCorners(master_frame, img_class, False)
         self.calibrateCamera()
         self.saveToCache()
         self.updateImageFrame(master_frame)
@@ -1205,45 +1274,45 @@ class CalibrateGui(CTkFrame):
 
     def calibrate(self, master_frame):
         self.calculating = True
-        self.calibrateButton.configure(state='disabled', text='Calibrating...', fg_color='gray')
+        self.calibrate_button.configure(state='disabled', text='Calibrating...', fg_color='gray')
         self.t1 = Thread(target=lambda f=master_frame: self.threadedCal(f))
         self.t1.start()
 
     def threadedCal(self, master_frame):
-        for imgClass in self.imageConfig.img_collection:
-            if imgClass.include is True:
-                self.findChessboardCorners(master_frame, imgClass, False)
+        for img_class in self.image_config.img_collection:
+            if img_class.include is True:
+                self.findChessboardCorners(master_frame, img_class, False)
         self.calibrateCamera()
         self.saveToCache()
         self.updateImageFrame(master_frame)
         self.finishCalibration()
 
     def finishCalibration(self, btn: CTkButton = None):
-        self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
+        self.calibrate_button.configure(state='normal', text='Calibrate', fg_color=GREEN)
         self.calculating = False
         if btn is not None:
             btn.configure(text='Start Calibration', state='normal', fg_color=GREEN, hover_color='dark green')
         if callable(self.on_calibration_complete):
             self.on_calibration_complete()
 
-    def widthInput(self, newVal):
-        self.imageConfig.num_inner_corners_W = int(newVal)
+    def widthInput(self, new_val):
+        self.image_config.num_inner_corners_w = int(new_val)
         self.saveToCache()
 
-    def heightInput(self, newVal):
-        self.imageConfig.num_inner_corners_H = int(newVal)
+    def heightInput(self, new_val):
+        self.image_config.num_inner_corners_h = int(new_val)
         self.saveToCache()
 
-    def SUBwidthInput(self, newVal):
-        self.imageConfig.SUB_num_inner_corners_W = int(newVal)
-        if self.imageConfig.SUB_num_inner_corners_W > self.imageConfig.num_inner_corners_W:
-            self.imageConfig.SUB_num_inner_corners_W = self.imageConfig.num_inner_corners_W
+    def SUBwidthInput(self, new_val):
+        self.image_config.sub_num_inner_corners_w = int(new_val)
+        if self.image_config.sub_num_inner_corners_w > self.image_config.num_inner_corners_w:
+            self.image_config.sub_num_inner_corners_w = self.image_config.num_inner_corners_w
         self.saveToCache()
 
-    def SUBheightInput(self, newVal):
-        self.imageConfig.SUB_num_inner_corners_H = int(newVal)
-        if self.imageConfig.SUB_num_inner_corners_H > self.imageConfig.num_inner_corners_H:
-            self.imageConfig.SUB_num_inner_corners_H = self.imageConfig.num_inner_corners_H
+    def SUBheightInput(self, new_val):
+        self.image_config.sub_num_inner_corners_h = int(new_val)
+        if self.image_config.sub_num_inner_corners_h > self.image_config.num_inner_corners_h:
+            self.image_config.sub_num_inner_corners_h = self.image_config.num_inner_corners_h
         self.saveToCache()
 
     def selectFolder(self):
@@ -1252,8 +1321,8 @@ class CalibrateGui(CTkFrame):
             return
 
         self.filepath = os.path.dirname(poss_filepath)
-        self.folderLabel.configure(text=os.path.basename(self.filepath))
-        self.imageConfig.img_collection = []
+        self.folder_label.configure(text=os.path.basename(self.filepath))
+        self.image_config.img_collection = []
 
         self.loadFromCache(False)
         self.saveToCache()
@@ -1266,116 +1335,116 @@ class CalibrateGui(CTkFrame):
           2) sharpness (if any exist)
           3) imageName (fallback)
         """
-        imgs = self.imageConfig.img_collection
+        imgs = self.image_config.img_collection
 
         has_residual = any((img.include and img.residual is not None) for img in imgs)
         has_sharpness = any((img.include and img.sharpness is not None) for img in imgs)
 
         if has_residual:
             # smaller residuals first; None goes to the bottom via sharpnessTest(None)->50.0
-            self.imageConfig.img_collection = sorted(
+            self.image_config.img_collection = sorted(
                 imgs,
-                key=lambda img: (self.sharpnessTest(img.residual), img.imageName.lower())
+                key=lambda img: (self.sharpnessTest(img.residual), img.image_name.lower())
             )
         elif has_sharpness:
             # keep your existing behavior (whatever “sharpness” direction you intended)
-            self.imageConfig.img_collection = sorted(
+            self.image_config.img_collection = sorted(
                 imgs,
-                key=lambda img: (self.sharpnessTest(img.sharpness), img.imageName.lower())
+                key=lambda img: (self.sharpnessTest(img.sharpness), img.image_name.lower())
             )
         else:
-            self.imageConfig.img_collection = sorted(imgs, key=lambda img: img.imageName.lower())
+            self.image_config.img_collection = sorted(imgs, key=lambda img: img.image_name.lower())
 
     def sortBySharpness(self):
-        self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,
-                                                 key=lambda img: self.sharpnessTest(img.sharpness))
+        self.image_config.img_collection = sorted(self.image_config.img_collection,
+                                                  key=lambda img: self.sharpnessTest(img.sharpness))
 
     def sortByResidual(self):
-        self.imageConfig.img_collection = sorted(self.imageConfig.img_collection,
-                                                 key=lambda img: self.sharpnessTest(img.residual))
+        self.image_config.img_collection = sorted(self.image_config.img_collection,
+                                                  key=lambda img: self.sharpnessTest(img.residual))
 
     @staticmethod
-    def sharpnessTest(sharpValue):
-        return 50.0 if sharpValue is None else sharpValue
+    def sharpnessTest(sharp_value):
+        return 50.0 if sharp_value is None else sharp_value
 
     def loadImages(self):
-        imgs = glob.glob(join(self.filepath, '*.' + self.imageConfig.img_type))
-        existing_names = {img.imageName for img in self.imageConfig.img_collection}
+        imgs = glob.glob(join(self.filepath, '*.' + self.image_config.img_type))
+        existing_names = {img.image_name for img in self.image_config.img_collection}
 
         for img in imgs:
             img_name = os.path.basename(img)
             if img_name not in existing_names:
-                self.imageConfig.img_collection.append(ImageData(img_name))
+                self.image_config.img_collection.append(ImageData(img_name))
                 existing_names.add(img_name)
 
         self.updateImageAvailabilityState()
 
         self.saveToCache()
-        if not self.initImageFrame:
-            self.initImageFrame = True
+        if not self.init_image_frame:
+            self.init_image_frame = True
 
     def updateImageAvailabilityState(self):
-        if self.availImagesLabel is None or self.calibrateButton is None:
+        if self.avail_images_label is None or self.calibrate_button is None:
             return
 
-        has_enough_images = len(self.imageConfig.img_collection) > 5
-        self.availImagesLabel.configure(
-            text=f'{self.imageConfig.num_valid_imgs} valid images',
+        has_enough_images = self.image_config.num_valid_imgs > 5
+        self.avail_images_label.configure(
+            text=f'{self.image_config.num_valid_imgs} valid images',
             fg_color='blue' if has_enough_images else 'red'
         )
-        self.calibrateButton.configure(state="normal" if has_enough_images else "disabled")
+        self.calibrate_button.configure(state="normal" if has_enough_images else "disabled")
 
     def invertImageToggle(self):
-        self.imageConfig.invert_image = not self.imageConfig.invert_image
+        self.image_config.invert_image = not self.image_config.invert_image
         self.saveToCache()
 
     def toggleFisheye(self):
-        self.imageConfig.fisheye = not self.imageConfig.fisheye
+        self.image_config.fisheye = not self.image_config.fisheye
         self.saveToCache()
 
-    def showBasicImage(self, imgClass):
-        img = cv2.imread(join(self.filepath, imgClass.imageName))
+    def showBasicImage(self, img_class):
+        img = cv2.imread(join(self.filepath, img_class.image_name))
 
         h, w, toss = img.shape
         if h > 1080 or w > 1080:
             self.scale = max(1080 / h, 1080 / w) * 1.1
-            dispImg = cv2.resize(img, (int(w * self.scale), int(h * self.scale)))
+            disp_img = cv2.resize(img, (int(w * self.scale), int(h * self.scale)))
         else:
-            dispImg = copy.copy(img)
+            disp_img = copy.copy(img)
 
-        cv2.namedWindow(imgClass.imageName, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(img_class.image_name, cv2.WINDOW_NORMAL)
 
-        cv2.imshow(imgClass.imageName, dispImg)
+        cv2.imshow(img_class.image_name, disp_img)
 
-        self.currImgClass = imgClass
-        self.currImg = copy.copy(dispImg)
-        cv2.setMouseCallback(imgClass.imageName, self.click_event)
+        self.curr_img_class = img_class
+        self.curr_img = copy.copy(disp_img)
+        cv2.setMouseCallback(img_class.image_name, self.click_event)
 
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-        self.firstClick = None
+        self.first_click = None
 
     def click_event(self, event, x, y, flags, param):
 
         if event == cv2.EVENT_RBUTTONDOWN or flags == cv2.EVENT_FLAG_RBUTTON:
-            self.firstClick = None
-            cv2.imshow(self.currImgClass.imageName, self.currImg)
+            self.first_click = None
+            cv2.imshow(self.curr_img_class.image_name, self.curr_img)
             return
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.firstClick = (x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and flags == cv2.EVENT_FLAG_LBUTTON and self.firstClick is not None:
-            cloned_img = copy.copy(self.currImg)
-            cv2.rectangle(cloned_img, self.firstClick, (x, y), (0, 255, 0), 2)
-            cv2.imshow(self.currImgClass.imageName, cloned_img)
-        elif event == cv2.EVENT_LBUTTONUP and self.firstClick is not None:
-            img = cv2.imread(join(self.filepath, self.currImgClass.imageName))
-            self.copyToRemovedFolder(self.currImgClass)
+            self.first_click = (x, y)
+        elif event == cv2.EVENT_MOUSEMOVE and flags == cv2.EVENT_FLAG_LBUTTON and self.first_click is not None:
+            cloned_img = copy.copy(self.curr_img)
+            cv2.rectangle(cloned_img, self.first_click, (x, y), (0, 255, 0), 2)
+            cv2.imshow(self.curr_img_class.image_name, cloned_img)
+        elif event == cv2.EVENT_LBUTTONUP and self.first_click is not None:
+            img = cv2.imread(join(self.filepath, self.curr_img_class.image_name))
+            self.copyToRemovedFolder(self.curr_img_class)
             cv2.destroyAllWindows()
 
             x = int(x / self.scale)
             y = int(y / self.scale)
-            first_x = int(self.firstClick[0] / self.scale)
-            first_y = int(self.firstClick[1] / self.scale)
+            first_x = int(self.first_click[0] / self.scale)
+            first_y = int(self.first_click[1] / self.scale)
 
             low_x = min(x, first_x)
             low_y = min(y, first_y)
@@ -1388,24 +1457,24 @@ class CalibrateGui(CTkFrame):
             new_img[:, high_x:] = np.zeros(new_img[:, high_x:].shape)
             new_img[high_y:] = np.zeros(new_img[high_y:].shape)
 
-            cv2.imwrite(join(self.filepath, self.currImgClass.imageName), new_img)
+            cv2.imwrite(join(self.filepath, self.curr_img_class.image_name), new_img)
 
             h, w, toss = new_img.shape
-            dispImg = cv2.resize(new_img, (int(w * self.scale), int(h * self.scale)))
+            disp_img = cv2.resize(new_img, (int(w * self.scale), int(h * self.scale)))
 
-            cv2.imshow("New", dispImg)
+            cv2.imshow("New", disp_img)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
-    def findChessboardCorners(self, master_frame, imgClass, showImage=True, updateImageFrame=False):
+    def findChessboardCorners(self, master_frame, img_class, show_image=True, update_image_frame=False):
 
-        if imgClass.imgPts is not None and not showImage:
+        if img_class.img_pts is not None and not show_image:
             return  # Already have points for this image
 
-        img = cv2.imread(join(self.filepath, imgClass.imageName))
+        img = cv2.imread(join(self.filepath, img_class.image_name))
 
         if img is None:
-            imgClass.include = False
+            img_class.include = False
             return
 
         # arucoDict = cv2.aruco.DICT_5X5_1000
@@ -1425,98 +1494,99 @@ class CalibrateGui(CTkFrame):
         # cv2.imshow("hey hey hey!", newImg)
         # cv2.waitKey(0)
 
-        objp = np.zeros((self.imageConfig.num_inner_corners_W * self.imageConfig.num_inner_corners_H, 3),
+        objp = np.zeros((self.image_config.num_inner_corners_w * self.image_config.num_inner_corners_h, 3),
                         np.float32)
-        objp[:, :2] = np.mgrid[0:self.imageConfig.num_inner_corners_W,
-        0:self.imageConfig.num_inner_corners_H].T.reshape(-1, 2) * self.imageConfig.spacing
+        objp[:, :2] = np.mgrid[0:self.image_config.num_inner_corners_w,
+                               0:self.image_config.num_inner_corners_h].T.reshape(-1, 2) * self.image_config.spacing
 
-        if self.imageConfig.invert_image:
+        if self.image_config.invert_image:
             temp = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             inv_img = cv2.bitwise_not(temp)
             gray = inv_img
         else:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        if imgClass.imgPts is not None and showImage:
-            self.drawImagePoints(imgClass, img, gray)
+        if img_class.img_pts is not None and show_image:
+            self.drawImagePoints(img_class, img, gray)
             return
 
-        if self.imageConfig.calMode == CalibrationType.Chessboard:
-            if self.imageConfig.screen_based_checkerboard:
+        if self.image_config.cal_mode == CalibrationType.Chessboard:
+            if self.image_config.screen_based_checkerboard:
                 flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
                 ret, corners = cv2.findChessboardCornersSB(gray,
-                                                           (self.imageConfig.num_inner_corners_W,
-                                                            self.imageConfig.num_inner_corners_H),
+                                                           (self.image_config.num_inner_corners_w,
+                                                            self.image_config.num_inner_corners_h),
                                                            flags)
             else:
                 ret, corners = cv2.findChessboardCorners(gray,
-                                                         (self.imageConfig.num_inner_corners_W,
-                                                          self.imageConfig.num_inner_corners_H))
+                                                         (self.image_config.num_inner_corners_w,
+                                                          self.image_config.num_inner_corners_h))
 
-        elif self.imageConfig.calMode == CalibrationType.Circles:
+        elif self.image_config.cal_mode == CalibrationType.Circles:
 
             ret, corners = cv2.findCirclesGrid(gray,
-                                               (self.imageConfig.num_inner_corners_W,
-                                                self.imageConfig.num_inner_corners_H),
+                                               (self.image_config.num_inner_corners_w,
+                                                self.image_config.num_inner_corners_h),
                                                flags=cv2.ADAPTIVE_THRESH_GAUSSIAN_C)  #, blobDetector=blob)
         else:
             ret = False
+            corners = None
             print('Unknown Cal Mode')
 
         if ret:
-            imgClass.objPts = objp
+            img_class.obj_pts = objp
 
             criteria = (
-                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, self.imageConfig.maxIter,
-                self.imageConfig.minStepSize)
+                cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, self.image_config.max_iter,
+                self.image_config.min_step_size)
             corners2 = cv2.cornerSubPix(gray, np.float32(corners),
-                                        (self.imageConfig.SUB_num_inner_corners_H,
-                                         self.imageConfig.SUB_num_inner_corners_W),
+                                        (self.image_config.sub_num_inner_corners_h,
+                                         self.image_config.sub_num_inner_corners_w),
                                         (-1, -1), criteria)
-            imgClass.imgPts = corners2
+            img_class.img_pts = corners2
 
             sharpness = cv2.estimateChessboardSharpness(gray, (
-                self.imageConfig.num_inner_corners_W, self.imageConfig.num_inner_corners_H), np.float32(corners2))
-            imgClass.sharpness = sharpness[0][0]
+                self.image_config.num_inner_corners_w, self.image_config.num_inner_corners_h), np.float32(corners2))
+            img_class.sharpness = sharpness[0][0]
         else:
-            imgClass.include = False
+            img_class.include = False
             self.updateImageAvailabilityState()
 
-        if updateImageFrame:
+        if update_image_frame:
             self.updateImageFrame(master_frame)
 
         self.saveToCache()
 
-        if showImage:
-            self.drawImagePoints(imgClass, img, gray)
+        if show_image:
+            self.drawImagePoints(img_class, img, gray)
 
-    def drawImagePoints(self, imgClass, img, gray):
-        if imgClass.imgPts is None:
-            imgClass.include = False
+    def drawImagePoints(self, img_class, img, gray):
+        if img_class.img_pts is None:
+            img_class.include = False
             h, w = gray.shape
-            dispImg = cv2.resize(gray, (int(w * self.scale), int(h * self.scale)))
-            cv2.imshow('NO CHESSBOARD CORNERS FOUND', dispImg)
+            disp_img = cv2.resize(gray, (int(w * self.scale), int(h * self.scale)))
+            cv2.imshow('NO CHESSBOARD CORNERS FOUND', disp_img)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
             return
 
         # Compute ROI in original image coordinates
-        min_X = max(int(np.min(imgClass.imgPts[:, 0, 0]) - 100), 0)
-        max_X = min(int(np.max(imgClass.imgPts[:, 0, 0]) + 100), img.shape[1])
-        min_Y = max(int(np.min(imgClass.imgPts[:, 0, 1]) - 100), 0)
-        max_Y = min(int(np.max(imgClass.imgPts[:, 0, 1]) + 100), img.shape[0])
+        min_x = max(int(np.min(img_class.img_pts[:, 0, 0]) - 100), 0)
+        max_x = min(int(np.max(img_class.img_pts[:, 0, 0]) + 100), img.shape[1])
+        min_y = max(int(np.min(img_class.img_pts[:, 0, 1]) - 100), 0)
+        max_y = min(int(np.max(img_class.img_pts[:, 0, 1]) + 100), img.shape[0])
 
-        roi_base = img[min_Y:max_Y, min_X:max_X].copy()
+        roi_base = img[min_y:max_y, min_x:max_x].copy()
 
         # Shift points into ROI coordinates
-        pts_roi = imgClass.imgPts.copy()
-        pts_roi[:, 0, 0] -= min_X
-        pts_roi[:, 0, 1] -= min_Y
+        pts_roi = img_class.img_pts.copy()
+        pts_roi[:, 0, 0] -= min_x
+        pts_roi[:, 0, 1] -= min_y
 
-        pattern_size = (self.imageConfig.num_inner_corners_W,
-                        self.imageConfig.num_inner_corners_H)
+        pattern_size = (self.image_config.num_inner_corners_w,
+                        self.image_config.num_inner_corners_h)
 
-        resid_roi, proj_roi, Hmat = self.chessboard_point_residuals_homography(pts_roi, pattern_size)
+        resid_roi, proj_roi, hmat = self.chessboard_point_residuals_homography(pts_roi, pattern_size)
 
         self.show_with_locked_aspect_redraw(
             'Chessboard Corners Detected',
@@ -1593,9 +1663,8 @@ class CalibrateGui(CTkFrame):
                 for (u, v) in pts2:
                     cv2.circle(resized, (int(round(u)), int(round(v))), 3, (0, 255, 0), 2)
             else:
-                # Identify worst K
-                K = min(10, len(resid_roi))
-                worst_idx = np.argsort(-resid_roi)[:K]
+                worst_count = min(10, len(resid_roi))
+                worst_idx = np.argsort(-resid_roi)[:worst_count]
 
                 for k, (u, v) in enumerate(pts2):
                     e = float(resid_roi[k])
@@ -1623,7 +1692,7 @@ class CalibrateGui(CTkFrame):
                 # Optional: draw predicted points as tiny crosses
                 if proj2 is not None:
                     for (u, v) in proj2:
-                        u = int(round(u));
+                        u = int(round(u))
                         v = int(round(v))
                         cv2.line(resized, (u - 3, v), (u + 3, v), (255, 255, 255), 1)
                         cv2.line(resized, (u, v - 3), (u, v + 3), (255, 255, 255), 1)
@@ -1653,7 +1722,7 @@ class CalibrateGui(CTkFrame):
         cv2.destroyWindow(name)
 
     @staticmethod
-    def chessboard_point_residuals_homography(imgPts, pattern_size):
+    def chessboard_point_residuals_homography(img_pts, pattern_size):
         """
         imgPts: (N,1,2) float32/64 in ROI coordinates
         pattern_size: (W, H) inner corners
@@ -1662,32 +1731,32 @@ class CalibrateGui(CTkFrame):
             proj: (N,2) predicted points from homography
             H: 3x3 homography
         """
-        W, H = pattern_size
-        N = W * H
-        pts = np.asarray(imgPts, dtype=np.float32).reshape(-1, 2)
-        if pts.shape[0] != N:
+        pattern_width, pattern_height = pattern_size
+        expected_points = pattern_width * pattern_height
+        pts = np.asarray(img_pts, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] != expected_points:
             return None, None, None
 
         # Ideal grid coordinates in chessboard index space
         # (0..W-1, 0..H-1)
-        obj2d = np.array([(i, j) for j in range(H) for i in range(W)], dtype=np.float32)
+        obj2d = np.array([(i, j) for j in range(pattern_height) for i in range(pattern_width)], dtype=np.float32)
 
         # Robust homography (helps if a few corners are bad)
-        Hmat, inliers = cv2.findHomography(obj2d, pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-        if Hmat is None:
+        hmat, inliers = cv2.findHomography(obj2d, pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+        if hmat is None:
             # fall back to least squares
-            Hmat, _ = cv2.findHomography(obj2d, pts, method=0)
+            hmat, _ = cv2.findHomography(obj2d, pts, method=0)
 
         # Project ideal grid through H -> predicted pixel locations
-        proj = cv2.perspectiveTransform(obj2d.reshape(-1, 1, 2), Hmat).reshape(-1, 2)
+        proj = cv2.perspectiveTransform(obj2d.reshape(-1, 1, 2), hmat).reshape(-1, 2)
 
         resid = np.linalg.norm(pts - proj, axis=1)  # pixels
-        return resid, proj, Hmat
+        return resid, proj, hmat
 
     def findIndexGivenImageName(self, name):
         sol_idx = None
-        for idx, imgClass in enumerate(self.imageConfig.img_collection):
-            if imgClass.imageName == name:
+        for idx, img_class in enumerate(self.image_config.img_collection):
+            if img_class.image_name == name:
                 sol_idx = idx
         return sol_idx
 
@@ -1711,18 +1780,18 @@ class CalibrateGui(CTkFrame):
         res - list of residuals for each input image
         """
 
-        startTime = time.time()
+        start_time = time.time()
 
         images = []
-        objPoints = []
-        imgPoints = []
-        for idx, imgClass in enumerate(self.imageConfig.img_collection):
-            if imgClass.include and imgClass.objPts is not None and imgClass.imgPts is not None:
+        obj_points = []
+        img_points = []
+        for idx, img_class in enumerate(self.image_config.img_collection):
+            if img_class.include and img_class.obj_pts is not None and img_class.img_pts is not None:
                 images.append(self.fileName(idx))
-                objPoints.append(imgClass.objPts)
-                imgPoints.append(imgClass.imgPts)
-            elif imgClass.include:
-                imgClass.include = False
+                obj_points.append(img_class.obj_pts)
+                img_points.append(img_class.img_pts)
+            elif img_class.include:
+                img_class.include = False
 
         if not images:
             self.rejectCalibration(
@@ -1750,24 +1819,24 @@ class CalibrateGui(CTkFrame):
 
         gray = cv2.cvtColor(first_img, cv2.COLOR_BGR2GRAY)
 
-        if self.imageConfig.fisheye:
-            def _as_fisheye_object_points(objPts):
+        if self.image_config.fisheye:
+            def _as_fisheye_object_points(obj_pts):
                 out = []
-                for P in objPts:
-                    P = np.asarray(P, dtype=np.float64)
+                for points in obj_pts:
+                    points = np.asarray(points, dtype=np.float64)
                     # accept (N,3) or (N,1,3)
-                    if P.ndim == 2 and P.shape[1] == 3:
-                        P = P.reshape(-1, 1, 3)
-                    elif P.ndim == 3 and P.shape[1:] == (1, 3):
+                    if points.ndim == 2 and points.shape[1] == 3:
+                        points = points.reshape(-1, 1, 3)
+                    elif points.ndim == 3 and points.shape[1:] == (1, 3):
                         pass
                     else:
-                        raise ValueError(f"objectPoints must be (N,3) or (N,1,3), got {P.shape}")
-                    out.append(P)
+                        raise ValueError(f"objectPoints must be (N,3) or (N,1,3), got {points.shape}")
+                    out.append(points)
                 return out
 
-            def _as_fisheye_image_points(imgPts):
+            def _as_fisheye_image_points(img_pts):
                 out = []
-                for p in imgPts:
+                for p in img_pts:
                     p = np.asarray(p, dtype=np.float64)
                     # accept (N,2) or (N,1,2)
                     if p.ndim == 2 and p.shape[1] == 2:
@@ -1779,58 +1848,58 @@ class CalibrateGui(CTkFrame):
                     out.append(p)
                 return out
 
-            K = np.array([[400.0, 0.0, 400.0],
-                          [0.0, 400.0, 400.0],
-                          [0.0, 0.0, 1.0]], dtype=np.float64)
-            D = np.zeros((4, 1), dtype=np.float64)
+            camera_matrix = np.array([[400.0, 0.0, 400.0],
+                                      [0.0, 400.0, 400.0],
+                                      [0.0, 0.0, 1.0]], dtype=np.float64)
+            distortion_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-            objp = _as_fisheye_object_points(objPoints)
-            imgp = _as_fisheye_image_points(imgPoints)
+            objp = _as_fisheye_object_points(obj_points)
+            imgp = _as_fisheye_image_points(img_points)
 
             # You can pass empty lists; OpenCV will fill them.
             rvecs, tvecs = [], []
 
             try:
-                rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                rms, camera_matrix, distortion_coeffs, rvecs, tvecs = cv2.fisheye.calibrate(
                     objectPoints=objp,
                     imagePoints=imgp,
                     image_size=gray.shape[::-1],
-                    K=K,
-                    D=D,
+                    K=camera_matrix,
+                    D=distortion_coeffs,
                     rvecs=rvecs,
                     tvecs=tvecs,
                     flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW,
                     criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                              self.imageConfig.maxIter,
-                              self.imageConfig.minStepSize)
+                              self.image_config.max_iter,
+                              self.image_config.min_step_size)
                 )
             except (cv2.error, ValueError) as err:
                 self.rejectCalibrationFromOpenCv(err)
                 return False
 
             ret = rms
-            mtx = K
-            dist = D.reshape(-1)  # 4,
+            mtx = camera_matrix
+            dist = distortion_coeffs.reshape(-1)  # 4,
         else:
             try:
-                K0 = cv2.initCameraMatrix2D(objPoints, imgPoints, gray.shape[::-1], 0)
+                initial_camera_matrix = cv2.initCameraMatrix2D(obj_points, img_points, gray.shape[::-1], 0)
             except cv2.error as err:
                 self.rejectCalibrationFromOpenCv(err)
                 return False
 
-            flags = (self.imageConfig.flags or 0) | cv2.CALIB_USE_INTRINSIC_GUESS
+            flags = (self.image_config.flags or 0) | cv2.CALIB_USE_INTRINSIC_GUESS
 
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                        self.imageConfig.maxIter,  # e.g. 30–50 is usually enough
-                        self.imageConfig.minStepSize)  # e.g. 1e-6..1e-5
+                        self.image_config.max_iter,  # e.g. 30–50 is usually enough
+                        self.image_config.min_step_size)  # e.g. 1e-6..1e-5
 
             try:
-                calValues = cv2.calibrateCameraROExtended(
-                    objectPoints=objPoints,
-                    imagePoints=imgPoints,
+                cal_values = cv2.calibrateCameraROExtended(
+                    objectPoints=obj_points,
+                    imagePoints=img_points,
                     imageSize=gray.shape[::-1],
                     iFixedPoint=1,
-                    cameraMatrix=K0,
+                    cameraMatrix=initial_camera_matrix,
                     distCoeffs=None,
                     flags=flags,
                     criteria=criteria
@@ -1838,35 +1907,36 @@ class CalibrateGui(CTkFrame):
             except cv2.error as err:
                 self.rejectCalibrationFromOpenCv(err)
                 return False
-            ret = calValues[0]
-            mtx = calValues[1]
-            dist = calValues[2]
+            ret = cal_values[0]
+            mtx = cal_values[1]
+            dist = cal_values[2]
             # rvecs = calValues[3]
             # tvecs = calValues[4]
             # newObjPoints = calValues[5]
             # stdDevIntrinsics = calValues[6]
             # stdDevExtrinsics = calValues[7]
             # stdDevObjPoints = calValues[8]
-            residuals = calValues[9]
+            residuals = cal_values[9]
 
             for img_idx, img in enumerate(images):
-                self.imageConfig.img_collection[self.findIndexGivenImageName(os.path.basename(img))].residual = \
+                self.image_config.img_collection[self.findIndexGivenImageName(os.path.basename(img))].residual = \
                     residuals[img_idx][0]
 
             # Sort the images by their residual Values
             self.sortByResidual()
 
-        endTime = time.time()
+        end_time = time.time()
 
-        fovx, fovy, focalLength, principalPoint, aspectRatio = cv2.calibrationMatrixValues(mtx, gray.shape[::-1], 25.,
-                                                                                           25.)
+        fovx, fovy, focal_length, principal_point, aspect_ratio = cv2.calibrationMatrixValues(mtx, gray.shape[::-1],
+                                                                                              25.,
+                                                                                              25.)
 
-        self.imageConfig.camCal.fisheye = self.imageConfig.fisheye
-        self.imageConfig.camCal.setCameraMatrix(mtx=mtx)
-        self.imageConfig.camCal.setDistortion(dist=dist.T)
-        self.imageConfig.camCal.setAccessories(calTime=endTime - startTime, numCBUsed=len(images),
-                                               width=gray.shape[::-1][0], height=gray.shape[::-1][1], hfov=fovx,
-                                               rms=ret, timeOfCompute=datetime.datetime.now())
+        self.image_config.cam_cal.fisheye = self.image_config.fisheye
+        self.image_config.cam_cal.setCameraMatrix(mtx=mtx)
+        self.image_config.cam_cal.setDistortion(dist=dist.T)
+        self.image_config.cam_cal.setAccessories(calTime=end_time - start_time, numCBUsed=len(images),
+                                                 width=gray.shape[::-1][0], height=gray.shape[::-1][1], hfov=fovx,
+                                                 rms=ret, timeOfCompute=datetime.datetime.now())
 
         self.updateCalFrameState()
 
@@ -1880,7 +1950,7 @@ class CalibrateGui(CTkFrame):
         def show_warning():
             messagebox.showwarning("Calibration not run", message)
 
-        self.after(0, show_warning)
+        self.after(0, show_warning)  # type: ignore[call-arg]
 
     def rejectCalibrationFromOpenCv(self, err):
         self.rejectCalibration(

@@ -11,7 +11,7 @@ from enum import Enum
 from functools import partial
 from os.path import join
 from threading import Thread
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 from customtkinter import (CTkFrame, CTkImage, CTkEntry, CTkButton, CTkLabel, CTkComboBox, CTkCheckBox, CTkInputDialog,
                            END, CTkToplevel)
@@ -161,6 +161,7 @@ class CalibrateGui(CTkFrame):
         self.scale = 1.0
 
         self.func_that_refits = None
+        self.on_calibration_complete = None
 
         self.filepath = ''
         self.loadFromCache(True)
@@ -506,29 +507,25 @@ class CalibrateGui(CTkFrame):
             self.scaleAnyButton.configure(state='disabled')
 
     def scaleTo864(self, master_frame):
-        self.imageConfig.camCal.scaleCalibration(864)
-        self.saveToCache()
-        self.updateConfigWindow(master_frame)
-        self.updateCalFrameState()
+        self.scaleCalibrationTo(864)
 
     def scaleTo2848(self, master_frame):
-        self.imageConfig.camCal.scaleCalibration(2848)
-        self.saveToCache()
-        self.updateConfigWindow(master_frame)
-        self.updateCalFrameState()
+        self.scaleCalibrationTo(2848)
 
     def scaleToInput(self, master_frame):
         dialog = CTkInputDialog(
             text='Input an integer value. The updated calibration width will be this value.',
             title='Calibration Scale Selection')
         try:
-            self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
-            self.saveToCache()
-            self.updateConfigWindow(master_frame)
-            self.updateCalFrameState()
-        except ValueError:
+            self.scaleCalibrationTo(int(dialog.get_input()))
+        except (TypeError, ValueError):
             from support.io.my_logging import LOG
             LOG.warning('Invalid input. Please input only an integer.')
+
+    def scaleCalibrationTo(self, width):
+        self.imageConfig.camCal.scaleCalibration(width)
+        self.saveToCache()
+        self.updateCalFrameState()
 
     def updateConfigWindow(self, master_frame):
         rowID = 0
@@ -603,9 +600,7 @@ class CalibrateGui(CTkFrame):
             entry.delete(0, END)
             entry.insert(0, str(self.imageConfig.minStepSize))
         self.saveToCache()
-        entry.configure(fg_color='yellow')
-        entry.after(1, self.update_idletasks())
-        entry.after(500, entry.configure(fg_color='green'))
+        self.flashEntrySaved(entry)
 
     def stoppingCritIterUpdate(self, entry=None):
         try:
@@ -616,9 +611,12 @@ class CalibrateGui(CTkFrame):
             return
         self.imageConfig.maxIter = newIter
         self.saveToCache()
+        self.flashEntrySaved(entry)
+
+    def flashEntrySaved(self, entry):
         entry.configure(fg_color='yellow')
-        entry.after(1, self.update_idletasks())
-        entry.after(500, entry.configure(fg_color=GREEN))
+        entry.after(1, self.update_idletasks)
+        entry.after(500, lambda: entry.configure(fg_color=GREEN))
 
     def toggleZeroTangentDist(self):
         self.imageConfig.zeroTangentDist = not self.imageConfig.zeroTangentDist
@@ -885,12 +883,7 @@ class CalibrateGui(CTkFrame):
             self.imageConfig.img_collection.pop(idx)
         self.saveToCache()
         self.updateImageFrame(master_frame)
-
-        if len(self.imageConfig.img_collection) > 5:
-            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color='blue')
-            self.calibrateButton.configure(state="normal")
-        else:
-            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color="red")
+        self.updateImageAvailabilityState()
 
     def copyToRemovedFolder(self, imgClass):
         if not os.path.exists(join(self.filepath, 'Removed')):
@@ -937,99 +930,76 @@ class CalibrateGui(CTkFrame):
                 checkbox.deselect()
 
     def unprotectInvert(self):
-        self.imgInvertProtectedButton.configure(command=self.invertAll, fg_color=GREEN, hover_color='dark green')
-        self.imgInvertProtectedButton.update_idletasks()
-        self.after(2000, self.protectInvert, 1)
+        self.unprotectImageActionButton(self.imgInvertProtectedButton, self.invertAll, self.protectInvert)
 
     def unprotectAllGrayscale(self):
-        self.imgGrayProtectedButton.configure(command=self.grayscaleAll, fg_color=GREEN, hover_color='dark green')
-        self.imgGrayProtectedButton.update_idletasks()
-        self.after(2000, self.protectAllGrayscale, 1)
+        self.unprotectImageActionButton(self.imgGrayProtectedButton, self.grayscaleAll, self.protectAllGrayscale)
 
     def unprotectRotateCCW(self):
-        self.imgRotateCCWProtectedButton.configure(command=self.rotateAllCCW, fg_color=GREEN, hover_color='dark green')
-        self.imgRotateCCWProtectedButton.update_idletasks()
-        self.after(2000, self.protectRotateCCW, 1)
+        self.unprotectImageActionButton(self.imgRotateCCWProtectedButton, self.rotateAllCCW, self.protectRotateCCW)
 
     def unprotectRotateCW(self):
-        self.imgRotateCWProtectedButton.configure(command=self.rotateAllCW, fg_color=GREEN, hover_color='dark green')
-        self.imgRotateCWProtectedButton.update_idletasks()
-        self.after(2000, self.protectRotateCW, 1)
+        self.unprotectImageActionButton(self.imgRotateCWProtectedButton, self.rotateAllCW, self.protectRotateCW)
+
+    def unprotectImageActionButton(self, button, action, protect):
+        button.configure(command=action, fg_color=GREEN, hover_color='dark green')
+        button.update_idletasks()
+        self.after(2000, protect, 1)
 
     def protectInvert(self, row=1):
-        self.imgInvertProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectInvert)
-        if not self.imgInvertProtectedButton.winfo_ismapped():
-            self.imgInvertProtectedButton.grid(row=row, column=6, padx=5, pady=5, sticky='nsew')
+        self.protectImageActionButton(self.imgInvertProtectedButton, self.unprotectInvert, row, 6)
 
     def protectAllGrayscale(self, row=1):
-        self.imgGrayProtectedButton.configure(fg_color='blue', hover_color='cyan4', command=self.unprotectAllGrayscale)
-        if not self.imgGrayProtectedButton.winfo_ismapped():
-            self.imgGrayProtectedButton.grid(row=row, column=7, padx=5, pady=5, sticky='nsew')
+        self.protectImageActionButton(self.imgGrayProtectedButton, self.unprotectAllGrayscale, row, 7)
 
     def protectRotateCCW(self, row=1):
-        self.imgRotateCCWProtectedButton.configure(fg_color='blue', hover_color='cyan4',
-                                                   command=self.unprotectRotateCCW)
-        if not self.imgRotateCCWProtectedButton.winfo_ismapped():
-            self.imgRotateCCWProtectedButton.grid(row=row, column=8, padx=5, pady=5, sticky='nsew')
+        self.protectImageActionButton(self.imgRotateCCWProtectedButton, self.unprotectRotateCCW, row, 8)
 
     def protectRotateCW(self, row=1):
-        self.imgRotateCWProtectedButton.configure(fg_color='blue', hover_color='cyan4',
-                                                  command=self.unprotectRotateCW)
-        if not self.imgRotateCWProtectedButton.winfo_ismapped():
-            self.imgRotateCWProtectedButton.grid(row=row, column=9, padx=5, pady=5, sticky='nsew')
+        self.protectImageActionButton(self.imgRotateCWProtectedButton, self.unprotectRotateCW, row, 9)
+
+    @staticmethod
+    def protectImageActionButton(button, command, row, column):
+        button.configure(fg_color='blue', hover_color='cyan4', command=command)
+        if not button.winfo_ismapped():
+            button.grid(row=row, column=column, padx=5, pady=5, sticky='nsew')
 
     def invertAll(self):
-        self.imgInvertProtectedButton.configure(fg_color='black')
-        self.imgInvertProtectedButton.update_idletasks()
-        for imgClass in self.imageConfig.img_collection:
-            self.invertIndividualImage(imgClass)
-        self.protectInvert()
+        self.applyToAllImages(self.imgInvertProtectedButton, self.invertIndividualImage, self.protectInvert)
 
     def grayscaleAll(self):
-        self.imgGrayProtectedButton.configure(fg_color='black')
-        self.imgGrayProtectedButton.update_idletasks()
-        for imgClass in self.imageConfig.img_collection:
-            self.grayscaleIndividualImage(imgClass)
-        self.protectAllGrayscale()
+        self.applyToAllImages(self.imgGrayProtectedButton, self.grayscaleIndividualImage, self.protectAllGrayscale)
 
     def rotateAllCW(self):
-        self.imgRotateCWProtectedButton.configure(fg_color='black')
-        self.imgRotateCWProtectedButton.update_idletasks()
-        for imgClass in self.imageConfig.img_collection:
-            self.rotateCWIndividualImage(imgClass)
-        self.protectRotateCW()
+        self.applyToAllImages(self.imgRotateCWProtectedButton, self.rotateCWIndividualImage, self.protectRotateCW)
 
     def rotateAllCCW(self):
-        self.imgRotateCCWProtectedButton.configure(fg_color='black')
-        self.imgRotateCCWProtectedButton.update_idletasks()
+        self.applyToAllImages(self.imgRotateCCWProtectedButton, self.rotateCCWIndividualImage, self.protectRotateCCW)
+
+    def applyToAllImages(self, button, action, protect):
+        button.configure(fg_color='black')
+        button.update_idletasks()
         for imgClass in self.imageConfig.img_collection:
-            self.rotateCCWIndividualImage(imgClass)
-        self.protectRotateCCW()
+            action(imgClass)
+        protect()
 
     def invertIndividualImage(self, imgClass):
-        filepath = join(self.filepath, imgClass.imageName)
-        img = cv2.imread(filepath)
-        invt_img = cv2.bitwise_not(img)
-        cv2.imwrite(filepath, invt_img)
+        self.transformIndividualImage(imgClass, cv2.bitwise_not)
 
     def grayscaleIndividualImage(self, imgClass):
         self.copyToRemovedFolder(imgClass)
-        filepath = join(self.filepath, imgClass.imageName)
-        img = cv2.imread(filepath)
-        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(filepath, gray_img)
+        self.transformIndividualImage(imgClass, lambda img: cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
 
     def rotateCWIndividualImage(self, imgClass):
-        filepath = join(self.filepath, imgClass.imageName)
-        img = cv2.imread(filepath)
-        invt_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        cv2.imwrite(filepath, invt_img)
+        self.transformIndividualImage(imgClass, lambda img: cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE))
 
     def rotateCCWIndividualImage(self, imgClass):
+        self.transformIndividualImage(imgClass, lambda img: cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE))
+
+    def transformIndividualImage(self, imgClass, transform):
         filepath = join(self.filepath, imgClass.imageName)
         img = cv2.imread(filepath)
-        invt_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        cv2.imwrite(filepath, invt_img)
+        cv2.imwrite(filepath, transform(img))
 
     def includeAll(self):
         for imgClass in self.imageConfig.img_collection:
@@ -1151,9 +1121,7 @@ class CalibrateGui(CTkFrame):
         self.calibrateCamera()
         self.saveToCache()
         self.updateImageFrame(master_frame)
-        self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
-        self.calculating = False
-        btn.configure(text='Start Calibration', state='normal')
+        self.finishCalibration(btn)
         self.update()
 
     def calibrate(self, master_frame):
@@ -1169,8 +1137,15 @@ class CalibrateGui(CTkFrame):
         self.calibrateCamera()
         self.saveToCache()
         self.updateImageFrame(master_frame)
+        self.finishCalibration()
+
+    def finishCalibration(self, btn: CTkButton = None):
         self.calibrateButton.configure(state='normal', text='Calibrate', fg_color=GREEN)
         self.calculating = False
+        if btn is not None:
+            btn.configure(text='Start Calibration', state='normal', fg_color=GREEN, hover_color='dark green')
+        if callable(self.on_calibration_complete):
+            self.on_calibration_complete()
 
     def widthInput(self, newVal):
         self.imageConfig.num_inner_corners_W = int(newVal)
@@ -1242,33 +1217,34 @@ class CalibrateGui(CTkFrame):
 
     @staticmethod
     def sharpnessTest(sharpValue):
-        if sharpValue is None:
-            return 50.0
-        else:
-            return sharpValue
+        return 50.0 if sharpValue is None else sharpValue
 
     def loadImages(self):
         imgs = glob.glob(join(self.filepath, '*.' + self.imageConfig.img_type))
+        existing_names = {img.imageName for img in self.imageConfig.img_collection}
 
         for img in imgs:
-            img = os.path.basename(img)
-            isAlreadyPresent = False
-            for existingImgClass in self.imageConfig.img_collection:
-                if img == existingImgClass.imageName:
-                    isAlreadyPresent = True
-            if not isAlreadyPresent:
-                self.imageConfig.img_collection.append(ImageData(os.path.basename(img)))
+            img_name = os.path.basename(img)
+            if img_name not in existing_names:
+                self.imageConfig.img_collection.append(ImageData(img_name))
+                existing_names.add(img_name)
 
-        if len(self.imageConfig.img_collection) > 5:
-            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color='blue')
-            self.calibrateButton.configure(state="normal")
-        else:
-            self.availImagesLabel.configure(text=f'{self.imageConfig.num_valid_imgs} valid images', fg_color="red")
-            self.calibrateButton.configure(state="disabled")
+        self.updateImageAvailabilityState()
 
         self.saveToCache()
         if not self.initImageFrame:
             self.initImageFrame = True
+
+    def updateImageAvailabilityState(self):
+        if self.availImagesLabel is None or self.calibrateButton is None:
+            return
+
+        has_enough_images = len(self.imageConfig.img_collection) > 5
+        self.availImagesLabel.configure(
+            text=f'{self.imageConfig.num_valid_imgs} valid images',
+            fg_color='blue' if has_enough_images else 'red'
+        )
+        self.calibrateButton.configure(state="normal" if has_enough_images else "disabled")
 
     def invertImageToggle(self):
         self.imageConfig.invert_image = not self.imageConfig.invert_image
@@ -1425,7 +1401,7 @@ class CalibrateGui(CTkFrame):
             imgClass.sharpness = sharpness[0][0]
         else:
             imgClass.include = False
-            self.availImagesLabel.configure(text=str(len(self.imageConfig.img_collection)) + ' valid images')
+            self.updateImageAvailabilityState()
 
         if updateImageFrame:
             self.updateImageFrame(master_frame)
@@ -1662,12 +1638,38 @@ class CalibrateGui(CTkFrame):
         objPoints = []
         imgPoints = []
         for idx, imgClass in enumerate(self.imageConfig.img_collection):
-            if imgClass.include:
+            if imgClass.include and imgClass.objPts is not None and imgClass.imgPts is not None:
                 images.append(self.fileName(idx))
                 objPoints.append(imgClass.objPts)
                 imgPoints.append(imgClass.imgPts)
+            elif imgClass.include:
+                imgClass.include = False
 
-        gray = cv2.cvtColor(cv2.imread(self.fileName(0)), cv2.COLOR_BGR2GRAY)
+        if not images:
+            self.rejectCalibration(
+                "No usable calibration images were found.\n\n"
+                "The calibration pattern was not detected in any selected image. Check the calibration type, "
+                "inner-corner width/height, inversion setting, file type, and image quality, then try again."
+            )
+            return False
+
+        if len(images) < 2:
+            self.rejectCalibration(
+                "Calibration needs at least two usable images.\n\n"
+                f"Only {len(images)} selected image had a detected calibration pattern. Add more images with "
+                "successful pattern detections, or check the calibration type, inner-corner width/height, "
+                "inversion setting, and image quality."
+            )
+            return False
+
+        first_img = cv2.imread(images[0])
+        if first_img is None:
+            self.rejectCalibration(
+                "Calibration could not start because the first usable image could not be read."
+            )
+            return False
+
+        gray = cv2.cvtColor(first_img, cv2.COLOR_BGR2GRAY)
 
         if self.imageConfig.fisheye:
             def _as_fisheye_object_points(objPts):
@@ -1709,25 +1711,33 @@ class CalibrateGui(CTkFrame):
             # You can pass empty lists; OpenCV will fill them.
             rvecs, tvecs = [], []
 
-            rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
-                objectPoints=objp,
-                imagePoints=imgp,
-                image_size=gray.shape[::-1],
-                K=K,
-                D=D,
-                rvecs=rvecs,
-                tvecs=tvecs,
-                flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW,
-                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                          self.imageConfig.maxIter,
-                          self.imageConfig.minStepSize)
-            )
+            try:
+                rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                    objectPoints=objp,
+                    imagePoints=imgp,
+                    image_size=gray.shape[::-1],
+                    K=K,
+                    D=D,
+                    rvecs=rvecs,
+                    tvecs=tvecs,
+                    flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC | cv2.fisheye.CALIB_FIX_SKEW,
+                    criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                              self.imageConfig.maxIter,
+                              self.imageConfig.minStepSize)
+                )
+            except (cv2.error, ValueError) as err:
+                self.rejectCalibrationFromOpenCv(err)
+                return False
 
             ret = rms
             mtx = K
             dist = D.reshape(-1)  # 4,
         else:
-            K0 = cv2.initCameraMatrix2D(objPoints, imgPoints, gray.shape[::-1], 0)
+            try:
+                K0 = cv2.initCameraMatrix2D(objPoints, imgPoints, gray.shape[::-1], 0)
+            except cv2.error as err:
+                self.rejectCalibrationFromOpenCv(err)
+                return False
 
             flags = (self.imageConfig.flags or 0) | cv2.CALIB_USE_INTRINSIC_GUESS
 
@@ -1735,16 +1745,20 @@ class CalibrateGui(CTkFrame):
                         self.imageConfig.maxIter,  # e.g. 30–50 is usually enough
                         self.imageConfig.minStepSize)  # e.g. 1e-6..1e-5
 
-            calValues = cv2.calibrateCameraROExtended(
-                objectPoints=objPoints,
-                imagePoints=imgPoints,
-                imageSize=gray.shape[::-1],
-                iFixedPoint=1,
-                cameraMatrix=K0,
-                distCoeffs=None,
-                flags=flags,
-                criteria=criteria
-            )
+            try:
+                calValues = cv2.calibrateCameraROExtended(
+                    objectPoints=objPoints,
+                    imagePoints=imgPoints,
+                    imageSize=gray.shape[::-1],
+                    iFixedPoint=1,
+                    cameraMatrix=K0,
+                    distCoeffs=None,
+                    flags=flags,
+                    criteria=criteria
+                )
+            except cv2.error as err:
+                self.rejectCalibrationFromOpenCv(err)
+                return False
             ret = calValues[0]
             mtx = calValues[1]
             dist = calValues[2]
@@ -1778,6 +1792,24 @@ class CalibrateGui(CTkFrame):
         self.updateCalFrameState()
 
         self.notify()
+        return True
+
+    def rejectCalibration(self, message):
+        self.updateImageAvailabilityState()
+        print(message)
+
+        def show_warning():
+            messagebox.showwarning("Calibration not run", message)
+
+        self.after(0, show_warning)
+
+    def rejectCalibrationFromOpenCv(self, err):
+        self.rejectCalibration(
+            "Calibration could not be solved from the selected images.\n\n"
+            "Add more usable images with varied camera positions, or check the calibration type, "
+            "inner-corner width/height, inversion setting, and image quality.\n\n"
+            f"OpenCV reported: {err}"
+        )
 
     @staticmethod
     def notify():

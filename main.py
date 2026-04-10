@@ -73,6 +73,7 @@ class CalibratePage(ctk.CTkFrame):
         self.columnconfigure(0, weight=1)
 
         self.calPage = calibrate.CalibrateGui(self)
+        self.set_main_button_calculating = None
 
         # define "sections" as frames we can swap
         self.sections = {
@@ -101,15 +102,21 @@ class CalibratePage(ctk.CTkFrame):
     def submenu_footer(self):
         def on_toggle(btn: ctk.CTkButton):
             # call your existing toggle
+            if callable(self.set_main_button_calculating):
+                self.set_main_button_calculating(True)
             running = self.calPage.calibrate_buttonCallback(self, btn)
 
             btn.configure(text="Calibrating", fg_color="royalblue4", hover_color="blue", state='disabled')
             # update UI to reflect state
             # if running:
             # else:
-            #     btn.configure(text="Start Calibrate", fg_color=GREEN, hover_color=DEFAULT_HOVER)
+            #     btn.configure(text="Start Calibration", fg_color=GREEN, hover_color=DEFAULT_HOVER)
 
-        return ("Start Calibrate", on_toggle)
+        return ("Start Calibration", on_toggle)
+
+    def bind_main_button_state(self, callback):
+        self.set_main_button_calculating = callback
+        self.calPage.on_calibration_complete = lambda: callback(False)
 
     def on_show(self):
         if hasattr(self.calPage, "set_ui_active"):
@@ -184,6 +191,9 @@ class CameraPage(ctk.CTkFrame):
 
     def submenu_footer(self):
         def render(btn: ctk.CTkButton):
+            if getattr(btn, "_footer_owner", None) is not self:
+                return
+
             running = bool(self.camGui.stream_running_var.get())
             if running:
                 btn.configure(text="Stop Camera", fg_color="royalblue4", hover_color="blue")
@@ -312,8 +322,24 @@ class App(ctk.CTk):
             btn.pack(fill="x", padx=12, pady=6)
             self.main_buttons[name] = btn
 
+        calibrate_page = self.pages.get("Calibrate")
+        if hasattr(calibrate_page, "bind_main_button_state"):
+            calibrate_page.bind_main_button_state(self._set_calibrate_main_button_calculating)
+
     def _on_mainnav_click(self, name):
         self.show_page(name)
+
+    def _set_calibrate_main_button_calculating(self, calculating: bool):
+        btn = self.main_buttons.get("Calibrate")
+        if not _is_alive(btn):
+            return
+
+        if calculating:
+            btn.configure(state="disabled", fg_color="royalblue4", hover_color="blue")
+        else:
+            btn.configure(state="normal", fg_color=GREEN, hover_color=DEFAULT_HOVER)
+            if self.current_page == "Calibrate":
+                self._highlight_main_button("Calibrate")
 
     def _highlight_main_button(self, name):
         # safely reset the previously active main button
@@ -395,6 +421,7 @@ class App(ctk.CTk):
             else:
                 text, cmd, binder = out
 
+            self.subnav_footer_btn._footer_owner = page
             self.subnav_footer_btn.configure(
                 text=text,
                 command=lambda fn=cmd, btn=self.subnav_footer_btn: fn(btn)

@@ -193,6 +193,7 @@ class CalibrateGui(CTkFrame):
         self.nextPageBtn = None
         self.lastPageBtn = None
 
+        self.calFrame = None
         self.saveCalButton = None
         self.scale864Button = None
         self.scale2848Button = None
@@ -215,6 +216,7 @@ class CalibrateGui(CTkFrame):
         self.SUBcornerInputLabel = None
         self.SUBwidthLabel = self.SUBheightLabel = self.SUBwidthComboEntry = self.SUBheightComboEntry = None
         self.calibrateButton = None
+        self.clearCacheButton = None
         self.displayCal = None
 
         # # Once a calibration is active, allow user to display a window that manages the calibration
@@ -461,57 +463,59 @@ class CalibrateGui(CTkFrame):
 
     def setup_CalFrame(self, master_frame):
 
-        f = CTkFrame(master_frame)
-        # If we have a previous calibration
-        if self.saveCalButton is None:
-            self.saveCalButton = CTkButton(master=f, text='Save Calibration')
+        if self.calFrame is None:
+            self.calFrame = CTkFrame(master_frame)
+
+            self.saveCalButton = CTkButton(master=self.calFrame, text='Save Calibration')
             self.saveCalButton.configure(command=lambda btn=self.saveCalButton: self.saveCal(btn))
             self.saveCalButton.grid(row=0, column=0, padx=5, pady=5)
 
-        if self.scale864Button is None:
-            self.scale864Button = CTkButton(master=f, text='Scale to 864x864', command=lambda: self.scaleTo864(f))
+            self.calLabel = CTkLabel(master=self.calFrame, justify='center', anchor='w')
+            self.calLabel.grid(row=1, column=0, padx=5, pady=5)
+
+            self.scale864Button = CTkButton(master=self.calFrame, text='Scale to 864x864',
+                                            command=lambda: self.scaleTo864(self.calFrame))
             self.scale864Button.grid(row=3, column=0, padx=5, pady=5)
 
-        if self.scale2848Button is None:
-            self.scale2848Button = CTkButton(master=f, text='Scale to 2848x2848', command=lambda: self.scaleTo2848(f))
+            self.scale2848Button = CTkButton(master=self.calFrame, text='Scale to 2848x2848',
+                                             command=lambda: self.scaleTo2848(self.calFrame))
             self.scale2848Button.grid(row=4, column=0, padx=5, pady=5)
 
-        if self.scaleAnyButton is None:
-            self.scaleAnyButton = CTkButton(master=f, text='Scale to Input Size', command=lambda: self.scaleToInput(f))
+            self.scaleAnyButton = CTkButton(master=self.calFrame, text='Scale to Input Size',
+                                            command=lambda: self.scaleToInput(self.calFrame))
             self.scaleAnyButton.grid(row=5, column=0, padx=5, pady=5)
 
-        if self.imageConfig.camCal.validCal:
-            # Then display the calibration
-            if self.calLabel is None:
-                self.calLabel = CTkLabel(master=f, text=self.imageConfig.camCal.calStr, justify='center', anchor='w')
-                self.calLabel.grid(row=1, column=0, padx=5, pady=5)
-            else:
-                self.calLabel.configure(text=self.imageConfig.camCal.calStr)
-        else:
-            if self.calLabel is None:
-                self.calLabel = CTkLabel(f, text="No calibration calculated yet.", justify='center')
-                self.calLabel.grid(row=1, column=0, padx=5, pady=5)
-            else:
-                self.calLabel.configure(text="No calibration available.")
+        self.updateCalFrameState()
+        return self.calFrame
 
+    def updateCalFrameState(self):
+        if self.calFrame is None:
+            return
+
+        if self.imageConfig.camCal.validCal:
+            self.calLabel.configure(text=self.imageConfig.camCal.calStr)
+            self.saveCalButton.configure(state='normal')
+            self.scale864Button.configure(state='normal')
+            self.scale2848Button.configure(state='normal')
+            self.scaleAnyButton.configure(state='normal')
+        else:
+            self.calLabel.configure(text="No calibration calculated yet.")
             self.saveCalButton.configure(state='disabled')
             self.scale864Button.configure(state='disabled')
             self.scale2848Button.configure(state='disabled')
             self.scaleAnyButton.configure(state='disabled')
 
-        return f
-
     def scaleTo864(self, master_frame):
         self.imageConfig.camCal.scaleCalibration(864)
         self.saveToCache()
         self.updateConfigWindow(master_frame)
-        self.setup_CalFrame(master_frame)
+        self.updateCalFrameState()
 
     def scaleTo2848(self, master_frame):
         self.imageConfig.camCal.scaleCalibration(2848)
         self.saveToCache()
         self.updateConfigWindow(master_frame)
-        self.setup_CalFrame(master_frame)
+        self.updateCalFrameState()
 
     def scaleToInput(self, master_frame):
         dialog = CTkInputDialog(
@@ -521,7 +525,7 @@ class CalibrateGui(CTkFrame):
             self.imageConfig.camCal.scaleCalibration(int(dialog.get_input()))
             self.saveToCache()
             self.updateConfigWindow(master_frame)
-            self.setup_CalFrame(master_frame)
+            self.updateCalFrameState()
         except ValueError:
             from support.io.my_logging import LOG
             LOG.warning('Invalid input. Please input only an integer.')
@@ -1033,38 +1037,38 @@ class CalibrateGui(CTkFrame):
         self.saveToCache()
         self.updateIncludeCheckboxes()
 
-    def unprotectClearCache(self, master_frame, button: CTkButton, rowID):
-        button.grid_forget()
-        clearCacheButton = CTkButton(master=master_frame, text='Really Clear Cache', fg_color='green',
-                                     command=lambda f=master_frame: self.clearCache(f, rowID))
-        clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
+    def unprotectClearCache(self, master_frame, rowID):
+        self.clearCacheButton.configure(text='Really Clear Cache', fg_color='green', hover_color='dark green',
+                                        text_color='white',
+                                        command=lambda f=master_frame: self.clearCache(f, rowID))
+        self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
         self.after(2000, self.protectClearCache, master_frame, rowID)
-        self.after(2000, clearCacheButton.grid_forget)
 
     def protectClearCache(self, master_frame, rowID):
-        clearCacheButton = CTkButton(master=master_frame, text='Clear Cache', fg_color='blue', hover_color='navy')
-        clearCacheButton.configure(
-            command=lambda button=clearCacheButton, f=master_frame, rid=rowID: self.unprotectClearCache(f, button, rid))
-        clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
+        if self.clearCacheButton is None:
+            self.clearCacheButton = CTkButton(master=master_frame, text='Clear Cache')
+        self.clearCacheButton.configure(text='Clear Cache', fg_color='blue', hover_color='navy', text_color='white',
+                                        command=lambda f=master_frame, rid=rowID: self.unprotectClearCache(f, rid))
+        self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
 
     def clearCache(self, master_frame, rowID):
         if os.path.exists(join(self.filepath, IMAGE_CACHE)):
             filepath = copy.copy(self.filepath)
             os.remove(join(self.filepath, IMAGE_CACHE))
 
-            clearCacheButton = CTkButton(master=master_frame, text='Clearing', fg_color='yellow',
-                                         text_color='black', hover_color='yellow')
-            clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+            self.clearCacheButton.configure(text='Clearing', fg_color='yellow', text_color='black',
+                                            hover_color='yellow')
+            self.clearCacheButton.grid(row=rowID, column=1, columnspan=1, padx=5, pady=5)
             self.imageConfig.camCal = Calibration()
             self.imageConfig = ImageryCalibrationConfig()
             self.filepath = filepath
             self.restoreFromWindowState()
             self.loadImages()
             self.updateImageFrame(master_frame)
-            self.calLabel.configure(text=self.imageConfig.camCal.calStr)
+            self.updateCalFrameState()
         else:
-            clearCacheButton = CTkButton(master=master_frame, text='No cache!', fg_color='red', hover_color='red')
-            clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
+            self.clearCacheButton.configure(text='No cache!', fg_color='red', text_color='white', hover_color='red')
+            self.clearCacheButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5)
         self.after(2000, self.protectClearCache, master_frame, rowID)
 
     def updateInclusion(self, idx):
@@ -1366,7 +1370,8 @@ class CalibrateGui(CTkFrame):
         # cv2.imshow("hey hey hey!", newImg)
         # cv2.waitKey(0)
 
-        objp = np.zeros((self.imageConfig.num_inner_corners_W * self.imageConfig.num_inner_corners_H, 3), np.float32)
+        objp = np.zeros((self.imageConfig.num_inner_corners_W * self.imageConfig.num_inner_corners_H, 3),
+                        np.float32)
         objp[:, :2] = np.mgrid[0:self.imageConfig.num_inner_corners_W,
         0:self.imageConfig.num_inner_corners_H].T.reshape(-1, 2) * self.imageConfig.spacing
 
@@ -1770,12 +1775,7 @@ class CalibrateGui(CTkFrame):
                                                width=gray.shape[::-1][0], height=gray.shape[::-1][1], hfov=fovx,
                                                rms=ret, timeOfCompute=datetime.datetime.now())
 
-        self.calLabel.configure(text=self.imageConfig.camCal.calStr)
-
-        self.saveCalButton.configure(state='normal')
-        self.scale864Button.configure(state='normal')
-        self.scale2848Button.configure(state='normal')
-        self.scaleAnyButton.configure(state='normal')
+        self.updateCalFrameState()
 
         self.notify()
 
@@ -1785,6 +1785,7 @@ class CalibrateGui(CTkFrame):
         # Try winsound
         try:
             import winsound
+
             def play_beep():
                 winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS)
                 time.sleep(0.2)  # allow sound to fully complete before closing thread

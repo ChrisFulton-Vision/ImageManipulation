@@ -1,4 +1,3 @@
-from copy import deepcopy
 from typing import Any
 
 import cv2
@@ -25,6 +24,47 @@ class PoseRuntime:
 
     def __init__(self, owner: Any):
         self.owner = owner
+        self._truth_lookup_source = None
+        self._truth_lookup = None
+
+    def _get_truth_lookup(self) -> dict[int, np.ndarray]:
+        if self.owner.ThreeDTruthPoints is None:
+            self.owner.loadTruthPoints()
+
+        truth_points = self.owner.ThreeDTruthPoints.truthPoints
+        if truth_points is not self._truth_lookup_source:
+            self._truth_lookup_source = truth_points
+            self._truth_lookup = {
+                int(k): np.asarray(v, dtype=np.float64)
+                for k, v in truth_points.items()
+            }
+        return self._truth_lookup
+
+    def _matched_truth_correspondences(self) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        centers = self.owner.centers
+        detect_ids = self.owner.detectIDS
+        if centers is None or detect_ids is None or len(centers) < 6:
+            return None, None
+
+        lookup = self._get_truth_lookup()
+        object_points = []
+        image_points = []
+
+        for detect_id, center in zip(detect_ids, centers):
+            key = int(detect_id[0])
+            obj_pt = lookup.get(key)
+            if obj_pt is None:
+                continue
+            object_points.append(obj_pt)
+            image_points.append(center)
+
+        if len(object_points) < 6:
+            return None, None
+
+        return (
+            np.asarray(object_points, dtype=np.float64),
+            np.asarray(image_points, dtype=np.float64),
+        )
 
     def detect_april_tags(
         self,
@@ -84,28 +124,9 @@ class PoseRuntime:
         ctx: GuiQueue.FrameCtx,
         args,
     ) -> None:
-        if self.owner.ThreeDTruthPoints is None:
-            self.owner.loadTruthPoints()
-
-        if self.owner.centers is not None and len(self.owner.centers) >= 6:
-            truth_points = deepcopy(self.owner.ThreeDTruthPoints.truthPoints)
-            points = []
+        points, centers = self._matched_truth_correspondences()
+        if points is not None:
             dist_params = np.zeros((5,))
-
-            remove_ids = []
-            for idx, detect_id in enumerate(self.owner.detectIDS):
-                try:
-                    points.append(truth_points[str(detect_id[0])])
-                except KeyError:
-                    remove_ids.append(idx)
-
-            centers = deepcopy(self.owner.centers)
-            for idx in reversed(remove_ids):
-                centers = np.delete(centers, idx, axis=0)
-            points = np.array(points)
-
-            if len(points) < 6:
-                return
 
             ret, rvec, tvec, *_ = cv2.solvePnPRansac(
                 objectPoints=points,
@@ -187,28 +208,8 @@ class PoseRuntime:
         ctx: GuiQueue.FrameCtx,
         args,
     ) -> None:
-        if self.owner.ThreeDTruthPoints is None:
-            self.owner.loadTruthPoints()
-
-        if self.owner.centers is not None and len(self.owner.centers) >= 6:
-            truth_points = deepcopy(self.owner.ThreeDTruthPoints.truthPoints)
-            points = []
-
-            remove_ids = []
-            for idx, detect_id in enumerate(self.owner.detectIDS):
-                try:
-                    points.append(truth_points[str(detect_id[0])])
-                except KeyError:
-                    remove_ids.append(idx)
-
-            centers = deepcopy(self.owner.centers)
-            for idx in reversed(remove_ids):
-                centers = np.delete(centers, idx, axis=0)
-            points = np.array(points)
-
-            if len(points) < 6:
-                return
-
+        points, centers = self._matched_truth_correspondences()
+        if points is not None:
             quat, vect, *_ = solveQnP(points, centers, self.owner.calibration, True)
             xyz_proj = quat * self.owner.ThreeDTruthPoints.getTruthPointsNumpy() + vect
 

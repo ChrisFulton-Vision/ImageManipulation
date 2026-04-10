@@ -40,6 +40,7 @@ from support.vision.fisheye_to_cubemap import (
 
 from support.runtime.frame_processor import FrameProcessor
 from support.runtime.PlaybackController import PlaybackController
+from support.runtime.config_runtime import ConfigRuntime
 from support.runtime.pose_runtime import PoseRuntime
 from support.runtime.stream_runner import StreamRunner
 
@@ -137,6 +138,12 @@ class CameraGui(ctk.CTkFrame):
         self.arucoDict = None
         self.arucoParams = None
 
+        self.yolo_output_type = YoloOutput
+        self.config_runtime = ConfigRuntime(self)
+        self.frame_processor = FrameProcessor(self)
+        self.pose_runtime = PoseRuntime(self)
+        self.stream_runner = StreamRunner(self)
+
         self._init_flag_vars()
 
         self.step_options: List[GuiQueue.StepOption] = [
@@ -229,6 +236,7 @@ class CameraGui(ctk.CTkFrame):
         self._cb_last_found = False
         self._cb_last_corners = None
         self._cb_throttle_sec = 0.05  # 10 Hz overlay update
+        self._cb_status_until = 0.0
         self.checkerboard_launcher = CheckerboardLauncher(
             state=self._checker_state,
             after=self.after,
@@ -282,10 +290,6 @@ class CameraGui(ctk.CTkFrame):
         self.filepath_page = Filepath_page.Filepath_page(master,
                                                          controller=self)
 
-        self.yolo_output_type = YoloOutput
-        self.frame_processor = FrameProcessor(self)
-        self.pose_runtime = PoseRuntime(self)
-        self.stream_runner = StreamRunner(self)
         self.playback_controller = PlaybackController(self)
         self.batch_controller = BatchController(self)
 
@@ -362,373 +366,62 @@ class CameraGui(ctk.CTkFrame):
         self.func_that_refits = func
 
     def _init_flag_vars(self):
-        """Create Tk variable wrappers for config-backed UI flags.
-
-        Initializes tracked variables from the config model and attaches change
-        callbacks so user edits immediately propagate back into the config.
-        """
-        double_vars = ['yolo_conf', 'yolo_iou']
-        for name in self._flags:
-            if not hasattr(self.camConfig, name):
-                setattr(self.camConfig, name, 1.0 if name in double_vars else False)
-
-            if name in double_vars:
-                v = ctk.DoubleVar(value=getattr(self.camConfig, name, 1.0))
-            else:
-                v = ctk.BooleanVar(value=bool(getattr(self.camConfig, name, False)))
-
-            # when UI flips, write to model
-            v.trace_add("write", lambda var_name, index, op, n=name: self._on_flag_changed(n))
-            self._flag_vars[name] = v
+        self.config_runtime.init_flag_vars()
 
     def _on_flag_changed(self, name: str):
-        """Handle a write to a tracked UI flag variable.
-
-        Normalizes the value to the correct scalar type, stores it on the
-        camera config, and triggers a cache save.
-        """
-        # DoubleVars must stay float; everything else is bool
-        if name in ("yolo_conf", "yolo_iou"):
-            val = float(self._flag_vars[name].get())
-        else:
-            val = bool(self._flag_vars[name].get())
-
-        setattr(self.camConfig, name, val)
-        self.saveToCache()
+        self.config_runtime.on_flag_changed(name)
 
     def sync_flags_from_model(self):
-        """Push config-backed flag values into their Tk variable mirrors."""
-        for n in self._flags:
-            if n in ("yolo_conf", "yolo_iou"):
-                self._flag_vars[n].set(float(getattr(self.camConfig, n, 1.0)))
-            else:
-                self._flag_vars[n].set(bool(getattr(self.camConfig, n, False)))
+        self.config_runtime.sync_flags_from_model()
 
     def _sync_dp_from_model(self):
-        self.batch_controller.sync_from_model()
+        self.config_runtime.sync_dp_from_model()
 
     def _on_queue_changed(self, new_queue):
-        """Accept a queue edit from the GUI editor and persist it to the model.
-
-        Normalizes queue arguments via deep copy, updates the active processing
-        pipeline, writes the serialized queue into the camera config, and saves
-        the new state to cache when the signature changes.
-        """
-        if getattr(self, "_loading_config", False):
-            return
-
-        normalized_queue = [
-            (fn, copy.deepcopy(args))
-            for fn, args in new_queue
-        ]
-
-        sig_did_change = self.list_of_image_process_functors != normalized_queue
-        self.list_of_image_process_functors = normalized_queue
-
-        if sig_did_change:
-            self.camConfig.image_processing_queue = self._queue_to_config(normalized_queue)
-            self.saveToCache()
-
-            if self.func_that_refits is not None:
-                self.func_that_refits()
+        self.config_runtime.on_queue_changed(new_queue)
 
     def _sync_queue_from_model(self):
-        """Rebuild the runtime queue and queue editor from cached config data.
-
-        Deserializes the saved queue specification into callable steps plus
-        arguments, updates the in-memory processing list, and refreshes the
-        queue editor without re-emitting change events.
-        """
-        cfg = getattr(self.camConfig, "image_processing_queue", [])
-        rebuilt = self._queue_from_config(cfg)
-
-        self.list_of_image_process_functors = [
-            (fn, copy.deepcopy(args)) for fn, args in rebuilt
-        ]
-
-        if hasattr(self, "imgProcQueue_editor") and self.imgProcQueue_editor is not None:
-            self.imgProcQueue_editor.set_queue(
-                [(fn, copy.deepcopy(args)) for fn, args in rebuilt],
-                emit_change=False,
-            )
+        self.config_runtime.sync_queue_from_model()
 
     def _queue_to_config(self, queue):
-        """Serialize a runtime processing queue into cache-friendly config data.
-
-        Converts each processing function to its user-facing label and serializes
-        its argument values into a plain dictionary representation.
-        """
-        out = []
-
-        for fn, args in queue:
-            try:
-                label = self.fn_to_label[fn]
-            except KeyError:
-                raise RuntimeError(f"Queue contains unknown processing function: {fn}")
-
-            clean_args = {
-                k: self._serialize_queue_arg(v)
-                for k, v in args.items()
-            }
-
-            out.append({
-                "label": label,
-                "args": clean_args
-            })
-
-        return out
+        return self.config_runtime.queue_to_config(queue)
 
     def _queue_from_config(self, queue_cfg):
-        """Deserialize a saved queue specification into callable pipeline steps.
-
-        Unknown step labels are skipped with a warning. Missing arguments are
-        filled from defaults, and cached values are coerced back into their
-        expected runtime types where possible.
-        """
-        if not queue_cfg:
-            return []
-
-        option_by_label = {opt.label: opt for opt in self.step_options}
-        rebuilt = []
-
-        for row in queue_cfg:
-            label = row["label"]
-
-            if label not in option_by_label:
-                LOG.warning("Skipping cached queue step '%s' (unknown)", label)
-                continue
-
-            opt = option_by_label[label]
-            raw_args = copy.deepcopy(row.get("args", {}))
-
-            # Start from defaults so missing fields are filled in automatically
-            parsed_args = opt.default_args.copy()
-
-            spec_by_name = {spec.name: spec for spec in opt.get_arg_specs(parsed_args)}
-            for arg_name, raw_val in raw_args.items():
-                spec = spec_by_name.get(arg_name)
-                if spec is None:
-                    parsed_args[arg_name] = raw_val
-                    continue
-
-                parsed_args[arg_name] = self._deserialize_queue_arg(spec, raw_val)
-
-            # Recompute once more after deserialization in case one arg changes which specs exist
-            spec_by_name = {spec.name: spec for spec in opt.get_arg_specs(parsed_args)}
-            for spec in spec_by_name.values():
-                parsed_args.setdefault(spec.name, spec.default)
-
-            rebuilt.append((opt.fn, parsed_args))
-
-        return rebuilt
+        return self.config_runtime.queue_from_config(queue_cfg)
 
     @staticmethod
     def _serialize_queue_arg(v):
-        """Convert a queue argument into a cache-safe scalar representation.
-
-        Enum values are stored by value; all other types are passed through
-        unchanged.
-        """
-        if isinstance(v, enum.Enum):
-            return v.value
-        return v
+        return ConfigRuntime.serialize_queue_arg(v)
 
     @staticmethod
     def _deserialize_queue_arg(spec, raw_val):
-        """Reconstruct a typed queue argument from cached data.
-
-        Uses the argument spec's default value to infer the desired runtime type
-        and falls back to that default if conversion fails.
-        """
-        default = spec.default
-
-        # Enum args: rebuild from saved scalar/string value
-        if isinstance(default, enum.Enum):
-            enum_type = type(default)
-            try:
-                return enum_type(raw_val)
-            except (TypeError, ValueError):
-                LOG.warning(
-                    "Failed to parse enum arg '%s' from cached value %r; using default %r",
-                    spec.name, raw_val, default
-                )
-                return default
-
-        # Optional: coerce basic scalar types back to the default's type
-        try:
-            if isinstance(default, bool):
-                return bool(raw_val)
-            if isinstance(default, int) and not isinstance(default, bool):
-                return int(raw_val)
-            if isinstance(default, float):
-                return float(raw_val)
-            if isinstance(default, str):
-                return str(raw_val)
-        except TypeError as e:
-            LOG.warning(
-                "Failed to parse arg '%s' from cached value %r; using default %r. \nError: %s",
-                spec.name, raw_val, default, e
-            )
-            return default
-
-        return raw_val
+        return ConfigRuntime.deserialize_queue_arg(spec, raw_val)
 
     def loadFromCache(self) -> bool:
-        """Load cached configuration into the active camera config object.
-
-        Returns:
-            True if a YAML-backed config was restored, else False.
-        """
-        self._loading_config = True
-        res = self.config_store.load_from_cache(self.camConfig)
-        if not res.loaded_yaml:
-            self._loading_config = False
-            return False
-        return True
+        return self.config_runtime.load_from_cache()
 
     def update_post_newCamConfig(self):
-        """Refresh runtime systems after loading or replacing the camera config.
-
-        Synchronizes UI variables, calibration, YOLO state, optional truth data,
-        batch-processing controls, queue editor state, and any layout refit
-        callback that depends on the new configuration.
-        """
-        iou = copy.deepcopy(self.camConfig.yolo_iou)
-        self._flag_vars["yolo_conf"].set(float(self.camConfig.yolo_conf))
-        self._flag_vars["yolo_iou"].set(float(iou))
-
-        self.updateLogFile()
-        self.ingestCalibration()
-        self.updateYOLOModel()
-        if self.ThreeDTruthPoints is not None:
-            self.loadTruthPoints()
-
-        self.sync_flags_from_model()
-        self._sync_dp_from_model()
-        self._sync_queue_from_model()
-
-        try:
-            if hasattr(self, "gpu_slider"):
-                self.gpu_slider.configure(
-                    state="normal" if bool(getattr(self.camConfig, "dp_gpu", False)) else "disabled"
-                )
-            if not bool(getattr(self.camConfig, "dp_gpu", False)):
-                self.gpu_slider.set(0.0)
-        except TypeError:
-            pass
-
-        if self.exportStartFrame is not None:
-            self.exportStartFrame.configure(text=f"Start Frame: {self.camConfig.start_export_idx}")
-        if self.exportEndFrame is not None:
-            self.exportEndFrame.configure(text=f"End Frame: {self.camConfig.end_export_idx}")
-
-        if hasattr(self, "filepath_page") and self.filepath_page is not None:
-            self.filepath_page.sync_labels()
-
-        if hasattr(self, "playback_controller") and self.playback_controller is not None:
-            self.playback_controller.update_playback_menu()
-
-        if hasattr(self, "exportQualityCombo") and self.exportQualityCombo is not None:
-            self.exportQualityCombo.set(self.camConfig.export_quality.value)
-
-        self.saveToCache()
-
-        if self.func_that_refits is not None:
-            self.func_that_refits()
+        self.config_runtime.update_post_new_config()
 
     def saveToCache(self,
                     immediate: bool = False,
                     delay_ms: int = 500):
-        """Persist the current camera configuration to cache.
-
-        Copies selected live UI values back into the config model before
-        delegating to the config store, with optional debounced saving.
-        """
-        if getattr(self, "_loading_config", False):
-            return
-
-        self.camConfig.yolo_conf = float(self._flag_vars["yolo_conf"].get())
-        self.camConfig.yolo_iou = float(self._flag_vars["yolo_iou"].get())
-
-        self.config_store.save_to_cache(self.camConfig, immediate=immediate, delay_ms=delay_ms)
+        self.config_runtime.save_to_cache(immediate=immediate, delay_ms=delay_ms)
 
     def updateLogFile(self):
-        """Reload HUD attitude/log data from the configured source path."""
-        if self.hud_marker is not None:
-            self.hud_marker.read_attitude_files(self.camConfig.hud_data_filepath)
-            self.playback_controller.load_time_offset(self.camConfig.hud_data_filepath)
-        self.saveToCache()
+        self.config_runtime.update_log_file()
 
     def updateYOLOModel(self):
-        """Point the active YOLO session at the configured model directory."""
-        if self.camConfig.yoloFilepath and self.yoloSession is not None:
-            self.yoloSession.setNewFolder(self.camConfig.yoloFilepath)
+        self.config_runtime.update_yolo_model()
 
     def loadTruthPoints(self):
-        """Load 3D truth points from the configured truth-data file, if present."""
-        if not self.camConfig.ThreeDTruthFilepath:
-            return
-
-        truth_path = Path(self.camConfig.ThreeDTruthFilepath)
-
-        from support.io.ThreeD_truth import TruthPoints
-        self.ThreeDTruthPoints = TruthPoints()
-        self.ThreeDTruthPoints.try_load(truth_path)
+        self.config_runtime.load_truth_points()
 
     def updateQuality(self, qualityValue: str):
-        """Update the configured export quality and persist the change."""
-        self.camConfig.export_quality = ExportQuality(qualityValue)
-        self.saveToCache()
+        self.config_runtime.update_quality(qualityValue)
 
     def ingestCalibration(self):
-        """Load calibration data and prepare undistortion maps.
-
-        Attempts to read the configured calibration file, updates related UI,
-        propagates the calibration into the YOLO session, and precomputes
-        OpenCV remap matrices for fast undistortion during playback.
-
-        Important note: the undistort map does not have the same focal parameters as the original projection!
-        """
-        if not self.calibration.fromBinFile(self.camConfig.calibFilepath) and not self.calibration.fromFile(
-                self.camConfig.calibFilepath):
-            if self.selectCalibLabel is not None:
-                self.selectCalibLabel.configure(text='No Calibration Found')
-                self.after(10, self.update_idletasks)  # type: ignore[call-arg]
-            return
-
-        if not self.calibration.validCal:
-            return
-
-        if self.selectCalibLabel is not None:
-            self.selectCalibLabel.configure(
-                text="../" + Path(self.camConfig.calibFilepath).name if self.camConfig.calibFilepath else "../",
-                bg_color=self.selectCalibLabel.cget("bg_color"))
-            self.filepath_page.update_idletasks()
-            self.update_idletasks()
-            self.selectCalibLabel.update_idletasks()
-            self.filepath_page.update_idletasks()
-            self.update_idletasks()
-
-        if self.yoloSession is not None:
-            self.yoloSession.set_calibration(self.calibration)
-
-        # New owner for remap caches
-        self.fisheye_mgr.clear()
-
-        # Always compute a remapK so downstream code can rely on it existing.
-        newK, std_map1, std_map2 = self.fisheye_mgr.ensure_standard_undistort_maps(
-            self.calibration,
-            alpha=0.0,
-        )
-        self.calibration.remapK = newK
-
-        # Only the non-fisheye path uses map1/map2 in this class.
-        if self.calibration.fisheye:
-            self.map1, self.map2 = None, None
-        else:
-            self.map1, self.map2 = std_map1, std_map2
-
-        self.saveToCache()
+        self.config_runtime.ingest_calibration()
 
     def setupFrame(self):
         """Build the major secondary UI sections for export, data, and playback."""
@@ -1235,7 +928,7 @@ class CameraGui(ctk.CTkFrame):
         self._checker_residual.draw_chessboard(markupFrame, self.curr_frame_gray, self._cb_pattern)
 
     def _draw_chessboard_state(self, frame):
-        width, height, _ = frame.shape
+        height, width, _ = frame.shape
         org1 = (int(width * 0.1), int(height * 0.20))
         org2 = (int(width * 0.1), int(height * 0.25))
 

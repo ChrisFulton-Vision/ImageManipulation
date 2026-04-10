@@ -62,6 +62,9 @@ class FrameProcessor:
 
         self.draw_time(frame, markup_frame, ctx, ())
 
+        if time.monotonic() < float(getattr(self.owner, "_cb_status_until", 0.0)):
+            self.owner._draw_chessboard_state(markup_frame)
+
         if display_in_realtime:
             self.cleanup(markup_frame)
             return None

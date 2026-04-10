@@ -150,8 +150,6 @@ class StreamRunner:
             self.owner.lastHeight = self.owner.curr_frame.shape[0]
             self.owner.lastWidth = self.owner.curr_frame.shape[1]
 
-        stop_display_time = None
-
         while (
             rval
             and not self.owner.threadStopper.is_set()
@@ -159,9 +157,6 @@ class StreamRunner:
             and not self.owner.making_gifOrVid
         ):
             rval, frame = self.owner.vc.read()
-
-            if stop_display_time is not None:
-                self.owner._draw_chessboard_state(frame)
 
             self.owner.analyze_image(frame)
             key = cv2.waitKey(1)
@@ -173,10 +168,7 @@ class StreamRunner:
 
             new_time = self.owner._handle_chessboard_hotkeys(key)
             if new_time is not None:
-                stop_display_time = new_time
-
-            if stop_display_time is not None and time.monotonic() > stop_display_time:
-                stop_display_time = None
+                self.owner._cb_status_until = new_time
 
             if not self.owner._window_is_open():
                 self.owner.after(0, self.owner.filepath_page.toggle_stream)  # type: ignore[call-arg]

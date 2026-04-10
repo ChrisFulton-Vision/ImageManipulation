@@ -34,13 +34,15 @@ class pnp_qnp_draw:
     def __init__(self):
         self.last_q_vec = None
         self.last_t_vec = None
+        self.last_pnp_rvec = None
+        self.last_pnp_tvec = None
 
         # -----------------------------
         # NEW: estimation-only helpers
         # -----------------------------
 
-    @staticmethod
-    def _estimate_pnp(object_points: NDArray,
+    def _estimate_pnp(self,
+                      object_points: NDArray,
                       image_points: NDArray,
                       calibration: Calibration):
         """
@@ -53,17 +55,51 @@ class pnp_qnp_draw:
         if len(object_points) < 6:
             return None
 
-        ret, rvec, tvec, inliers = cv2.solvePnPRansac(
+        camera_matrix = calibration.getCameraMatrix()
+        dist_coeffs = np.zeros((5,))
+
+        if self.last_pnp_rvec is not None and self.last_pnp_tvec is not None:
+            ret, rvec, tvec = cv2.solvePnP(
+                objectPoints=object_points,
+                imagePoints=image_points,
+                cameraMatrix=camera_matrix,
+                distCoeffs=dist_coeffs,
+                rvec=self.last_pnp_rvec,
+                tvec=self.last_pnp_tvec,
+                useExtrinsicGuess=True,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+            if ret:
+                self.last_pnp_rvec = rvec
+                self.last_pnp_tvec = tvec
+                return rvec, tvec
+
+        fast_flag = cv2.SOLVEPNP_SQPNP if hasattr(cv2, "SOLVEPNP_SQPNP") else cv2.SOLVEPNP_EPNP
+        ret, rvec, tvec = cv2.solvePnP(
             objectPoints=object_points,
             imagePoints=image_points,
-            cameraMatrix=calibration.getCameraMatrix(),
-            distCoeffs=np.zeros((5,)),
-            confidence=0.99,
-            flags=cv2.SOLVEPNP_ITERATIVE
+            cameraMatrix=camera_matrix,
+            distCoeffs=dist_coeffs,
+            flags=fast_flag,
         )
-        if not ret:
-            return None
-        return rvec, tvec
+        if ret:
+            self.last_pnp_rvec = rvec
+            self.last_pnp_tvec = tvec
+            return rvec, tvec
+
+        ret, rvec, tvec, _inliers = cv2.solvePnPRansac(
+            objectPoints=object_points,
+            imagePoints=image_points,
+            cameraMatrix=camera_matrix,
+            distCoeffs=dist_coeffs,
+            confidence=0.99,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if ret:
+            self.last_pnp_rvec = rvec
+            self.last_pnp_tvec = tvec
+            return rvec, tvec
+        return None
 
     def _estimate_qnp(self,
                       object_points: NDArray,

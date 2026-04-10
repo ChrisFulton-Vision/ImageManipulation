@@ -55,7 +55,10 @@ class YOLO:
         self.output = []
         self.boxes, self.scores, self.class_ids = [], [], []
         self.session = None
+        self.input_name = None
         self.calibration = None
+        self._input_tensor = None
+        self._resize_buffer = None
 
         self.class_names = range(numClasses)
         self.yoloSize = yoloSize
@@ -134,6 +137,7 @@ class YOLO:
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # sess_options.add_session_config_entry("session.intra_op.allow_spinning", "1")
         self.session = ort.InferenceSession(self.modelPath, sess_options=sess_options, providers=self.provider)
+        self.input_name = self.session.get_inputs()[0].name
 
     def inferOnImage(self,
                      image: NDArray,
@@ -164,11 +168,28 @@ class YOLO:
         h, w, _ = image.shape
         if (h, w) != self.yoloSize:
             height, width = self.yoloSize
-            image = cv2.resize(image, (width, height))
-        image = image.transpose((2, 0, 1))
-        image = np.expand_dims(image, axis=0)
-        image = image.astype(np.float32) / 255.0
-        return image
+            if (
+                self._resize_buffer is None
+                or self._resize_buffer.shape != (height, width, 3)
+                or self._resize_buffer.dtype != image.dtype
+            ):
+                self._resize_buffer = np.empty((height, width, 3), dtype=image.dtype)
+            cv2.resize(image, (width, height), dst=self._resize_buffer, interpolation=cv2.INTER_LINEAR)
+            image_view = self._resize_buffer
+        else:
+            height, width = h, w
+            image_view = image
+
+        if self._input_tensor is None or self._input_tensor.shape != (1, 3, height, width):
+            self._input_tensor = np.empty((1, 3, height, width), dtype=np.float32)
+
+        np.multiply(
+            image_view.transpose((2, 0, 1)),
+            1.0 / 255.0,
+            out=self._input_tensor[0],
+            casting="unsafe",
+        )
+        return self._input_tensor
 
     def processImage(self, yoloImage: NDArray) -> tuple[list, list, list, list, float]:
         """
@@ -187,7 +208,7 @@ class YOLO:
         """
         startTime = datetime.datetime.now()
         if self.session is not None:
-            output = self.session.run(None, {self.session.get_inputs()[0].name: yoloImage})
+            output = self.session.run(None, {self.input_name: yoloImage})
         else:
             output = None
         endTime = datetime.datetime.now()

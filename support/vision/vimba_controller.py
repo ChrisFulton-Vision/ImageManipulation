@@ -195,6 +195,7 @@ class VimbaController:
                 "name": "Full Res",
                 "bin_x": 1,
                 "bin_y": 1,
+                "bin_mode": "",
                 "roi_w": 0,      # 0 => full sensor
                 "roi_h": 0,
                 "preview_max_dim": 0,   # 0 => no forced preview downscale
@@ -204,16 +205,28 @@ class VimbaController:
                 "name": "Zoom 1440",
                 "bin_x": 0,
                 "bin_y": 0,
+                "bin_mode": "",
                 "roi_w": 1440,
                 "roi_h": 1440,
                 "preview_max_dim": 1440,
                 "buffer_count": 2,
             },
-            "Bin To 1440": {
-                "name": "Bin To 1440",
+            "BinSum To 1440": {
+                "name": "BinSum To 1440",
                 "bin_x": 2,
                 "bin_y": 2,
+                "bin_mode": "Sum",
                 "roi_w": 0, # example: 864, captures center 864 columns of image
+                "roi_h": 0,
+                "preview_max_dim": 1440,
+                "buffer_count": 2,
+            },
+            "BinAvg To 1440": {
+                "name": "BinAvg To 1440",
+                "bin_x": 2,
+                "bin_y": 2,
+                "bin_mode": "Average",
+                "roi_w": 0,
                 "roi_h": 0,
                 "preview_max_dim": 1440,
                 "buffer_count": 2,
@@ -222,26 +235,77 @@ class VimbaController:
                 "name": "Zoom 864",
                 "bin_x": 0,
                 "bin_y": 0,
+                "bin_mode": "",
                 "roi_w": 864, # example: 864, captures center 864 columns of image
                 "roi_h": 864,
                 "preview_max_dim": 864,
                 "buffer_count": 2,
             },
-            "Bin To 864": {
-                "name": "Bin to 864",
-                "bin_x": 3,
-                "bin_y": 3,
+            "BinSum To 864": {
+                "name": "BinSum To 864",
+                "bin_x": 2,
+                "bin_y": 2,
+                "bin_mode": "Sum",
                 "roi_w": 0, # example: 864, captures center 864 columns of image
+                "roi_h": 0,
+                "preview_max_dim": 864,
+                "buffer_count": 2,
+            },
+            "BinAvg To 864": {
+                "name": "BinAvg To 864",
+                "bin_x": 2,
+                "bin_y": 2,
+                "bin_mode": "Average",
+                "roi_w": 0,
+                "roi_h": 0,
+                "preview_max_dim": 864,
+                "buffer_count": 2,
+            },
+            "BinSum To 712": {
+                "name": "BinSum To 712",
+                "bin_x": 4,
+                "bin_y": 4,
+                "bin_mode": "Sum",
+                "roi_w": 0, # example: 864, captures center 864 columns of image
+                "roi_h": 0,
+                "preview_max_dim": 864,
+                "buffer_count": 2,
+            },
+            "BinAvg To 712": {
+                "name": "BinAvg To 712",
+                "bin_x": 4,
+                "bin_y": 4,
+                "bin_mode": "Average",
+                "roi_w": 0,
                 "roi_h": 0,
                 "preview_max_dim": 864,
                 "buffer_count": 2,
             },
         }
 
+        legacy_profiles = {
+            "Bin To 1440": "BinSum To 1440",
+            "Bin To 864": "BinSum To 864",
+            "Bin To 712": "BinSum To 712",
+        }
+        profile = legacy_profiles.get(profile, profile)
         return profiles.get(profile, profiles["Full Res"])
 
     def _apply_vimba_profile(self, cam, vimba_profile):
         spec = self.get_vimba_profile_spec(vimba_profile)
+
+        bin_mode = str(spec.get("bin_mode", "") or "").strip()
+        if bin_mode:
+            self._set_vimba_enum_feature(
+                cam,
+                ("BinningSelector",),
+                "Digital",
+            )
+            self._set_vimba_enum_feature(
+                cam,
+                ("BinningHorizontalMode", "BinningVerticalMode"),
+                bin_mode,
+            )
 
         # 1) Binning first
         self._set_vimba_int_feature(cam, ("BinningHorizontal",), int(spec["bin_x"]))
@@ -421,8 +485,8 @@ class VimbaController:
             max_dim = max(h, w)
             if max_dim > preview_max_dim:
                 s = preview_max_dim / float(max_dim)
-                new_w = max(1, int(round(w * s)))
-                new_h = max(1, int(round(h * s)))
+                new_w = min(w, preview_max_dim)
+                new_h = min(h, preview_max_dim)
                 img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         ts = time.time()

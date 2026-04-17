@@ -209,7 +209,9 @@ class Filepath_page(ctk.CTkFrame):
         self.vimba_exposure_entry.bind("<FocusOut>", lambda *_: self.save_vimba_controls())
 
         self.vimba_profile_var = ctk.StringVar(
-            value=str(getattr(self.ctrl.camConfig, "vimba_profile", "Full Res"))
+            value=self._normalize_vimba_profile_name(
+                getattr(self.ctrl.camConfig, "vimba_profile", "Full Res")
+            )
         )
 
         ctk.CTkLabel(self.vimba_controls_frame, text="Profile").grid(
@@ -217,7 +219,15 @@ class Filepath_page(ctk.CTkFrame):
         )
         self.vimba_profile_combo = ctk.CTkComboBox(
             self.vimba_controls_frame,
-            values=["Full Res", "Zoom 1440", "Bin To 1440", "Zoom 864", "Bin To 864"],
+            values=[
+                "Full Res",
+                "Zoom 1440",
+                "BinSum To 1440",
+                "BinAvg To 1440",
+                "Zoom 864",
+                "BinSum To 864",
+                "BinAvg To 864",
+            ],
             variable=self.vimba_profile_var,
             command=lambda *_: self._on_vimba_profile_changed(),
         )
@@ -389,9 +399,11 @@ class Filepath_page(ctk.CTkFrame):
         blurbs = {
             "Full Res": "Full sensor, no preview downscale.",
             "Zoom 1440": "Centered 1440 ROI. Applies on next stream start.",
-            "Bin To 1440": "Binned full-frame preview near 1440-class output. Applies on next stream start.",
+            "BinSum To 1440": "2x2 digital sum binning for a 1440-class preview. Applies on next stream start.",
+            "BinAvg To 1440": "2x2 digital average binning for a 1440-class preview. Applies on next stream start.",
             "Zoom 864": "Centered 864 ROI. Applies on next stream start.",
-            "Bin To 864": "Heavier binning for fast preview near 864-class output. Applies on next stream start.",
+            "BinSum To 864": "2x2 digital sum binning for a fast 864-class preview. Applies on next stream start.",
+            "BinAvg To 864": "2x2 digital average binning for a fast 864-class preview. Applies on next stream start.",
         }
         self.vimba_status_text.set(blurbs.get(profile, "Vimba profile updated."))
         self.save_vimba_controls()
@@ -420,6 +432,16 @@ class Filepath_page(ctk.CTkFrame):
             "true": "Continuous",
         }
         return mapping.get(text, "Off")
+
+    @staticmethod
+    def _normalize_vimba_profile_name(value: Any) -> str:
+        text = str(value or "Full Res").strip()
+        mapping = {
+            "Bin To 1440": "BinSum To 1440",
+            "Bin To 864": "BinSum To 864",
+            "Bin To 712": "BinSum To 712",
+        }
+        return mapping.get(text, text)
 
     def _should_show_vimba_controls(self) -> bool:
         return (
@@ -485,7 +507,11 @@ class Filepath_page(ctk.CTkFrame):
         if not hasattr(self, "vimba_gain_auto_var"):
             return
 
-        self.vimba_profile_var.set(str(getattr(self.ctrl.camConfig, "vimba_profile", "Full Res")))
+        self.vimba_profile_var.set(
+            self._normalize_vimba_profile_name(
+                getattr(self.ctrl.camConfig, "vimba_profile", "Full Res")
+            )
+        )
         self.vimba_gain_auto_var.set(
             self._normalize_vimba_auto_mode(
                 getattr(self.ctrl.camConfig, "vimba_gain_auto", "Off")
@@ -503,7 +529,9 @@ class Filepath_page(ctk.CTkFrame):
     def save_vimba_controls(self):
         self._ensure_vimba_control_defaults()
 
-        self.ctrl.camConfig.vimba_profile = str(self.vimba_profile_var.get() or "Full Res")
+        self.ctrl.camConfig.vimba_profile = self._normalize_vimba_profile_name(
+            self.vimba_profile_var.get() or "Full Res"
+        )
         self.ctrl.camConfig.vimba_gain_auto = self._normalize_vimba_auto_mode(self.vimba_gain_auto_var.get())
         self.ctrl.camConfig.vimba_exposure_auto = self._normalize_vimba_auto_mode(self.vimba_exposure_auto_var.get())
 

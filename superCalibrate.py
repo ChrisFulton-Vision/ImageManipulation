@@ -153,6 +153,7 @@ class ImageData:
         self.obj_pts = None
         self.residual = None
         self.sharpness = None
+        self.points_edited = False
 
     def normalize_legacy_attrs(self):
         self.normalize_object_legacy_attrs(self)
@@ -238,6 +239,7 @@ class CalibrateGui(CTkFrame):
 
         self.cal_frame = None
         self.save_cal_button = None
+        self.open_folder_button = None
         self.scale864_button = None
         self.scale2848_button = None
         self.scale_any_button = None
@@ -508,6 +510,12 @@ class CalibrateGui(CTkFrame):
             return
         button.configure(fg_color='red')
 
+    def openCalibrationFolder(self):
+        if not self.filepath or not os.path.isdir(self.filepath):
+            messagebox.showerror('Folder Not Found', 'The current calibration folder is not available.')
+            return
+        os.startfile(self.filepath)
+
     def setup_CalFrame(self, master_frame):
 
         if self.cal_frame is None:
@@ -517,8 +525,12 @@ class CalibrateGui(CTkFrame):
             self.save_cal_button.configure(command=lambda btn=self.save_cal_button: self.saveCal(btn))
             self.save_cal_button.grid(row=0, column=0, padx=5, pady=5)
 
+            self.open_folder_button = CTkButton(master=self.cal_frame, text='Open Folder',
+                                                command=self.openCalibrationFolder)
+            self.open_folder_button.grid(row=1, column=0, padx=5, pady=5)
+
             self.cal_label = CTkLabel(master=self.cal_frame, justify='center', anchor='w')
-            self.cal_label.grid(row=1, column=0, padx=5, pady=5)
+            self.cal_label.grid(row=2, column=0, padx=5, pady=5)
 
             self.scale864_button = CTkButton(master=self.cal_frame, text='Scale to 864x864',
                                              command=lambda: self.scaleTo864(self.cal_frame))
@@ -538,6 +550,9 @@ class CalibrateGui(CTkFrame):
     def updateCalFrameState(self):
         if self.cal_frame is None:
             return
+
+        folder_button_state = 'normal' if self.filepath and os.path.isdir(self.filepath) else 'disabled'
+        self.open_folder_button.configure(state=folder_button_state)
 
         if self.image_config.cam_cal.validCal:
             self.cal_label.configure(text=self.image_config.cam_cal.calStr)
@@ -685,6 +700,7 @@ class CalibrateGui(CTkFrame):
          img_shp,
          img_restore_button,
          img_find_corners_button,
+         img_edit_points_button,
          img_invert_button,
          img_gray_button,
          img_ccw_rotate_button,
@@ -698,7 +714,9 @@ class CalibrateGui(CTkFrame):
                                        state="normal")
 
         # labels
-        if img_class.residual is None:
+        if getattr(img_class, 'points_edited', False) and img_class.residual is None:
+            curr_res = 'Edited'
+        elif img_class.residual is None:
             curr_res = ''
         elif img_class.residual == 10000.0:
             curr_res = 'Disabled'
@@ -715,6 +733,7 @@ class CalibrateGui(CTkFrame):
         img_restore_button.configure(command=partial(self.restore, img_class), state="normal")
         img_find_corners_button.configure(command=partial(self.findChessboardCorners, f, img_class, True, True),
                                           state="normal")
+        img_edit_points_button.configure(command=partial(self.editImagePoints, img_class), state="normal")
         img_invert_button.configure(command=partial(self.invertIndividualImage, img_class), state="normal")
         img_gray_button.configure(command=partial(self.grayscaleIndividualImage, img_class), state="normal")
         img_ccw_rotate_button.configure(command=partial(self.rotateCCWIndividualImage, img_class), state="normal")
@@ -761,12 +780,12 @@ class CalibrateGui(CTkFrame):
         # Header container (row 0)
         header = CTkFrame(f, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew")
-        header.grid_columnconfigure(list(range(12)), weight=0)  # plenty of columns
+        header.grid_columnconfigure(list(range(17)), weight=0)  # plenty of columns
 
         # Rows container (row 1)
         self._rows_holder = CTkFrame(f, fg_color="transparent")
         self._rows_holder.grid(row=1, column=0, sticky="nsew")
-        self._rows_holder.grid_columnconfigure(list(range(10)), weight=0)
+        self._rows_holder.grid_columnconfigure(list(range(11)), weight=0)
 
         # --- put all header buttons in `header` (NOT in f) ---
         row_id = 0
@@ -824,10 +843,10 @@ class CalibrateGui(CTkFrame):
         self.last_page_btn = CTkButton(header, text="▶▶", command=self._last_page, width=70)
         for page_button in (self.first_page_btn, self.prev_page_btn, self.next_page_btn, self.last_page_btn):
             page_button.configure(width=self.header_button_width(page_button.cget("text")))
-        self.first_page_btn.grid(row=row_id, column=10, padx=6, pady=6, sticky='w')
-        self.prev_page_btn.grid(row=row_id, column=11, padx=6, pady=6, sticky="w")
-        self.next_page_btn.grid(row=row_id, column=13, padx=6, pady=6, sticky="w")
-        self.last_page_btn.grid(row=row_id, column=14, padx=6, pady=6, sticky='w')
+        self.first_page_btn.grid(row=row_id, column=13, padx=6, pady=6, sticky='w')
+        self.prev_page_btn.grid(row=row_id, column=14, padx=6, pady=6, sticky="w")
+        self.next_page_btn.grid(row=row_id, column=15, padx=6, pady=6, sticky="w")
+        self.last_page_btn.grid(row=row_id, column=16, padx=6, pady=6, sticky='w')
 
         # fresh paging state
         self._page_start = 0
@@ -859,23 +878,26 @@ class CalibrateGui(CTkFrame):
         img_find_corners_button = CTkButton(master=f, text='Find Corners')
         img_find_corners_button.grid(row=row_id, column=5, padx=5, pady=5)
 
+        img_edit_points_button = CTkButton(master=f, text='Edit Points')
+        img_edit_points_button.grid(row=row_id, column=6, padx=5, pady=5)
+
         img_invert_button = CTkButton(master=f, text='Invert Image')
-        img_invert_button.grid(row=row_id, column=6, padx=5, pady=5)
+        img_invert_button.grid(row=row_id, column=7, padx=5, pady=5)
 
         img_gray_button = CTkButton(master=f, text='Grayscale Image')
-        img_gray_button.grid(row=row_id, column=7, padx=5, pady=5)
+        img_gray_button.grid(row=row_id, column=8, padx=5, pady=5)
 
         img_ccw_rotate_button = CTkButton(master=f, text='', image=self.left_arrow,
                                           width=self.arrow_button_size, height=self.arrow_button_size)
-        img_ccw_rotate_button.grid(row=row_id, column=8, padx=5, pady=5)
+        img_ccw_rotate_button.grid(row=row_id, column=9, padx=5, pady=5)
 
         img_cw_rotate_button = CTkButton(master=f, text='', image=self.right_arrow,
                                          width=self.arrow_button_size, height=self.arrow_button_size)
-        img_cw_rotate_button.grid(row=row_id, column=9, padx=5, pady=5)
+        img_cw_rotate_button.grid(row=row_id, column=10, padx=5, pady=5)
 
         self.image_config_window_objects.append(
             [img_include_checkbox, img_name_button, img_res, img_shp, img_restore_button,
-             img_find_corners_button, img_invert_button, img_gray_button,
+             img_find_corners_button, img_edit_points_button, img_invert_button, img_gray_button,
              img_ccw_rotate_button, img_cw_rotate_button])
 
     def _update_page_label_and_buttons(self):
@@ -1017,16 +1039,16 @@ class CalibrateGui(CTkFrame):
         self.after(2000, protect, 1)
 
     def protectInvert(self, row=1):
-        self.protectImageActionButton(self.img_invert_protected_button, self.unprotectInvert, row, 6)
+        self.protectImageActionButton(self.img_invert_protected_button, self.unprotectInvert, row, 7)
 
     def protectAllGrayscale(self, row=1):
-        self.protectImageActionButton(self.img_gray_protected_button, self.unprotectAllGrayscale, row, 7)
+        self.protectImageActionButton(self.img_gray_protected_button, self.unprotectAllGrayscale, row, 8)
 
     def protectRotateCCW(self, row=1):
-        self.protectImageActionButton(self.img_rotate_ccw_protected_button, self.unprotectRotateCCW, row, 8)
+        self.protectImageActionButton(self.img_rotate_ccw_protected_button, self.unprotectRotateCCW, row, 9)
 
     def protectRotateCW(self, row=1):
-        self.protectImageActionButton(self.img_rotate_cw_protected_button, self.unprotectRotateCW, row, 9)
+        self.protectImageActionButton(self.img_rotate_cw_protected_button, self.unprotectRotateCW, row, 10)
 
     @staticmethod
     def protectImageActionButton(button, command, row, column):
@@ -1466,6 +1488,372 @@ class CalibrateGui(CTkFrame):
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
+    def editImagePoints(self, img_class):
+        img = cv2.imread(join(self.filepath, img_class.image_name))
+        if img is None:
+            messagebox.showwarning("Edit points", "Image could not be read.")
+            return
+        if img_class.img_pts is None:
+            messagebox.showwarning("Edit points", "Find corners before editing points.")
+            return
+
+        h, w = img.shape[:2]
+        display_scale = min(1.0, 1200 / w, 900 / h)
+        window_name = f"Edit Corners - {img_class.image_name}"
+        zoom_window_name = f"Corner Zoom - {img_class.image_name}"
+        state = {
+            'img': img,
+            'img_class': img_class,
+            'display_scale': display_scale,
+            'window_name': window_name,
+            'zoom_window_name': zoom_window_name,
+            'selected_idx': None,
+            'dragging': False,
+            'dirty': False,
+            'last_orig_xy': None,
+            'drag_start_point': None,
+            'dragging_in_zoom': False,
+            'zoom_origin': (0, 0),
+            'zoom_drag_origin': None,
+            'select_radius_px': 18,
+            'zoom_half_size': 20,
+            'zoom_scale': 18,
+            'nudge_step': 0.1,
+            'fine_nudge_step': 0.01,
+            'hotkey_help': [
+                "Left drag: move nearest corner",
+                "Zoom: drag/click selected corner precisely",
+                "I/J/K/L: nudge 0.1 px",
+                "W/A/S/D: nudge 0.01 px",
+                "Right click: cancel current drag",
+                "Esc or Q: close editor",
+            ],
+        }
+
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(zoom_window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, self.edit_points_mouse_event, state)
+        cv2.setMouseCallback(zoom_window_name, self.edit_points_zoom_mouse_event, state)
+        self.redraw_edit_points(state)
+
+        while True:
+            try:
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+            except cv2.error:
+                break
+
+            key = cv2.waitKey(30) & 0xFF
+            if key in (27, ord('q')):
+                break
+            if self.handle_edit_points_key(key, state):
+                self.redraw_edit_points(state)
+
+        cv2.destroyWindow(window_name)
+        try:
+            cv2.destroyWindow(zoom_window_name)
+        except cv2.error:
+            pass
+
+        if state['dirty']:
+            self.mark_points_edited(img_class)
+            self.invalidate_calibration_results()
+            self.saveToCache()
+            self.updateImageFrame()
+            self.show_edited_point_residuals(img_class)
+
+    def handle_edit_points_key(self, key, state):
+        selected_idx = state['selected_idx']
+        if selected_idx is None:
+            return False
+
+        step = state['fine_nudge_step'] if key in (ord('a'), ord('d'), ord('w'), ord('s')) else state['nudge_step']
+        deltas = {
+            ord('j'): (-step, 0.0),
+            ord('l'): (step, 0.0),
+            ord('i'): (0.0, -step),
+            ord('k'): (0.0, step),
+            ord('a'): (-step, 0.0),
+            ord('d'): (step, 0.0),
+            ord('w'): (0.0, -step),
+            ord('s'): (0.0, step),
+        }
+        if key not in deltas:
+            return False
+
+        img_class = state['img_class']
+        dx, dy = deltas[key]
+        x = img_class.img_pts[selected_idx, 0, 0] + dx
+        y = img_class.img_pts[selected_idx, 0, 1] + dy
+        self.move_corner_to(img_class, selected_idx, (x, y))
+        state['last_orig_xy'] = (x, y)
+        state['dirty'] = True
+        self.mark_points_edited(img_class)
+        self.saveToCache()
+        return True
+
+    def edit_points_mouse_event(self, event, x, y, flags, state):
+        img_class = state['img_class']
+        scale = state['display_scale']
+        orig_xy = self.display_to_original_point(x, y, scale, state['img'].shape)
+        state['last_orig_xy'] = orig_xy
+
+        if event == cv2.EVENT_RBUTTONDOWN or flags == cv2.EVENT_FLAG_RBUTTON:
+            if state['dragging'] and state['selected_idx'] is not None and state['drag_start_point'] is not None:
+                idx = state['selected_idx']
+                img_class.img_pts[idx, 0, :] = state['drag_start_point']
+            state['dragging'] = False
+            state['dragging_in_zoom'] = False
+            state['selected_idx'] = None
+            state['drag_start_point'] = None
+            state['zoom_drag_origin'] = None
+            self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            idx = self.nearest_corner_idx(img_class.img_pts, x, y, scale)
+            if idx is not None:
+                state['selected_idx'] = idx
+                state['dragging'] = True
+                state['drag_start_point'] = img_class.img_pts[idx, 0, :].copy()
+                self.move_corner_to(img_class, idx, orig_xy)
+                state['dirty'] = True
+                self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_MOUSEMOVE:
+            if state['dragging'] and state['selected_idx'] is not None:
+                self.move_corner_to(img_class, state['selected_idx'], orig_xy)
+                state['dirty'] = True
+            self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_LBUTTONUP and state['dragging'] and state['selected_idx'] is not None:
+            self.move_corner_to(img_class, state['selected_idx'], orig_xy)
+            state['dirty'] = True
+            self.mark_points_edited(img_class)
+            self.saveToCache()
+            state['dragging'] = False
+            state['drag_start_point'] = None
+            state['zoom_drag_origin'] = None
+            self.redraw_edit_points(state)
+
+    def edit_points_zoom_mouse_event(self, event, x, y, flags, state):
+        img_class = state['img_class']
+        orig_xy = self.zoom_to_original_point(x, y, state)
+        state['last_orig_xy'] = orig_xy
+
+        if event == cv2.EVENT_RBUTTONDOWN or flags == cv2.EVENT_FLAG_RBUTTON:
+            if state['dragging'] and state['selected_idx'] is not None and state['drag_start_point'] is not None:
+                idx = state['selected_idx']
+                img_class.img_pts[idx, 0, :] = state['drag_start_point']
+            state['dragging'] = False
+            state['dragging_in_zoom'] = False
+            state['selected_idx'] = None
+            state['drag_start_point'] = None
+            state['zoom_drag_origin'] = None
+            self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            idx = self.nearest_zoom_corner_idx(img_class.img_pts, x, y, state)
+            if idx is not None:
+                state['selected_idx'] = idx
+                state['drag_start_point'] = img_class.img_pts[idx, 0, :].copy()
+            if state['selected_idx'] is not None:
+                state['dragging'] = True
+                state['dragging_in_zoom'] = True
+                state['zoom_drag_origin'] = state['zoom_origin']
+                self.move_corner_to(img_class, state['selected_idx'], orig_xy)
+                state['dirty'] = True
+                self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_MOUSEMOVE and state['dragging_in_zoom'] and state['selected_idx'] is not None:
+            self.move_corner_to(img_class, state['selected_idx'], orig_xy)
+            state['dirty'] = True
+            self.redraw_edit_points(state)
+            return
+
+        if event == cv2.EVENT_LBUTTONUP and state['dragging_in_zoom'] and state['selected_idx'] is not None:
+            self.move_corner_to(img_class, state['selected_idx'], orig_xy)
+            state['dirty'] = True
+            self.mark_points_edited(img_class)
+            self.saveToCache()
+            state['dragging'] = False
+            state['dragging_in_zoom'] = False
+            state['drag_start_point'] = None
+            state['zoom_drag_origin'] = None
+            self.redraw_edit_points(state)
+
+    @staticmethod
+    def display_to_original_point(x, y, scale, img_shape):
+        h, w = img_shape[:2]
+        orig_x = float(np.clip(x / scale, 0, w - 1))
+        orig_y = float(np.clip(y / scale, 0, h - 1))
+        return orig_x, orig_y
+
+    @staticmethod
+    def nearest_corner_idx(img_pts, x, y, scale, select_radius_px=18):
+        pts = img_pts.reshape(-1, 2).astype(np.float32)
+        display_pts = pts * scale
+        distances = np.linalg.norm(display_pts - np.array([x, y], dtype=np.float32), axis=1)
+        idx = int(np.argmin(distances))
+        if distances[idx] > select_radius_px:
+            return None
+        return idx
+
+    @staticmethod
+    def zoom_to_original_point(x, y, state):
+        origin = state['zoom_drag_origin'] or state['zoom_origin']
+        zoom_scale = state['zoom_scale']
+        h, w = state['img'].shape[:2]
+        orig_x = float(np.clip(origin[0] + x / zoom_scale, 0, w - 1))
+        orig_y = float(np.clip(origin[1] + y / zoom_scale, 0, h - 1))
+        return orig_x, orig_y
+
+    @staticmethod
+    def nearest_zoom_corner_idx(img_pts, x, y, state):
+        origin = state['zoom_drag_origin'] or state['zoom_origin']
+        zoom_scale = state['zoom_scale']
+        pts = img_pts.reshape(-1, 2).astype(np.float32)
+        zoom_pts = (pts - np.array(origin, dtype=np.float32)) * zoom_scale
+        distances = np.linalg.norm(zoom_pts - np.array([x, y], dtype=np.float32), axis=1)
+        idx = int(np.argmin(distances))
+        if distances[idx] > state['select_radius_px']:
+            return None
+        return idx
+
+    @staticmethod
+    def move_corner_to(img_class, idx, orig_xy):
+        img_class.img_pts[idx, 0, 0] = float(orig_xy[0])
+        img_class.img_pts[idx, 0, 1] = float(orig_xy[1])
+
+    @staticmethod
+    def mark_points_edited(img_class):
+        img_class.residual = None
+        img_class.points_edited = True
+
+    def invalidate_calibration_results(self):
+        self.image_config.cam_cal = Calibration()
+        for image_class in self.image_config.img_collection:
+            image_class.residual = None
+        self.sortForCuration()
+        self.updateCalFrameState()
+
+    def redraw_edit_points(self, state):
+        img = state['img']
+        img_class = state['img_class']
+        scale = state['display_scale']
+        display_img = cv2.resize(img, (int(img.shape[1] * scale), int(img.shape[0] * scale)),
+                                 interpolation=cv2.INTER_NEAREST)
+        pts = img_class.img_pts.reshape(-1, 2)
+
+        for idx, (px, py) in enumerate(pts):
+            center = (int(round(px * scale)), int(round(py * scale)))
+            color = (0, 255, 255) if idx == state['selected_idx'] else (0, 255, 0)
+            radius = 6 if idx == state['selected_idx'] else 4
+            cv2.circle(display_img, center, radius, color, 2)
+
+        self.draw_hotkey_help(display_img, state['hotkey_help'])
+        cv2.imshow(state['window_name'], display_img)
+        self.redraw_edit_points_zoom(state)
+
+    @staticmethod
+    def draw_hotkey_help(img, lines, origin=(10, 22)):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        line_height = 18
+        thickness = 1
+        x, y = origin
+        text_width = max(cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines)
+        box_w = text_width + 14
+        box_h = line_height * len(lines) + 10
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x - 6, y - 16), (x - 6 + box_w, y - 16 + box_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.55, img, 0.45, 0, dst=img)
+        for idx, line in enumerate(lines):
+            baseline_y = y + idx * line_height
+            cv2.putText(img, line, (x, baseline_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    @staticmethod
+    def redraw_edit_points_zoom(state):
+        img = state['img']
+        img_class = state['img_class']
+        selected_idx = state['selected_idx']
+        half_size = state['zoom_half_size']
+        zoom_scale = state['zoom_scale']
+        h, w = img.shape[:2]
+
+        if state['dragging_in_zoom'] and state['zoom_drag_origin'] is not None:
+            x0, y0 = state['zoom_drag_origin']
+            x1 = min(w, x0 + half_size * 2 + 1)
+            y1 = min(h, y0 + half_size * 2 + 1)
+            if selected_idx is not None:
+                center_x, center_y = img_class.img_pts[selected_idx, 0, :]
+                center_x, center_y = int(round(center_x)), int(round(center_y))
+            else:
+                center_x, center_y = state['last_orig_xy'] or (x0 + half_size, y0 + half_size)
+        elif selected_idx is not None:
+            center_x, center_y = img_class.img_pts[selected_idx, 0, :]
+            center_x, center_y = int(round(center_x)), int(round(center_y))
+            x0 = max(0, center_x - half_size)
+            x1 = min(w, center_x + half_size + 1)
+            y0 = max(0, center_y - half_size)
+            y1 = min(h, center_y + half_size + 1)
+        else:
+            if state['last_orig_xy'] is not None:
+                center_x, center_y = state['last_orig_xy']
+            else:
+                pts = img_class.img_pts.reshape(-1, 2)
+                center_x, center_y = [int(round(v)) for v in pts[0]]
+            x0 = max(0, center_x - half_size)
+            x1 = min(w, center_x + half_size + 1)
+            y0 = max(0, center_y - half_size)
+            y1 = min(h, center_y + half_size + 1)
+
+        x0 = int(np.clip(np.floor(x0), 0, w - 1))
+        y0 = int(np.clip(np.floor(y0), 0, h - 1))
+        x1 = int(np.clip(np.ceil(x1), x0 + 1, w))
+        y1 = int(np.clip(np.ceil(y1), y0 + 1, h))
+        state['zoom_origin'] = (x0, y0)
+        roi = img[y0:y1, x0:x1].copy()
+        zoom = cv2.resize(roi, (roi.shape[1] * zoom_scale, roi.shape[0] * zoom_scale),
+                          interpolation=cv2.INTER_NEAREST)
+
+        pts = img_class.img_pts.reshape(-1, 2)
+        for idx, (px, py) in enumerate(pts):
+            if x0 <= px < x1 and y0 <= py < y1:
+                point = (int(round((px - x0) * zoom_scale)), int(round((py - y0) * zoom_scale)))
+                color = (0, 255, 255) if idx == selected_idx else (0, 255, 0)
+                cv2.circle(zoom, point, 7, color, 2)
+
+        cross_x = int(round((center_x - x0) * zoom_scale))
+        cross_y = int(round((center_y - y0) * zoom_scale))
+        cv2.line(zoom, (cross_x, 0), (cross_x, zoom.shape[0] - 1), (255, 255, 255), 1)
+        cv2.line(zoom, (0, cross_y), (zoom.shape[1] - 1, cross_y), (255, 255, 255), 1)
+        cv2.putText(zoom, "Drag/click here for precision", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3,
+                    cv2.LINE_AA)
+        cv2.putText(zoom, "Drag/click here for precision", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        CalibrateGui.draw_hotkey_help(zoom, state['hotkey_help'], origin=(8, 48))
+        cv2.imshow(state['zoom_window_name'], zoom)
+
+    def show_edited_point_residuals(self, img_class):
+        img = cv2.imread(join(self.filepath, img_class.image_name))
+        if img is None or img_class.img_pts is None:
+            return
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        self.drawImagePoints(
+            img_class,
+            img,
+            gray,
+            window_name='Edited Chessboard Corners',
+            show_homography_residuals=False,
+            show_projected_points=False,
+            status_text='Edited points shown. Recalibrate to compute calibration residuals.'
+        )
+
     def findChessboardCorners(self, master_frame, img_class, show_image=True, update_image_frame=False):
 
         if img_class.img_pts is not None and not show_image:
@@ -1544,10 +1932,15 @@ class CalibrateGui(CTkFrame):
                                          self.image_config.sub_num_inner_corners_w),
                                         (-1, -1), criteria)
             img_class.img_pts = corners2
+            img_class.residual = None
+            img_class.points_edited = False
 
             sharpness = cv2.estimateChessboardSharpness(gray, (
                 self.image_config.num_inner_corners_w, self.image_config.num_inner_corners_h), np.float32(corners2))
             img_class.sharpness = sharpness[0][0]
+
+            if not self.calculating:
+                self.invalidate_calibration_results()
         else:
             img_class.include = False
             self.updateImageAvailabilityState()
@@ -1560,7 +1953,8 @@ class CalibrateGui(CTkFrame):
         if show_image:
             self.drawImagePoints(img_class, img, gray)
 
-    def drawImagePoints(self, img_class, img, gray):
+    def drawImagePoints(self, img_class, img, gray, window_name='Chessboard Corners Detected',
+                        show_homography_residuals=True, show_projected_points=True, status_text=None):
         if img_class.img_pts is None:
             img_class.include = False
             h, w = gray.shape
@@ -1586,23 +1980,38 @@ class CalibrateGui(CTkFrame):
         pattern_size = (self.image_config.num_inner_corners_w,
                         self.image_config.num_inner_corners_h)
 
-        resid_roi, proj_roi, hmat = self.chessboard_point_residuals_homography(pts_roi, pattern_size)
+        if show_homography_residuals or show_projected_points:
+            resid_roi, proj_roi, hmat = self.chessboard_point_residuals_homography(pts_roi, pattern_size)
+        else:
+            resid_roi, proj_roi = None, None
+        if not show_projected_points:
+            proj_roi = None
 
         self.show_with_locked_aspect_redraw(
-            'Chessboard Corners Detected',
+            window_name,
             roi_base,
             pts_roi,
             pattern_size,
             resid_roi=resid_roi,  # <-- new
-            proj_roi=proj_roi  # <-- optional (can draw predicted too)
+            proj_roi=proj_roi,  # <-- optional (can draw predicted too)
+            on_click=lambda: self.editImagePoints(img_class),
+            status_text=status_text
         )
 
     @staticmethod
-    def show_with_locked_aspect_redraw(name, base_img, pts_roi, pattern_size, *, resid_roi=None, proj_roi=None):
+    def show_with_locked_aspect_redraw(name, base_img, pts_roi, pattern_size, *, resid_roi=None, proj_roi=None,
+                                       on_click=None, status_text=None):
         if base_img.ndim == 2:
             base_img = cv2.cvtColor(base_img, cv2.COLOR_GRAY2BGR)
 
         cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        click_state = {'clicked': False}
+        if on_click is not None:
+            def open_editor_on_click(event, _x, _y, flags, param):
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    click_state['clicked'] = True
+
+            cv2.setMouseCallback(name, open_editor_on_click)
         last_w_win, last_h_win = None, None
 
         # Precompute some stats for coloring/thresholding
@@ -1629,12 +2038,20 @@ class CalibrateGui(CTkFrame):
                 key = cv2.waitKey(30)
                 if key == 27:
                     break
+                if click_state['clicked']:
+                    cv2.destroyWindow(name)
+                    on_click()
+                    return
                 continue
 
             if last_w_win == w_win and last_h_win == h_win:
                 key = cv2.waitKey(30)
                 if key == 27:
                     break
+                if click_state['clicked']:
+                    cv2.destroyWindow(name)
+                    on_click()
+                    return
                 continue
             last_w_win, last_h_win = w_win, h_win
 
@@ -1700,10 +2117,23 @@ class CalibrateGui(CTkFrame):
                 # Summary text
                 mean_e = float(np.mean(resid_roi))
                 max_e = float(np.max(resid_roi))
-                cv2.putText(resized, f"per-point residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
+                cv2.putText(resized, f"homography residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(resized, f"per-point residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
+                cv2.putText(resized, f"homography residuals: mean {mean_e:.2f}px  max {max_e:.2f}px",
                             (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+            if on_click is not None:
+                edit_text = "Click anywhere to edit corners"
+                cv2.putText(resized, edit_text, (10, max(45, resized.shape[0] - 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(resized, edit_text, (10, max(45, resized.shape[0] - 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+            if status_text is not None:
+                cv2.putText(resized, status_text, (10, max(45, resized.shape[0] - 40)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(resized, status_text, (10, max(45, resized.shape[0] - 40)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
             # Letterbox canvas
             canvas = np.zeros((h_win, w_win, 3), dtype=np.uint8)
@@ -1716,6 +2146,10 @@ class CalibrateGui(CTkFrame):
             key = cv2.waitKey(30)
             if key == 27:
                 break
+            if click_state['clicked']:
+                cv2.destroyWindow(name)
+                on_click()
+                return
 
         if cv2.getWindowProperty(name, cv2.WND_PROP_VISIBLE) < 1:
             return
@@ -1919,8 +2353,9 @@ class CalibrateGui(CTkFrame):
             residuals = cal_values[9]
 
             for img_idx, img in enumerate(images):
-                self.image_config.img_collection[self.findIndexGivenImageName(os.path.basename(img))].residual = \
-                    residuals[img_idx][0]
+                img_class = self.image_config.img_collection[self.findIndexGivenImageName(os.path.basename(img))]
+                img_class.residual = residuals[img_idx][0]
+                img_class.points_edited = False
 
             # Sort the images by their residual Values
             self.sortByResidual()

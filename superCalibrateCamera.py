@@ -409,7 +409,7 @@ class CameraGui(ctk.CTkFrame):
         self.config_runtime.save_to_cache(immediate=immediate, delay_ms=delay_ms)
 
     def updateLogFile(self):
-        self.config_runtime.update_log_file()
+        return self.config_runtime.update_log_file()
 
     def updateYOLOModel(self):
         self.config_runtime.update_yolo_model()

@@ -95,7 +95,7 @@ class AttitudeReader:
         self.alt_t = self.alt = None                      # BARO.csv
         self.pitch = self.despitch = None                 # ATT.csv
         self.yaw = self.desyaw = None                     # ATT.csv
-        self.cmd_t = self.c3 = self.c8 = None             # RCOU.csv
+        self.cmd_t = self.c4 = self.c10 = None             # RCOU.csv
         self.cmd_throttle_perc = None                     # pre-mapped throttle %
 
         # GPS.csv
@@ -160,7 +160,7 @@ class AttitudeReader:
         if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch', 'Yaw', 'DesYaw'}.issubset(self.roll_dict.columns):
             print("ATT.csv file not in expected format.")
             return False
-        if not {'timestamp', 'C1', 'C3', 'C8'}.issubset(self.cmd_dict.columns):
+        if not {'timestamp', 'C1', 'C5', 'C10'}.issubset(self.cmd_dict.columns):
             print("RCOU.csv file not in expected format.")
             return False
 
@@ -214,9 +214,9 @@ class AttitudeReader:
         self.desyaw   = self.roll_dict['DesYaw'].to_numpy(np.float32)
 
         self.cmd_t = self.cmd_dict['timestamp'].to_numpy(np.float64)
-        self.c3 = self.cmd_dict['C3'].to_numpy(np.float32)  # throttle pwm
-        self.c8 = self.cmd_dict['C8'].to_numpy(np.float32)  # mode pwm
-        self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c3).astype(np.float32)
+        self.c5 = self.cmd_dict['C5'].to_numpy(np.float32)  # throttle pwm
+        self.c10 = self.cmd_dict['C10'].to_numpy(np.float32)  # mode pwm
+        self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c5).astype(np.float32)
 
         # --- GPS handling ---
         self.has_gps = False
@@ -346,7 +346,7 @@ class AttitudeReader:
         yaw = np.interp(t, self.att_t, self.yaw)
         cmd_yaw = np.interp(t, self.att_t, self.desyaw)
         thr_perc = np.interp(t, self.cmd_t, self.cmd_throttle_perc)
-        mode = self.ch8_pwm_to_mode(np.interp(t, self.cmd_t, self.c8))
+        mode = self.ch10_pwm_to_mode(np.interp(t, self.cmd_t, self.c10))
 
         gps_valid = False
         lat_deg = 0.0
@@ -396,13 +396,13 @@ class AttitudeReader:
         )
 
     @staticmethod
-    def ch8_pwm_to_mode(ch8):
+    def ch10_pwm_to_mode(ch8):
         if 950 < ch8 < 1250:
-            return ControlMode.controller
+            return ControlMode.manual
         if 1250 <= ch8 < 1750:
             return ControlMode.auto
         if 1750 <= ch8 < 2050:
-            return ControlMode.manual
+            return ControlMode.controller
         return ControlMode.error
 
     @staticmethod

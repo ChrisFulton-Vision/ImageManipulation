@@ -345,7 +345,11 @@ class PoseRuntime:
         if self.owner.pnpDrawer is None:
             self.owner.pnpDrawer = pnp_drw.pnp_qnp_draw()
 
-        output = self.owner.yoloSession.inferOnImage(frame, False)
+        infer_frame = frame
+        if opts.inference_source == GuiQueue.YoloInferenceSource.MARKUP:
+            infer_frame = markup_frame
+
+        output = self.owner.yoloSession.inferOnImage(infer_frame, False)
 
         algos = pnp_drw.twoToThreeSelectedAlgorithms()
         algos.use_pnp = opts.want_pnp
@@ -364,7 +368,7 @@ class PoseRuntime:
             yoloSize=self.owner.yoloSession.yoloSize,
             idsNamesLocs=self.owner.yoloSession.reader.idsNamesLocs,
             usedAlgos=algos,
-            originalSize=(int(frame.shape[0]), int(frame.shape[1])),
+            originalSize=(int(infer_frame.shape[0]), int(infer_frame.shape[1])),
             circles_not_features=opts.feature_circles,
             img_scale=scale,
         )

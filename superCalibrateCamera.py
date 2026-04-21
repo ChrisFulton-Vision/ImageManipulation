@@ -1301,6 +1301,7 @@ class CameraGui(ctk.CTkFrame):
                  markupFrame: NDArray,
                  ctx: GuiQueue.FrameCtx,
                  args) -> None:
+        """Run YOLO using either the original frame or the current markup frame."""
         self.pose_runtime.run_yolo(frame, markupFrame, ctx, args)
 
     @staticmethod

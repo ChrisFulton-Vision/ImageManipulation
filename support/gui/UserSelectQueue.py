@@ -79,6 +79,11 @@ class AprilTagDetectOpts:
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
 
 
+class YoloInferenceSource(Enum):
+    ORIGINAL = "Original Image"
+    MARKUP = "Markup Frame"
+
+
 @dataclass(slots=True)
 class YoloOpts:
     want_pnp: bool = False
@@ -87,6 +92,7 @@ class YoloOpts:
     factor_graph: bool = False
     hyper_focus: bool = False
     feature_circles: bool = False
+    inference_source: YoloInferenceSource = YoloInferenceSource.ORIGINAL
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("PnP", "want_pnp", bool, False),
         ArgBinding("QnP", "want_qnp", bool, False),
@@ -94,6 +100,7 @@ class YoloOpts:
         ArgBinding("Factor Graph", "factor_graph", bool, False),
         ArgBinding("Hyper Attention", "hyper_focus", bool, False),
         ArgBinding("Feature Circles", "feature_circles", bool, False),
+        ArgBinding("Inference Source", "inference_source", YoloInferenceSource, YoloInferenceSource.ORIGINAL),
     )
 
     # Derived, guaranteed consistent

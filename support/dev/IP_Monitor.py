@@ -6,11 +6,14 @@ import subprocess
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk
 
 REFRESH_MS = 2000
 PING_TIMEOUT_MS = 800
 CUSTOM_DEVICES_FILE = Path(__file__).with_name("IP_Monitor.custom_devices.json")
+AIRCRAFT = ("Shadow", "Supersonic")
+TIME_INPUT_HINT = "Use HH:MM, HH:MM:SS, or YYYY-MM-DD HH:MM"
 
 DEVICES = [
     ("Microhard Antenna", "192.168.168.101"),
@@ -19,6 +22,48 @@ DEVICES = [
     ("Shadow Antenna", "192.168.168.104"),
     ("Shadow Thor", "192.168.168.114"),
 ]
+
+
+def parse_event_time(value):
+    value = value.strip()
+    if not value:
+        return None
+
+    now = datetime.now()
+    formats = (
+        "%H:%M",
+        "%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+    )
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+
+        if fmt.startswith("%H"):
+            return parsed.replace(year=now.year, month=now.month, day=now.day)
+        return parsed
+
+    raise ValueError("Unsupported time format")
+
+
+def format_elapsed(start_time, now):
+    if start_time is None:
+        return "--"
+
+    elapsed_seconds = int((now - start_time).total_seconds())
+    if elapsed_seconds < 0:
+        return "starts in " + format_duration(abs(elapsed_seconds))
+
+    return format_duration(elapsed_seconds)
+
+
+def format_duration(total_seconds):
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def run_command(cmd):
@@ -71,16 +116,29 @@ class PingMonitorApp:
         self.custom_name_var = tk.StringVar()
         self.custom_ip_var = tk.StringVar()
         self.form_status_var = tk.StringVar(value="")
+        self.aircraft_stats = {}
+        self.stats_update_job = None
 
         self.next_device_id = 1
         self.devices = []
         self.device_rows = {}
+
+        for aircraft in AIRCRAFT:
+            self.aircraft_stats[aircraft] = {
+                "engine_start_var": tk.StringVar(),
+                "takeoff_var": tk.StringVar(),
+                "land_var": tk.StringVar(),
+                "engine_time_var": tk.StringVar(value="--"),
+                "flight_time_var": tk.StringVar(value="--"),
+                "status_var": tk.StringVar(value=""),
+            }
 
         for name, ip in DEVICES:
             self.devices.append(self.make_device(name, ip, custom=False))
         self.load_custom_devices()
 
         self.build_ui()
+        self.schedule_stats_update()
         self.schedule_refresh(initial=True)
 
     def make_device(self, name, ip, custom):
@@ -131,6 +189,17 @@ class PingMonitorApp:
         name_entry.bind("<Return>", lambda _event: self.add_custom_device())
         ip_entry.bind("<Return>", lambda _event: self.add_custom_device())
 
+        self.build_aircraft_stats_panel(main)
+
+        button_row = ttk.Frame(main)
+        button_row.pack(side="bottom", fill="x", pady=(16, 0))
+
+        refresh_btn = ttk.Button(button_row, text="Refresh Now", command=self.manual_refresh)
+        refresh_btn.pack(side="left")
+
+        quit_btn = ttk.Button(button_row, text="Quit", command=self.close)
+        quit_btn.pack(side="right")
+
         table_container = ttk.Frame(main)
         table_container.pack(fill="both", expand=True)
 
@@ -154,14 +223,80 @@ class PingMonitorApp:
         scrollbar.pack(side="right", fill="y")
         self.render_device_table()
 
-        button_row = ttk.Frame(main)
-        button_row.pack(fill="x", pady=(16, 0))
+    def build_aircraft_stats_panel(self, parent):
+        stats_frame = ttk.LabelFrame(parent, text="Flight Test Stats", padding=10)
+        stats_frame.pack(fill="x", pady=(0, 10))
 
-        refresh_btn = ttk.Button(button_row, text="Refresh Now", command=self.manual_refresh)
-        refresh_btn.pack(side="left")
+        ttk.Label(
+            stats_frame,
+            text=f"{TIME_INPUT_HINT}. Use Now buttons to stamp current local time.",
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(0, 8))
 
-        quit_btn = ttk.Button(button_row, text="Quit", command=self.close)
-        quit_btn.pack(side="right")
+        for aircraft in AIRCRAFT:
+            stats = self.aircraft_stats[aircraft]
+            aircraft_frame = ttk.Frame(stats_frame)
+            aircraft_frame.pack(fill="x", pady=3)
+            aircraft_frame.columnconfigure(1, weight=1)
+
+            ttk.Label(aircraft_frame, text=aircraft, font=("Segoe UI", 10, "bold"), width=12).grid(
+                row=0, column=0, rowspan=2, sticky="nw", padx=(0, 10), pady=(2, 0)
+            )
+
+            input_row = ttk.Frame(aircraft_frame)
+            input_row.grid(row=0, column=1, sticky="ew")
+
+            ttk.Label(input_row, text="Engine Start").pack(side="left", padx=(0, 4))
+            engine_entry = ttk.Entry(input_row, textvariable=stats["engine_start_var"], width=14)
+            engine_entry.pack(side="left", padx=(0, 4))
+
+            ttk.Button(
+                input_row,
+                text="Now",
+                width=5,
+                command=lambda aircraft=aircraft: self.stamp_aircraft_time(aircraft, "engine_start_var"),
+            ).pack(side="left", padx=(0, 10))
+
+            ttk.Label(input_row, text="Take-off").pack(side="left", padx=(0, 4))
+            takeoff_entry = ttk.Entry(input_row, textvariable=stats["takeoff_var"], width=14)
+            takeoff_entry.pack(side="left", padx=(0, 4))
+
+            ttk.Button(
+                input_row,
+                text="Now",
+                width=5,
+                command=lambda aircraft=aircraft: self.stamp_aircraft_time(aircraft, "takeoff_var"),
+            ).pack(side="left", padx=(0, 10))
+
+            ttk.Label(input_row, text="Land").pack(side="left", padx=(0, 4))
+            land_entry = ttk.Entry(input_row, textvariable=stats["land_var"], width=14)
+            land_entry.pack(side="left", padx=(0, 4))
+
+            ttk.Button(
+                input_row,
+                text="Now",
+                width=5,
+                command=lambda aircraft=aircraft: self.stamp_aircraft_time(aircraft, "land_var"),
+            ).pack(side="left")
+
+            metric_row = ttk.Frame(aircraft_frame)
+            metric_row.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+            ttk.Label(metric_row, text="Engine Time", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 4))
+            ttk.Label(metric_row, textvariable=stats["engine_time_var"], width=12).pack(
+                side="left", padx=(0, 14)
+            )
+            ttk.Label(metric_row, text="Flight Time", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 4))
+            ttk.Label(metric_row, textvariable=stats["flight_time_var"], width=12).pack(
+                side="left", padx=(0, 14)
+            )
+            ttk.Label(metric_row, textvariable=stats["status_var"], foreground="#aa0000").pack(
+                side="left", fill="x", expand=True
+            )
+
+            engine_entry.bind("<Return>", lambda _event: self.update_aircraft_stats())
+            takeoff_entry.bind("<Return>", lambda _event: self.update_aircraft_stats())
+            land_entry.bind("<Return>", lambda _event: self.update_aircraft_stats())
 
     def render_device_table(self):
         for child in self.table.winfo_children():
@@ -204,6 +339,63 @@ class PingMonitorApp:
         if label is None:
             return
         label.config(text=text, fg=color)
+
+    def stamp_aircraft_time(self, aircraft, field_name):
+        self.aircraft_stats[aircraft][field_name].set(datetime.now().strftime("%H:%M:%S"))
+        self.update_aircraft_stats()
+
+    def schedule_stats_update(self):
+        if not self.running:
+            return
+
+        self.update_aircraft_stats()
+        self.stats_update_job = self.root.after(1000, self.schedule_stats_update)
+
+    def update_aircraft_stats(self):
+        now = datetime.now()
+
+        for aircraft in AIRCRAFT:
+            stats = self.aircraft_stats[aircraft]
+            status_messages = []
+
+            try:
+                engine_start = parse_event_time(stats["engine_start_var"].get())
+            except ValueError:
+                engine_start = None
+                status_messages.append("Invalid engine start")
+
+            try:
+                takeoff = parse_event_time(stats["takeoff_var"].get())
+            except ValueError:
+                takeoff = None
+                status_messages.append("Invalid take-off")
+
+            try:
+                land = parse_event_time(stats["land_var"].get())
+            except ValueError:
+                land = None
+                status_messages.append("Invalid land")
+
+            elapsed_end = land if land is not None else now
+
+            if engine_start is None:
+                stats["engine_time_var"].set("--")
+            else:
+                stats["engine_time_var"].set(format_elapsed(engine_start, elapsed_end))
+
+            if takeoff is None:
+                stats["flight_time_var"].set("--")
+            else:
+                stats["flight_time_var"].set(format_elapsed(takeoff, elapsed_end))
+
+            if engine_start and takeoff and takeoff < engine_start:
+                status_messages.append("Take-off before engine start")
+            if engine_start and land and land < engine_start:
+                status_messages.append("Land before engine start")
+            if takeoff and land and land < takeoff:
+                status_messages.append("Land before take-off")
+
+            stats["status_var"].set("; ".join(status_messages))
 
     def load_custom_devices(self):
         try:
@@ -340,6 +532,9 @@ class PingMonitorApp:
     def close(self):
         self.running = False
         self.stop_refresh_animation()
+        if self.stats_update_job is not None:
+            self.root.after_cancel(self.stats_update_job)
+            self.stats_update_job = None
         self.root.destroy()
 
 

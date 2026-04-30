@@ -6,6 +6,7 @@ from typing import Any
 import customtkinter as ctk
 
 from support.core.enums import ExportQuality
+from support.io.attitude_interpreter import AttitudeReader
 from support.io.my_logging import LOG
 
 
@@ -229,11 +230,24 @@ class ConfigRuntime:
             delay_ms=delay_ms,
         )
 
-    def update_log_file(self) -> None:
-        if self.owner.hud_marker is not None:
-            self.owner.hud_marker.read_attitude_files(self.owner.camConfig.hud_data_filepath)
-            self.owner.playback_controller.load_time_offset(self.owner.camConfig.hud_data_filepath)
+    def update_log_file(self) -> bool:
+        hud_path = getattr(self.owner.camConfig, "hud_data_filepath", "") or ""
+
+        loaded = True
+        if hud_path:
+            if self.owner.hud_marker is not None:
+                loaded = bool(self.owner.hud_marker.read_attitude_files(hud_path))
+            else:
+                loaded = bool(AttitudeReader().read_files(hud_path))
+
+            if loaded:
+                self.owner.playback_controller.load_time_offset(hud_path)
+            else:
+                LOG.warning("Failed to load flight log data from '%s'", hud_path)
+                self.owner.camConfig.hud_data_filepath = ""
+
         self.save_to_cache()
+        return loaded
 
     def update_yolo_model(self) -> None:
         if self.owner.camConfig.yoloFilepath and self.owner.yoloSession is not None:

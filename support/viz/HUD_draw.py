@@ -92,12 +92,13 @@ class HUD_Marker:
 
     def read_attitude_files(self, filepath):
         self.attRdr = AttRdr()
-        self.attRdr.read_files(filepath)
+        loaded = self.attRdr.read_files(filepath)
 
         # New data set -> reset minimap state
         self.minimap_start_px = None
         self.minimap_trail_px.clear()
         self.minimap_last_time_s = None
+        return loaded
 
     def update_offset(self, delta_offset):
         self.attRdr.offset += delta_offset

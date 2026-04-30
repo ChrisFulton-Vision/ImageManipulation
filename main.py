@@ -4,8 +4,8 @@
 
 from tkinter import TclError
 import customtkinter as ctk
-import superCalibrateCamera as cam
-import superCalibrate as calibrate
+import cameraGUI as cam
+import calibrateGUI as calibrate
 from functools import partial
 # from SupportModules.LidarTruth import TruthPoints
 ctk.deactivate_automatic_dpi_awareness()

@@ -44,7 +44,7 @@ class FilepathController(Protocol):
 
     def updateYOLOModel(self) -> None: ...
 
-    def updateLogFile(self) -> None: ...
+    def updateLogFile(self) -> bool: ...
 
     def startStreamToggle(self) -> bool: ...
 
@@ -911,6 +911,8 @@ class Filepath_page(ctk.CTkFrame):
         if poss_dir:
             self.ctrl.camConfig.hud_data_filepath = poss_dir
             self.ctrl.updateLogFile()
+            self.updateLogLabel()
 
     def updateLogLabel(self):
-        self.FlightLogLabelText.set(Path(self.ctrl.camConfig.hud_data_filepath).name)
+        self.FlightLogLabelText.set(Path(self.ctrl.camConfig.hud_data_filepath).name if
+                                    self.ctrl.camConfig.hud_data_filepath else '')

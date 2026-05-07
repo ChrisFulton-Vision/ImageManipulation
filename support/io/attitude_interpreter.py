@@ -7,6 +7,24 @@ from os.path import join
 from enum import Enum
 from dataclasses import dataclass
 
+_EARTH_RADIUS_M = 6378137.0
+
+# Hard-coded runway corners for initial integration.
+# Order should follow the perimeter so HUD drawing can close the quadrilateral.
+_RUNWAY_CORNERS_LLA = (
+    (39.344333, -86.009638, 216.0),  #NW
+    (39.344341, -86.009465, 216.0),  #NE
+    (39.341582, -86.009378, 212.0),  #SE
+    (39.341578, -86.009557, 212.0),  #SW
+)
+
+# Camera origin relative to the aircraft/body origin in body axes [forward, right, down], meters.
+# Positive right moves the camera to starboard.
+_CAMERA_LEVER_ARM_BODY_M = (0.0, 0.75, 0.0)
+
+# Camera angular offset relative to the aircraft/body axes in [roll, pitch, yaw] degrees.
+_CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 1.0)
+
 class ControlMode(Enum):
     auto       = 'auto'
     manual     = 'manual'
@@ -41,6 +59,9 @@ class AttitudeSample:
     # These are NOT global meters, just a locally consistent flat projection.
     map_x: float = 0.0
     map_y: float = 0.0
+
+    # Runway corners in aircraft/body coordinates [forward, right, down], meters.
+    runway_corners_body_m: tuple[tuple[float, float, float], ...] | None = None
 
     @property
     def rpy_deg(self) -> tuple[float, float, float]:
@@ -371,6 +392,17 @@ class AttitudeReader:
                 map_y = float(lat_deg - self.gps_lat0_deg)
                 gps_valid = True
 
+        runway_corners_body_m = None
+        if gps_valid:
+            runway_corners_body_m = self._runway_corners_in_body_frame(
+                lat_deg=lat_deg,
+                lng_deg=lng_deg,
+                alt_m=gps_alt_m,
+                roll_deg=float(roll),
+                pitch_deg=float(pitch),
+                yaw_deg=float(yaw),
+            )
+
         return AttitudeSample(
             valid=True,
             time_s=float(t),
@@ -393,7 +425,84 @@ class AttitudeReader:
             gps_yaw_deg=gps_yaw_deg,
             map_x=map_x,
             map_y=map_y,
+            runway_corners_body_m=runway_corners_body_m,
         )
+
+    @staticmethod
+    def _lla_to_ned_delta_m(
+        lat_deg: float,
+        lng_deg: float,
+        alt_m: float,
+        ref_lat_deg: float,
+        ref_lng_deg: float,
+        ref_alt_m: float,
+    ) -> np.ndarray:
+        lat_rad = np.deg2rad(lat_deg)
+        lng_rad = np.deg2rad(lng_deg)
+        ref_lat_rad = np.deg2rad(ref_lat_deg)
+        ref_lng_rad = np.deg2rad(ref_lng_deg)
+
+        d_lat = lat_rad - ref_lat_rad
+        d_lng = lng_rad - ref_lng_rad
+
+        north_m = d_lat * _EARTH_RADIUS_M
+        east_m = d_lng * _EARTH_RADIUS_M * np.cos(ref_lat_rad)
+        down_m = ref_alt_m - alt_m
+        return np.array([north_m, east_m, down_m], dtype=float)
+
+    @staticmethod
+    def _rotmat_wr_from_rpy(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+        rr = np.deg2rad(roll_deg)
+        rp = np.deg2rad(pitch_deg)
+        ry = np.deg2rad(yaw_deg)
+
+        cr, sr = np.cos(rr), np.sin(rr)
+        cp, sp = np.cos(rp), np.sin(rp)
+        cy, sy = np.cos(ry), np.sin(ry)
+
+        rx = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr],
+        ], dtype=float)
+        ry = np.array([
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp],
+        ], dtype=float)
+        rz = np.array([
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+        return rz @ ry @ rx
+
+    def _runway_corners_in_body_frame(
+        self,
+        lat_deg: float,
+        lng_deg: float,
+        alt_m: float,
+        roll_deg: float,
+        pitch_deg: float,
+        yaw_deg: float,
+    ) -> tuple[tuple[float, float, float], ...]:
+        r_wr = self._rotmat_wr_from_rpy(roll_deg, pitch_deg, yaw_deg)
+        r_rw = r_wr.T
+
+        body_pts = []
+        for corner_lat, corner_lng, corner_alt in _RUNWAY_CORNERS_LLA:
+            runway_ned = self._lla_to_ned_delta_m(
+                lat_deg=corner_lat,
+                lng_deg=corner_lng,
+                alt_m=corner_alt,
+                ref_lat_deg=lat_deg,
+                ref_lng_deg=lng_deg,
+                ref_alt_m=alt_m,
+            )
+            runway_body = r_rw @ runway_ned
+            body_pts.append(tuple(float(v) for v in runway_body))
+
+        return tuple(body_pts)
 
     @staticmethod
     def ch10_pwm_to_mode(ch8):

@@ -1,4 +1,5 @@
 from typing import Any
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -26,6 +27,7 @@ class PoseRuntime:
         self.owner = owner
         self._truth_lookup_source = None
         self._truth_lookup = None
+        self._yolo_sessions_by_dir: dict[str, Any] = {}
 
     def _get_truth_lookup(self) -> dict[int, np.ndarray]:
         if self.owner.ThreeDTruthPoints is None:
@@ -328,17 +330,53 @@ class PoseRuntime:
                 dim_factor=float(p.dim_factor),
             )
 
-    def run_yolo(self, frame: NDArray, markup_frame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
-        opts = self.owner.parse_args(args, GuiQueue.YoloOpts())
+    def _resolve_yolo_folder(self, opts: GuiQueue.YoloOpts) -> str:
+        queue_path = (opts.model_folder or "").strip()
+        if queue_path:
+            return queue_path
+        return str(getattr(self.owner.camConfig, "yoloFilepath", "") or "").strip()
 
+    @staticmethod
+    def _normalize_dir(path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    @staticmethod
+    def _validate_yolo_folder(yolo_folder: str) -> None:
+        folder = Path(yolo_folder)
+        if not folder.is_dir():
+            raise ValueError(f"YOLO folder does not exist: {yolo_folder}")
+        if not any(folder.glob("*.onnx")) or not any(folder.glob("*.csv")):
+            raise ValueError(
+                "YOLO folder must contain at least one .onnx model and one .csv metadata file: "
+                f"{yolo_folder}"
+            )
+
+    def _ensure_yolo_session(self, yolo_folder: str) -> None:
         from support.vision import yolo
 
-        if self.owner.yoloSession is None:
-            self.owner.yoloSession = yolo.YOLO()
-            self.owner.yoloSession.setNewFolder(self.owner.camConfig.yoloFilepath)
-            self.owner.yoloSession.set_calibration(self.owner.calibration)
-            self.owner.yoloSession.iou = self.owner.camConfig.yolo_iou
-            self.owner.yoloSession.conf = self.owner.camConfig.yolo_conf
+        if not yolo_folder:
+            raise ValueError("No YOLO folder selected. Set one in the YOLO queue step or the filepath page.")
+
+        requested = self._normalize_dir(yolo_folder.strip())
+        self._validate_yolo_folder(requested)
+
+        session = self._yolo_sessions_by_dir.get(requested)
+        if session is None:
+            session = yolo.YOLO()
+            session.setNewFolder(requested)
+            session.set_calibration(self.owner.calibration)
+            self._yolo_sessions_by_dir[requested] = session
+
+        session.iou = self.owner.camConfig.yolo_iou
+        session.conf = self.owner.camConfig.yolo_conf
+        session.set_calibration(self.owner.calibration)
+
+        self.owner.yoloSession = session
+
+    def run_yolo(self, frame: NDArray, markup_frame: NDArray, ctx: GuiQueue.FrameCtx, args) -> None:
+        opts = self.owner.parse_args(args, GuiQueue.YoloOpts())
+        yolo_folder = self._resolve_yolo_folder(opts)
+        self._ensure_yolo_session(yolo_folder)
 
         import support.viz.draw_pnp_qnp as pnp_drw
 

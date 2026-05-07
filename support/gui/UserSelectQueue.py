@@ -2,6 +2,7 @@ import customtkinter as ctk
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type, ClassVar
 from enum import Enum
+from tkinter import filedialog
 
 DEFAULT_CHOICE = "(select)"
 
@@ -21,6 +22,7 @@ class ArgSpec:
     default: Any
     min: float | None = None
     max: float | None = None
+    path_kind: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class ArgBinding:
@@ -93,6 +95,7 @@ class YoloOpts:
     hyper_focus: bool = False
     feature_circles: bool = False
     inference_source: YoloInferenceSource = YoloInferenceSource.ORIGINAL
+    model_folder: str = ""
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("PnP", "want_pnp", bool, False),
         ArgBinding("QnP", "want_qnp", bool, False),
@@ -104,10 +107,12 @@ class YoloOpts:
     )
 
     # Derived, guaranteed consistent
-    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = tuple(
-        ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
+    ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = (
+        *(ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS),
+        ArgSpec("YOLO Folder", str, "", path_kind="directory"),
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+    KEYMAP["YOLO Folder"] = "model_folder"
     
 
 @dataclass(slots=True)
@@ -260,6 +265,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         self._args_body = ctk.CTkFrame(self._args_panel, fg_color="transparent", height=1, width=1)
         self._args_body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
         self._args_body.grid_columnconfigure(1, weight=1)
+        self._args_body.grid_columnconfigure(2, weight=0)
 
         # Ensure the frame size follows children (and stays tiny when empty).
         self._args_body.grid_propagate(True)
@@ -589,6 +595,30 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             except Exception:
                 pass
 
+    def _browse_for_arg(self, spec: ArgSpec) -> None:
+        if self._active_idx is None or self._active_idx >= len(self._rows):
+            return
+
+        row = self._rows[self._active_idx]
+        current = str(row.args.get(spec.name, spec.default) or "")
+
+        if spec.path_kind == "directory":
+            selected = filedialog.askdirectory(
+                initialdir=current or ".",
+                title=f"Select {spec.name}",
+            )
+        else:
+            selected = filedialog.askopenfilename(
+                initialdir=current or ".",
+                title=f"Select {spec.name}",
+            )
+
+        if not selected:
+            return
+
+        self._set_arg(spec.name, selected)
+        self._render_args_panel()
+
     def _render_args_panel(self) -> None:
         self._clear_args_body()
 
@@ -673,6 +703,29 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                     width=75
                 )
                 slider.grid(row=i, column=1, sticky="ew", pady=4)
+                continue
+
+            # int/str -> entry with cast on commit
+            if isinstance(val, str) and spec.path_kind is not None:
+                svar = ctk.StringVar(value=val)
+                ent = ctk.CTkEntry(self._args_body, textvariable=svar)
+                ent.grid(row=i, column=1, sticky="ew", pady=4)
+
+                spec_name = spec.name
+
+                def _commit_path(_evt=None, n=spec_name, sv=svar):
+                    self._set_arg(n, sv.get())
+
+                ent.bind("<Return>", _commit_path)
+                ent.bind("<FocusOut>", _commit_path)
+
+                browse_btn = ctk.CTkButton(
+                    self._args_body,
+                    text="Browse",
+                    width=70,
+                    command=lambda s=spec: self._browse_for_arg(s),
+                )
+                browse_btn.grid(row=i, column=2, sticky="e", padx=(8, 0), pady=4)
                 continue
 
             # int/str -> entry with cast on commit

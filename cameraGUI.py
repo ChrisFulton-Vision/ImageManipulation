@@ -689,36 +689,31 @@ class CameraGui(ctk.CTkFrame):
         Loads each source frame, applies the configured analysis pipeline, and
         returns a list of processed images suitable for GIF or video export.
         """
+        frames, _frame_times = self._gather_annotated_frames_and_timebase()
+        return frames
+
+    def _gather_annotated_frames_and_timebase(self) -> tuple[list[NDArray], NDArray | None]:
+        """Render export frames and return a matching normalized timebase when available."""
         self.reset_runtime_state(reset_fg=True)
         directory = Path(self.camConfig.imageFilepath).parent
-        self.populate_idsTimes(str(directory))
 
-        paths = []
-        for rec in self.ImageTimeReader.idsTimes:
-            p = Path(rec[0])
-            paths.append(p if p.is_absolute() else (directory / p))
+        loaded_offset = self.playback_controller.load_time_offset(directory)
+        if self.hud_marker is not None:
+            self.hud_marker.update_offset(loaded_offset)
+        self.camConfig.cam_to_log_time_offset = 0.0
 
-        try:
-            import pandas as pd
-            offset_dict = pd.read_csv(directory / '__TIME_OFFSET.csv')
-            loaded_offset = float(offset_dict['offset'][0])
+        paths, timebase = self.playback_controller._build_sequence_and_timebase(directory)
 
-            if self.hud_marker is not None:
-                self.hud_marker.update_offset(loaded_offset)
-
-            # UI delta should always start at zero after loading persisted offset.
-            self.camConfig.cam_to_log_time_offset = 0.0
-
-        except FileNotFoundError:
-            if self.hud_marker is not None:
-                self.hud_marker.update_offset(0.0)
-            self.camConfig.cam_to_log_time_offset = 0.0
-
-        cv_imgs = []
+        cv_imgs: list[NDArray] = []
+        selected_times: list[float] = []
         start = self.camConfig.start_export_idx
         end = self.camConfig.end_export_idx + 1
+
         for idx, img_path in zip(range(start, end), paths[start:end]):
             frame = cv2.imread(str(img_path))
+            if frame is None:
+                continue
+
             ts = self.ImageTimeReader.idsTimes[idx][1]
             cv_img = self.analyze_image(
                 frame,
@@ -728,8 +723,46 @@ class CameraGui(ctk.CTkFrame):
             )
             if cv_img is not None:
                 cv_imgs.append(cv_img)
+                if idx < len(timebase):
+                    selected_times.append(float(timebase[idx]))
 
-        return cv_imgs
+        if len(selected_times) == len(cv_imgs) and selected_times:
+            arr = np.asarray(selected_times, dtype=np.float64)
+            arr -= float(arr[0])
+            return cv_imgs, arr
+
+        return cv_imgs, None
+
+    @staticmethod
+    def _derive_video_export_schedule(
+            frame_times: NDArray | None,
+            fallback_fps: float,
+            frame_count: int,
+    ) -> tuple[float, list[int]]:
+        """Approximate timestamped playback inside a constant-FPS video container."""
+        if frame_count <= 0:
+            return max(1.0, float(fallback_fps)), []
+
+        if frame_count == 1 or frame_times is None or len(frame_times) != frame_count:
+            return max(1.0, float(fallback_fps)), list(range(frame_count))
+
+        times = np.asarray(frame_times, dtype=np.float64)
+        if not np.all(np.isfinite(times)):
+            return max(1.0, float(fallback_fps)), list(range(frame_count))
+
+        times = times - float(times[0])
+        dt = np.diff(times)
+        valid_dt = dt[dt > 1e-6]
+        if valid_dt.size == 0:
+            return max(1.0, float(fallback_fps)), list(range(frame_count))
+
+        fps = float(np.clip(1.0 / np.median(valid_dt), 1.0, 240.0))
+        step = 1.0 / fps
+        total_duration = max(float(times[-1]), step * (frame_count - 1))
+        sample_times = np.arange(0.0, total_duration + 0.5 * step, step, dtype=np.float64)
+        sample_idx = np.searchsorted(times, sample_times, side="right") - 1
+        sample_idx = np.clip(sample_idx, 0, frame_count - 1)
+        return fps, sample_idx.tolist()
 
     def exportToGif(self, exportToGifButton, exportToVidButton):
         """Begin asynchronous GIF/APNG export for the current frame range."""
@@ -774,11 +807,20 @@ class CameraGui(ctk.CTkFrame):
     def exportToVid_worker(self,
                            exportToGifButton, exportToVidButton):
         try:
-            frames = self._gather_annotated_frames()
+            frames, frame_times = self._gather_annotated_frames_and_timebase()
+            if not frames:
+                return
+
             h, w = frames[0].shape[:2]
             fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-            out = cv2.VideoWriter('output_video.mp4', fourcc, 10, (w, h))
-            for f in frames:
+            fps, sample_idx = self._derive_video_export_schedule(
+                frame_times,
+                self.camConfig.target_fps,
+                len(frames),
+            )
+            out = cv2.VideoWriter('output_video.mp4', fourcc, fps, (w, h))
+            for idx in sample_idx:
+                f = frames[idx]
                 out.write(f)
             out.release()
         finally:
@@ -906,6 +948,7 @@ class CameraGui(ctk.CTkFrame):
         attitude = self.hud_marker.draw_HUD(image=markupFrame,
                                             img_time=ctx.img_time,
                                             opts=opts,
+                                            calibration=self.calibration if self.calibration.validCal else None,
                                             cx_cy_ori=cx_cy,
                                             scale=scale)
         if opts.store_attitude:

@@ -1,11 +1,10 @@
-# Testing.py
-# Minimal CustomTkinter "pages + router" example
+
 # pip install customtkinter
 
 from tkinter import TclError
 import customtkinter as ctk
-import cameraGUI as cam
-import calibrateGUI as calibrate
+from cameraGUI import CameraGui as camGui
+from calibrateGUI import CalibrateGui as calGui
 from functools import partial
 # from SupportModules.LidarTruth import TruthPoints
 ctk.deactivate_automatic_dpi_awareness()
@@ -72,7 +71,7 @@ class CalibratePage(ctk.CTkFrame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self.calPage = calibrate.CalibrateGui(self)
+        self.calPage = calGui(self)
         self.set_main_button_calculating = None
 
         # define "sections" as frames we can swap
@@ -145,7 +144,7 @@ class CameraPage(ctk.CTkFrame):
 
         self.title = "Camera"
 
-        self.camGui = cam.CameraGui(self)
+        self.camGui = camGui(self)
 
         self.sections = {
             "Filepaths": self._make_setupPage(),

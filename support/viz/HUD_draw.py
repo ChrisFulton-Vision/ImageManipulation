@@ -1,6 +1,11 @@
 import numpy as np
 from numpy import sin, cos, deg2rad
-from support.io.attitude_interpreter import AttitudeReader as AttRdr, ControlMode
+from support.io.attitude_interpreter import (
+    AttitudeReader as AttRdr,
+    ControlMode,
+    _CAMERA_LEVER_ARM_BODY_M,
+    _CAMERA_RPY_OFFSET_DEG,
+)
 from support.viz.CVFontScaling import med_text, small_thick, med_thick, lrg_thick
 from numpy.typing import NDArray
 import cv2
@@ -205,6 +210,7 @@ class HUD_Marker:
                  image: NDArray,
                  img_time: float,
                  opts: HudOpts,
+                 calibration=None,
                  cx_cy_ori: tuple[float, float] = None,
                  scale: float = 1.0):
         h, w = image.shape[:2]
@@ -243,10 +249,120 @@ class HUD_Marker:
         if draw_mode:
             self.draw_controlMode(image, att.mode)
 
+        self.draw_runway(image, att, calibration, cx_cy, scale)
+
         # --- minimap ---
         self.draw_minimap(image, att, map_transparency)
 
         return att
+
+    @staticmethod
+    def _camera_offset_rotmat() -> np.ndarray:
+        roll_deg, pitch_deg, yaw_deg = _CAMERA_RPY_OFFSET_DEG
+        rr = np.deg2rad(roll_deg)
+        rp = np.deg2rad(pitch_deg)
+        ry = np.deg2rad(yaw_deg)
+
+        cr, sr = np.cos(rr), np.sin(rr)
+        cp, sp = np.cos(rp), np.sin(rp)
+        cy, sy = np.cos(ry), np.sin(ry)
+
+        rx = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr],
+        ], dtype=float)
+        ry_m = np.array([
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp],
+        ], dtype=float)
+        rz = np.array([
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+        return rz @ ry_m @ rx
+
+    @classmethod
+    def _body_to_camera_points(cls, body_points: np.ndarray) -> np.ndarray:
+        # Body frame is treated as [forward, right, down].
+        # Camera frame for projection is [right, down, forward].
+        lever_arm_body = np.asarray(_CAMERA_LEVER_ARM_BODY_M, dtype=float).reshape(1, 3)
+        camera_relative_body = body_points - lever_arm_body
+        r_cb = cls._camera_offset_rotmat().T
+        camera_aligned_body = (r_cb @ camera_relative_body.T).T
+        return np.column_stack((
+            camera_aligned_body[:, 1],
+            camera_aligned_body[:, 2],
+            camera_aligned_body[:, 0],
+        ))
+
+    @staticmethod
+    def _fallback_camera_matrix(image: NDArray, cx_cy: tuple[int, int] | None) -> np.ndarray:
+        h, w = image.shape[:2]
+        cx = float(w * 0.5 if cx_cy is None else cx_cy[0])
+        cy = float(h * 0.5 if cx_cy is None else cx_cy[1])
+        fx = float(w)
+        fy = float(w)
+        return np.array([
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+
+    def _project_body_points(
+        self,
+        image: NDArray,
+        body_points: np.ndarray,
+        calibration,
+        cx_cy: tuple[int, int] | None,
+        scale: float,
+    ) -> np.ndarray | None:
+        if body_points.shape[0] == 0:
+            return None
+
+        cam_points = self._body_to_camera_points(body_points)
+        depth = cam_points[:, 2]
+        if np.any(depth <= 1e-3):
+            return None
+
+        if calibration is not None and getattr(calibration, 'validCal', False):
+            k = calibration.getCameraMatrix()
+        else:
+            k = None
+        if k is None:
+            k = self._fallback_camera_matrix(image, cx_cy)
+        elif abs(scale - 1.0) > 1e-9:
+            k = np.asarray(k, dtype=float).copy()
+            k[0, 0] *= scale
+            k[1, 1] *= scale
+            k[0, 2] = scale * (k[0, 2] + 0.5) - 0.5
+            k[1, 2] = scale * (k[1, 2] + 0.5) - 0.5
+
+        homog = (k @ cam_points.T).T
+        return homog[:, :2] / homog[:, 2:3]
+
+    def draw_runway(self, image, att, calibration, cx_cy, scale: float):
+        corners_body = getattr(att, 'runway_corners_body_m', None)
+        if not corners_body:
+            return
+
+        body_points = np.asarray(corners_body, dtype=float).reshape(-1, 3)
+        pts_2d = self._project_body_points(image, body_points, calibration, cx_cy, scale)
+        if pts_2d is None or pts_2d.shape[0] < 4:
+            return
+
+        h, w = image.shape[:2]
+        pts_px = np.rint(pts_2d).astype(np.int32)
+
+        # Skip draws that are wildly off-screen; this avoids long lines from near-singular projections.
+        if np.any(pts_px[:, 0] < -2 * w) or np.any(pts_px[:, 0] > 3 * w):
+            return
+        if np.any(pts_px[:, 1] < -2 * h) or np.any(pts_px[:, 1] > 3 * h):
+            return
+
+        cv2.polylines(image, [pts_px], True, clr.HUD_YELLOW, med_thick(h))
 
     @staticmethod
     def draw_crosshairs(image, cx_cy):

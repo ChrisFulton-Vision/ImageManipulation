@@ -1,9 +1,7 @@
 import copy
-import os
 import time
 import sys
 import threading
-import enum
 from dataclasses import dataclass
 
 import numpy as np
@@ -300,10 +298,12 @@ class CameraGui(ctk.CTkFrame):
         self.image_processing_page.grid_columnconfigure(0, weight=1, minsize=400)
         self.image_processing_page.grid_columnconfigure(1, weight=1)
 
+        self.imgProcQueue_editor = None
         self.imgProcQueue_editor = GuiQueue.StepSpecQueueEditor(
             master=self.image_processing_page,
             options=self.step_options,
             on_change=self._on_queue_changed,
+            func_that_refits=self.func_that_refits,
         )
         self.imgProcQueue_editor.grid(row=20, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
 
@@ -346,8 +346,10 @@ class CameraGui(ctk.CTkFrame):
                 pass
 
         def _poll_worker_then_close():
-            t = self._thread
-            if t is not None and t.is_alive():
+            stream_thread = self._thread
+            plot_thread = getattr(self.batch_controller, "_plot_thread", None)
+            if ((stream_thread is not None and stream_thread.is_alive())
+                    or (plot_thread is not None and plot_thread.is_alive())):
                 try:
                     root.after(50, _poll_worker_then_close)  # type: ignore[call-arg]
                 except tk.TclError:
@@ -364,6 +366,7 @@ class CameraGui(ctk.CTkFrame):
         required GUI geometry.
         """
         self.func_that_refits = func
+        self.imgProcQueue_editor.func_that_refits = func
 
     def _init_flag_vars(self):
         self.config_runtime.init_flag_vars()
@@ -378,6 +381,14 @@ class CameraGui(ctk.CTkFrame):
         self.config_runtime.sync_dp_from_model()
 
     def _on_queue_changed(self, new_queue):
+        def queue_change_resize():
+            print('Testing...')
+            if self.imgProcQueue_editor is not None and self.imgProcQueue_editor.winfo_exists():
+                print(self.imgProcQueue_editor.winfo_reqheight())
+                print('Test2')
+            if self.func_that_refits is not None:
+                self.func_that_refits()
+
         self.config_runtime.on_queue_changed(new_queue)
 
     def _sync_queue_from_model(self):

@@ -1,4 +1,6 @@
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # Prevents accessing GUI logic, allows threaded saving
 import matplotlib.pyplot as plt
 from support.io.my_logging import LOG
 from pathlib import Path
@@ -112,8 +114,9 @@ class Plotter:
             if has_kf_pos:
                 plt.plot(t, merged[f"qnp_kf_{comp}"], label="QnP (KF-weighted)")
 
-            plt.xlabel("Time [s]")
-            plt.ylabel(f"{comp.upper()} position")
+            plt.xlabel("Time [s]", fontsize=20)
+            plt.ylabel(f"{comp.upper()} position [m]", fontsize=20)
+            plt.tick_params(axis='both', labelsize=20)
             # plt.title(f"{comp.upper()} Position vs Time")
             plt.legend()
             plt.grid(True)
@@ -333,17 +336,16 @@ class Plotter:
             )
 
             # used_n over time + KF rejected count (derived from kf_used_rate)
-            if ("qnp_used_n" in merged.columns) and ("kf_used_rate" in merged.columns):
+            if ("qnp_used_n" in merged.columns) and ("qnp_kf_used_n" in merged.columns):
                 plt.figure()
-
                 n_used = merged["qnp_used_n"].to_numpy(dtype=float)
-                kf_used_rate = merged["kf_used_rate"].to_numpy(dtype=float)
+                n_kf_used_eff = merged["qnp_kf_used_n"].to_numpy(dtype=float)
 
                 # rejected fraction in [0,1]
-                n_kf_rejected_eff = n_used * kf_used_rate
+                # n_kf_used_eff = n_used * kf_used_rate
 
                 plt.plot(t, n_used, label="QnP used_n")
-                plt.plot(t, n_kf_rejected_eff, linestyle="--", label="QnP-KF used_n")
+                plt.step(t, n_kf_used_eff, where="mid", linestyle="--", label="QnP-KF used_n")
 
                 plt.xlabel("Time [s]")
                 plt.ylabel("N features")
@@ -360,13 +362,13 @@ class Plotter:
             # Rotation sigmas
             plt.figure()
             if have_qnp_sig:
-                plt.plot(t, merged["qnp_sig_rx"], label="QnP sig_rx [rad]")
-                plt.plot(t, merged["qnp_sig_ry"], label="QnP sig_ry [rad]")
-                plt.plot(t, merged["qnp_sig_rz"], label="QnP sig_rz [rad]")
+                plt.plot(t[1:], merged["qnp_sig_rx"][1:], label="QnP sig_rx [rad]")
+                plt.plot(t[1:], merged["qnp_sig_ry"][1:], label="QnP sig_ry [rad]")
+                plt.plot(t[1:], merged["qnp_sig_rz"][1:], label="QnP sig_rz [rad]")
             if have_qnp_kf_sig:
-                plt.plot(t, merged["qnp_kf_sig_rx"], linestyle="--", label="QnP-KF sig_rx [rad]")
-                plt.plot(t, merged["qnp_kf_sig_ry"], linestyle="--", label="QnP-KF sig_ry [rad]")
-                plt.plot(t, merged["qnp_kf_sig_rz"], linestyle="--", label="QnP-KF sig_rz [rad]")
+                plt.plot(t[1:], merged["qnp_kf_sig_rx"][1:], linestyle="--", label="QnP-KF sig_rx [rad]")
+                plt.plot(t[1:], merged["qnp_kf_sig_ry"][1:], linestyle="--", label="QnP-KF sig_ry [rad]")
+                plt.plot(t[1:], merged["qnp_kf_sig_rz"][1:], linestyle="--", label="QnP-KF sig_rz [rad]")
             plt.xlabel("Time [s]")
             plt.ylabel("Rotation 1σ [rad]")
             # plt.title("SolveQnP Rotation Uncertainty (Rodrigues tangent) vs Time")
@@ -381,13 +383,13 @@ class Plotter:
             # Translation sigmas
             plt.figure()
             if have_qnp_sig:
-                plt.plot(t, merged["qnp_sig_tx"], label="QnP sig_tx")
-                plt.plot(t, merged["qnp_sig_ty"], label="QnP sig_ty")
-                plt.plot(t, merged["qnp_sig_tz"], label="QnP sig_tz")
+                plt.plot(t[1:], merged["qnp_sig_tx"][1:], label="QnP sig_tx")
+                plt.plot(t[1:], merged["qnp_sig_ty"][1:], label="QnP sig_ty")
+                plt.plot(t[1:], merged["qnp_sig_tz"][1:], label="QnP sig_tz")
             if have_qnp_kf_sig:
-                plt.plot(t, merged["qnp_kf_sig_tx"], linestyle="--", label="QnP-KF sig_tx")
-                plt.plot(t, merged["qnp_kf_sig_ty"], linestyle="--", label="QnP-KF sig_ty")
-                plt.plot(t, merged["qnp_kf_sig_tz"], linestyle="--", label="QnP-KF sig_tz")
+                plt.plot(t[1:], merged["qnp_kf_sig_tx"][1:], linestyle="--", label="QnP-KF sig_tx")
+                plt.plot(t[1:], merged["qnp_kf_sig_ty"][1:], linestyle="--", label="QnP-KF sig_ty")
+                plt.plot(t[1:], merged["qnp_kf_sig_tz"][1:], linestyle="--", label="QnP-KF sig_tz")
             plt.xlabel("Time [s]")
             plt.ylabel("Translation 1σ [m]")
             # plt.title("SolveQnP Translation Uncertainty vs Time")

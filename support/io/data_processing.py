@@ -1302,18 +1302,21 @@ class DataProcessorRunner:
             # ------------------------------------------------------------------
             sigma_2N = None
             kf_img_pts = []
+            kf_obj_pts = []
+            qnp_kf_used_n = np.nan
             width, height = calibration.width, calibration.height
 
             if kalman_available:
                 row_kf = df_kf.iloc[idx - 1]
                 sig_2N_list: list[float] = []
-                any_valid = False
+                accepted_indices: list[int] = []
 
-                for fid in kept_ids:
+                for j, fid in enumerate(kept_ids):
                     px_name = f"feat_{fid}_kf_x"
                     py_name = f"feat_{fid}_kf_y"
                     px_sig_name = f"feat_{fid}_kf_sigma_px"
                     py_sig_name = f"feat_{fid}_kf_sigma_py"
+                    used_name = f"feat_{fid}_kf_used"
 
                     try:
                         sx = float(row_kf.get(px_sig_name, np.nan))
@@ -1329,21 +1332,34 @@ class DataProcessorRunner:
                     except Exception:
                         kf_u, kf_v = np.nan, np.nan
 
+                    try:
+                        used_flag = float(row_kf.get(used_name, np.nan))
+                    except Exception:
+                        used_flag = np.nan
+
+                    is_accepted = (
+                        np.isfinite(used_flag) and used_flag > 0.5 and
+                        np.isfinite(kf_u) and np.isfinite(kf_v) and
+                        np.isfinite(sx) and sx > 0.0 and
+                        np.isfinite(sy) and sy > 0.0
+                    )
+                    if not is_accepted:
+                        continue
+
+                    accepted_indices.append(j)
                     kf_img_pts.append([float(kf_u * width), float(kf_v * height)])
+                    sig_2N_list.extend([sx, sy])
 
-                    if np.isfinite(sx) and sx > 0.0 and np.isfinite(sy) and sy > 0.0:
-                        any_valid = True
-                        sig_2N_list.extend([sx, sy])
-                    else:
-                        sig_2N_list.extend([np.nan, np.nan])
-
-                if any_valid:
+                qnp_kf_used_n = int(len(accepted_indices))
+                if accepted_indices:
+                    kf_obj_pts = obj_pts[accepted_indices]
                     sigma_2N = np.asarray(
-                        [_BIG_SIGMA if (not np.isfinite(s)) else max(float(s), _MIN_SIGMA) for s in sig_2N_list],
+                        [max(float(s), _MIN_SIGMA) for s in sig_2N_list],
                         dtype=np.float64,
                     )
 
             kf_img_pts = np.asarray(kf_img_pts, dtype=np.float32)
+            kf_obj_pts = np.asarray(kf_obj_pts, dtype=np.float32)
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
@@ -1398,10 +1414,10 @@ class DataProcessorRunner:
                     calibration,
                     True,
                     None,
-                    # user_seed_q=prev_qnp_q,
-                    # user_seed_t=prev_qnp_t,
-                    user_seed_q=None,
-                    user_seed_t=None,
+                    user_seed_q=prev_qnp_q,
+                    user_seed_t=prev_qnp_t,
+                    # user_seed_q=None,
+                    # user_seed_t=None,
                 )
                 t_qnp += time.perf_counter() - t0
 
@@ -1409,19 +1425,19 @@ class DataProcessorRunner:
 
                 quatQ_kf = vectQ_kf = None
                 kf_stats = None
-                if sigma_2N is not None:
+                if sigma_2N is not None and len(kf_obj_pts) >= 6 and len(kf_img_pts) >= 6:
                     try:
                         t0 = time.perf_counter()
                         quatQ_kf, vectQ_kf, kf_stats = solveQnP(
-                            obj_pts,
-                            img_pts,
+                            kf_obj_pts,
+                            kf_img_pts,
                             calibration,
                             True,
                             sigma_2N,
-                            # user_seed_q=prev_qnp_kf_q,
-                            # user_seed_t=prev_qnp_kf_t,
-                            user_seed_q=None,
-                            user_seed_t=None,
+                            user_seed_q=prev_qnp_kf_q,
+                            user_seed_t=prev_qnp_kf_t,
+                            # user_seed_q=None,
+                            # user_seed_t=None,
                         )
                         t_qnp_kf += time.perf_counter() - t0
                         prev_qnp_kf_q, prev_qnp_kf_t = quatQ_kf, vectQ_kf
@@ -1445,7 +1461,7 @@ class DataProcessorRunner:
                         "qnp_kf_x": float(vectQ_kf_aftr[0]),
                         "qnp_kf_y": float(vectQ_kf_aftr[1]),
                         "qnp_kf_z": float(vectQ_kf_aftr[2]),
-                        "qnp_kf_used_n": int(kf_stats.N),
+                        "qnp_kf_used_n": int(qnp_kf_used_n),
                         "qnp_kf_s2": float(kf_stats.s2),
                         "qnp_kf_dof": int(kf_stats.dof),
                         "qnp_kf_sse_w": float(kf_stats.sse_w),
@@ -1460,7 +1476,7 @@ class DataProcessorRunner:
                     kf_fields = {
                         "qnp_kf_qw": np.nan, "qnp_kf_qx": np.nan, "qnp_kf_qy": np.nan, "qnp_kf_qz": np.nan,
                         "qnp_kf_x": np.nan, "qnp_kf_y": np.nan, "qnp_kf_z": np.nan,
-                        "qnp_kf_used_n": np.nan,
+                        "qnp_kf_used_n": qnp_kf_used_n,
                         "qnp_kf_s2": np.nan, "qnp_kf_dof": np.nan, "qnp_kf_sse_w": np.nan,
                         "qnp_kf_sig_rx": np.nan, "qnp_kf_sig_ry": np.nan, "qnp_kf_sig_rz": np.nan,
                         "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
@@ -1512,12 +1528,12 @@ class DataProcessorRunner:
 
                 # qnp_kf_resid (weighted)
                 if sigma_2N is not None and quatQ_kf is not None and vectQ_kf is not None:
-                    X_cam_kf = quatQ_kf * obj_pts + vectQ_kf
+                    X_cam_kf = quatQ_kf * kf_obj_pts + vectQ_kf
                     Zk = np.where(X_cam_kf[:, 2] > 1e-6, X_cam_kf[:, 2], 1e-6)
                     uk = calibration.fx * (X_cam_kf[:, 0] / Zk) + calibration.cx
                     vk = calibration.fy * (X_cam_kf[:, 1] / Zk) + calibration.cy
                     qnp_kf_resid = _reproj_metrics_from_proj_meas(
-                        np.column_stack([uk, vk]), img_pts.reshape(-1, 2), sigma_2N, "chi"
+                        np.column_stack([uk, vk]), kf_img_pts.reshape(-1, 2), sigma_2N, "chi"
                     )
                     resid_stats["qnp_kf"].append(qnp_kf_resid)
 

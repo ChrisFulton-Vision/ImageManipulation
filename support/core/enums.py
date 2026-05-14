@@ -1,6 +1,32 @@
 from enum import Enum
 import numpy as np
 from itertools import cycle
+from typing import Type
+
+Type_enum = Type[Enum]
+
+
+def check_if_enum(poss_enum):
+    return isinstance(poss_enum, Enum)
+
+
+class YoloInferenceSource(Enum):
+    ORIGINAL = "Original Image"
+    MARKUP = "Markup Frame"
+
+
+class ControlMode(Enum):
+    auto = 'auto'
+    manual = 'manual'
+    controller = 'controller'
+    error = 'error'
+
+
+class CalibrationType(Enum):
+    Chessboard = 'Chessboard'
+    Circles = 'Circles'
+    chArUco = 'chArUco'
+
 
 class ExportQuality(Enum):
     low_quality = 'Low Quality'
@@ -58,6 +84,7 @@ class ImageKernel(Enum):
                 return None
         return kernel
 
+
 class PlaybackSpeed(Enum):
     Fixed_fps = 'fixed_fps'
     Real_time = 'realtime'
@@ -68,10 +95,12 @@ class PlaybackSpeed(Enum):
             if member is self:
                 return next(iterator)
 
+
 class ImageSource(Enum):
     Camera_Stream = 'Camera Stream'
     Static_Image = 'Static Image'
     Stream_from_Folder = 'Stream from Folder'
+
 
 class robust_cost(Enum):
     none = None,

@@ -477,7 +477,7 @@ class App(ctk.CTk):
             sub_h = self.subnav.winfo_reqheight() if show_subnav else 0
             page_h = self._section_layout_height(page)
 
-            BORDER_W, BORDER_H = 12, 12
+            BORDER_W, BORDER_H = 50, 12
             target_w = main_w + sub_w + page_w + BORDER_W
             target_h = max(main_h, sub_h, page_h) + BORDER_H
 

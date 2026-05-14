@@ -1,11 +1,10 @@
 import copy
-import enum
 from pathlib import Path
 from typing import Any
 
 import customtkinter as ctk
 
-from support.core.enums import ExportQuality
+from support.core.enums import ExportQuality, check_if_enum
 from support.io.attitude_interpreter import AttitudeReader
 from support.io.my_logging import LOG
 
@@ -129,7 +128,7 @@ class ConfigRuntime:
 
     @staticmethod
     def serialize_queue_arg(value):
-        if isinstance(value, enum.Enum):
+        if check_if_enum(value):
             return value.value
         return value
 
@@ -137,7 +136,7 @@ class ConfigRuntime:
     def deserialize_queue_arg(spec, raw_val):
         default = spec.default
 
-        if isinstance(default, enum.Enum):
+        if check_if_enum(default):
             enum_type = type(default)
             try:
                 return enum_type(raw_val)

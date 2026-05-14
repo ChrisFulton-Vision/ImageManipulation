@@ -1,19 +1,21 @@
 import customtkinter as ctk
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type, ClassVar
-from enum import Enum
+from support.core.enums import YoloInferenceSource, check_if_enum, Type_enum
 from tkinter import filedialog
 
 DEFAULT_CHOICE = "(select)"
 
 ROW_H = 36  # fixed row height
+DROPDOWN_W = 120
 DROPDOWN_H = 32  # fixed optionmenu height
 ICON_BTN_W = 36
 
 Args = Dict[str, Any]
-ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type[Enum]]
+ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type_enum]
 StepFn = Callable[..., None]
 StepSpec = Tuple[StepFn, Args]
+
 
 @dataclass(frozen=True)
 class ArgSpec:
@@ -24,14 +26,16 @@ class ArgSpec:
     max: float | None = None
     path_kind: str | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class ArgBinding:
-    label: str          # GUI key / display name
-    field: str          # dataclass attribute name
+    label: str  # GUI key / display name
+    field: str  # dataclass attribute name
     object_type: type
     default: object
     min: float | None = None
     max: float | None = None
+
 
 @dataclass(slots=True)
 class UndistortOpts:
@@ -45,6 +49,7 @@ class UndistortOpts:
         ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
 
 @dataclass(slots=True)
 class ResizeOpts:
@@ -60,6 +65,7 @@ class ResizeOpts:
         ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
 
 @dataclass(slots=True)
 class AprilTagDetectOpts:
@@ -79,11 +85,6 @@ class AprilTagDetectOpts:
         ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
-
-
-class YoloInferenceSource(Enum):
-    ORIGINAL = "Original Image"
-    MARKUP = "Markup Frame"
 
 
 @dataclass(slots=True)
@@ -113,7 +114,7 @@ class YoloOpts:
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
     KEYMAP["YOLO Folder"] = "model_folder"
-    
+
 
 @dataclass(slots=True)
 class HudOpts:
@@ -138,6 +139,7 @@ class HudOpts:
         ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
 
 _UNSET = object()
 
@@ -205,6 +207,7 @@ class StepOption:
     def default_args(self) -> Args:
         return {spec.name: spec.default for spec in self.get_arg_specs({})}
 
+
 class StepSpecQueueEditor(ctk.CTkFrame):
     """
     Dynamic queue editor for StepSpec = (StepFn, Args)
@@ -220,6 +223,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             options: List["StepOption"],
             on_change: Optional[Callable[[List[StepSpec]], None]] = None,
             initial: Optional[List[StepSpec]] = None,
+            func_that_refits: Callable,
             **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -233,6 +237,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
         self._on_change = on_change
         self._rows: List[_QueueRow] = []
+        self.func_that_refits = func_that_refits
 
         # --- two-panel layout: queue left, args right ---
         self.grid_columnconfigure(0, weight=1)
@@ -244,7 +249,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         self._queue_panel.grid_columnconfigure(0, weight=1)
 
         self._args_panel = ctk.CTkFrame(self)
-        self._args_panel.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
+        self._args_panel.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         self._args_panel.grid_columnconfigure(0, weight=1)
 
         title = ctk.CTkLabel(self._queue_panel, text="Image Processing Queue", anchor="w")
@@ -364,7 +369,9 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             variable=var,
             command=lambda _=None, rf=row_frame: self._on_row_changed(rf),
             anchor="w",
+            width=DROPDOWN_W,
             height=DROPDOWN_H,
+            dynamic_resizing=False,
         )
         dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
         dropdown.bind("<Button-1>", lambda _evt, rf=row_frame: self._set_active_by_frame(rf))
@@ -537,6 +544,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         - Preserves row.args["state"]
         - Updates active row + args panel
         """
+
         idx = next((i for i, r in enumerate(self._rows) if r.frame == frame), None)
         if idx is not None:
             row = self._rows[idx]
@@ -583,6 +591,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             return
         self._active_idx = idx
         self._render_args_panel()
+        self.func_that_refits()
 
     def _edit_args_for_frame(self, frame: ctk.CTkFrame) -> None:
         # right panel is live; clicking ⚙ just forces focus to that row
@@ -649,8 +658,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             lbl = ctk.CTkLabel(self._args_body, text=name, anchor="w")
             lbl.grid(row=i, column=0, sticky="w", padx=(0, 8), pady=4)
 
-            if isinstance(val, Enum):
-
+            if check_if_enum(val):
                 enum_t = type(val)
                 var = ctk.StringVar(value=val.name)
 

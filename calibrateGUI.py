@@ -8,7 +8,6 @@ import random
 import sys
 import time
 import tkinter
-from enum import Enum
 from functools import partial
 from os.path import join
 from threading import Thread
@@ -21,17 +20,12 @@ import numpy as np
 from PIL.Image import open as pil_open, fromarray
 
 from support.vision.calibration import Calibration
+from support.core.enums import CalibrationType
 
 sys.path.append(os.getcwd())
 GREEN = '#2FA572'
 FILEPATH_CACHE = 'Caches/filepath_cache.pkl'
 IMAGE_CACHE = 'imagery_cache.pkl'  # Local to each folder structure, stored with imagery
-
-
-class CalibrationType(Enum):
-    Chessboard = 'Chessboard'
-    Circles = 'Circles'
-    chArUco = 'chArUco'
 
 
 class ImageryCalibrationConfig:

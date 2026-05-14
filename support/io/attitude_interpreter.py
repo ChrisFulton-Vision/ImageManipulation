@@ -1,10 +1,10 @@
 # AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
 from support.io.my_logging import LOG
+from support.core.enums import ControlMode
 
 import pandas as pd
 import numpy as np
 from os.path import join
-from enum import Enum
 from dataclasses import dataclass
 
 _EARTH_RADIUS_M = 6378137.0
@@ -24,12 +24,6 @@ _CAMERA_LEVER_ARM_BODY_M = (0.0, 0.75, 0.0)
 
 # Camera angular offset relative to the aircraft/body axes in [roll, pitch, yaw] degrees.
 _CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 1.0)
-
-class ControlMode(Enum):
-    auto       = 'auto'
-    manual     = 'manual'
-    controller = 'controller'
-    error      = 'error'
 
 @dataclass(frozen=True)
 class AttitudeSample:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import TclError, filedialog
 from typing import Any, Callable
 
 import customtkinter as ctk
@@ -45,6 +45,7 @@ class BatchController:
         self._pnp_btn = None
         self._kalman_btn = None
         self._run_btn = None
+        self._plot_btn = None
         self._progress = None
         self._gpu_var = None
         self._progress_label = None
@@ -53,6 +54,7 @@ class BatchController:
         self._conf_list = None
         self._img_dir_var = None
         self.gpu_monitor = None
+        self._plot_thread = None
 
         self._mirror_runtime_refs()
 
@@ -212,12 +214,12 @@ class BatchController:
         )
         self._cancel_btn.grid(row=11, column=0, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
-        dp_plotter_btn = ctk.CTkButton(
+        self._plot_btn = ctk.CTkButton(
             f,
             text="Plot",
-            command=self.plot_sequential,
+            command=self.plot_sequential_threaded,
         )
-        dp_plotter_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+        self._plot_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
 
         dp_close_plot_btn = ctk.CTkButton(
             f,
@@ -470,6 +472,22 @@ class BatchController:
                 self.close_plots()
                 return
 
+    def plot_sequential_threaded(self) -> None:
+        """Run plotting on a background thread and keep the button state in sync."""
+        if self._plot_thread is not None and self._plot_thread.is_alive():
+            return
+
+        self._set_plot_button_state(running=True)
+
+        def _worker():
+            try:
+                self.plot_sequential()
+            finally:
+                self._post_to_ui(lambda: self._set_plot_button_state(running=False))
+
+        self._plot_thread = threading.Thread(target=_worker, daemon=True)
+        self._plot_thread.start()
+
     def close_plots(self) -> bool:
         """Close any open plotting windows through the plotting helper."""
         if self.owner.plotter is None:
@@ -531,6 +549,7 @@ class BatchController:
         self.owner._dp_pnp_btn = self._pnp_btn
         self.owner._dp_kalman_btn = self._kalman_btn
         self.owner._dp_run_btn = self._run_btn
+        self.owner._dp_plot_btn = self._plot_btn
         self.owner._dp_progress = self._progress
         self.owner._dp_gpu_var = self._gpu_var
         self.owner._dp_progress_label = self._progress_label
@@ -554,7 +573,12 @@ class BatchController:
         var.trace_add("write", _on_change)
 
     def _post_to_ui(self, fn: Callable[[], None]) -> None:
-        self.owner.after(0, lambda *_: fn(), ())
+        if getattr(self.owner, "shutting_down", False):
+            return
+        try:
+            self.owner.after(0, lambda *_: fn(), ())
+        except TclError:
+            pass
 
     def _current_img_dir(self) -> Path:
         p = Path(
@@ -599,6 +623,13 @@ class BatchController:
             self._progress.set(float(frac))
         if text is not None:
             self._set_status(text)
+
+    def _set_plot_button_state(self, *, running: bool) -> None:
+        if self._plot_btn is not None:
+            self._plot_btn.configure(
+                text="Plotting" if running else "Plot",
+                state="disabled" if running else "normal",
+            )
 
     def _set_run_button_state(self, running: bool) -> None:
         if self._run_btn is not None:

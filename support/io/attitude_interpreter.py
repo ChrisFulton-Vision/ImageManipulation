@@ -12,10 +12,10 @@ _EARTH_RADIUS_M = 6378137.0
 # Hard-coded runway corners for initial integration.
 # Order should follow the perimeter so HUD drawing can close the quadrilateral.
 _RUNWAY_CORNERS_LLA = (
-    (39.344333, -86.009638, 216.0),  #NW
-    (39.344341, -86.009465, 216.0),  #NE
-    (39.341582, -86.009378, 212.0),  #SE
-    (39.341578, -86.009557, 212.0),  #SW
+    (39.344333, -86.009638, 219.0),  #NW
+    (39.344341, -86.009465, 219.0),  #NE
+    (39.341582, -86.009378, 214.0),  #SE
+    (39.341578, -86.009557, 214.0),  #SW
 )
 
 # Camera origin relative to the aircraft/body origin in body axes [forward, right, down], meters.
@@ -23,7 +23,7 @@ _RUNWAY_CORNERS_LLA = (
 _CAMERA_LEVER_ARM_BODY_M = (0.0, 0.75, 0.0)
 
 # Camera angular offset relative to the aircraft/body axes in [roll, pitch, yaw] degrees.
-_CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 1.0)
+_CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 180.0)
 
 @dataclass(frozen=True)
 class AttitudeSample:
@@ -56,6 +56,12 @@ class AttitudeSample:
 
     # Runway corners in aircraft/body coordinates [forward, right, down], meters.
     runway_corners_body_m: tuple[tuple[float, float, float], ...] | None = None
+
+    # Runway corners in local minimap coordinates [map_x, map_y], meters.
+    runway_corners_map_m: tuple[tuple[float, float], ...] | None = None
+
+    # Axis-aligned runway bounds in local minimap coordinates [x_min, y_min, x_max, y_max], meters.
+    runway_rect_map_m: tuple[float, float, float, float] | None = None
 
     @property
     def rpy_deg(self) -> tuple[float, float, float]:
@@ -121,10 +127,14 @@ class AttitudeReader:
         self.gps_spd = None
         self.gps_gc = None
         self.gps_yaw = None
+        self.gps_gc_unwrapped = None
+        self.gps_yaw_unwrapped = None
 
         # Precomputed local-map coordinates (for minimap)
         self.gps_map_x = None
         self.gps_map_y = None
+        self.gps_east_m = None
+        self.gps_north_m = None
         self.gps_lat0_deg = 0.0
         self.gps_lng0_deg = 0.0
         self.gps_cos_lat0 = 1.0
@@ -142,6 +152,8 @@ class AttitudeReader:
         self.lng_max = 0.0
 
         self.has_gps = False
+        self.runway_corners_map_m = None
+        self.runway_rect_map_m = None
 
         self.offset = 0.0
         self.ready = False
@@ -154,7 +166,7 @@ class AttitudeReader:
             self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
             self.alt_dict  = pd.read_csv(join(csv_folder_path, 'BARO.csv'))
             self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
-            self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCOU.csv'))
+            self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCIN.csv'))
         except FileNotFoundError:
             LOG.info("Error. Aircraft Log datafile not found")
             return False
@@ -276,6 +288,15 @@ class AttitudeReader:
             gps_gc = gps_gc[valid]
             gps_yaw = gps_yaw[valid]
 
+            gps_t_unique, unique_idx = np.unique(gps_t, return_index=True)
+            gps_t = gps_t_unique
+            gps_lat = gps_lat[unique_idx]
+            gps_lng = gps_lng[unique_idx]
+            gps_alt = gps_alt[unique_idx]
+            gps_spd = gps_spd[unique_idx]
+            gps_gc = gps_gc[unique_idx]
+            gps_yaw = gps_yaw[unique_idx]
+
             if len(gps_t) >= 2:
                 self.gps_t = gps_t
                 self.gps_lat = gps_lat
@@ -284,6 +305,8 @@ class AttitudeReader:
                 self.gps_spd = gps_spd
                 self.gps_gc = gps_gc
                 self.gps_yaw = gps_yaw
+                self.gps_gc_unwrapped = self._unwrap_angle_series_deg(gps_gc)
+                self.gps_yaw_unwrapped = self._unwrap_angle_series_deg(gps_yaw)
 
                 self.lat_min = float(np.min(self.gps_lat))
                 self.lat_max = float(np.max(self.gps_lat))
@@ -294,14 +317,29 @@ class AttitudeReader:
                 self.gps_lng0_deg = float(np.mean(self.gps_lng))
                 self.gps_cos_lat0 = float(np.cos(np.deg2rad(self.gps_lat0_deg)))
 
-                self.gps_map_x = (self.gps_lng - self.gps_lng0_deg) * self.gps_cos_lat0
-                self.gps_map_y = (self.gps_lat - self.gps_lat0_deg)
+                deg_to_rad = np.pi / 180.0
+                self.gps_east_m = (
+                    (self.gps_lng - self.gps_lng0_deg)
+                    * deg_to_rad
+                    * _EARTH_RADIUS_M
+                    * self.gps_cos_lat0
+                )
+                self.gps_north_m = (
+                    (self.gps_lat - self.gps_lat0_deg)
+                    * deg_to_rad
+                    * _EARTH_RADIUS_M
+                )
+
+                self.gps_map_x = self.gps_east_m
+                self.gps_map_y = self.gps_north_m
 
                 self.map_x_min = float(np.min(self.gps_map_x))
                 self.map_x_max = float(np.max(self.gps_map_x))
                 self.map_y_min = float(np.min(self.gps_map_y))
                 self.map_y_max = float(np.max(self.gps_map_y))
 
+                self.runway_corners_map_m = self._runway_corners_in_map_frame()
+                self.runway_rect_map_m = self._runway_rect_in_map_frame(self.runway_corners_map_m)
                 self.has_gps = True
 
         # free dataframes to reduce memory/GC churn
@@ -313,6 +351,14 @@ class AttitudeReader:
 
         self.ready = True
         return True
+
+    @staticmethod
+    def _wrap_angle_deg(angle_deg):
+        return np.mod(angle_deg, 360.0)
+
+    @staticmethod
+    def _unwrap_angle_series_deg(angles_deg: np.ndarray) -> np.ndarray:
+        return np.rad2deg(np.unwrap(np.deg2rad(angles_deg.astype(np.float64))))
 
     def get_attitude_at(self, query_time) -> AttitudeSample:
         t = float(query_time) + self.offset
@@ -375,18 +421,29 @@ class AttitudeReader:
 
         if self.has_gps and self.gps_t is not None:
             if self.gps_t[0] <= t <= self.gps_t[-1]:
-                lat_deg = float(np.interp(t, self.gps_t, self.gps_lat))
-                lng_deg = float(np.interp(t, self.gps_t, self.gps_lng))
+                east_m = float(np.interp(t, self.gps_t, self.gps_east_m))
+                north_m = float(np.interp(t, self.gps_t, self.gps_north_m))
+                lat_deg = float(self.gps_lat0_deg + np.rad2deg(north_m / _EARTH_RADIUS_M))
+                lng_deg = float(
+                    self.gps_lng0_deg +
+                    np.rad2deg(east_m / (_EARTH_RADIUS_M * max(self.gps_cos_lat0, 1e-12)))
+                )
                 gps_alt_m = float(np.interp(t, self.gps_t, self.gps_alt))
                 gps_speed_mps = float(np.interp(t, self.gps_t, self.gps_spd))
-                gps_ground_course_deg = float(np.interp(t, self.gps_t, self.gps_gc))
-                gps_yaw_deg = float(np.interp(t, self.gps_t, self.gps_yaw))
+                gps_ground_course_deg = float(
+                    self._wrap_angle_deg(np.interp(t, self.gps_t, self.gps_gc_unwrapped))
+                )
+                gps_yaw_deg = float(
+                    self._wrap_angle_deg(np.interp(t, self.gps_t, self.gps_yaw_unwrapped))
+                )
 
-                map_x = float((lng_deg - self.gps_lng0_deg) * self.gps_cos_lat0)
-                map_y = float(lat_deg - self.gps_lat0_deg)
+                map_x = east_m
+                map_y = north_m
                 gps_valid = True
 
         runway_corners_body_m = None
+        runway_corners_map_m = None
+        runway_rect_map_m = None
         if gps_valid:
             runway_corners_body_m = self._runway_corners_in_body_frame(
                 lat_deg=lat_deg,
@@ -396,6 +453,8 @@ class AttitudeReader:
                 pitch_deg=float(pitch),
                 yaw_deg=float(yaw),
             )
+            runway_corners_map_m = self.runway_corners_map_m
+            runway_rect_map_m = self.runway_rect_map_m
 
         return AttitudeSample(
             valid=True,
@@ -420,6 +479,8 @@ class AttitudeReader:
             map_x=map_x,
             map_y=map_y,
             runway_corners_body_m=runway_corners_body_m,
+            runway_corners_map_m=runway_corners_map_m,
+            runway_rect_map_m=runway_rect_map_m,
         )
 
     @staticmethod
@@ -497,6 +558,43 @@ class AttitudeReader:
             body_pts.append(tuple(float(v) for v in runway_body))
 
         return tuple(body_pts)
+
+    def _runway_corners_in_map_frame(self) -> tuple[tuple[float, float], ...] | None:
+        if self.gps_t is None:
+            return None
+
+        corners = []
+        deg_to_rad = np.pi / 180.0
+        for corner_lat, corner_lng, _corner_alt in _RUNWAY_CORNERS_LLA:
+            east_m = (
+                (corner_lng - self.gps_lng0_deg)
+                * deg_to_rad
+                * _EARTH_RADIUS_M
+                * self.gps_cos_lat0
+            )
+            north_m = (
+                (corner_lat - self.gps_lat0_deg)
+                * deg_to_rad
+                * _EARTH_RADIUS_M
+            )
+            corners.append((float(east_m), float(north_m)))
+
+        return tuple(corners)
+
+    @staticmethod
+    def _runway_rect_in_map_frame(
+        runway_corners_map_m: tuple[tuple[float, float], ...] | None
+    ) -> tuple[float, float, float, float] | None:
+        if not runway_corners_map_m:
+            return None
+
+        corners = np.asarray(runway_corners_map_m, dtype=float)
+        return (
+            float(np.min(corners[:, 0])),
+            float(np.min(corners[:, 1])),
+            float(np.max(corners[:, 0])),
+            float(np.max(corners[:, 1])),
+        )
 
     @staticmethod
     def ch10_pwm_to_mode(ch8):

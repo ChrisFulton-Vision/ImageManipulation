@@ -106,7 +106,10 @@ class ConfigRuntime:
                 continue
 
             opt = option_by_label[label]
-            raw_args = copy.deepcopy(row.get("args", {}))
+            raw_args = self._normalize_legacy_queue_args(
+                opt,
+                copy.deepcopy(row.get("args", {})),
+            )
             parsed_args = opt.default_args.copy()
 
             spec_by_name = {spec.name: spec for spec in opt.get_arg_specs(parsed_args)}
@@ -125,6 +128,23 @@ class ConfigRuntime:
             rebuilt.append((opt.fn, parsed_args))
 
         return rebuilt
+
+    @staticmethod
+    def _normalize_legacy_queue_args(opt, raw_args: dict[str, Any]) -> dict[str, Any]:
+        keymap = getattr(opt, "keymap", None) or {}
+        if not keymap:
+            return raw_args
+
+        field_to_label = {field: label for label, field in keymap.items()}
+        normalized: dict[str, Any] = {}
+
+        for key, value in raw_args.items():
+            normalized_key = field_to_label.get(key, key)
+            if normalized_key in normalized and key != normalized_key:
+                continue
+            normalized[normalized_key] = value
+
+        return normalized
 
     @staticmethod
     def serialize_queue_arg(value):

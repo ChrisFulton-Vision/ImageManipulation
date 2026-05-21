@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Dict, Any, Tuple, Union, Type, ClassVar
 from support.core.enums import YoloInferenceSource, check_if_enum, Type_enum
 from tkinter import filedialog
+import tkinter.font as tkfont
 
 DEFAULT_CHOICE = "(select)"
 
@@ -10,6 +11,7 @@ ROW_H = 36  # fixed row height
 DROPDOWN_W = 120
 DROPDOWN_H = 32  # fixed optionmenu height
 ICON_BTN_W = 36
+ARGS_VALUE_W = 220
 
 Args = Dict[str, Any]
 ArgType = Union[Type[bool], Type[int], Type[float], Type[str], Type_enum]
@@ -197,6 +199,7 @@ class StepOption:
     fn: StepFn
     arg_specs: tuple[ArgSpec, ...] = ()
     arg_specs_fn: Optional[Callable[[Args], tuple[ArgSpec, ...]]] = None
+    keymap: Optional[Dict[str, str]] = None
 
     def get_arg_specs(self, args: Optional[Args] = None) -> tuple[ArgSpec, ...]:
         if self.arg_specs_fn is not None:
@@ -234,6 +237,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         self._step_options: List["StepOption"] = options
         self._labels: List[str] = [DEFAULT_CHOICE] + [o.label for o in options]
         self._label_to_opt: Dict[str, "StepOption"] = {o.label: o for o in options}
+        self._step_dropdown_w = self._calc_step_dropdown_width()
 
         self._on_change = on_change
         self._rows: List[_QueueRow] = []
@@ -269,7 +273,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         # causes widgets to be created inside this body.
         self._args_body = ctk.CTkFrame(self._args_panel, fg_color="transparent", height=1, width=1)
         self._args_body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
-        self._args_body.grid_columnconfigure(1, weight=1)
+        self._args_body.grid_columnconfigure(1, weight=1, minsize=ARGS_VALUE_W)
         self._args_body.grid_columnconfigure(2, weight=0)
 
         # Ensure the frame size follows children (and stays tiny when empty).
@@ -344,6 +348,20 @@ class StepSpecQueueEditor(ctk.CTkFrame):
 
     # -------- internals --------
 
+    def _calc_step_dropdown_width(self) -> int:
+        try:
+            font = ctk.CTkFont()
+            family = font.cget("family")
+            size = int(font.cget("size"))
+            weight = font.cget("weight")
+            tk_font = tkfont.Font(family=family, size=size, weight=weight)
+            text_w = max((tk_font.measure(label) for label in self._labels), default=0)
+        except Exception:
+            text_w = max((len(label) for label in self._labels), default=0) * 8
+
+        # Reserve room for the right-side chevron and internal padding.
+        return max(DROPDOWN_W, int(text_w + 54))
+
     def _add_row(self, *, selected: str = DEFAULT_CHOICE, args_override: Optional[Args] = None) -> None:
         row_frame = ctk.CTkFrame(self._queue_panel, fg_color="transparent", height=ROW_H)
         row_frame.grid(row=len(self._rows) + 1, column=0, sticky="ew", padx=8, pady=4)
@@ -369,7 +387,7 @@ class StepSpecQueueEditor(ctk.CTkFrame):
             variable=var,
             command=lambda _=None, rf=row_frame: self._on_row_changed(rf),
             anchor="w",
-            width=DROPDOWN_W,
+            width=self._step_dropdown_w,
             height=DROPDOWN_H,
             dynamic_resizing=False,
         )
@@ -672,6 +690,8 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                     variable=var,
                     command=_on_enum_change,
                     anchor="w",
+                    width=ARGS_VALUE_W,
+                    dynamic_resizing=False,
                 )
                 dd.grid(row=i, column=1, sticky="ew", pady=4)
                 continue

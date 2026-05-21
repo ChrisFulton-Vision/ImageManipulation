@@ -201,6 +201,7 @@ class CalibrateGui(CTkFrame):
         self.t1 = None
         self.t2 = None
         self.t3 = None
+        self._flip_all_error = None
 
         ##########################################################################
         # Image Management Frame Setup
@@ -1035,7 +1036,7 @@ class CalibrateGui(CTkFrame):
         self.unprotectImageActionButton(self.img_rotate_cw_protected_button, self.rotateAllCW, self.protectRotateCW)
 
     def unprotectFlip(self):
-        self.unprotectImageActionButton(self.img_flip_protected_button, self.flipAll, self.protectRotateCW)
+        self.unprotectImageActionButton(self.img_flip_protected_button, self.flipAll, self.protectFlip)
 
     def unprotectImageActionButton(self, button, action, protect):
         button.configure(command=action, fg_color=GREEN, hover_color='dark green')
@@ -1073,7 +1074,16 @@ class CalibrateGui(CTkFrame):
         self.applyToAllImages(self.img_rotate_cw_protected_button, self.rotateCWIndividualImage, self.protectRotateCW)
 
     def flipAll(self):
-        self.applyToAllImages(self.img_flip_protected_button, self.flipIndividualImage, self.protectFlip)
+        button = self.img_flip_protected_button
+        if self.t2 and self.t2.is_alive():
+            return
+
+        self._flip_all_error = None
+        button.configure(text='Flipping...', fg_color='gray', hover_color='gray', state='disabled')
+        button.update_idletasks()
+        self.t2 = Thread(target=self.threadedFlipAll, daemon=True)
+        self.t2.start()
+        self.after(100, self._pollFlipAllCompletion)
 
     def rotateAllCCW(self):
         self.applyToAllImages(self.img_rotate_ccw_protected_button, self.rotateCCWIndividualImage,
@@ -1101,6 +1111,25 @@ class CalibrateGui(CTkFrame):
 
     def flipIndividualImage(self, img_class):
         self.transformIndividualImage(img_class, lambda img: cv2.rotate(img, cv2.ROTATE_180))
+
+    def threadedFlipAll(self):
+        try:
+            for img_class in list(self.image_config.img_collection):
+                self.flipIndividualImage(img_class)
+        except Exception as exc:
+            self._flip_all_error = exc
+
+    def _pollFlipAllCompletion(self):
+        if self.t2 and self.t2.is_alive():
+            self.after(100, self._pollFlipAllCompletion)
+            return
+        self.finishFlipAll()
+
+    def finishFlipAll(self):
+        self.img_flip_protected_button.configure(text='Flip All', state='normal')
+        self.protectFlip()
+        if self._flip_all_error is not None:
+            messagebox.showerror('Flip All Failed', str(self._flip_all_error))
 
     def transformIndividualImage(self, img_class, transform):
         filepath = join(self.filepath, img_class.image_name)

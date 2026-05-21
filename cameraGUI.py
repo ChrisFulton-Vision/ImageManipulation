@@ -2,6 +2,7 @@ import copy
 import time
 import sys
 import threading
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -9,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import List, Any, Callable
 from pathlib import Path
+from tkinter import messagebox
 
 import customtkinter as ctk
 import cv2
@@ -147,20 +149,23 @@ class CameraGui(ctk.CTkFrame):
         self.step_options: List[GuiQueue.StepOption] = [
             GuiQueue.StepOption(label="Undistort",
                                 fn=self.undistort,
-                                arg_specs=GuiQueue.UndistortOpts.ARG_SPECS),
+                                arg_specs=GuiQueue.UndistortOpts.ARG_SPECS,
+                                keymap=GuiQueue.UndistortOpts.KEYMAP),
             GuiQueue.StepOption(label="Draw Chessboard",
                                 fn=self.draw_chessboard,
                                 arg_specs=()),
             GuiQueue.StepOption(label="Resize",
                                 fn=self.resize_image,
-                                arg_specs=GuiQueue.ResizeOpts.ARG_SPECS),
+                                arg_specs=GuiQueue.ResizeOpts.ARG_SPECS,
+                                keymap=GuiQueue.ResizeOpts.KEYMAP),
             GuiQueue.StepOption(
                 label="Apply Image Filter",
                 fn=self.applyKernel,
                 arg_specs_fn=self.image_filter_arg_specs),
-            GuiQueue.StepOption(label="Apply YOLO -> Q/PnP",
+            GuiQueue.StepOption(label="YOLO+Q/PnP",
                                 fn=self.run_yolo,
-                                arg_specs=GuiQueue.YoloOpts.ARG_SPECS),
+                                arg_specs=GuiQueue.YoloOpts.ARG_SPECS,
+                                keymap=GuiQueue.YoloOpts.KEYMAP),
             GuiQueue.StepOption(label="Detect Corners in Image",
                                 fn=self.detect_corners,
                                 arg_specs=()),
@@ -172,11 +177,13 @@ class CameraGui(ctk.CTkFrame):
                                 arg_specs=()),
             GuiQueue.StepOption(label="Draw HUD",
                                 fn=self.draw_HUD,
-                                arg_specs=GuiQueue.HudOpts.ARG_SPECS),
+                                arg_specs=GuiQueue.HudOpts.ARG_SPECS,
+                                keymap=GuiQueue.HudOpts.KEYMAP),
             GuiQueue.StepOption(
                 label="Detect AprilTags and Q/PnP",
                 fn=self.detectAprilTags,
                 arg_specs=GuiQueue.AprilTagDetectOpts.ARG_SPECS,
+                keymap=GuiQueue.AprilTagDetectOpts.KEYMAP,
             ),
         ]
         self.fn_to_label = {opt.fn: opt.label for opt in self.step_options}
@@ -263,6 +270,11 @@ class CameraGui(ctk.CTkFrame):
 
         self.exportQualityCombo = ctk.CTkComboBox(self.export_frame, values=[member.value for member in ExportQuality],
                                                   command=self.updateQuality)
+        self.openOutputFolderButton = ctk.CTkButton(
+            self.export_frame,
+            text='Open Output Folder',
+            command=self.open_export_output_folder,
+        )
 
         self.making_gifOrVid = False
 
@@ -490,7 +502,7 @@ class CameraGui(ctk.CTkFrame):
         self.grid_sideBySide(rowID, self.exportStartFrame, self.exportEndFrame)
 
         rowID += 1
-
+        self.openOutputFolderButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
         self.btn_checkerboard.grid(row=rowID, column=1, padx=5, pady=5, sticky='ew')
 
     def _on_checker_status(self, btn_state: str, btn_text: str) -> None:
@@ -744,6 +756,37 @@ class CameraGui(ctk.CTkFrame):
 
         return cv_imgs, None
 
+    def _get_export_output_dir(self, *, create: bool = False) -> Path:
+        """Resolve the directory used for exports and recorded imagery."""
+        candidates = [
+            getattr(self.camConfig, "saveFolder", ""),
+            Path(self.camConfig.imageFilepath).parent if self.camConfig.imageFilepath else None,
+            Path.cwd(),
+        ]
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            directory = Path(candidate).expanduser()
+            if create:
+                directory.mkdir(parents=True, exist_ok=True)
+                return directory
+            if directory.exists():
+                return directory
+
+        fallback = Path(self.camConfig.saveFolder).expanduser() if self.camConfig.saveFolder else Path.cwd()
+        if create:
+            fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+    def open_export_output_folder(self) -> None:
+        """Open the current export output directory in Explorer."""
+        directory = self._get_export_output_dir(create=True)
+        if not directory.exists():
+            messagebox.showerror('Folder Not Found', f'The output folder is not available:\n{directory}')
+            return
+        os.startfile(str(directory))
+
     @staticmethod
     def _derive_video_export_schedule(
             frame_times: NDArray | None,
@@ -810,7 +853,8 @@ class CameraGui(ctk.CTkFrame):
             # from support.io.convert_to_gif import make_gif
             # make_gif(frames, 10, infinite=True, quality=self.camConfig.export_quality)
             from support.io.convert_to_gif import make_apng
-            make_apng(frames, 60, infinite=True, quality=self.camConfig.export_quality)
+            output_path = self._get_export_output_dir(create=True) / 'output'
+            make_apng(frames, 60, name=str(output_path), infinite=True, quality=self.camConfig.export_quality)
         finally:
             self.after(0, self._exportToGifOrVid_done,
                        exportToGifButton, exportToVidButton)
@@ -829,7 +873,8 @@ class CameraGui(ctk.CTkFrame):
                 self.camConfig.target_fps,
                 len(frames),
             )
-            out = cv2.VideoWriter('output_video.mp4', fourcc, fps, (w, h))
+            output_path = self._get_export_output_dir(create=True) / 'output_video.mp4'
+            out = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
             for idx in sample_idx:
                 f = frames[idx]
                 out.write(f)
@@ -893,12 +938,15 @@ class CameraGui(ctk.CTkFrame):
         valid_fields = {f.name for f in fields(obj)}
 
         for in_key, value in args.items():
-            if in_key not in obj.KEYMAP:
+            if in_key in obj.KEYMAP:
+                field_name = obj.KEYMAP[in_key]
+            elif in_key in valid_fields:
+                field_name = in_key
+            else:
                 if not ignore_unknown:
                     raise KeyError(f"Unknown incoming key: {in_key!r}")
                 continue
 
-            field_name = obj.KEYMAP[in_key]
             if field_name not in valid_fields:
                 raise KeyError(f"keymap maps {in_key!r} -> {field_name!r}, but that field doesn't exist")
 

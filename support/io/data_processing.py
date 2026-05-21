@@ -12,6 +12,8 @@ import numpy as np
 import cv2
 from concurrent.futures import ThreadPoolExecutor, wait
 
+from sympy import false
+
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.io.my_logging import LOG
 
@@ -517,7 +519,7 @@ class DataProcessorRunner:
         # --- KF parameter seed ---
         kf0 = PixelKalmanFilter()
         kf0.set_image_size(width, height)
-        kf0.set_sigma_meas_px(2.0, 2.0)
+        kf0.set_sigma_meas_px(0.001, 0.001)
         kf0.set_max_pixel_jump_px(100.0)
         kf0.max_mahalanobis_sq = 9.21
 
@@ -541,7 +543,7 @@ class DataProcessorRunner:
         accepted_feat_target = int(max(50, burn_in_good_frames * M * min_used_frac_for_good))
         accepted_feat_accum = 0
 
-        freeze_r = True
+        freeze_r = False
         frozen = False
         var_meas_x_frozen = None
         var_meas_y_frozen = None
@@ -572,10 +574,17 @@ class DataProcessorRunner:
 
         out_used = np.zeros((total_rows, M), dtype=np.uint8)
         out_nis = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_innov_x_px = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_innov_y_px = np.full((total_rows, M), np.nan, dtype=np.float64)
+        out_innov_r_px = np.full((total_rows, M), np.nan, dtype=np.float64)
 
         out_used_rate = np.full(total_rows, np.nan, dtype=np.float64)
         out_nis_med_used = np.full(total_rows, np.nan, dtype=np.float64)
         out_nis_p95_used = np.full(total_rows, np.nan, dtype=np.float64)
+        out_innov_r_med_all_px = np.full(total_rows, np.nan, dtype=np.float64)
+        out_innov_r_p95_all_px = np.full(total_rows, np.nan, dtype=np.float64)
+        out_innov_r_med_used_px = np.full(total_rows, np.nan, dtype=np.float64)
+        out_innov_r_p95_used_px = np.full(total_rows, np.nan, dtype=np.float64)
         out_var_meas_x = np.full(total_rows, np.nan, dtype=np.float64)
         out_var_meas_y = np.full(total_rows, np.nan, dtype=np.float64)
         out_sig_meas_px = np.full(total_rows, np.nan, dtype=np.float64)
@@ -584,6 +593,8 @@ class DataProcessorRunner:
         last_report_t = 0.0
         last_report_row = 0
         nis_out = np.empty(M, dtype=np.float64)
+        innov_x_out = np.empty(M, dtype=np.float64)
+        innov_y_out = np.empty(M, dtype=np.float64)
 
         for idx in range(total_rows):
             if cancel_event is not None and cancel_event.is_set():
@@ -611,11 +622,17 @@ class DataProcessorRunner:
                 X, P, last_t, init,
                 var_proc, var_meas_x, var_meas_y,
                 max_pixel_jump, max_mahalanobis_sq,
-                nis_out
+                nis_out, innov_x_out, innov_y_out
             )
 
             out_used[idx, :] = used_u8
             out_nis[idx, :] = nis_out
+            innov_x_px = innov_x_out * width
+            innov_y_px = innov_y_out * height
+            innov_r_px = np.sqrt(innov_x_px * innov_x_px + innov_y_px * innov_y_px)
+            out_innov_x_px[idx, :] = innov_x_px
+            out_innov_y_px[idx, :] = innov_y_px
+            out_innov_r_px[idx, :] = innov_r_px
 
             used_bool = used_u8.astype(bool)
             used_count = int(used_bool.sum())
@@ -635,10 +652,20 @@ class DataProcessorRunner:
                 nis_med = np.nan
                 nis_p95 = np.nan
 
+            innov_good = np.isfinite(innov_r_px) & (innov_r_px >= 0.0)
+            innov_all = innov_r_px[innov_good]
+            innov_used = innov_r_px[innov_good & used_bool]
+            if innov_all.size > 0:
+                out_innov_r_med_all_px[idx] = float(np.median(innov_all))
+                out_innov_r_p95_all_px[idx] = float(np.percentile(innov_all, 95.0))
+            if innov_used.size > 0:
+                out_innov_r_med_used_px[idx] = float(np.median(innov_used))
+                out_innov_r_p95_used_px[idx] = float(np.percentile(innov_used, 95.0))
+
             if good_frame:
                 accepted_feat_accum += used_count
 
-            do_adapt = (not freeze_r) or (not frozen)
+            do_adapt = false
             if do_adapt and good_frame:
                 ratio = nis_p95 / nis_p95_target
                 ratio = max(nis_clip_lo, min(ratio, nis_clip_hi))
@@ -729,6 +756,10 @@ class DataProcessorRunner:
             "kf_used_rate": out_used_rate,
             "kf_nis_med_used": out_nis_med_used,
             "kf_nis_p95_used": out_nis_p95_used,
+            "kf_innov_r_med_all_px": out_innov_r_med_all_px,
+            "kf_innov_r_p95_all_px": out_innov_r_p95_all_px,
+            "kf_innov_r_med_used_px": out_innov_r_med_used_px,
+            "kf_innov_r_p95_used_px": out_innov_r_p95_used_px,
             "kf_var_meas_x": out_var_meas_x,
             "kf_var_meas_y": out_var_meas_y,
             "kf_sigma_meas_px": out_sig_meas_px,
@@ -744,6 +775,9 @@ class DataProcessorRunner:
             new_cols[f"feat_{fid}_kf_sigma_py"] = np.clip(out_sig_py[:, j], 1e-6, None)
             new_cols[f"feat_{fid}_kf_used"] = out_used[:, j].astype(np.uint8)
             new_cols[f"feat_{fid}_kf_nis"] = out_nis[:, j]
+            new_cols[f"feat_{fid}_kf_innov_x_px"] = out_innov_x_px[:, j]
+            new_cols[f"feat_{fid}_kf_innov_y_px"] = out_innov_y_px[:, j]
+            new_cols[f"feat_{fid}_kf_innov_r_px"] = out_innov_r_px[:, j]
 
         out_df = pd.concat([out_df, pd.DataFrame(new_cols)], axis=1)
 

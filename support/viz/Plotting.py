@@ -510,6 +510,42 @@ class Plotter:
                     if not show:
                         plt.close()
 
+            have_innov_all = all(c in merged_kf.columns for c in ["kf_innov_r_med_all_px", "kf_innov_r_p95_all_px"])
+            have_innov_used = all(c in merged_kf.columns for c in ["kf_innov_r_med_used_px", "kf_innov_r_p95_used_px"])
+            if have_innov_all or have_innov_used:
+                plt.figure()
+                if have_innov_all:
+                    plt.plot(t, merged_kf["kf_innov_r_med_all_px"], label="Innovation |r| median [px] (all measured)")
+                    plt.plot(t, merged_kf["kf_innov_r_p95_all_px"], label="Innovation |r| p95 [px] (all measured)")
+                if have_innov_used:
+                    plt.plot(t, merged_kf["kf_innov_r_med_used_px"], linestyle="--",
+                             label="Innovation |r| median [px] (accepted)")
+                    plt.plot(t, merged_kf["kf_innov_r_p95_used_px"], linestyle="--",
+                             label="Innovation |r| p95 [px] (accepted)")
+                plt.xlabel("Time [s]")
+                plt.ylabel("Innovation magnitude [px]")
+                plt.grid(True)
+                plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path("15_KF_Innovation_Pixels_vs_time.pdf"))
+                    if not show:
+                        plt.close()
+
+            if have_innov_used:
+                plt.figure()
+                plt.plot(t, merged_kf["kf_innov_r_med_used_px"], label="Innovation |r| median [px] (accepted)")
+                plt.plot(t, merged_kf["kf_innov_r_p95_used_px"], label="Innovation |r| p95 [px] (accepted)")
+                plt.xlabel("Time [s]")
+                plt.ylabel("Innovation magnitude [px]")
+                plt.grid(True)
+                plt.legend()
+
+                if save:
+                    plt.savefig(dir_path / Path("15a_KF_Innovation_Pixels_AcceptedOnly_vs_time.pdf"))
+                    if not show:
+                        plt.close()
+
             nis_cols = [c for c in merged_kf.columns if c.endswith("_kf_nis")]
             used_cols = [c for c in merged_kf.columns if c.endswith("_kf_used")]
 
@@ -540,7 +576,7 @@ class Plotter:
                     plt.legend()
 
                     if save:
-                        plt.savefig(dir_path / Path(f"15_NIS_Accepted_Histogram_vs_time.pdf"))
+                        plt.savefig(dir_path / Path("15b_NIS_Accepted_Histogram.pdf"))
                         if not show:
                             plt.close()
 
@@ -729,13 +765,17 @@ class Plotter:
                 if len(nis_cols) > 0:
                     cols = sorted(nis_cols, key=_feat_sort_key)
                     data_kind = "NIS"
-                    # Mask invalid zeros/negatives as NaN
+                    # Accepted-only NIS heatmap so the display matches the KF NIS summaries.
+                    # Use a fixed chi-square-relevant scale for interpretability.
                     M = merged_kf[cols].to_numpy(dtype=float)
+                    used_cols_for_nis = [c.replace("_kf_nis", "_kf_used") for c in cols]
+                    if all(c in merged_kf.columns for c in used_cols_for_nis):
+                        used_M = merged_kf[used_cols_for_nis].to_numpy(dtype=float)
+                        M[used_M <= 0.5] = np.nan
                     M[M <= 0.0] = np.nan
-                    # Optional: clip for readability (keep extreme spikes from dominating colormap)
-                    # (Use percentile clipping so it adapts to runs)
-                    vmin = np.nanpercentile(M, 5)
-                    vmax = np.nanpercentile(M, 95)
+                    M[~np.isfinite(M)] = np.nan
+                    vmin = 0.0
+                    vmax = 9.0
 
                 elif len(sig_cols) > 0:
                     cols = sorted(sig_cols, key=_feat_sort_key)
@@ -768,6 +808,9 @@ class Plotter:
                     ax.set_ylabel("Feature index")
                     cbar = plt.colorbar(im, ax=ax)
                     cbar.set_label(data_kind)
+                    if data_kind == "NIS":
+                        for yref in (2.0, 5.991, 9.21):
+                            cbar.ax.axhline(yref, color="white", linestyle="--", linewidth=0.8)
 
                     # Overlay confidence gain on a second axis (same x)
                     ax2 = ax.twinx()
@@ -809,7 +852,10 @@ class Plotter:
                     h1, l1 = ax2.get_legend_handles_labels()
                     ax2.legend(h1, l1, loc="upper right")
 
-                    plt.title(f"Per-feature {data_kind} heatmap with confidence gain overlay")
+                    if data_kind == "NIS":
+                        plt.title("Per-feature accepted NIS heatmap with confidence gain overlay")
+                    else:
+                        plt.title(f"Per-feature {data_kind} heatmap with confidence gain overlay")
 
                     if save:
                         _ensure_dir()

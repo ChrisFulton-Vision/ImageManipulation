@@ -8,7 +8,9 @@ def _kf_step_inplace_with_nis(
         x, P, dt, z0, z1, has_meas,
         var_proc, var_meas_x, var_meas_y,
         max_pixel_jump, max_mahalanobis_sq,
-        out_m_sq  # shape (1,)
+        out_m_sq,  # shape (1,)
+        out_innov_x,  # shape (1,)
+        out_innov_y,  # shape (1,)
 ):
     """
     In-place constant-velocity KF step for one track.
@@ -18,6 +20,8 @@ def _kf_step_inplace_with_nis(
     """
 
     out_m_sq[0] = -1.0  # default when no valid measurement update
+    out_innov_x[0] = np.nan
+    out_innov_y[0] = np.nan
     used = 0
 
     # ---- build Q terms (matches your update_matrices(dt) structure) :contentReference[oaicite:1]{index=1}
@@ -112,6 +116,8 @@ def _kf_step_inplace_with_nis(
     # ---- innovation y = z - H x_pred, H picks x,y :contentReference[oaicite:3]{index=3}
     y0 = z0 - x0p
     y1 = z1 - x1p
+    out_innov_x[0] = y0
+    out_innov_y[0] = y1
 
     # pixel-jump gate
     pj = y0 * y0 + y1 * y1
@@ -376,7 +382,9 @@ class KalmanFilter:
             X, P, last_t, init,  # X:(M,4), P:(M,4,4), last_t:(M,), init:(M,)
             var_proc, var_meas_x, var_meas_y,
             max_pixel_jump, max_mahalanobis_sq,
-            nis_out  # (M,) float64, filled with NIS or -1
+            nis_out,  # (M,) float64, filled with NIS or -1
+            innov_x_out,  # (M,) float64, normalized innovation in x
+            innov_y_out,  # (M,) float64, normalized innovation in y
     ):
         """
         One row update for ALL features.
@@ -392,6 +400,8 @@ class KalmanFilter:
 
         for j in prange(M):
             nis_out[j] = -1.0  # default
+            innov_x_out[j] = np.nan
+            innov_y_out[j] = np.nan
 
             # init track only when we have a measurement
             if init[j] == 0:
@@ -420,7 +430,9 @@ class KalmanFilter:
                 z0, z1, has_meas,
                 var_proc, var_meas_x, var_meas_y,
                 max_pixel_jump, max_mahalanobis_sq,
-                nis_out[j:j + 1]
+                nis_out[j:j + 1],
+                innov_x_out[j:j + 1],
+                innov_y_out[j:j + 1]
             )
 
         return used

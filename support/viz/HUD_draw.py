@@ -14,6 +14,8 @@ import support.viz.colors as clr
 from support.core.enums import PlaybackSpeed
 from support.gui.UserSelectQueue import HudOpts
 
+MINIMAP_TRI = np.array([[0, 5, -5, 0], [0, 12, 12, 0]])
+
 class HUD_Marker:
     def __init__(self, filepath=None):
         self.cam_bank_offset = 0.0  # deg
@@ -165,6 +167,7 @@ class HUD_Marker:
         cv2.addWeighted(overlay, alpha, roi, 1.0 - alpha, 0.0, dst=roi)
 
         cv2.rectangle(image, (x0, y0), (x1, y1), clr.HUD_GREEN, med_thick(h))
+        self.draw_minimap_runway(image, att)
 
         cur_px = self._map_to_minimap_px(att.map_x, att.map_y)
         if cur_px is None:
@@ -203,8 +206,34 @@ class HUD_Marker:
             cv2.line(image, (sx - s, sy + s), (sx + s, sy - s), clr.DARKBLUE, 2)
 
         # current marker "O"
+        hdg_rad = np.deg2rad(att.yaw_deg)
+        rotmat_2d = np.array([[np.cos(hdg_rad), -np.sin(hdg_rad)],
+                              [np.sin(hdg_rad), np.cos(hdg_rad)]])
         cx, cy = cur_px
-        cv2.circle(image, (cx, cy), 4, clr.HUD_GREEN, 1)
+        triangle = (rotmat_2d @ MINIMAP_TRI).astype(np.int32) + np.array([[cx],[cy]])
+        cv2.polylines(image, [triangle.T], False, clr.HUD_GREEN, med_thick(h))
+
+    def draw_minimap_runway(self, image, att):
+        runway_rect_map_m = getattr(att, 'runway_rect_map_m', None)
+        if not runway_rect_map_m:
+            return
+
+        x_min, y_min, x_max, y_max = runway_rect_map_m
+        p0 = self._map_to_minimap_px(x_min, y_min)
+        p1 = self._map_to_minimap_px(x_max, y_max)
+        if p0 is None or p1 is None:
+            return
+
+        h, _w = image.shape[:2]
+        x0, y0 = p0
+        x1, y1 = p1
+        cv2.rectangle(
+            image,
+            (min(x0, x1), min(y0, y1)),
+            (max(x0, x1), max(y0, y1)),
+            clr.HUD_YELLOW,
+            small_thick(h),
+        )
 
     def draw_HUD(self,
                  image: NDArray,
@@ -311,6 +340,35 @@ class HUD_Marker:
             [0.0, 0.0, 1.0],
         ], dtype=float)
 
+    @staticmethod
+    def _clip_polygon_to_near_plane(cam_points: np.ndarray, near_z: float = 1e-3) -> np.ndarray:
+        if cam_points.shape[0] == 0:
+            return cam_points
+
+        clipped = []
+        prev = cam_points[-1]
+        prev_inside = prev[2] >= near_z
+
+        for curr in cam_points:
+            curr_inside = curr[2] >= near_z
+
+            if curr_inside != prev_inside:
+                dz = curr[2] - prev[2]
+                if abs(dz) > 1e-12:
+                    t = (near_z - prev[2]) / dz
+                    clipped.append(prev + t * (curr - prev))
+
+            if curr_inside:
+                clipped.append(curr)
+
+            prev = curr
+            prev_inside = curr_inside
+
+        if not clipped:
+            return np.empty((0, 3), dtype=float)
+
+        return np.asarray(clipped, dtype=float)
+
     def _project_body_points(
         self,
         image: NDArray,
@@ -323,8 +381,8 @@ class HUD_Marker:
             return None
 
         cam_points = self._body_to_camera_points(body_points)
-        depth = cam_points[:, 2]
-        if np.any(depth <= 1e-3):
+        cam_points = self._clip_polygon_to_near_plane(cam_points)
+        if cam_points.shape[0] < 2:
             return None
 
         if calibration is not None and getattr(calibration, 'validCal', False):
@@ -350,19 +408,20 @@ class HUD_Marker:
 
         body_points = np.asarray(corners_body, dtype=float).reshape(-1, 3)
         pts_2d = self._project_body_points(image, body_points, calibration, cx_cy, scale)
-        if pts_2d is None or pts_2d.shape[0] < 4:
+        if pts_2d is None or pts_2d.shape[0] < 2:
             return
 
         h, w = image.shape[:2]
         pts_px = np.rint(pts_2d).astype(np.int32)
+        clip_rect = (0, 0, w, h)
+        thickness = med_thick(h)
 
-        # Skip draws that are wildly off-screen; this avoids long lines from near-singular projections.
-        if np.any(pts_px[:, 0] < -2 * w) or np.any(pts_px[:, 0] > 3 * w):
-            return
-        if np.any(pts_px[:, 1] < -2 * h) or np.any(pts_px[:, 1] > 3 * h):
-            return
-
-        cv2.polylines(image, [pts_px], True, clr.HUD_YELLOW, med_thick(h))
+        for idx in range(pts_px.shape[0]):
+            p0 = tuple(int(v) for v in pts_px[idx])
+            p1 = tuple(int(v) for v in pts_px[(idx + 1) % pts_px.shape[0]])
+            ok, q0, q1 = cv2.clipLine(clip_rect, p0, p1)
+            if ok:
+                cv2.line(image, q0, q1, clr.HUD_YELLOW, thickness)
 
     @staticmethod
     def draw_crosshairs(image, cx_cy):
@@ -575,7 +634,7 @@ class HUD_Marker:
                             cv2.FONT_HERSHEY_SIMPLEX, med_text(h), (0, 0, 255), med_thick(h))
 
     @staticmethod
-    def draw_playbackStats(image, lowPassFPS, target_fps, playback_mode, rt_speed, cam_to_log_time_offset):
+    def draw_playbackStats(image, lowPassFPS, target_fps, playback_mode, rt_speed, cam_to_log_time_offset, last_nonzero_sign):
         (h, w) = image.shape[:2]
 
         (txt_width, txt_height), base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
@@ -587,12 +646,18 @@ class HUD_Marker:
         cv2.putText(image, f"Offset: {cam_to_log_time_offset:+.2f}s",
                     (pad, txt_pix_start_perRow * 2 + pad), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(h), clr.HUD_YELLOW, med_thick(h))
+
+        sign = '+' if last_nonzero_sign > 0 else '-'
+        if playback_mode == PlaybackSpeed.Real_time:
+            playspeed_text = 'Realtime: ' + sign + f'{rt_speed:.2f}'
+        else:
+            playspeed_text = 'FPS: ' + sign + f'{lowPassFPS:.2f}/{target_fps:.2f}'
         cv2.putText(image,
-                    f'Realtime: {rt_speed:.2f}' if playback_mode == PlaybackSpeed.Real_time else f'FPS: {lowPassFPS:.2f}/{target_fps:.2f}',
+                    playspeed_text,
                     (pad, txt_pix_start_perRow * 3 + pad), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(h), clr.BLACK, lrg_thick(h))
         cv2.putText(image,
-                    f'Realtime: {rt_speed:.2f}' if playback_mode == PlaybackSpeed.Real_time else f'FPS: {lowPassFPS:.2f}/{target_fps:.2f}',
+                    playspeed_text,
                     (pad, txt_pix_start_perRow * 3 + pad), cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(h), clr.HUD_YELLOW, med_thick(h))
 
@@ -611,10 +676,10 @@ def draw_time_on_image(frame, time_str):
     (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
                                                       med_text(h), lrg_thick(h))
 
-    pad = int(0.3 * time_height)
+    pad = int(0.5 * time_height)
     img_w, img_h, *_ = frame.shape
-    cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
-                cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
+    # cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
+    #             cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
 
     cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad ),
                 cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.HUD_GREEN, med_thick(h))

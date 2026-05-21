@@ -457,6 +457,7 @@ class PlaybackController:
             self.owner.camConfig.playback_mode,
             self.owner.camConfig.rt_speed,
             self.owner.camConfig.cam_to_log_time_offset,
+            self.last_nonzero_sign
         )
 
     def update_playback_menu(self) -> None:

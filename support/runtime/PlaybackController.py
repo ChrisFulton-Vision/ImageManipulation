@@ -443,10 +443,14 @@ class PlaybackController:
     def draw_playback_stats(self, frame, markup_frame, ctx, args) -> None:
         from support.viz.HUD_draw import HUD_Marker
 
+        update_time_offset_func = self.write_offset_csv
+
         if self.owner.hud_marker is None:
             self.owner.hud_marker = HUD_Marker()
             self.owner.hud_marker.read_attitude_files(
-                self.owner.camConfig.hud_data_filepath
+                self.owner.camConfig.hud_data_filepath,
+                self.owner.camConfig.imageFilepath,
+                update_time_offset_func
             )
 
         self.low_pass_fps = 0.925 * self.low_pass_fps + 0.075 * self.curr_fps
@@ -851,23 +855,26 @@ class PlaybackController:
     def _on_adjust_offset(self, delta: float) -> None:
         self.owner.camConfig.cam_to_log_time_offset += float(delta)
 
-    def write_offset_csv(self) -> None:
-        if self.owner.hud_marker is None:
-            return
+    def write_offset_csv(
+        self,
+        offset_value: float | None = None,
+        directory: str | Path | None = None,
+    ) -> None:
+        if offset_value is None:
+            if self.owner.hud_marker is None:
+                return
+            self.owner.hud_marker.update_offset(self.owner.camConfig.cam_to_log_time_offset)
+            offset_value = float(self.owner.hud_marker.offset)
 
-        self.owner.hud_marker.update_offset(self.owner.camConfig.cam_to_log_time_offset)
-        hud_path = Path(self.owner.camConfig.hud_data_filepath)
-        if hud_path.is_dir():
-            out_csv = hud_path / "__TIME_OFFSET.csv"
-        else:
-            out_csv = hud_path.parent / "__TIME_OFFSET.csv"
+        out_csv = self._resolve_time_offset_csv_path(directory)
+        if out_csv is None:
+            return
 
         out_csv.parent.mkdir(parents=True, exist_ok=True)
 
         import pandas as pd
-
-        pd.DataFrame({"offset": [self.owner.hud_marker.offset]}).to_csv(out_csv, index=False)
-        LOG.info(f"Saved offset {self.owner.camConfig.cam_to_log_time_offset:+.3f}s to {out_csv}")
+        pd.DataFrame({"offset": [float(offset_value)]}).to_csv(out_csv, index=False)
+        LOG.info("Saved offset %.6f to %s", float(offset_value), out_csv)
         self.owner.camConfig.cam_to_log_time_offset = 0.0
 
     @staticmethod
@@ -907,10 +914,30 @@ class PlaybackController:
         try:
             import pandas as pd
 
-            offset_dict = pd.read_csv(Path(directory) / "__TIME_OFFSET.csv")
+            offset_path = Path(directory)
+            if offset_path.suffix:
+                offset_path = offset_path.parent
+            offset_dict = pd.read_csv(offset_path / "__TIME_OFFSET.csv")
             return float(offset_dict["offset"][0])
         except FileNotFoundError:
             return 0.0
+
+    def _resolve_time_offset_csv_path(
+        self,
+        directory: str | Path | None = None,
+    ) -> Path | None:
+        candidate = directory
+        if not candidate:
+            candidate = getattr(self.owner.camConfig, "hud_data_filepath", "") or ""
+        if not candidate:
+            candidate = getattr(self.owner.camConfig, "imageFilepath", "") or ""
+        if not candidate:
+            return None
+
+        base = Path(candidate)
+        if base.suffix:
+            base = base.parent
+        return base / "__TIME_OFFSET.csv"
 
     def _build_sequence_and_timebase(self, directory):
         self.populate_ids_times(str(directory))

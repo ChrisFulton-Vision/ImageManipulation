@@ -4,6 +4,7 @@ from support.core.enums import ControlMode
 
 import pandas as pd
 import numpy as np
+from numpy.typing import NDArray
 from os.path import join
 from dataclasses import dataclass
 
@@ -20,10 +21,11 @@ _RUNWAY_CORNERS_LLA = (
 
 # Camera origin relative to the aircraft/body origin in body axes [forward, right, down], meters.
 # Positive right moves the camera to starboard.
-_CAMERA_LEVER_ARM_BODY_M = (0.0, 0.75, 0.0)
+CAMERA_LEVER_ARM_BODY_M = (0.0, 0.0, 0.0)
 
 # Camera angular offset relative to the aircraft/body axes in [roll, pitch, yaw] degrees.
-_CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 180.0)
+CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+
 
 @dataclass(frozen=True)
 class AttitudeSample:
@@ -67,7 +69,7 @@ class AttitudeSample:
     def rpy_deg(self) -> tuple[float, float, float]:
         return self.roll_deg, self.pitch_deg, self.yaw_deg
 
-    def rotmat_wr(self) -> np.ndarray | None:
+    def rotmat_wr(self) -> NDArray | None:
         if not self.valid:
             return None
 
@@ -116,7 +118,7 @@ class AttitudeReader:
         self.alt_t = self.alt = None                      # BARO.csv
         self.pitch = self.despitch = None                 # ATT.csv
         self.yaw = self.desyaw = None                     # ATT.csv
-        self.cmd_t = self.c4 = self.c10 = None             # RCOU.csv
+        self.cmd_t = self.c4 = self.c5 = self.c10 = None  # RCOU.csv
         self.cmd_throttle_perc = None                     # pre-mapped throttle %
 
         # GPS.csv
@@ -160,40 +162,46 @@ class AttitudeReader:
         if csv_folder_path is not None:
             self.read_files(csv_folder_path)
 
-    def read_files(self, csv_folder_path: str):
+    def read_files(self,
+                   csv_folder_path: str,
+                   img_folder_path: str|None = None,
+                   update_time_offset_func = None):
+
+        def read_from_csv(filename: str):
+            return pd.read_csv(join(csv_folder_path, filename))
 
         try:
-            self.spd_dict  = pd.read_csv(join(csv_folder_path, 'ARSP.csv'))
-            self.alt_dict  = pd.read_csv(join(csv_folder_path, 'BARO.csv'))
-            self.roll_dict = pd.read_csv(join(csv_folder_path, 'ATT.csv'))
-            self.cmd_dict  = pd.read_csv(join(csv_folder_path, 'RCIN.csv'))
+            self.spd_dict = read_from_csv('ARSP.csv')
+            self.alt_dict = read_from_csv('BARO.csv')
+            self.roll_dict = read_from_csv('ATT.csv')
+            self.cmd_dict = read_from_csv('RCIN.csv')
         except FileNotFoundError:
             LOG.info("Error. Aircraft Log datafile not found")
             return False
 
         # GPS is optional for now
         try:
-            self.gps_dict = pd.read_csv(join(csv_folder_path, 'GPS.csv'))
+            self.gps_dict = read_from_csv('GPS.csv')
         except FileNotFoundError:
             self.gps_dict = None
 
         # validate columns
         if not {'timestamp', 'Airspeed'}.issubset(self.spd_dict.columns):
-            print("ARSP.csv file not in expected format.")
+            LOG.warning("ARSP.csv file not in expected format.")
             return False
         if not {'timestamp', 'Alt'}.issubset(self.alt_dict.columns):
-            print("BARO.csv file not in expected format.")
+            LOG.warning("BARO.csv file not in expected format.")
             return False
         if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch', 'Yaw', 'DesYaw'}.issubset(self.roll_dict.columns):
-            print("ATT.csv file not in expected format.")
+            LOG.warning("ATT.csv file not in expected format.")
             return False
         if not {'timestamp', 'C1', 'C5', 'C10'}.issubset(self.cmd_dict.columns):
-            print("RCOU.csv file not in expected format.")
+            LOG.warning("RCOU.csv file not in expected format.")
             return False
 
         if self.gps_dict is not None:
             if not {'timestamp', 'Lat', 'Lng'}.issubset(self.gps_dict.columns):
-                print("GPS.csv file not in expected format. Ignoring GPS.")
+                LOG.warning("GPS.csv file not in expected format. Ignoring GPS.")
                 self.gps_dict = None
 
         # stable ascending time -> better for np.interp
@@ -206,8 +214,10 @@ class AttitudeReader:
             self.gps_dict = self.gps_dict.sort_values('timestamp').reset_index(drop=True)
 
         # --- Read or synthesize time offset as a DataFrame consistently ---
+        should_persist_offset = False
+
         try:
-            offset_df = pd.read_csv(join(csv_folder_path, '__TIME_OFFSET.csv'))
+            offset_df = read_from_csv('__TIME_OFFSET.csv')
             if 'offset' not in offset_df.columns:
                 for cand in ('time_offset', 'Offset', 'OFFSET'):
                     if cand in offset_df.columns:
@@ -216,69 +226,166 @@ class AttitudeReader:
             if 'offset' not in offset_df.columns:
                 raise ValueError("__TIME_OFFSET.csv missing required 'offset' column")
         except FileNotFoundError:
-            print("No __TIME_OFFSET.csv found; defaulting offset to first ARSP timestamp.")
-            t0 = float(self.spd_dict['timestamp'].iloc[0])
-            offset_df = pd.DataFrame({'offset': [t0]})
+
+            img_path = None
+            offset_df = None
+
+            if img_folder_path is not None:
+                try:
+                    import os
+                    from pathlib import Path
+
+                    img_path = Path(img_folder_path)
+                    if not Path.is_dir(img_path):
+                        img_path = img_path.parent
+                    log_name = img_path.glob("*.log").__next__().name
+
+                    import re
+                    from datetime import datetime, timezone
+                    MONTHS = {
+                        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+                        "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+                        "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+                    }
+
+                    def parse_utc_log_timestamp(filename: str):
+                        pattern = re.compile(
+                            r"^___"
+                            r"(?P<year>\d{4})\."
+                            r"(?P<month>[A-Za-z]{3})\."
+                            r"(?P<day>\d{1,2})_"
+                            r"(?P<hour>\d{1,2})\."
+                            r"(?P<minute>\d{1,2})\."
+                            r"(?P<second>\d{1,2})\."
+                            r"(?P<frac>\d{1,9})"
+                            r"\.UTC"
+                            r"(?:\.log)?$"
+                        )
+
+                        m = pattern.match(filename)
+                        if not m:
+                            LOG.warning(f"LOG Filename does not match expected timestamp format: {filename}")
+                            return None
+
+                        month_str = m.group("month").title()
+                        if month_str not in MONTHS:
+                            LOG.warning(f"Invalid month abbreviation in filename: {month_str}")
+                            return None
+
+                        try:
+                            year = int(m.group("year"))
+                            month = MONTHS[month_str]
+                            day = int(m.group("day"))
+                            hour = int(m.group("hour"))
+                            minute = int(m.group("minute"))
+                            second = int(m.group("second"))
+
+                            frac_ns = int(m.group("frac").ljust(9, "0")[:9])
+
+                            dt = datetime(
+                                year, month, day,
+                                hour, minute, second,
+                                microsecond=frac_ns // 1000,
+                                tzinfo=timezone.utc,
+                            )
+
+                        except ValueError as e:
+                            LOG.warning(f"Invalid timestamp values in filename: {filename}")
+                            return None
+
+                        remaining_nanoseconds = frac_ns % 1000
+
+                        unix_seconds = dt.timestamp()
+                        unix_nanoseconds = int(unix_seconds * 1_000_000_000) + remaining_nanoseconds
+
+                        return {
+                            "datetime_utc": dt,
+                            "nanosecond": frac_ns,
+                            "remaining_nanoseconds": remaining_nanoseconds,
+                            "unix_seconds": unix_seconds + remaining_nanoseconds / 1e9,
+                            "unix_nanoseconds": unix_nanoseconds,
+                        }
+                    parsed = parse_utc_log_timestamp(log_name)
+                    if parsed is not None:
+                        offset_df = pd.DataFrame({'offset': [parsed['unix_seconds']]})
+                        should_persist_offset = True
+                        LOG.info("No __TIME_OFFSET.csv found; defaulting offset to LOG filename Time.")
+                except FileNotFoundError as e:
+                    pass
+
         except Exception as e:
-            print("Unexpected error while reading __TIME_OFFSET.csv:\n", e)
+            LOG.warning(f"Unexpected error while reading __TIME_OFFSET.csv:\n{e}")
             return False
 
+        if offset_df is None:
+            LOG.info("No __TIME_OFFSET.csv found; defaulting offset to first ARSP timestamp.")
+            t0 = float(self.spd_dict['timestamp'].iloc[0])
+            offset_df = pd.DataFrame({'offset': [t0]})
+            should_persist_offset = True
+
         self.offset = float(offset_df['offset'][0])
+        if should_persist_offset and update_time_offset_func is not None:
+            update_time_offset_func(self.offset, csv_folder_path)
 
         # ---- one-time conversion to NumPy ----
-        self.spd_t = self.spd_dict['timestamp'].to_numpy(np.float64)
-        self.spd_v = self.spd_dict['Airspeed'].to_numpy(np.float32)
+        def convert_to_numpy(conversion_dict_subset, np_type=np.float32) -> NDArray | None:
+            if conversion_dict_subset is not None:
+                return conversion_dict_subset.to_numpy(np_type)
+            return None
 
-        self.alt_t = self.alt_dict['timestamp'].to_numpy(np.float64)
-        self.alt = self.alt_dict['Alt'].to_numpy(np.float32)
+        self.spd_t = convert_to_numpy(self.spd_dict['timestamp'], np.float64)
+        self.spd_v = convert_to_numpy(self.spd_dict['Airspeed'])
 
-        self.att_t    = self.roll_dict['timestamp'].to_numpy(np.float64)
-        self.roll     = self.roll_dict['Roll'].to_numpy(np.float32)
-        self.desroll  = self.roll_dict['DesRoll'].to_numpy(np.float32)
-        self.pitch    = self.roll_dict['Pitch'].to_numpy(np.float32)
-        self.despitch = self.roll_dict['DesPitch'].to_numpy(np.float32)
-        self.yaw      = self.roll_dict['Yaw'].to_numpy(np.float32)
-        self.desyaw   = self.roll_dict['DesYaw'].to_numpy(np.float32)
+        self.alt_t = convert_to_numpy(self.alt_dict['timestamp'], np.float64)
+        self.alt = convert_to_numpy(self.alt_dict['Alt'])
 
-        self.cmd_t = self.cmd_dict['timestamp'].to_numpy(np.float64)
-        self.c5 = self.cmd_dict['C5'].to_numpy(np.float32)  # throttle pwm
-        self.c10 = self.cmd_dict['C10'].to_numpy(np.float32)  # mode pwm
+        self.att_t = convert_to_numpy(self.roll_dict['timestamp'], np.float64)
+        self.roll = convert_to_numpy(self.roll_dict['Roll'])
+        self.desroll = convert_to_numpy(self.roll_dict['DesRoll'])
+        self.pitch = convert_to_numpy(self.roll_dict['Pitch'])
+        self.despitch = convert_to_numpy(self.roll_dict['DesPitch'])
+        self.yaw = convert_to_numpy(self.roll_dict['Yaw'])
+        self.desyaw = convert_to_numpy(self.roll_dict['DesYaw'])
+
+        self.cmd_t = convert_to_numpy(self.cmd_dict['timestamp'], np.float64)
+        self.c5 = convert_to_numpy(self.cmd_dict['C5'])  # throttle pwm
+        self.c10 = convert_to_numpy(self.cmd_dict['C10'])  # mode pwm
         self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c5).astype(np.float32)
 
         # --- GPS handling ---
         self.has_gps = False
         if self.gps_dict is not None and len(self.gps_dict) > 0:
-            gps_t = self.gps_dict['timestamp'].to_numpy(np.float64)
-            gps_lat = self.gps_dict['Lat'].to_numpy(np.float64)
-            gps_lng = self.gps_dict['Lng'].to_numpy(np.float64)
+            gps_t = convert_to_numpy(self.gps_dict['timestamp'], np.float64)
+            gps_lat = convert_to_numpy(self.gps_dict['Lat'], np.float64)
+            gps_lng = convert_to_numpy(self.gps_dict['Lng'], np.float64)
 
             # Optional fields
             if 'Alt' in self.gps_dict.columns:
-                gps_alt = self.gps_dict['Alt'].to_numpy(np.float32)
+                gps_alt = convert_to_numpy(self.gps_dict['Alt'])
             else:
                 gps_alt = np.zeros(len(self.gps_dict), dtype=np.float32)
 
             if 'Spd' in self.gps_dict.columns:
-                gps_spd = self.gps_dict['Spd'].to_numpy(np.float32)
+                gps_spd = convert_to_numpy(self.gps_dict['Spd'])
             else:
                 gps_spd = np.zeros(len(self.gps_dict), dtype=np.float32)
 
             if 'GCrs' in self.gps_dict.columns:
-                gps_gc = self.gps_dict['GCrs'].to_numpy(np.float32)
+                gps_gc = convert_to_numpy(self.gps_dict['GCrs'])
             else:
                 gps_gc = np.zeros(len(self.gps_dict), dtype=np.float32)
 
             if 'Yaw' in self.gps_dict.columns:
-                gps_yaw = self.gps_dict['Yaw'].to_numpy(np.float32)
+                gps_yaw = convert_to_numpy(self.gps_dict['Yaw'])
             else:
                 gps_yaw = np.zeros(len(self.gps_dict), dtype=np.float32)
 
             valid = (
                 np.isfinite(gps_t) &
                 np.isfinite(gps_lat) &
-                np.isfinite(gps_lng)
+                np.isfinite(gps_lng) &
+                ((np.abs(gps_lat) > 1e-12) | (np.abs(gps_lng) > 1e-12))
             )
-            valid &= (np.abs(gps_lat) > 1e-12) | (np.abs(gps_lng) > 1e-12)
 
             gps_t = gps_t[valid]
             gps_lat = gps_lat[valid]
@@ -317,7 +424,7 @@ class AttitudeReader:
                 self.gps_lng0_deg = float(np.mean(self.gps_lng))
                 self.gps_cos_lat0 = float(np.cos(np.deg2rad(self.gps_lat0_deg)))
 
-                deg_to_rad = np.pi / 180.0
+                deg_to_rad = np.deg2rad(1.0)
                 self.gps_east_m = (
                     (self.gps_lng - self.gps_lng0_deg)
                     * deg_to_rad
@@ -357,7 +464,7 @@ class AttitudeReader:
         return np.mod(angle_deg, 360.0)
 
     @staticmethod
-    def _unwrap_angle_series_deg(angles_deg: np.ndarray) -> np.ndarray:
+    def _unwrap_angle_series_deg(angles_deg: NDArray) -> NDArray:
         return np.rad2deg(np.unwrap(np.deg2rad(angles_deg.astype(np.float64))))
 
     def get_attitude_at(self, query_time) -> AttitudeSample:
@@ -491,7 +598,7 @@ class AttitudeReader:
         ref_lat_deg: float,
         ref_lng_deg: float,
         ref_alt_m: float,
-    ) -> np.ndarray:
+    ) -> NDArray:
         lat_rad = np.deg2rad(lat_deg)
         lng_rad = np.deg2rad(lng_deg)
         ref_lat_rad = np.deg2rad(ref_lat_deg)
@@ -506,7 +613,7 @@ class AttitudeReader:
         return np.array([north_m, east_m, down_m], dtype=float)
 
     @staticmethod
-    def _rotmat_wr_from_rpy(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    def _rotmat_wr_from_rpy(roll_deg: float, pitch_deg: float, yaw_deg: float) -> NDArray:
         rr = np.deg2rad(roll_deg)
         rp = np.deg2rad(pitch_deg)
         ry = np.deg2rad(yaw_deg)
@@ -607,7 +714,7 @@ class AttitudeReader:
         return ControlMode.error
 
     @staticmethod
-    def throttle_pwm_to_perc(throttle_pwm: np.ndarray) -> np.ndarray:
+    def throttle_pwm_to_perc(throttle_pwm: NDArray) -> NDArray:
         MIN_THROTTLE = 1000.0
-        MAX_THROTTLE = 1935.0
+        MAX_THROTTLE = 2000.0
         return (throttle_pwm - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE) * 100.0

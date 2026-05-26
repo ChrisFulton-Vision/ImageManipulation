@@ -251,13 +251,16 @@ class ConfigRuntime:
 
     def update_log_file(self) -> bool:
         hud_path = getattr(self.owner.camConfig, "hud_data_filepath", "") or ""
+        img_path = getattr(self.owner.camConfig, "imageFilepath", "") or ""
+
+        update_time_offset_func = self.owner.playback_controller.write_offset_csv
 
         loaded = True
         if hud_path:
             if self.owner.hud_marker is not None:
-                loaded = bool(self.owner.hud_marker.read_attitude_files(hud_path))
+                loaded = bool(self.owner.hud_marker.read_attitude_files(hud_path, img_path, update_time_offset_func))
             else:
-                loaded = bool(AttitudeReader().read_files(hud_path))
+                loaded = bool(AttitudeReader().read_files(hud_path, img_path, update_time_offset_func))
 
             if loaded:
                 self.owner.playback_controller.load_time_offset(hud_path)

@@ -1000,7 +1000,8 @@ class CameraGui(ctk.CTkFrame):
 
         from support.viz.HUD_draw import HUD_Marker
         if self.hud_marker is None:
-            self.hud_marker = HUD_Marker(self.camConfig.hud_data_filepath)
+            self.hud_marker = HUD_Marker(self.camConfig.hud_data_filepath,
+                                         self.camConfig.imageFilepath)
 
         scale = ctx.resize.get_or(1.0)
 

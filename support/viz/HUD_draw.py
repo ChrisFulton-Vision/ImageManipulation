@@ -3,8 +3,8 @@ from numpy import sin, cos, deg2rad
 from support.io.attitude_interpreter import (
     AttitudeReader as AttRdr,
     ControlMode,
-    _CAMERA_LEVER_ARM_BODY_M,
-    _CAMERA_RPY_OFFSET_DEG,
+    CAMERA_LEVER_ARM_BODY_M,
+    CAMERA_RPY_OFFSET_DEG,
 )
 from support.viz.CVFontScaling import med_text, small_thick, med_thick, lrg_thick
 from numpy.typing import NDArray
@@ -16,8 +16,9 @@ from support.gui.UserSelectQueue import HudOpts
 
 MINIMAP_TRI = np.array([[0, 5, -5, 0], [0, 12, 12, 0]])
 
+
 class HUD_Marker:
-    def __init__(self, filepath=None):
+    def __init__(self, filepath=None, img_folder_path=None):
         self.cam_bank_offset = 0.0  # deg
         self.attRdr = AttRdr()
         self.bank_indicator_points = self.create_bank_indicator()
@@ -38,7 +39,7 @@ class HUD_Marker:
         self.update_storage(864, 864)
 
         if filepath is not None:
-            self.read_attitude_files(filepath)
+            self.read_attitude_files(filepath, img_folder_path)
 
     def update_storage(self, x, y):
         self.last_xy = (x, y)
@@ -97,9 +98,15 @@ class HUD_Marker:
                                       0.8 + 0.11 * cos(deg2rad(60))))
         return bank_indicator_points
 
-    def read_attitude_files(self, filepath):
+    def read_attitude_files(self,
+                            filepath,
+                            img_folder_path,
+                            update_time_offset_func=None):
+
         self.attRdr = AttRdr()
-        loaded = self.attRdr.read_files(filepath)
+        loaded = self.attRdr.read_files(filepath,
+                                        img_folder_path,
+                                        update_time_offset_func)
 
         # New data set -> reset minimap state
         self.minimap_start_px = None
@@ -210,7 +217,7 @@ class HUD_Marker:
         rotmat_2d = np.array([[np.cos(hdg_rad), -np.sin(hdg_rad)],
                               [np.sin(hdg_rad), np.cos(hdg_rad)]])
         cx, cy = cur_px
-        triangle = (rotmat_2d @ MINIMAP_TRI).astype(np.int32) + np.array([[cx],[cy]])
+        triangle = (rotmat_2d @ MINIMAP_TRI).astype(np.int32) + np.array([[cx], [cy]])
         cv2.polylines(image, [triangle.T], False, clr.HUD_GREEN, med_thick(h))
 
     def draw_minimap_runway(self, image, att):
@@ -287,7 +294,7 @@ class HUD_Marker:
 
     @staticmethod
     def _camera_offset_rotmat() -> np.ndarray:
-        roll_deg, pitch_deg, yaw_deg = _CAMERA_RPY_OFFSET_DEG
+        roll_deg, pitch_deg, yaw_deg = CAMERA_RPY_OFFSET_DEG
         rr = np.deg2rad(roll_deg)
         rp = np.deg2rad(pitch_deg)
         ry = np.deg2rad(yaw_deg)
@@ -317,7 +324,7 @@ class HUD_Marker:
     def _body_to_camera_points(cls, body_points: np.ndarray) -> np.ndarray:
         # Body frame is treated as [forward, right, down].
         # Camera frame for projection is [right, down, forward].
-        lever_arm_body = np.asarray(_CAMERA_LEVER_ARM_BODY_M, dtype=float).reshape(1, 3)
+        lever_arm_body = np.asarray(CAMERA_LEVER_ARM_BODY_M, dtype=float).reshape(1, 3)
         camera_relative_body = body_points - lever_arm_body
         r_cb = cls._camera_offset_rotmat().T
         camera_aligned_body = (r_cb @ camera_relative_body.T).T
@@ -501,7 +508,7 @@ class HUD_Marker:
         def hv(alpha: float, beta: float):
             X = cx + x * (alpha * c_neg + beta * s_neg)
             Y = cy + y * (alpha * s_neg - beta * c_neg)
-            return (int(X), int(Y))
+            return int(X), int(Y)
 
         # Left triangle vertices
         left_tri = np.array([
@@ -681,5 +688,5 @@ def draw_time_on_image(frame, time_str):
     # cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
     #             cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
 
-    cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad ),
+    cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
                 cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.HUD_GREEN, med_thick(h))

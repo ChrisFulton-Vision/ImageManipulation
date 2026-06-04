@@ -1,6 +1,15 @@
 /Caches
 /Configs
+/Images
+/Processed
+/ProcessedImages
 !/Configs/Default.yaml
 /Calibrations
 !/Calibrations/GenericAlvium2848.txt
 !/Calibrations/GenericAlvium864.txt
+/YOLOModels
+/test
+/Data
+/.idea
+/FixedPointMethods
+/GraphModules

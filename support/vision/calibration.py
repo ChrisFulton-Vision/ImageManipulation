@@ -14,6 +14,7 @@ class Calibration:
         # cache bits first so __setattr__ can use them safely
         self._validCal_dirty = True
         self._validCal_cache = False
+        self._validMat_cache = False
         self._VALID_FIELDS = ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'width', 'height']
 
         self.fx = None
@@ -236,7 +237,7 @@ class Calibration:
         if not hasattr(self, "scale"):
             self.scale = 1.0
 
-        if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None and self.scale is not None:
+        if self._validMat_cache:
             fx = self.scale * self.fx
             fy = self.scale * self.fy
             cx = self.scale * (self.cx + 0.5) - 0.5
@@ -252,7 +253,7 @@ class Calibration:
         if not hasattr(self, "scale"):
             self.scale = 1.0
 
-        if self.fx is not None and self.fy is not None and self.cx is not None and self.cy is not None and self.scale is not None:
+        if self._validMat_cache:
             fx = self.scale * self.fx
             fy = self.scale * self.fy
             cx = self.scale * (self.cx + 0.5) - 0.5
@@ -471,7 +472,6 @@ class Calibration:
             return False
 
     def _compute_validCal(self) -> bool:
-        # (this is your existing logic, just moved into a function)
         if self.fisheye and any([
             self.fx is None, self.fy is None, self.cx is None, self.cy is None,
             self.k1 is None, self.k2 is None, self.k3 is None, self.k4 is None,
@@ -489,6 +489,16 @@ class Calibration:
         self.has_tangential = self.p1 != 0.0 or self.p2 != 0.0
         return True
 
+    def _compute_validMat(self) -> bool:
+        if self.fisheye:
+            return False
+        elif not self.fisheye and any([
+            self.fx is None, self.fy is None, self.cx is None, self.cy is None,
+            self.width is None, self.height is None, self.hfov is None
+        ]):
+            return False
+        return True
+
     @property
     def validCal(self) -> bool:
         '''
@@ -504,6 +514,7 @@ class Calibration:
 
         if self._validCal_dirty:
             self._validCal_cache = self._compute_validCal()
+            self._validMat_cache = True if self._validCal_cache else self._compute_validMat()
             self._validCal_dirty = False
         return self._validCal_cache
 

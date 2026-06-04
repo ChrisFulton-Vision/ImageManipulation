@@ -1,4 +1,3 @@
-
 # pip install customtkinter
 
 from tkinter import TclError
@@ -6,10 +5,12 @@ import customtkinter as ctk
 from cameraGUI import CameraGui as camGui
 from calibrateGUI import CalibrateGui as calGui
 from functools import partial
+
 # from SupportModules.LidarTruth import TruthPoints
 ctk.deactivate_automatic_dpi_awareness()
 GREEN = '#2FA572'
 DEFAULT_HOVER = ('#0C955A', '#106A43')
+
 
 # ----- page-owned submenu -----
 def build_submenu(master_frame, parent, on_click):
@@ -31,13 +32,16 @@ def _is_alive(widget) -> bool:
     except TclError:
         return False
 
+
 # ----- section swapping -----
 def show_section(master_frame, name):
     if hasattr(master_frame, "_active_section_name"):
         prev = master_frame._active_section_name
         if hasattr(master_frame, "on_section_hide"):
-            try: master_frame.on_section_hide(prev)
-            except Exception: pass
+            try:
+                master_frame.on_section_hide(prev)
+            except Exception:
+                pass
 
     if hasattr(master_frame, "_ensure_section"):
         master_frame._ensure_section(name)
@@ -54,15 +58,16 @@ def show_section(master_frame, name):
     master_frame._active_section = frame
 
     if hasattr(master_frame, "on_section_show"):
-        try: master_frame.on_section_show(name)
-        except Exception: pass
-
-
+        try:
+            master_frame.on_section_show(name)
+        except Exception:
+            pass
 
 
 # ------------ Pages ------------
 class CalibratePage(ctk.CTkFrame):
     """This page exposes its own submenu (Sources / Parsing / Validation)."""
+
     def __init__(self, master):
         super().__init__(master)
 
@@ -111,7 +116,7 @@ class CalibratePage(ctk.CTkFrame):
             # else:
             #     btn.configure(text="Start Calibration", fg_color=GREEN, hover_color=DEFAULT_HOVER)
 
-        return ("Start Calibration", on_toggle)
+        return "Start Calibration", on_toggle
 
     def bind_main_button_state(self, callback):
         self.set_main_button_calculating = callback
@@ -158,14 +163,19 @@ class CameraPage(ctk.CTkFrame):
 
     def _make_setupPage(self):
         return self.camGui.filepath_page
+
     def _make_ImgProcPage(self):
         return self.camGui.image_processing_page
+
     def _make_exportPage(self):
         return self.camGui.export_frame
+
     def _make_playbackPage(self):
         return self.camGui.playback_frame
+
     def _make_dataPage(self):
         return self.camGui.data_frame
+
     def _make_hotkeyPage(self):
         return self.camGui.hotkey_page
 
@@ -211,7 +221,8 @@ class CameraPage(ctk.CTkFrame):
             self.camGui.stream_running_var.trace_add("write", lambda *_: render(btn))
 
         # Return the handler *and* a binder
-        return ("Start Camera", on_toggle, bind_footer)
+        return "Start Camera", on_toggle, bind_footer
+
 
 # ------------ App / Router with two sidebars ------------
 
@@ -509,7 +520,8 @@ class App(ctk.CTk):
             # let the last scheduled after run before clearing; small delay prevents re-entrancy thrash
             self.after(50, lambda: setattr(self, "_resize_inflight", False))
 
-    def _active_section(self, page):
+    @staticmethod
+    def _active_section(page):
         # Prefer explicitly recorded active section (see show_section)
         sec = getattr(page, "_active_section", None)
         if sec and sec.winfo_exists():

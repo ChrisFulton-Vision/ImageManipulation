@@ -394,8 +394,6 @@ class PoseRuntime:
         algos.use_qnp = opts.want_qnp
         algos.use_wqnp = opts.want_wqnp
 
-        scale = ctx.resize.get_or(1.0)
-
         pose_output = self.owner.pnpDrawer.markUpImage(
             image=markup_frame,
             output=output,
@@ -408,7 +406,6 @@ class PoseRuntime:
             usedAlgos=algos,
             originalSize=(int(infer_frame.shape[0]), int(infer_frame.shape[1])),
             circles_not_features=opts.feature_circles,
-            img_scale=scale,
         )
 
         if pose_output is not None:
@@ -437,22 +434,34 @@ class PoseRuntime:
         last_yolo_3d_estimate = None
         if len(centers) > 0 and self.owner.yoloSession.reader.numClasses == 1:
             best_idx = scores.index(max(scores))
-            img_yolo_x_correction = markup_frame.shape[0] / self.owner.yoloSession.reader.imageSize
-            img_yolo_y_correction = markup_frame.shape[1] / self.owner.yoloSession.reader.imageSize
+            infer_h, infer_w = infer_frame.shape[:2]
+            draw_h, draw_w = markup_frame.shape[:2]
+            img_yolo_x_correction = infer_w / self.owner.yoloSession.reader.imageSize
+            img_yolo_y_correction = infer_h / self.owner.yoloSession.reader.imageSize
+            draw_sx = draw_w / float(infer_w) if infer_w > 0 else 1.0
+            draw_sy = draw_h / float(infer_h) if infer_h > 0 else 1.0
 
-            last_bounding_box_size = (
+            bbox_size_infer = (
                 (boxes[best_idx][2] - boxes[best_idx][0]) * img_yolo_x_correction,
                 (boxes[best_idx][3] - boxes[best_idx][1]) * img_yolo_y_correction,
             )
-            last_yolo_center = (
+            center_infer = (
                 int(centers[best_idx][0] * img_yolo_x_correction),
                 int(centers[best_idx][1] * img_yolo_y_correction),
             )
+            last_bounding_box_size = (
+                bbox_size_infer[0] * draw_sx,
+                bbox_size_infer[1] * draw_sy,
+            )
+            last_yolo_center = (
+                int(round(center_infer[0] * draw_sx)),
+                int(round(center_infer[1] * draw_sy)),
+            )
 
-            self.owner.calibration.scaleCalibration(markup_frame.shape[0])
+            self.owner.calibration.scaleCalibration(infer_w)
             K = self.owner.calibration.getCameraMatrix()
-            two_d_points = np.array([last_yolo_center[0], last_yolo_center[1], 1.0]) * scale
-            dist_est = self.owner.calibration.fx * 4.07 / last_bounding_box_size[0]
+            two_d_points = np.array([center_infer[0], center_infer[1], 1.0])
+            dist_est = self.owner.calibration.fx * 4.07 / bbox_size_infer[0]
 
             if self.check_above_horizon(last_yolo_center):
                 last_yolo_3d_estimate = np.linalg.inv(K).dot(two_d_points) * dist_est

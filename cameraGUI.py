@@ -45,11 +45,9 @@ from support.runtime.pose_runtime import PoseRuntime
 from support.runtime.stream_runner import StreamRunner
 
 import support.viz.colors as clr
-from support.viz.CVFontScaling import small_text, med_text, med_thick, lrg_thick
+from support.viz.CVFontScaling import small_text, med_text
 from support.viz.checkerboard_stats import CheckerboardResiduals as CkR
 from support.viz.draw_pnp_qnp import PoseOutput
-
-from copy import deepcopy
 
 # cv2.setNumThreads(0)
 cv2.setUseOptimized(True)

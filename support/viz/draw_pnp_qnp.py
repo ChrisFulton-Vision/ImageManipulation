@@ -159,8 +159,7 @@ class pnp_qnp_draw:
                     idsNamesLocs,
                     usedAlgos: twoToThreeSelectedAlgorithms,
                     originalSize: tuple[int, int],
-                    circles_not_features: bool = False,
-                    img_scale: float = 1.0) -> PoseOutput | None:
+                    circles_not_features: bool = False) -> PoseOutput | None:
 
         h, w, _ = image.shape
         h_ori, w_ori = originalSize
@@ -171,6 +170,8 @@ class pnp_qnp_draw:
         y_h, y_w = yoloSize
         sx = w_ori / float(y_w)
         sy = h_ori / float(y_h)
+        draw_sx = w / float(w_ori) if w_ori > 0 else 1.0
+        draw_sy = h / float(h_ori) if h_ori > 0 else 1.0
 
         centers_px = np.asarray(centers_dist, dtype=np.float64)
         centers_px[:, 0] *= sx
@@ -244,6 +245,16 @@ class pnp_qnp_draw:
                 ])
 
             boxes_for_draw = undist_boxes
+
+        centers_for_draw[:, 0] *= draw_sx
+        centers_for_draw[:, 1] *= draw_sy
+        if len(boxes_for_draw) > 0:
+            boxes_arr = np.asarray(boxes_for_draw, dtype=np.float64)
+            boxes_arr[:, 0] *= draw_sx
+            boxes_arr[:, 2] *= draw_sx
+            boxes_arr[:, 1] *= draw_sy
+            boxes_arr[:, 3] *= draw_sy
+            boxes_for_draw = boxes_arr.tolist()
 
         if len(class_ids) == 0:
             return None
@@ -332,9 +343,9 @@ class pnp_qnp_draw:
                 calibration=calibration,
                 yoloSize=yoloSize,
                 idsNamesLocs=idsNamesLocs,
+                originalSize=originalSize,
                 idx=idx,
                 draw_as_circles=circles_not_features,
-                img_scale=img_scale
             )
             idx += 1
 
@@ -351,9 +362,9 @@ class pnp_qnp_draw:
                 calibration=calibration,
                 yoloSize=yoloSize,
                 idsNamesLocs=idsNamesLocs,
+                originalSize=originalSize,
                 idx=idx,
                 draw_as_circles=circles_not_features,
-                img_scale=img_scale
             )
             idx += 1
 
@@ -454,9 +465,9 @@ class pnp_qnp_draw:
                            calibration,
                            yoloSize,
                            idsNamesLocs,
+                           originalSize,
                            idx=0,
-                           draw_as_circles=False,
-                           img_scale: float = 1.0):
+                           draw_as_circles=False):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -477,12 +488,12 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
+            originalSize=originalSize,
             title=f'PNP: {tvec[0, 0]:+6.3f}, {tvec[1, 0]:+6.3f}, {tvec[2, 0]:+6.3f} ({np.linalg.norm(tvec[:, 0]):6.3f})',
             rowIDX=idx,
             txt_scale=0.75,
             draw_as_circles=draw_as_circles,
             circle_radius_px=int(round(scale * w)),
-            img_scale=img_scale
         )
 
     def _drawQnP_from_pose(self,
@@ -496,9 +507,9 @@ class pnp_qnp_draw:
                            calibration,
                            yoloSize,
                            idsNamesLocs,
+                           originalSize,
                            idx=0,
-                           draw_as_circles=False,
-                           img_scale: float = 1.0):
+                           draw_as_circles=False):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -519,12 +530,12 @@ class pnp_qnp_draw:
             calibration=calibration,
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
+            originalSize=originalSize,
             title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({np.linalg.norm(q_tvec):6.3f})',
             rowIDX=idx,
             txt_color=clr.ORANGE,
             draw_as_circles=draw_as_circles,
             circle_radius_px=int(round(scale * w)),
-            img_scale=img_scale
         )
 
     @staticmethod
@@ -538,16 +549,18 @@ class pnp_qnp_draw:
                   calibration: Calibration,
                   yoloSize,
                   idsNamesLocs,
+                  originalSize: tuple[int, int],
                   title: str,
                   rowIDX: int,
                   txt_color=clr.YELLOW,
                   txt_scale=1.0,
                   draw_as_circles: bool = False,
-                  circle_radius_px: int | None = None,
-                  img_scale: float = 1.0):
+                  circle_radius_px: int | None = None):
 
         h, w, _ = image.shape
-        y_h, y_w = yoloSize
+        h_ori, w_ori = originalSize
+        draw_sx = w / float(w_ori) if w_ori > 0 else 1.0
+        draw_sy = h / float(h_ori) if h_ori > 0 else 1.0
 
         (width, height), base = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
         lower_left_corner = (int(0.01 * w), int(h - (0.01 * h * (rowIDX + 1)) - height * rowIDX))
@@ -581,6 +594,8 @@ class pnp_qnp_draw:
                                                      P=calibration.remapK,  # If undistorted, remap produces new K
                                                      )
             x, y = np.squeeze(projectedPixel)
+            x *= draw_sx
+            y *= draw_sy
 
             if np.isnan(x) or np.isnan(y):
                 return
@@ -589,7 +604,7 @@ class pnp_qnp_draw:
                 if draw_as_circles:
                     # radius scales gently with image size unless overridden
                     r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.006 * w)))
-                    cx, cy = int(round(img_scale * x)), int(round(img_scale * y))
+                    cx, cy = int(round(x)), int(round(y))
                     # outline + fill for contrast
                     cv2.circle(image, (cx, cy), r + 3, clr.BLACK, 1)
                     cv2.circle(image, (cx, cy), r, txt_color, 2)
@@ -598,7 +613,7 @@ class pnp_qnp_draw:
 
                     (txt_w, txt_h), base = cv2.getTextSize(str(id), cv2.FONT_HERSHEY_SIMPLEX, txt_size,
                                                            med_thick(h))
-                    lowerLeftCorner = (int(img_scale * x - txt_w / 2), int(img_scale * y + txt_h / 2))
+                    lowerLeftCorner = (int(x - txt_w / 2), int(y + txt_h / 2))
 
                     cv2.putText(image, str(id), lowerLeftCorner, cv2.FONT_HERSHEY_SIMPLEX,
                                 txt_size, clr.BLACK, lrg_thick(h))

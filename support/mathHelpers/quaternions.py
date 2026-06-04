@@ -28,6 +28,8 @@ from typing_extensions import Self
 from support.mathHelpers.include_numba import _njit as njit, prange
 
 _FLOAT_EPS = np.finfo(np.float64).eps
+_SO3_EXP_EPS2 = 1e-16
+_SO3_LOG_EPS2 = 1e-16
 
 
 @njit(cache=True, fastmath=False)
@@ -100,11 +102,11 @@ class Quaternion:
     __array_priority__ = 10_000  # overrides numpy priority for right mult
 
     def __init__(
-        self,
-        s: Optional[float] = None,
-        vec: Optional[NDArray] = None,
-        quat: Optional[NDArray | Self] = None,
-        makeUnitQuat: bool = True,
+            self,
+            s: Optional[float] = None,
+            vec: Optional[NDArray] = None,
+            quat: Optional[NDArray | Self] = None,
+            makeUnitQuat: bool = True,
     ) -> None:
         # These two parameters form the definition of the quaternion. self.s is a scalar associated with the
         # real component of the quaternion, while self.vec is the vector, associated with i, j, k / x, y, z components
@@ -236,11 +238,11 @@ class Quaternion:
         if not isinstance(other, Quaternion):
             return False
 
-        if abs(self.s - other.s) < _FLOAT_EPS and np.linalg.norm(self.vec - other.vec) < _FLOAT_EPS:
+        if abs(self.s - other.s) < _FLOAT_EPS * 3 and np.linalg.norm(self.vec - other.vec) < _FLOAT_EPS * 3:
             return True
 
         # A negative quaternion is equivalent to it's positive: -q = q
-        if abs(self.s + other.s) < _FLOAT_EPS and np.linalg.norm(self.vec + other.vec) < _FLOAT_EPS:
+        if abs(self.s + other.s) < _FLOAT_EPS * 3 and np.linalg.norm(self.vec + other.vec) < _FLOAT_EPS * 3:
             return True
 
         return False
@@ -624,20 +626,142 @@ class Quaternion:
     def angle_betweenD(self, otherQuat: Self) -> float:
         return 180.0 / np.pi * self.angle_betweenR(otherQuat)
 
+    @staticmethod
+    def exp_so3(theta: np.ndarray) -> Self:
+        """
+        SO(3) exponential map.
+
+        Input:
+            theta: 3-vector rotation perturbation in radians.
+
+        Output:
+            unit quaternion representing exp(theta/2).
+
+        Satisfies:
+            Quaternion.exp_so3(theta).ln_so3.vec == theta
+            for small/moderate theta, up to branch limits.
+        """
+        theta = np.asarray(theta, dtype=float).reshape(3)
+        phi2 = float(theta @ theta)
+
+        if phi2 < _SO3_EXP_EPS2:
+            # phi = ||theta||
+            # cos(phi/2) ~= 1 - phi^2/8 + phi^4/384
+            # sin(phi/2)/phi ~= 1/2 - phi^2/48 + phi^4/3840
+            s = 1.0 - phi2 / 8.0 + (phi2 * phi2) / 384.0
+            k = 0.5 - phi2 / 48.0 + (phi2 * phi2) / 3840.0
+        else:
+            phi = np.sqrt(phi2)
+            half_phi = 0.5 * phi
+            s = cos(half_phi)
+            k = sin(half_phi) / phi
+
+        return Quaternion(s=s, vec=k * theta, makeUnitQuat=False)
+
+    @property
+    def ln_so3(self) -> Self:
+        """
+        SO(3) logarithm map.
+
+        Returns a pure quaternion whose vector part is the rotation vector theta.
+
+        For a unit quaternion q = [s, v]:
+
+            theta = 2 atan2(||v||, s) v / ||v||
+
+        with a Taylor expansion near identity.
+        """
+        n = self.norm
+        if n <= 0.0:
+            raise ValueError("Cannot take log of a zero-norm quaternion.")
+
+        s = self.s / n
+        v = self.vec / n
+
+        # Optional but usually desired in optimization:
+        # use the antipodal representative with positive scalar part
+        # to get the shortest local rotation.
+        if s < 0.0:
+            s = -s
+            v = -v
+
+        v2 = float(v @ v)
+
+        if v2 < _SO3_LOG_EPS2:
+            # For unit quaternion with positive scalar:
+            # theta = 2 asin(||v||) * v / ||v||
+            # 2 asin(x)/x ~= 2 + x^2/3 + 3x^4/20
+            coeff = 2.0 + v2 / 3.0 + 3.0 * v2 * v2 / 20.0
+        else:
+            vnorm = np.sqrt(v2)
+            coeff = 2.0 * np.atan2(vnorm, s) / vnorm
+
+        return Quaternion(s=0.0, vec=coeff * v, makeUnitQuat=False)
+
     @property
     def exp(self) -> Self:
-        vec_norm = np.linalg.norm(self.vec)
-        if vec_norm > 0.00000001:
-            return np.exp(self.s) * Quaternion(s=cos(vec_norm), vec=self.vec / vec_norm * sin(vec_norm),
-                                               makeUnitQuat=False)
-        return Quaternion(s=1.0, vec=np.zeros((3,)), makeUnitQuat=False)
+        """
+        General quaternion exponential.
+
+        exp(s + v) = exp(s) [cos(||v||) + v/||v|| sin(||v||)]
+
+        This is not the same as SO(3) Exp unless the input vector already
+        contains the half-angle.
+        """
+        v = self.vec
+        v2 = float(v @ v)
+        scale = np.exp(self.s)
+
+        if v2 < 1e-16:
+            # cos(x) ~= 1 - x^2/2 + x^4/24
+            # sin(x)/x ~= 1 - x^2/6 + x^4/120
+            c = 1.0 - v2 / 2.0 + (v2 * v2) / 24.0
+            sinc = 1.0 - v2 / 6.0 + (v2 * v2) / 120.0
+        else:
+            vnorm = np.sqrt(v2)
+            c = cos(vnorm)
+            sinc = sin(vnorm) / vnorm
+
+        return Quaternion(
+            s=scale * c,
+            vec=scale * sinc * v,
+            makeUnitQuat=False,
+        )
 
     @property
     def ln(self) -> Self:
-        if np.linalg.norm(self.vec) < 0.000001:
-            return Quaternion(s=0.0, vec=np.zeros((3,)), makeUnitQuat=False)
-        return Quaternion(s=np.log(self.norm), vec=self.vec / np.linalg.norm(self.vec) * np.acos(self.s / self.norm),
-                          makeUnitQuat=False)
+        """
+        General quaternion logarithm.
+
+        log(q) = log(||q||) + v/||v|| atan2(||v||, s)
+
+        Uses atan2 instead of acos for much better behavior near identity.
+        """
+        n = self.norm
+        if n <= 0.0:
+            raise ValueError("Cannot take log of a zero-norm quaternion.")
+
+        v = self.vec
+        v2 = float(v @ v)
+
+        if v2 < 1e-16:
+            # For q = s + tiny_v:
+            # atan2(||v||, s)/||v|| ~= 1/s when s > 0.
+            # If s <= 0 and v is tiny, the branch is singular/ambiguous.
+            if self.s <= 0.0:
+                raise ValueError(
+                    "Quaternion log is branch-ambiguous near the negative real axis."
+                )
+            coeff = 1.0 / self.s
+        else:
+            vnorm = np.sqrt(v2)
+            coeff = np.atan2(vnorm, self.s) / vnorm
+
+        return Quaternion(
+            s=np.log(n),
+            vec=coeff * v,
+            makeUnitQuat=False,
+        )
 
     def power(self, power: Real) -> Self:
         if not isinstance(power, float):
@@ -728,6 +852,10 @@ pure_qs = Quaternion(s=1.0, vec=np.zeros((3,)))
 pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
 pure_qy = Quaternion(s=0.0, vec=np.array([0.0, 1.0, 0.0]))
 pure_qz = Quaternion(s=0.0, vec=np.array([0.0, 0.0, 1.0]))
+
+
+def identity() -> Quaternion:
+    return pure_qs.copy()
 
 
 def from_SE3(Mat4: NDArray):

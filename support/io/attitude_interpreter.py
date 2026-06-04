@@ -1,4 +1,4 @@
-# AttitudeInterpreter.py  (refactor: Pandas -> NumPy arrays)
+# AttitudeInterpreter.py
 from support.io.my_logging import LOG
 from support.core.enums import ControlMode
 
@@ -24,7 +24,7 @@ _RUNWAY_CORNERS_LLA = (
 CAMERA_LEVER_ARM_BODY_M = (0.0, 0.0, 0.0)
 
 # Camera angular offset relative to the aircraft/body axes in [roll, pitch, yaw] degrees.
-CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+CAMERA_RPY_OFFSET_DEG = (0.0, 0.0, 1.0)
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,9 @@ class AttitudeSample:
     # These are NOT global meters, just a locally consistent flat projection.
     map_x: float = 0.0
     map_y: float = 0.0
+
+    home_x: float = 0.0
+    home_y: float = 0.0
 
     # Runway corners in aircraft/body coordinates [forward, right, down], meters.
     runway_corners_body_m: tuple[tuple[float, float, float], ...] | None = None
@@ -88,14 +91,14 @@ class AttitudeSample:
         ], dtype=float)
 
         Ry = np.array([
-            [ cp, 0.0, sp],
+            [cp,  0.0, sp],
             [0.0, 1.0, 0.0],
             [-sp, 0.0, cp],
         ], dtype=float)
 
         Rz = np.array([
-            [cy, -sy, 0.0],
-            [sy,  cy, 0.0],
+            [cy, -sy,  0.0],
+            [sy,  cy,  0.0],
             [0.0, 0.0, 1.0],
         ], dtype=float)
 
@@ -135,6 +138,8 @@ class AttitudeReader:
         # Precomputed local-map coordinates (for minimap)
         self.gps_map_x = None
         self.gps_map_y = None
+        self.gps_home_x = None
+        self.gps_home_y = None
         self.gps_east_m = None
         self.gps_north_m = None
         self.gps_lat0_deg = 0.0
@@ -164,26 +169,23 @@ class AttitudeReader:
 
     def read_files(self,
                    csv_folder_path: str,
-                   img_folder_path: str|None = None,
-                   update_time_offset_func = None):
+                   img_folder_path: str | None = None,
+                   update_time_offset_func=None):
 
         def read_from_csv(filename: str):
-            return pd.read_csv(join(csv_folder_path, filename))
-
+            try:
+                return pd.read_csv(join(csv_folder_path, filename))
+            except FileNotFoundError:
+                LOG.info("Error. Aircraft Log datafile not found")
+                raise FileNotFoundError
         try:
             self.spd_dict = read_from_csv('ARSP.csv')
             self.alt_dict = read_from_csv('BARO.csv')
             self.roll_dict = read_from_csv('ATT.csv')
             self.cmd_dict = read_from_csv('RCIN.csv')
-        except FileNotFoundError:
-            LOG.info("Error. Aircraft Log datafile not found")
-            return False
-
-        # GPS is optional for now
-        try:
             self.gps_dict = read_from_csv('GPS.csv')
         except FileNotFoundError:
-            self.gps_dict = None
+            return False
 
         # validate columns
         if not {'timestamp', 'Airspeed'}.issubset(self.spd_dict.columns):
@@ -198,20 +200,16 @@ class AttitudeReader:
         if not {'timestamp', 'C1', 'C5', 'C10'}.issubset(self.cmd_dict.columns):
             LOG.warning("RCOU.csv file not in expected format.")
             return False
-
-        if self.gps_dict is not None:
-            if not {'timestamp', 'Lat', 'Lng'}.issubset(self.gps_dict.columns):
-                LOG.warning("GPS.csv file not in expected format. Ignoring GPS.")
-                self.gps_dict = None
+        if not {'timestamp', 'Lat', 'Lng'}.issubset(self.gps_dict.columns):
+            LOG.warning("GPS.csv file not in expected format. Ignoring GPS.")
+            return False
 
         # stable ascending time -> better for np.interp
         self.spd_dict = self.spd_dict.sort_values('timestamp').reset_index(drop=True)
         self.alt_dict = self.alt_dict.sort_values('timestamp').reset_index(drop=True)
         self.roll_dict = self.roll_dict.sort_values('timestamp').reset_index(drop=True)
         self.cmd_dict = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
-
-        if self.gps_dict is not None:
-            self.gps_dict = self.gps_dict.sort_values('timestamp').reset_index(drop=True)
+        self.gps_dict = self.gps_dict.sort_values('timestamp').reset_index(drop=True)
 
         # --- Read or synthesize time offset as a DataFrame consistently ---
         should_persist_offset = False
@@ -289,7 +287,7 @@ class AttitudeReader:
                                 tzinfo=timezone.utc,
                             )
 
-                        except ValueError as e:
+                        except ValueError as valueError:
                             LOG.warning(f"Invalid timestamp values in filename: {filename}")
                             return None
 
@@ -354,7 +352,7 @@ class AttitudeReader:
 
         # --- GPS handling ---
         self.has_gps = False
-        if self.gps_dict is not None and len(self.gps_dict) > 0:
+        if len(self.gps_dict) > 0:
             gps_t = convert_to_numpy(self.gps_dict['timestamp'], np.float64)
             gps_lat = convert_to_numpy(self.gps_dict['Lat'], np.float64)
             gps_lng = convert_to_numpy(self.gps_dict['Lng'], np.float64)
@@ -440,6 +438,9 @@ class AttitudeReader:
                 self.gps_map_x = self.gps_east_m
                 self.gps_map_y = self.gps_north_m
 
+                self.gps_home_x = self.gps_map_x[0]
+                self.gps_home_y = self.gps_map_y[0]
+
                 self.map_x_min = float(np.min(self.gps_map_x))
                 self.map_x_max = float(np.max(self.gps_map_x))
                 self.map_y_min = float(np.min(self.gps_map_y))
@@ -485,6 +486,8 @@ class AttitudeReader:
                 throttle_pct=0.0,
                 mode=ControlMode.error,
                 gps_valid=False,
+                home_x=self.gps_home_x,
+                home_y=self.gps_home_y
             )
 
         if t < self.att_t[0] or t > self.att_t[-1]:
@@ -502,6 +505,8 @@ class AttitudeReader:
                 throttle_pct=0.0,
                 mode=ControlMode.error,
                 gps_valid=False,
+                home_x=self.gps_home_x,
+                home_y=self.gps_home_y
             )
 
         # all-NumPy interpolation
@@ -588,6 +593,8 @@ class AttitudeReader:
             runway_corners_body_m=runway_corners_body_m,
             runway_corners_map_m=runway_corners_map_m,
             runway_rect_map_m=runway_rect_map_m,
+            home_x=self.gps_home_x,
+            home_y=self.gps_home_y
         )
 
     @staticmethod

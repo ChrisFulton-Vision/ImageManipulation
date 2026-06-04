@@ -153,10 +153,6 @@ class HUD_Marker:
         return int(round(px)), int(round(py))
 
     def draw_minimap(self, image, att, map_transparency):
-        if not getattr(att, 'gps_valid', False):
-            return
-        if not getattr(self.attRdr, 'has_gps', False):
-            return
         if map_transparency < 0.01:
             return
 
@@ -182,7 +178,7 @@ class HUD_Marker:
 
         # establish start point lazily from first valid GPS draw
         if self.minimap_start_px is None:
-            self.minimap_start_px = cur_px
+            self.minimap_start_px = self._map_to_minimap_px(att.home_x, att.home_y)
 
         # reset trail if playback jumps around hard
         if self.minimap_last_time_s is not None:

@@ -38,7 +38,7 @@ np.set_printoptions(precision=6, suppress=True)
 # and the pseudo-inverse gives the least-squares correction.
 # -----------------------------------------------------------------------------
 
-N_MEASUREMENTS = 12
+N_MEASUREMENTS = 50
 MEAS_NOISE_SIGMA_RAD = np.deg2rad(10.)
 INITIAL_ERROR_RAD = np.deg2rad(np.array([50.0, -30.0, 20.0]))
 MAX_ITERS = 5
@@ -403,6 +403,8 @@ residual_rms_deg_history: list[float] = []
 dx_deg_history: list[float] = []
 error_deg_history: list[float] = [np.rad2deg(np.linalg.norm(quat_error_vec(q2_true, q2_current)))]
 
+r_final = 0.0
+
 for iter_idx in range(MAX_ITERS):
     q2_next, dx, J_stack, r_stack = apply_batch_update(
         q2_current=q2_current,
@@ -412,6 +414,7 @@ for iter_idx in range(MAX_ITERS):
 
     residual_rms_rad = np.sqrt(np.mean(r_stack**2))
     dx_deg = np.rad2deg(np.linalg.norm(dx))
+    r_final = residual_rms_rad
 
     print(f"Iteration {iter_idx}")
     print(f"  J_stack shape: {J_stack.shape}")
@@ -435,6 +438,24 @@ for iter_idx in range(MAX_ITERS):
 print()
 print(f"Final q2: {q2_current}")
 print_error_summary("Final", q2_true, q2_current)
+expected_residual_rms_deg = np.rad2deg(
+    np.sqrt((N_MEASUREMENTS - 1) / N_MEASUREMENTS) * MEAS_NOISE_SIGMA_RAD
+)
+
+expected_state_error_norm_rms_deg = np.rad2deg(
+    np.sqrt(3 / N_MEASUREMENTS) * MEAS_NOISE_SIGMA_RAD
+)
+
+state_err_deg = np.rad2deg(np.linalg.norm(quat_error_vec(q2_true, q2_current)))
+resid_rms_deg = np.rad2deg(np.sqrt(np.mean(r_final**2)))
+
+print()
+print("Statistical sanity checks")
+print("-------------------------")
+print(f"Observed residual RMS [deg]:       {resid_rms_deg:.6f}")
+print(f"Expected residual RMS [deg]:       {expected_residual_rms_deg:.6f}")
+print(f"Observed state error norm [deg]:   {state_err_deg:.6f}")
+print(f"Expected state error norm RMS [deg]: {expected_state_error_norm_rms_deg:.6f}")
 
 
 # -----------------------------------------------------------------------------

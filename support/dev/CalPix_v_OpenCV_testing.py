@@ -950,7 +950,7 @@ def test_cal(cal: Calibration, run_id: str):
 
     print("\nTIMING (avg seconds per call)   N=", N)
 
-    row = [('ours undistort scalar:', t_scalar_und),
+    row = [#('ours undistort scalar:', t_scalar_und),
            ('ours undistort vec (2fp+N):', t_vec_und_prec),
            ('ours undistort vec (5fp):', t_vec_und_cv),
            ('cv   undistort:', t_cv_und),
@@ -976,7 +976,7 @@ def test_cal(cal: Calibration, run_id: str):
 
     print("\nTHROUGHPUT (points/sec)")
 
-    row = [('ours undistort scalar:', N / t_scalar_und),
+    row = [#('ours undistort scalar:', N / t_scalar_und),
            ('ours undistort vec (2fp+N):', N / t_vec_und_prec),
            ('ours undistort vec (5fp):', N / t_vec_und_cv),
            ('cv  undistort:', N / t_cv_und),
@@ -1001,7 +1001,7 @@ def test_cal(cal: Calibration, run_id: str):
 
     # UNDISTORT precision vs truth (all points; truth is in-frame by construction)
     und_methods = [
-        ("ours undistort scalar", ours_und_scalar, t_scalar_und),
+        #("ours undistort scalar", ours_und_scalar, t_scalar_und),
         ("ours undistort vec (2fp+N)", ours_und_vec_prec, t_vec_und_prec),
         ("ours undistort vec (5fp)", ours_und_vec_cv, t_vec_und_cv),
         ("cv undistortPoints", cv_und, t_cv_und),

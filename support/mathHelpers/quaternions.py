@@ -847,6 +847,8 @@ class Quaternion:
     def perturb_from_rodrigues_var(self, var: NDArray) -> "Quaternion":
         return self.perturb_from_rodrigues_std(np.sqrt(var))
 
+    def slerp_with(self, q: "Quaternion", alpha: float) -> "Quaternion":
+        return interpolate(self, q, alpha)
 
 pure_qs = Quaternion(s=1.0, vec=np.zeros((3,)))
 pure_qx = Quaternion(s=0.0, vec=np.array([1.0, 0.0, 0.0]))
@@ -858,7 +860,7 @@ def identity() -> Quaternion:
     return pure_qs.copy()
 
 
-def from_SE3(Mat4: NDArray):
+def from_SE3(Mat4: NDArray) -> tuple[Quaternion, NDArray]:
     if Mat4.shape != (4, 4):
         raise ValueError(f"Mat4 must be of shape (4,4), but is {Mat4.shape}")
     dcm = Mat4[:3, :3]

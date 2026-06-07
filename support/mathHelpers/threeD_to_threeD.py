@@ -1,222 +1,373 @@
 """
-ThreeD_to_ThreeD.py (annotated)
+threeD_to_threeD.py
 
-Purpose
--------
-Estimate a rigid 3D→3D transform (unit quaternion rotation `q` and translation
-`t`) that maps `points1` to `points2` by minimizing reprojection residuals via a
-simple Gauss–Newton / trust-region backtracking scheme.
+Estimate the rigid SE(3) transform between two corresponding 3-D point sets.
 
-Key changes vs. the original:
-- Added comprehensive type annotations (NumPy dtypes and Optional types).
-- Added docstrings and explanatory comments.
-- Fixed a subtle bug in `gramSchmidtAxis` when forming the 3×3 orientation
-  matrix (now uses `np.column_stack` so the axes become *columns* of the matrix).
-- Made return types explicit and added validation in `__init__` for degenerate
-  seeds.
-- Minor cleanups (consistent `deepcopy`, clarified variable names).
+The estimated transform maps source-frame points into the target frame:
 
-Dependencies
-------------
-Relies on a `quaternions` module that provides:
-- `Quaternion` (aliased as `q` here) with attributes/methods:
-  - `.ndarray` (or similar) exposing the 4-vector
-  - `.s` the scalar part
-  - `.T` transpose/inverse as appropriate for composition
-  - `__mul__` overloaded for rotating Nx3 arrays of 3D points
-  - `.vect_deriv(point, makeUnitVec)` returning a 3×4 Jacobian d(R(q)p)/dq
-- `mat2quat(R)` : 3×3 rotation matrix → `Quaternion`
-- `randomQuat()` : random unit quaternion
+    p_target ~= R @ p_source + t
 
-Notes
------
-- This is a *minimal* LM-like scheme focused on readability. It uses the
-  pseudo-inverse for the normal equations and a simple backtracking rule based
-  on the ratio of actual vs. predicted residual reduction.
-- For serious performance/robustness, consider: damping (Levenberg),
-  robust loss, weighting by per-point covariances, and stopping criteria tied to
-  gradient/step norms.
+where R is constrained to SO(3) and t is a 3-vector. The implementation uses
+an SVD/Kabsch/orthogonal-Procrustes solution, which is the closed-form least-
+squares optimum for isotropic 3-D point residuals.
+
+This module intentionally contains only the math/data-model layer. CSV I/O,
+demos, plotting, animations, and command-line entry points live in:
+
+    support.io.threeD_fileReader
+
+Input point arrays may be either N x 3 or 3 x N. By default, N x 3 is assumed,
+except for unambiguous 3 x N arrays where N != 3. Use points_are_columns=True
+to force legacy 3 x N interpretation.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 
-from sys import maxsize
-from numpy.linalg import norm
-from numpy.typing import NDArray
 import numpy as np
-from support.mathHelpers.quaternions import Quaternion as Quat, mat2quat, randomQuat
+from numpy.typing import ArrayLike, NDArray
 
-np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
+import support.mathHelpers.quaternions as q
 
-# Small epsilon to guard against degeneracy in Gram–Schmidt seed.
-EPS: float = 1e-6
+FloatArray = NDArray[np.float64]
+
+_EPS = 1.0e-12
 
 
-class ThreeD_to_ThreeD:
-    """Estimate a rigid transform between two corresponding 3D point sets."""
+@dataclass(frozen=True)
+class SE3:
+    """Rigid transform from ``source_frame`` into ``target_frame``.
 
-    def __init__(self, points1: NDArray[np.floating], points2: NDArray[np.floating]) -> None:
-        self.points1: NDArray[np.floating] = points1.reshape(-1, 3).copy()
-        self.points2: NDArray[np.floating] = points2.reshape(-1, 3).copy()
-        self.num_points: int = self.points1.shape[0]
+    The transform convention is
 
-        seed = self.init_pose(self.points1, self.points2)
-        if seed is None:
-            raise ValueError("Degenerate seed from Gram–Schmidt (collinear or duplicate points).")
-        self.q: Quat = Quat()
-        self.t: NDArray = np.zeros(1)
+        p_target = R @ p_source + t
 
-        self.q, self.t = seed
+    for column-vector mathematics. For an N x 3 point array, this is evaluated
+    efficiently as ``points @ R.T + t``.
+    """
 
-        self.opt()
+    R: FloatArray
+    t: FloatArray
+    source_frame: str = "source"
+    target_frame: str = "target"
 
-    @staticmethod
-    def gramSchmidtAxis(points: NDArray[np.floating]) -> Optional[Quat]:
-        p0, p1, p2 = points[0], points[1], points[2]
+    def __post_init__(self) -> None:
+        R = np.asarray(self.R, dtype=float).reshape(3, 3)
+        t = np.asarray(self.t, dtype=float).reshape(3)
+        if not np.all(np.isfinite(R)) or not np.all(np.isfinite(t)):
+            raise ValueError("SE3 contains non-finite values.")
+        object.__setattr__(self, "R", R)
+        object.__setattr__(self, "t", t)
 
-        x_axis: NDArray[np.floating] = p1 - p0
-        x_nm = float(norm(x_axis))
-        if x_nm < EPS:
-            return None
-        x_axis /= x_nm
+    @property
+    def matrix(self) -> FloatArray:
+        """Return the 4 x 4 homogeneous matrix representation."""
 
-        yp_axis: NDArray[np.floating] = p2 - p0
-        yp_nm = float(norm(yp_axis))
-        if yp_nm < EPS:
-            return None
+        T = np.eye(4, dtype=float)
+        T[:3, :3] = self.R
+        T[:3, 3] = self.t
+        return T
 
-        z_axis: NDArray[np.floating] = np.cross(x_axis, yp_axis)
-        z_nm = float(norm(z_axis))
-        if z_nm < EPS:
-            return None
-        z_axis /= z_nm
+    @property
+    def q_sxyz(self):
+        """Return the scalar-first project quaternion corresponding to ``R``."""
 
-        y_axis: NDArray[np.floating] = np.cross(z_axis, x_axis)
+        return q.mat2quat(self.R)
 
-        R: NDArray[np.floating] = np.column_stack((x_axis, y_axis, z_axis))
-        return mat2quat(R)
+    def inverse(self) -> "SE3":
+        """Return the inverse rigid transform."""
 
-    @staticmethod
-    def init_pose(points1: NDArray[np.floating], points2: NDArray[np.floating]) -> (
-            Optional)[Tuple[Quat, NDArray[np.floating]]]:
-        quat1 = ThreeD_to_ThreeD.gramSchmidtAxis(points1)
-        quat2 = ThreeD_to_ThreeD.gramSchmidtAxis(points2)
-
-        if quat1 is None or quat2 is None:
-            return None
-
-        new_q: Quat = quat2.T * quat1
-        if new_q.s < 0.0:
-            new_q *= -1.0
-
-        tvec: NDArray[np.floating] = np.mean(points2.reshape(-1, 3), axis=0) - np.mean(
-            new_q * points1.reshape(-1, 3), axis=0
+        R_inv = self.R.T
+        t_inv = -R_inv @ self.t
+        return SE3(
+            R=R_inv,
+            t=t_inv,
+            source_frame=self.target_frame,
+            target_frame=self.source_frame,
         )
-        return new_q, tvec
 
-    def create_y(self, new_q: Optional[Quat] = None, new_t: Optional[NDArray[np.floating]] = None) -> NDArray[np.floating]:
-        if new_q is None:
-            new_q = self.q.copy()
-        if new_t is None:
-            new_t = self.t.copy()
+    def transform_points(
+        self,
+        points: ArrayLike,
+        *,
+        points_are_columns: Optional[bool] = None,
+    ) -> FloatArray:
+        """Apply the transform to points and return an N x 3 array."""
 
-        residuals: NDArray[np.floating] = self.points2 - (new_q * self.points1) - new_t
-        return residuals.reshape(-1)
+        pts = as_points3(points, points_are_columns=points_are_columns)
+        return pts @ self.R.T + self.t
 
-    def create_L(self) -> NDArray[np.floating]:
-        L = np.zeros((3 * self.num_points, 7), dtype=float)
+    def as_project_quaternion(self):  # pragma: no cover - depends on local project package
+        """Return the project Quaternion object when support.mathHelpers is available."""
 
-        for idx, pt1 in enumerate(self.points1):
-            row = idx * 3
-            dRp_dq: NDArray[np.floating] = self.q.vect_deriv(pt1, False)
-            L[row: row + 3, :4] = dRp_dq
-            L[row: row + 3, 4:] = np.eye(3)
+        return q.mat2quat(self.R)
 
-        return L
+    def as_project_SE3(self):  # pragma: no cover - depends on local project package
+        """Return the project SE3 object when the project Quaternion class supports it."""
 
-    def opt(self) -> None:
-        lambda_damp: float = 1e-2
-
-        keep_going = True
-        it = 0
-        while keep_going:
-            it += 1
-
-            y = self.create_y()
-            old_y_mag = float(norm(y))
-            L = self.create_L()
-
-            JT: NDArray[np.floating] = L.T
-            JTJ: NDArray[np.floating] = JT @ L
-            JTy: NDArray[np.floating] = JT @ y
-            D: NDArray[np.floating] = np.diag(np.diag(JTJ))
-            try:
-                delta_x = np.linalg.solve(JTJ + lambda_damp * D, JTy)
-            except np.linalg.LinAlgError:
-                delta_x = np.linalg.pinv(JTJ + lambda_damp * D) @ JTy
-
-            scale = 1.0
-            while True:
-                new_q = Quat(quat=self.q.ndarray + scale * delta_x[:4], makeUnitQuat=True)
-                new_t = self.t + scale * delta_x[4:]
-                new_y_mag = float(norm(self.create_y(new_q, new_t)))
-
-                y_pred_mag = float(norm(y - L @ (scale * delta_x)))
-
-                if abs(old_y_mag - y_pred_mag) < 1e-5:
-                    self.q = new_q
-                    self.t = new_t
-                    break
-
-                denom = max(old_y_mag - y_pred_mag, 1e-12)
-                ratio = (old_y_mag - new_y_mag) / denom
-
-                if 0.25 < ratio < 4.0:
-                    self.q = new_q
-                    self.t = new_t
-                    if ratio > 0.75:
-                        lambda_damp = max(lambda_damp / 3.0, 1e-12)
-                    break
-                else:
-                    lambda_damp = min(lambda_damp * 2.0, 1e12)
-                    scale *= 0.5
-                    if scale < 1e-6:
-                        break
-
-            if float(norm(scale * delta_x)) < 1e-7 or it > 10:
-                keep_going = False
-
-        if self.q.s < 0.0:
-            self.q *= -1.0
+        return self.as_project_quaternion().to_SE3_given_position(self.t)
 
 
-def print_3dPts(threeD_proj: NDArray[np.floating]) -> None:
-    pts = threeD_proj.reshape(-1, 3).copy()
-    print(f"Norm: {np.linalg.norm(pts)}")
-    for n, point in enumerate(pts):
-        print(f"Feature: {n:3d}, x: {point[0]: .5f}, y: {point[1]: .5f}, z: {point[2]: .5f}")
+@dataclass(frozen=True)
+class AlignmentDiagnostics:
+    """Fit quality information for a 3-D point alignment."""
+
+    residuals: FloatArray
+    residual_norms: FloatArray
+    rmse: float
+    weighted_rmse: float
+    max_error: float
+    singular_values: FloatArray
+    source_rank: int
+    target_rank: int
 
 
-def main() -> None:
-    test1: NDArray[np.floating] = np.random.normal(0.0, 1.0, (10, 3))
-    noise: NDArray[np.floating] = np.random.normal(0.0, 0.1, test1.shape)
-    print(test1)
-    q_true: Quat = randomQuat()
-    t_true: NDArray[np.floating] = np.array([10.0, 0.0, 0.0]) + np.random.normal(1.0, 1.0, (3,))
-    test2: NDArray[np.floating] = (q_true * test1 + t_true) + noise
+class ThreeDToThreeD:
+    """Estimate an SE(3) transform from corresponding 3-D points.
 
-    print(f"Targets: \n{q_true}\n{t_true}\n")
-    print(f"Targets: \n{q_true.to_SE3_given_position(t_true)}")
+    Parameters
+    ----------
+    source_points:
+        Points expressed in the source frame. These are transformed.
+    target_points:
+        Corresponding points expressed in the target frame.
+    weights:
+        Optional nonnegative per-point weights. If omitted, all points are
+        weighted equally.
+    points_are_columns:
+        ``True`` for legacy 3 x N point matrices, ``False`` for N x 3 point
+        matrices, or ``None`` for automatic detection.
+    source_frame, target_frame:
+        Names stored in the resulting :class:`SE3` object.
+    """
 
-    optClass = ThreeD_to_ThreeD(test1, test2)
+    def __init__(
+        self,
+        source_points: ArrayLike,
+        target_points: ArrayLike,
+        *,
+        weights: Optional[ArrayLike] = None,
+        points_are_columns: Optional[bool] = None,
+        source_frame: str = "source",
+        target_frame: str = "target",
+    ) -> None:
+        self.source_points = as_points3(source_points, points_are_columns=points_are_columns)
+        self.target_points = as_points3(target_points, points_are_columns=points_are_columns)
+        self.weights = validate_weights(weights, self.source_points.shape[0])
+        self.num_points = self.source_points.shape[0]
 
-    print(f'Estimates: \n{optClass.q}\n{optClass.t}\n')
-    print(f'Estimates(SE3):\n{optClass.q.to_SE3_given_position(optClass.t)}\n')
+        self.transform, self.diagnostics = fit_se3_kabsch(
+            self.source_points,
+            self.target_points,
+            weights=self.weights,
+            source_frame=source_frame,
+            target_frame=target_frame,
+        )
 
-    print(f"Resolved Residual: {norm(optClass.create_y())}\n{optClass.create_y()}")
-    print(f"True Residual: {norm(optClass.create_y(q_true, t_true))}\n{optClass.create_y(q_true, t_true)}")
+        # Compatibility aliases for older scripts.
+        self.points1 = self.source_points
+        self.points2 = self.target_points
+        self.R = self.transform.R
+        self.t = self.transform.t
+        self.q_sxyz = self.transform.q_sxyz
+        self.q = self.q_sxyz
+        self.ans_rot = self.R
+        self.ans_trans = self.t.reshape(3, 1)
+        self.residual = self.diagnostics.residual_norms
+
+    def transform_points(self, points: ArrayLike, *, points_are_columns: Optional[bool] = None) -> FloatArray:
+        """Apply the estimated source-to-target transform to points."""
+
+        return self.transform.transform_points(points, points_are_columns=points_are_columns)
+
+    def create_y(
+        self,
+        transform: Optional[SE3] = None,
+        *,
+        flatten: bool = True,
+    ) -> FloatArray:
+        """Return target minus transformed-source residuals."""
+
+        if transform is None:
+            transform = self.transform
+        residuals = self.target_points - transform.transform_points(self.source_points)
+        return residuals.reshape(-1) if flatten else residuals
+
+    def to_SE3(self) -> SE3:
+        """Return the estimated SE3 object."""
+
+        return self.transform
+
+    def to_project_SE3(self):  # pragma: no cover - depends on local project package
+        """Return the project-native SE3 object when project helpers are available."""
+
+        return self.transform.as_project_SE3()
 
 
-if __name__ == "__main__":
-    main()
+# Backward-compatible class name used by the older file.
+class ThreeD_to_ThreeD(ThreeDToThreeD):
+    pass
+
+
+def as_points3(points: ArrayLike, *, points_are_columns: Optional[bool] = None) -> FloatArray:
+    """Return points as an N x 3 floating-point array.
+
+    Legacy alignment scripts often used 3 x N arrays. Newer numerical code is
+    generally easier to read as N x 3. This helper accepts both.
+    """
+
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2:
+        raise ValueError(f"Expected a 2-D point array, got shape {pts.shape}.")
+
+    if points_are_columns is True:
+        if pts.shape[0] != 3:
+            raise ValueError(f"Expected a 3 x N array, got shape {pts.shape}.")
+        pts = pts.T
+    elif points_are_columns is False:
+        if pts.shape[1] != 3:
+            raise ValueError(f"Expected an N x 3 array, got shape {pts.shape}.")
+    else:
+        if pts.shape[1] == 3:
+            pass
+        elif pts.shape[0] == 3:
+            pts = pts.T
+        else:
+            raise ValueError(f"Expected N x 3 or 3 x N points, got shape {pts.shape}.")
+
+    pts = np.ascontiguousarray(pts, dtype=float)
+    if pts.shape[0] < 3:
+        raise ValueError("At least three corresponding points are required.")
+    if not np.all(np.isfinite(pts)):
+        raise ValueError("Point array contains NaN or infinite values.")
+    return pts
+
+
+def validate_weights(weights: Optional[ArrayLike], num_points: int) -> FloatArray:
+    """Return normalized positive weights of length ``num_points``."""
+
+    if weights is None:
+        return np.full(num_points, 1.0 / num_points, dtype=float)
+
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if w.size != num_points:
+        raise ValueError(f"Expected {num_points} weights, got {w.size}.")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("Weights contain NaN or infinite values.")
+    if np.any(w < 0.0):
+        raise ValueError("Weights must be nonnegative.")
+    total = float(np.sum(w))
+    if total <= _EPS:
+        raise ValueError("At least one weight must be positive.")
+    return w / total
+
+
+def fit_se3_kabsch(
+    source_points: ArrayLike,
+    target_points: ArrayLike,
+    *,
+    weights: Optional[ArrayLike] = None,
+    points_are_columns: Optional[bool] = None,
+    source_frame: str = "source",
+    target_frame: str = "target",
+) -> tuple[SE3, AlignmentDiagnostics]:
+    """Fit the weighted least-squares rigid transform from source to target."""
+
+    source = as_points3(source_points, points_are_columns=points_are_columns)
+    target = as_points3(target_points, points_are_columns=points_are_columns)
+    if source.shape != target.shape:
+        raise ValueError(f"Point arrays must have the same shape, got {source.shape} and {target.shape}.")
+
+    w = validate_weights(weights, source.shape[0])
+
+    source_centroid = np.sum(source * w[:, None], axis=0)
+    target_centroid = np.sum(target * w[:, None], axis=0)
+    source_centered = source - source_centroid
+    target_centered = target - target_centroid
+
+    source_rank = centered_rank(source_centered, w)
+    target_rank = centered_rank(target_centered, w)
+    if min(source_rank, target_rank) < 2:
+        raise ValueError(
+            "Degenerate point geometry: at least three non-collinear corresponding "
+            "points are required to determine a unique 3-D rigid rotation."
+        )
+
+    # Cross-covariance for column-vector convention p_target ~= R @ p_source + t.
+    H = source_centered.T @ (target_centered * w[:, None])
+    U, singular_values, Vt = np.linalg.svd(H)
+
+    R = Vt.T @ U.T
+    # Reflection correction: coordinate-frame alignment must live in SO(3), not O(3).
+    if np.linalg.det(R) < 0.0:
+        D = np.eye(3)
+        D[-1, -1] = -1.0
+        R = Vt.T @ D @ U.T
+
+    # Numerical cleanup: project back onto SO(3) after determinant correction.
+    R = project_to_so3(R)
+    t = target_centroid - R @ source_centroid
+
+    transform = SE3(R=R, t=t, source_frame=source_frame, target_frame=target_frame)
+    residuals = target - transform.transform_points(source)
+    residual_norms = np.linalg.norm(residuals, axis=1)
+    rmse = float(np.sqrt(np.mean(np.sum(residuals * residuals, axis=1))))
+    weighted_rmse = float(np.sqrt(np.sum(w * np.sum(residuals * residuals, axis=1))))
+    max_error = float(np.max(residual_norms))
+
+    diagnostics = AlignmentDiagnostics(
+        residuals=residuals,
+        residual_norms=residual_norms,
+        rmse=rmse,
+        weighted_rmse=weighted_rmse,
+        max_error=max_error,
+        singular_values=singular_values,
+        source_rank=source_rank,
+        target_rank=target_rank,
+    )
+    return transform, diagnostics
+
+
+def centered_rank(centered_points: FloatArray, weights: FloatArray) -> int:
+    """Return the numerical rank of the weighted centered point cloud."""
+
+    weighted = centered_points * np.sqrt(weights[:, None])
+    singular_values = np.linalg.svd(weighted, compute_uv=False)
+    tol = max(centered_points.shape) * np.finfo(float).eps * max(float(singular_values[0]), 1.0)
+    return int(np.sum(singular_values > tol))
+
+
+def project_to_so3(R: ArrayLike) -> FloatArray:
+    """Project a nearly valid rotation matrix onto SO(3)."""
+
+    R = np.asarray(R, dtype=float).reshape(3, 3)
+    U, _, Vt = np.linalg.svd(R)
+    R_so3 = U @ Vt
+    if np.linalg.det(R_so3) < 0.0:
+        U[:, -1] *= -1.0
+        R_so3 = U @ Vt
+    return R_so3
+
+
+def rotation_matrix_to_quat_sxyz(R: ArrayLike):
+    """Convert a rotation matrix to a scalar-first project quaternion [s, x, y, z]."""
+
+    R = np.asarray(R, dtype=float).reshape(3, 3)
+    return q.mat2quat(R)
+
+
+def quat_sxyz_to_rotation_matrix(quat: q.Quaternion) -> FloatArray:
+    """Convert a scalar-first unit quaternion [s, x, y, z] to a rotation matrix."""
+
+    quat = quat.normalize()
+    s = quat.s
+    x, y, z = quat.vec
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - s * z), 2.0 * (x * z + s * y)],
+            [2.0 * (x * y + s * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - s * x)],
+            [2.0 * (x * z - s * y), 2.0 * (y * z + s * x), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=float,
+    )

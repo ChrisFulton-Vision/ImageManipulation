@@ -97,6 +97,111 @@ def qmul_batch_left_numba(a: np.ndarray, Bs: np.ndarray) -> np.ndarray:
     return out
 
 
+class SE3_q:
+    def __init__(self,
+                 quat: "Quaternion" = None,
+                 tvec: NDArray = None):
+        self.quat = identity() if quat is None else Quaternion(quat=quat, makeUnitQuat=False)
+        self.tvec = np.zeros((3,), dtype=float) if tvec is None else np.asarray(tvec, dtype=float).reshape(3)
+
+    def __repr__(self) -> str:
+        return f"SE3_q(quat={self.quat!r}, tvec={self.tvec!r})"
+
+    def copy(self) -> Self:
+        return SE3_q(quat=self.quat.copy(), tvec=self.tvec.copy())
+
+    def compose(self, other: Self) -> Self:
+        if not isinstance(other, SE3_q):
+            raise ValueError(f"Can only compose SE3_q with SE3_q, got {type(other)}")
+        return SE3_q(
+            quat=(self.quat * other.quat).normalize(),
+            tvec=self.quat * other.tvec + self.tvec,
+        )
+
+    def __mul__(self, other: object) -> Self | np.ndarray:
+        if isinstance(other, SE3_q):
+            return self.compose(other)
+        if isinstance(other, np.ndarray):
+            arr = np.asarray(other, dtype=float)
+            if arr.shape == (3,):
+                return self.quat * arr + self.tvec
+            if arr.ndim == 2 and arr.shape == (3, 3):
+                return (self.quat * arr) + self.tvec.reshape(3, 1)
+            if arr.ndim == 2 and arr.shape[1] == 3:
+                return self.quat * arr + self.tvec
+            if arr.ndim == 2 and arr.shape[0] == 3:
+                return (self.quat * arr) + self.tvec.reshape(3, 1)
+            raise ValueError(f"SE3_q can only transform arrays with one dimension equal to 3, got shape {arr.shape}")
+        return NotImplemented
+
+    @property
+    def inv(self) -> Self:
+        q_inv = self.quat.T
+        return SE3_q(quat=q_inv, tvec=-(q_inv * self.tvec))
+
+    def inverse(self) -> Self:
+        return self.inv
+
+    @property
+    def array(self) -> np.ndarray:
+        return self.quat.to_SE3_given_position(self.tvec)
+
+    @property
+    def matrix(self) -> np.ndarray:
+        return self.array
+
+    @property
+    def minimal(self) -> np.ndarray:
+        return np.concatenate((self.quat.ln_so3.vec, self.tvec))
+
+    def jacobian(self) -> np.ndarray:
+        """
+        Jacobian of the local minimal pose coordinates under a left perturbation.
+
+        Let the pose state be parameterized as x = [phi, t], where
+            phi = Log_SO3(q)
+        and let the optimizer apply a left perturbation
+            T <- Exp(delta) * T
+        with delta = [dtheta, dt].
+
+        This returns dx / ddelta evaluated at the current pose:
+            [ J_l(phi)^(-T)   0 ]
+            [   -[t]_x        I ]
+
+        The transpose on the rotational block matches the row-major 3-vector
+        conventions used by this module's quaternion log map helpers.
+        """
+        J = np.eye(6, dtype=float)
+        phi = self.quat.ln_so3.vec
+        J[:3, :3] = np.linalg.inv(so3_left_jacobian(phi)).T
+        J[3:, :3] = -skew(self.tvec)
+        return J
+
+    @staticmethod
+    def random(tvec_length: float = 1.0) -> Self:
+        tvec_length = float(tvec_length)
+        if tvec_length < 0.0:
+            raise ValueError("tvec_length must be non-negative")
+
+        if tvec_length == 0.0:
+            tvec = np.zeros(3, dtype=float)
+        else:
+            tvec = np.random.randn(3)
+            norm = np.linalg.norm(tvec)
+            if norm < _FLOAT_EPS:
+                tvec = np.array([tvec_length, 0.0, 0.0], dtype=float)
+            else:
+                tvec = (tvec / norm) * tvec_length
+
+        return SE3_q(quat=randomQuat(), tvec=tvec)
+
+    @staticmethod
+    def from_SE3(Mat4: NDArray) -> Self:
+        quat, tvec = from_SE3(Mat4)
+        return SE3_q(quat=quat, tvec=tvec)
+
+
+
 class Quaternion:
     __slots__ = ("s", "vec", "_cache4")
     __array_priority__ = 10_000  # overrides numpy priority for right mult

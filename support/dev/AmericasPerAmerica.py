@@ -52,8 +52,8 @@ class AmericaPerAmericaApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.speed_var = ctk.StringVar(value="43")
-        self.unit_var = ctk.StringVar(value="m/s")
+        self.speed_var = ctk.StringVar(value="1776")
+        self.unit_var = ctk.StringVar(value="mph")
 
         self._build_ui()
         self._update_values()

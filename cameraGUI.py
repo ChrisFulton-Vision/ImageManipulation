@@ -956,13 +956,36 @@ class CameraGui(ctk.CTkFrame):
         if self.detector is None:
             self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
             self.arucoParams = cv2.aruco.DetectorParameters()
-            self.arucoParams.adaptiveThreshWinSizeMin = 5
-            self.arucoParams.adaptiveThreshWinSizeMax = 35
-            self.arucoParams.adaptiveThreshWinSizeStep = 5
-            self.arucoParams.minMarkerPerimeterRate = 0.02  # or higher if tags are big
-            self.arucoParams.maxMarkerPerimeterRate = 1.0
-            self.arucoParams.cornerRefinementMinAccuracy = 0.1  # or 0.2
-            self.arucoParams.cornerRefinementMaxIterations = 20
+
+            self.arucoParams.adaptiveThreshWinSizeMin = 3
+            self.arucoParams.adaptiveThreshWinSizeMax = 23
+            self.arucoParams.adaptiveThreshWinSizeStep = 10
+            self.arucoParams.adaptiveThreshConstant = 7.0
+
+            self.arucoParams.minMarkerPerimeterRate = 0.03
+            self.arucoParams.maxMarkerPerimeterRate = 4.0
+            self.arucoParams.cornerRefinementMinAccuracy = 0.1
+            self.arucoParams.minCornerDistanceRate = 0.05
+            self.arucoParams.minDistanceToBorder = 3
+
+            # AprilTag-specific: bias toward recall
+            self.arucoParams.aprilTagMinClusterPixels = 5
+            self.arucoParams.aprilTagMaxNmaxima = 10
+            self.arucoParams.aprilTagCriticalRad = 0.1745329201221466
+            self.arucoParams.aprilTagMaxLineFitMse = 10.0
+            self.arucoParams.aprilTagMinWhiteBlackDiff = 5
+            self.arucoParams.aprilTagDeglitch = 0
+            self.arucoParams.aprilTagQuadSigma = 0.0
+            self.arucoParams.aprilTagQuadDecimate = 0.0
+
+            self.arucoParams.detectInvertedMarker = False
+
+            self.arucoParams.errorCorrectionRate = 0.6
+
+            self.arucoParams.cornerRefinementMethod = 0
+            self.arucoParams.cornerRefinementMaxIterations = 30
+            self.arucoParams.cornerRefinementMinAccuracy = 0.1
+
         self.detector = cv2.aruco.ArucoDetector(self.arucoDict, self.arucoParams)
 
     def draw_playbackStats(self, frame,

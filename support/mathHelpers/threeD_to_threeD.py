@@ -350,13 +350,6 @@ def project_to_so3(R: ArrayLike) -> FloatArray:
     return R_so3
 
 
-def rotation_matrix_to_quat_sxyz(R: ArrayLike):
-    """Convert a rotation matrix to a scalar-first project quaternion [s, x, y, z]."""
-
-    R = np.asarray(R, dtype=float).reshape(3, 3)
-    return q.mat2quat(R)
-
-
 def quat_sxyz_to_rotation_matrix(quat: q.Quaternion) -> FloatArray:
     """Convert a scalar-first unit quaternion [s, x, y, z] to a rotation matrix."""
 

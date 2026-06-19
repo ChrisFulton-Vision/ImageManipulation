@@ -1,6 +1,7 @@
 from __future__ import annotations
 import numpy as np
 import math
+from pathlib import Path
 from numpy.typing import NDArray
 from dataclasses import dataclass, field
 from typing import Callable, Any, Dict, Tuple, List
@@ -93,6 +94,17 @@ def _factor_pred_and_residual(m, T_w_obj):
     return T_s_obj_pred, r
 
 
+def _default_plot_path(stem_suffix: str) -> Path:
+    return Path(__file__).with_name(f"{Path(__file__).stem}{stem_suffix}.pdf")
+
+
+def _save_figure(fig: plt.Figure, stem_suffix: str, *, dpi: int = 200) -> Path:
+    output_path = _default_plot_path(stem_suffix)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    print(f"Saved figure to: {output_path}")
+    return output_path
+
+
 def plot_sigma_residuals_per_sensor(fg, *, use_opt: bool = True, show: bool = True):
     """
     Bar plot of z = W r (sigma units) for each sensor.
@@ -100,15 +112,16 @@ def plot_sigma_residuals_per_sensor(fg, *, use_opt: bool = True, show: bool = Tr
 
     Requires:
       - fg.solve() already called (for T_opt)
-      - fg.W exists and aligned with fg.measurements
+      - whitening is evaluated at the selected reference pose
     """
     d, T_opt = _require_diag(fg)
     T_use = T_opt if use_opt else d.get("T_w_obj_init", None) or d.get("T_w_drg_init", None) or T_opt
 
     labels = ["dx", "dy", "dz", "dθx", "dθy", "dθz"]
 
-    for i, (m, W) in enumerate(zip(fg.measurements, fg.W)):
+    for i, m in enumerate(fg.measurements):
         _, r = _factor_pred_and_residual(m, T_use)
+        W = fg._factor_whitener(m, T_use)
         z = np.abs(W @ r)
 
         plt.figure()
@@ -136,8 +149,9 @@ def plot_chi2_per_sensor(fg, *, use_opt: bool = True, normalize_by_dof: bool = T
     names = []
     chi2s = []
 
-    for i, (m, W) in enumerate(zip(fg.measurements, fg.W)):
+    for i, m in enumerate(fg.measurements):
         _, r = _factor_pred_and_residual(m, T_use)
+        W = fg._factor_whitener(m, T_use)
         z = W @ r
         chi2 = float(z @ z)
         if normalize_by_dof:
@@ -156,34 +170,7 @@ def plot_chi2_per_sensor(fg, *, use_opt: bool = True, normalize_by_dof: bool = T
         plt.show()
 
 
-def _plot_cov_ellipse_2d(C2, mean2, *, title: str, xlabel: str, ylabel: str, nsig: float = 2.0):
-    """
-    Plot a 2D covariance ellipse for a 2x2 covariance matrix.
-    """
-    C2 = np.asarray(C2, dtype=float)
-    mean2 = np.asarray(mean2, dtype=float).reshape(2)
-
-    # Eigen-decomposition
-    vals, vecs = np.linalg.eigh(C2)
-    vals = np.maximum(vals, 0.0)
-
-    # Parametric ellipse in eigenbasis
-    t = np.linspace(0, 2 * np.pi, 200)
-    circle = np.vstack([np.cos(t), np.sin(t)])  # (2,N)
-    radii = nsig * np.sqrt(vals)  # (2,)
-    ellipse = (vecs @ (radii[:, None] * circle)) + mean2[:, None]  # (2,N)
-
-    plt.figure()
-    plt.title(title)
-    plt.plot(mean2[0], mean2[1], marker="o")  # mean
-    plt.plot(ellipse[0, :], ellipse[1, :])  # ellipse
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.axis("equal")
-    plt.tight_layout()
-
-
-def _ellipsoid_mesh_from_cov(C3, center, nsig=2.0, n_u=40, n_v=20):
+def _ellipsoid_mesh_from_cov(C3, center, nsig=2.795, n_u=40, n_v=20):
     """
     Build an ellipsoid mesh for the 3x3 covariance C3 centered at `center`.
 
@@ -222,16 +209,21 @@ def _ellipsoid_mesh_from_cov(C3, center, nsig=2.0, n_u=40, n_v=20):
     return X, Y, Z
 
 
+def _label_box_kwargs() -> dict:
+    return dict(boxstyle="round,pad=0.2", facecolor="white", edgecolor="none", alpha=0.85)
+
+
 def plot_translation_ellipsoids_3d(
         fg,
         *,
-        nsig: float = 2.0,
+        nsig: float = 2.795,
         show_sensor_ellipsoids: bool = True,
         show_fused_ellipsoid: bool = True,
         show_sensor_means: bool = True,
         show_fused_mean: bool = True,
         show: bool = True,
-):
+        save: bool = False,
+) -> plt.Figure:
     """
     Single 3D plot with translation uncertainty ellipsoids:
       - One ellipsoid per sensor "lift" (T_w_drg_i = T_w_s_i * T_s_drg_meas_i)
@@ -294,7 +286,7 @@ def plot_translation_ellipsoids_3d(
         mu_i = np.asarray(T_w_drg_i[:3, 3], dtype=float)
 
         # Translation covariance from measurement model (sensor frame)
-        C_i = np.asarray(m.covariance(), dtype=float)
+        C_i = np.asarray(fg._factor_covariance(m, T_w_drg_i), dtype=float)
         C_tt_s = C_i[:3, :3]
 
         # Rotate translation covariance into world
@@ -306,8 +298,9 @@ def plot_translation_ellipsoids_3d(
         sensor_names.append(m.sensor.name)
 
     # --- Plot ---
-    fig = plt.figure()
+    fig = plt.figure(figsize=(11.0, 8.5))
     ax = fig.add_subplot(111, projection="3d")
+    plt.tight_layout()
     ax.set_title(f"Translation uncertainty ellipsoids (±{nsig}σ)")
 
     # Avoid specifying colors; instead differentiate via linestyle/linewidth and labels
@@ -325,6 +318,8 @@ def plot_translation_ellipsoids_3d(
                 X, Y, Z,
                 rstride=2, cstride=2,
                 linewidth=1.2,
+                alpha=0.35,
+                zorder=1,
                 color=sensor_colors.get(name, "gray"),
                 label=f"{name} lift ±{nsig}σ"
             )
@@ -335,23 +330,29 @@ def plot_translation_ellipsoids_3d(
             X, Y, Z,
             rstride=2, cstride=2,
             linewidth=2.5,
+            alpha=0.45,
+            zorder=2,
             color=fused_color,
             label=f"Fused ±{nsig}σ"
         )
 
     if show_sensor_means:
         for name, mu_i in zip(sensor_names, sensor_mus):
-            ax.scatter(*mu_i, color=sensor_colors.get(name, "gray"), marker="o")
-            ax.text(*mu_i, f" {name} lift")
+            ax.scatter(*mu_i, color=sensor_colors.get(name, "gray"), marker="o", s=42,
+                       edgecolors="white", linewidths=0.8, depthshade=False, zorder=10)
+            ax.text(*mu_i, f" {name} lift", zorder=11, bbox=_label_box_kwargs())
 
     if show_fused_mean:
-        ax.scatter(*mu_fused, color=fused_color, marker="x", s=60)
-        ax.text(*mu_fused, " fused")
+        ax.scatter(*mu_fused, color=fused_color, marker="x", s=80, linewidths=2.0,
+                   depthshade=False, zorder=12)
+        ax.text(*mu_fused, " fused", zorder=13, bbox=_label_box_kwargs())
 
     if mu_true is not None:
         truth_label = "Truth"
-        ax.scatter(mu_true[0], mu_true[1], mu_true[2], marker="*", s=80, label=truth_label)
-        ax.text(mu_true[0], mu_true[1], mu_true[2], truth_label)
+        ax.scatter(mu_true[0], mu_true[1], mu_true[2], marker="*", s=110, color="k",
+                   edgecolors="white", linewidths=0.8, depthshade=False, zorder=14,
+                   label=truth_label)
+        ax.text(mu_true[0], mu_true[1], mu_true[2], truth_label, zorder=15, bbox=_label_box_kwargs())
 
     ax.set_xlabel("x")
     ax.set_ylabel("y")
@@ -359,8 +360,13 @@ def plot_translation_ellipsoids_3d(
     ax.legend()
     plt.tight_layout()
 
+    if save:
+        _save_figure(fig, "_ellipsoid_3d", dpi=400)
+
     if show:
         plt.show()
+
+    return fig
 
 
 def plot_hessian_eigs(fg, *, eps_t: float | None = None, eps_r: float | None = None,
@@ -398,7 +404,8 @@ def plot_hessian_eigs(fg, *, eps_t: float | None = None, eps_r: float | None = N
 
 
 def plot_world_geometry_topdown(fg, *, show_truth: bool = True, show_lifts: bool = True,
-                                use_opt: bool = True, show: bool = True):
+                                use_opt: bool = True, show: bool = True,
+                                save: bool = False) -> plt.Figure:
     """
     Simple XY top-down geometry sketch:
       - sensor positions (world)
@@ -435,65 +442,71 @@ def plot_world_geometry_topdown(fg, *, show_truth: bool = True, show_lifts: bool
         lifts = [se3_mul(m.sensor.T_w_s, m.T_s_obj) for m in fg.measurements]
     lift_xy = np.asarray([np.asarray(T[:3, 3], dtype=float)[:2] for T in lifts])
 
-    plt.figure()
-    plt.title("Top-down geometry (XY)")
+    fig, ax = plt.subplots()
+    ax.set_title("Top-down geometry (XY)")
 
     # Sensors
-    plt.plot(s_xy[:, 0], s_xy[:, 1], marker="o", linestyle="None", label="Sensors")
+    ax.plot(s_xy[:, 0], s_xy[:, 1], marker="o", linestyle="None", label="Sensors", zorder=3)
     for (x, y), nm in zip(s_xy, names):
-        plt.text(x, y, f" {nm}")
+        ax.text(x, y, f" {nm}", zorder=4, bbox=_label_box_kwargs())
 
     # Estimated
-    plt.plot(est_xy[0], est_xy[1], marker="x", label=("Estimate (opt)" if use_opt else "Estimate (init)"))
-    plt.text(est_xy[0], est_xy[1], " EST")
+    ax.plot(est_xy[0], est_xy[1], marker="x", label=("Estimate (opt)" if use_opt else "Estimate (init)"),
+            zorder=5, markersize=8, markeredgewidth=2.0)
+    ax.text(est_xy[0], est_xy[1], " EST", zorder=6, bbox=_label_box_kwargs())
 
     # Truth
     if true_xy is not None:
-        plt.plot(true_xy[0], true_xy[1], marker="*", label="Truth")
-        plt.text(true_xy[0], true_xy[1], " TRUE")
+        ax.plot(true_xy[0], true_xy[1], marker="*", label="Truth", zorder=7, markersize=10)
+        ax.text(true_xy[0], true_xy[1], " TRUE", zorder=8, bbox=_label_box_kwargs())
 
     # Lifts
     if show_lifts:
-        plt.plot(lift_xy[:, 0], lift_xy[:, 1], marker=".", linestyle="None", label="Per-sensor lifts")
+        ax.plot(lift_xy[:, 0], lift_xy[:, 1], marker=".", linestyle="None", label="Per-sensor lifts", zorder=3)
         for (x, y), nm in zip(lift_xy, names):
-            plt.text(x, y, f" lift({nm})")
+            ax.text(x, y, f" lift({nm})", zorder=4, bbox=_label_box_kwargs())
 
     # Rays to estimate
     for (sx, sy) in s_xy:
-        plt.plot([sx, est_xy[0]], [sy, est_xy[1]], linewidth=1)
+        ax.plot([sx, est_xy[0]], [sy, est_xy[1]], linewidth=1, alpha=0.5, zorder=1)
 
     # Rays to lifts
     if show_lifts:
         for (sx, sy), (lx, ly) in zip(s_xy, lift_xy):
-            plt.plot([sx, lx], [sy, ly], linewidth=1)
+            ax.plot([sx, lx], [sy, ly], linewidth=1, alpha=0.4, zorder=1)
 
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.axis("equal")
-    plt.legend()
-    plt.tight_layout()
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.axis("equal")
+    ax.legend()
+    fig.tight_layout()
+
+    if save:
+        _save_figure(fig, "_topdown")
 
     if show:
         plt.show()
+
+    return fig
 
 
 # -------------
 # Convenience runner: call this after fg.solve(...)
 # -------------
-def plot_all_fg_diagnostics(fg, *, show: bool = False):
+def plot_all_fg_diagnostics(fg, *, show: bool = False, save: bool = False):
     """
     Runs the full plotting suite discussed:
       1) sigma-unit residuals per sensor
       2) per-sensor chi² bar plot
-      3) posterior translation covariance ellipses (XY, XZ, YZ)
+      3) posterior translation covariance ellipsoid (3D)
       4) Hessian eigenvalue spectrum
       5) top-down world geometry (XY)
     """
     plot_sigma_residuals_per_sensor(fg, show=show)
     plot_chi2_per_sensor(fg, show=show)
-    plot_translation_ellipsoids_3d(fg, show=show)
+    plot_translation_ellipsoids_3d(fg, show=show, save=save)
     plot_hessian_eigs(fg, show=show)
-    plot_world_geometry_topdown(fg, show=show)
+    plot_world_geometry_topdown(fg, show=show, save=save)
     if not show:
         plt.show()
 
@@ -773,29 +786,174 @@ def rle_cov(sig_r_lat_el, sig_rot):
 
     def model(meas: Measurement) -> np.ndarray:
         t = np.asarray(meas.T_s_obj[:3, 3], dtype=float)
-        d = float(np.linalg.norm(t))
-        if d < 1e-9:
+        R_s_rle = _rle_basis_in_sensor(t)
+        if R_s_rle is None:
             # Degenerate: fall back to sensor axes
             C_tt_s = np.diag([sig_r**2, sig_lat**2, sig_el**2])
         else:
-            u_r = t / d
-
-            # Choose an "up-ish" reference to define lateral/elevation robustly
-            z_ref = np.array([0.0, 0.0, 1.0], dtype=float)
-            # If u_r is too close to z, use x instead
-            if abs(float(u_r @ z_ref)) > 0.95:
-                z_ref = np.array([1.0, 0.0, 0.0], dtype=float)
-
-            u_lat = np.cross(z_ref, u_r)
-            u_lat /= max(np.linalg.norm(u_lat), 1e-12)
-
-            u_el = np.cross(u_r, u_lat)
-            u_el /= max(np.linalg.norm(u_el), 1e-12)
-
-            R_s_rle = np.column_stack([u_r, u_lat, u_el])  # maps RLE coords -> sensor coords
-
             C_rle = np.diag([sig_r**2, sig_lat**2, sig_el**2])
             C_tt_s = R_s_rle @ C_rle @ R_s_rle.T
+
+        C = np.zeros((6, 6), dtype=float)
+        C[:3, :3] = C_tt_s
+        C[3:, 3:] = np.diag(sig_rot**2)
+        return C
+
+    return model
+
+
+def range_angular_cov(sig_range,
+                      sig_az,
+                      sig_el,
+                      sig_rot,
+                      *,
+                      angle_units: str = "rad",
+                      min_range: float = 1e-6):
+    """
+    Build covariance from one radial std-dev and two angular std-devs.
+
+    Translation is modeled in the same sensor-frame R/L/E basis as ``rle_cov``,
+    but the lateral/elevation components are derived from angular uncertainty:
+
+      sigma_lat ~= range * sigma_az
+      sigma_el  ~= range * sigma_el
+
+    This small-angle approximation is the usual way to convert azimuth/elevation
+    error into cross-range distance error.
+
+    Parameters
+    ----------
+    sig_range : float
+        Radial std-dev in meters.
+    sig_az : float
+        Azimuth std-dev in radians or degrees, controlled by ``angle_units``.
+    sig_el : float
+        Elevation std-dev in radians or degrees, controlled by ``angle_units``.
+    sig_rot : float or array-like, shape (3,)
+        Rodrigues rotation std-dev(s) in radians.
+    angle_units : {"rad", "deg"}
+        Units for ``sig_az`` and ``sig_el``.
+    min_range : float
+        Lower bound used when converting angular uncertainty to cross-range std.
+
+    Returns
+    -------
+    Callable[[Measurement], np.ndarray]
+        Measurement -> (6,6) covariance.
+    """
+    sig_range = float(sig_range)
+    sig_az = float(sig_az)
+    sig_el = float(sig_el)
+    if angle_units == "deg":
+        sig_az = np.deg2rad(sig_az)
+        sig_el = np.deg2rad(sig_el)
+    elif angle_units != "rad":
+        raise ValueError("angle_units must be 'rad' or 'deg'")
+
+    sig_rot = np.array(sig_rot, dtype=float).reshape(-1)
+    if sig_rot.size == 1:
+        sig_rot = np.repeat(sig_rot, 3)
+
+    def model(meas: Measurement) -> np.ndarray:
+        t = np.asarray(meas.T_s_obj[:3, 3], dtype=float)
+        d = max(float(np.linalg.norm(t)), float(min_range))
+
+        sig_lat = d * sig_az
+        sig_el_m = d * sig_el
+
+        R_s_rle = _rle_basis_in_sensor(t)
+        if R_s_rle is None:
+            C_tt_s = np.diag([sig_range**2, sig_lat**2, sig_el_m**2])
+        else:
+            C_rle = np.diag([sig_range**2, sig_lat**2, sig_el_m**2])
+            C_tt_s = R_s_rle @ C_rle @ R_s_rle.T
+
+        C = np.zeros((6, 6), dtype=float)
+        C[:3, :3] = C_tt_s
+        C[3:, 3:] = np.diag(sig_rot**2)
+        return C
+
+    return model
+
+
+def range_az_el_cov(sig_range,
+                    sig_az,
+                    sig_el,
+                    sig_rot,
+                    *,
+                    angle_units: str = "rad",
+                    min_range: float = 1e-6):
+    """
+    Build covariance from range / azimuth / elevation std-devs using Jacobian
+    propagation from spherical coordinates into sensor-frame Cartesian xyz.
+
+    This is more robust than the small-angle ``range_angular_cov`` helper
+    because it evaluates the local geometry at the actual measurement direction.
+
+    Spherical convention used here:
+
+      x = r * cos(el) * cos(az)
+      y = r * cos(el) * sin(az)
+      z = r * sin(el)
+
+    with azimuth in the sensor x-y plane and elevation above that plane.
+
+    Parameters
+    ----------
+    sig_range : float
+        Range std-dev in meters.
+    sig_az : float
+        Azimuth std-dev in radians or degrees, controlled by ``angle_units``.
+    sig_el : float
+        Elevation std-dev in radians or degrees, controlled by ``angle_units``.
+    sig_rot : float or array-like, shape (3,)
+        Rodrigues rotation std-dev(s) in radians.
+    angle_units : {"rad", "deg"}
+        Units for ``sig_az`` and ``sig_el``.
+    min_range : float
+        Lower bound used when the measured range is near zero.
+
+    Returns
+    -------
+    Callable[[Measurement], np.ndarray]
+        Measurement -> (6,6) covariance.
+    """
+    sig_range = float(sig_range)
+    sig_az = float(sig_az)
+    sig_el = float(sig_el)
+    if angle_units == "deg":
+        sig_az = np.deg2rad(sig_az)
+        sig_el = np.deg2rad(sig_el)
+    elif angle_units != "rad":
+        raise ValueError("angle_units must be 'rad' or 'deg'")
+
+    sig_rot = np.array(sig_rot, dtype=float).reshape(-1)
+    if sig_rot.size == 1:
+        sig_rot = np.repeat(sig_rot, 3)
+
+    def model(meas: Measurement) -> np.ndarray:
+        t = np.asarray(meas.T_s_obj[:3, 3], dtype=float).reshape(3)
+        x, y, z = float(t[0]), float(t[1]), float(t[2])
+        r_meas = float(np.linalg.norm(t))
+        r = max(r_meas, float(min_range))
+
+        az = math.atan2(y, x)
+        rho = math.hypot(x, y)
+        el = math.atan2(z, rho)
+
+        cos_az = math.cos(az)
+        sin_az = math.sin(az)
+        cos_el = math.cos(el)
+        sin_el = math.sin(el)
+
+        J = np.array([
+            [cos_el * cos_az, -r * cos_el * sin_az, -r * sin_el * cos_az],
+            [cos_el * sin_az,  r * cos_el * cos_az, -r * sin_el * sin_az],
+            [sin_el,            0.0,                 r * cos_el],
+        ], dtype=float)
+
+        C_sph = np.diag([sig_range**2, sig_az**2, sig_el**2])
+        C_tt_s = J @ C_sph @ J.T
 
         C = np.zeros((6, 6), dtype=float)
         C[:3, :3] = C_tt_s
@@ -880,7 +1038,7 @@ class SensorSpec:
     name: str
     mean_loc_w: np.ndarray  # (3,)
     yaw_deg: float = 0.0  # about world Z, degrees
-    pos_std_s: np.ndarray = None  # (3,) std on translation measurement in sensor frame
+    pos_std_s: np.ndarray = None  # (3,) std on translation measurement in sensor R/L/E basis
     rod_std: np.ndarray = None  # (3,) std on Rodrigues perturbation
     loc_jitter_std: float = 1.0  # std used by rand_position() for sensor placement
 
@@ -920,18 +1078,50 @@ def _true_pose_in_sensor(drg_quat: q,
     return true_q, true_t, true_T
 
 
+def _rle_basis_in_sensor(t_s_obj: np.ndarray) -> np.ndarray | None:
+    """
+    Build the sensor-frame basis whose columns are:
+      - radial: along the measured line of sight
+      - lateral: perpendicular to radial, roughly horizontal
+      - elevation: completes the right-handed triad
+
+    Returns None for a degenerate near-zero translation.
+    """
+    t_s_obj = np.asarray(t_s_obj, dtype=float).reshape(3)
+    d = float(np.linalg.norm(t_s_obj))
+    if d < 1e-9:
+        return None
+
+    u_r = t_s_obj / d
+
+    z_ref = np.array([0.0, 0.0, 1.0], dtype=float)
+    if abs(float(u_r @ z_ref)) > 0.95:
+        z_ref = np.array([1.0, 0.0, 0.0], dtype=float)
+
+    u_lat = np.cross(z_ref, u_r)
+    u_lat /= max(np.linalg.norm(u_lat), 1e-12)
+
+    u_el = np.cross(u_r, u_lat)
+    u_el /= max(np.linalg.norm(u_el), 1e-12)
+    return np.column_stack([u_r, u_lat, u_el])
+
+
 def _noisy_measurement_from_true(true_q: q,
                                  true_t: np.ndarray,
                                  pos_std: np.ndarray,
                                  rod_std: np.ndarray) -> np.ndarray:
     """
-    Apply noise in the same style as your current code:
+    Apply noise in the same style as the covariance model:
       - rotation: perturb_from_rodrigues_std(rod_std)
-      - translation: add pos_std * randn
+      - translation: sample in the sensor R/L/E basis and rotate into sensor xyz
     Returns T_s_drg_meas (4x4).
     """
     est_q = true_q.perturb_from_rodrigues_std(rod_std)
-    est_t = true_t + pos_std * np.random.randn(3)
+    pos_std = np.asarray(pos_std, dtype=float).reshape(3)
+    delta_rle = pos_std * np.random.randn(3)
+    R_s_rle = _rle_basis_in_sensor(true_t)
+    delta_t_s = delta_rle if R_s_rle is None else R_s_rle @ delta_rle
+    est_t = true_t + delta_t_s
     return est_q.to_SE3_given_position(est_t)
 
 
@@ -1009,10 +1199,27 @@ class StaticFGMeasurementMelding:
         self._diagnostics = {}
         self.measurements = measurements
         self._validate_input()
-        self.W = [chol_whitener(m.covariance()) for m in self.measurements]
 
     def _set_diag(self, **kwargs):
         self._diagnostics.update(kwargs)
+
+    def _predicted_measurement(self, m: Measurement, T_w_obj: np.ndarray) -> np.ndarray:
+        return se3_mul(se3_inv(m.sensor.T_w_s), T_w_obj)
+
+    def _factor_covariance(self, m: Measurement, T_w_obj: np.ndarray | None = None) -> np.ndarray:
+        if T_w_obj is None:
+            C = m.covariance()
+        else:
+            T_s_obj_ref = self._predicted_measurement(m, T_w_obj)
+            m_ref = Measurement(sensor=m.sensor, T_s_obj=T_s_obj_ref, meta=m.meta)
+            C = m_ref.covariance()
+        C = np.asarray(C, dtype=float)
+        if C.shape != (6, 6):
+            raise ValueError("Covariance must be (6,6)")
+        return C
+
+    def _factor_whitener(self, m: Measurement, T_w_obj: np.ndarray | None = None) -> np.ndarray:
+        return chol_whitener(self._factor_covariance(m, T_w_obj))
 
     def _validate_input(self):
         if not self.measurements:
@@ -1076,7 +1283,7 @@ class StaticFGMeasurementMelding:
             T_opt,
             eps_t=lm_kwargs.get("eps_t", 1e-4),
             eps_r=lm_kwargs.get("eps_r", 1e-5),
-            scale_by_reduced_chi2=True,
+            scale_by_reduced_chi2=False,
             damping=0.0,
         )
 
@@ -1122,7 +1329,12 @@ class StaticFGMeasurementMelding:
         r = self._stacked_whitened_residual(T_w_drg_opt)  # (m,)
         m = int(r.size)
 
-        J = self.numeric_jacobian(T_w_drg_opt, eps_t=eps_t, eps_r=eps_r)  # (m,6)
+        J = self.numeric_jacobian(
+            T_w_drg_opt,
+            eps_t=eps_t,
+            eps_r=eps_r,
+            freeze_whiteners=True,
+        )
         H = J.T @ J
 
         if damping > 0.0:
@@ -1307,7 +1519,7 @@ class StaticFGMeasurementMelding:
                 print(f"  ||dtheta|| = {dth_pm:.6f} rad")
 
                 try:
-                    W = self.W[i]
+                    W = self._factor_whitener(m, T_opt)
                     rw_pm = W @ r_pm
                     print(f"  ||W*r||    = {float(np.linalg.norm(rw_pm)):.6f}")
                 except (IndexError, ValueError, AttributeError):
@@ -1348,7 +1560,7 @@ class StaticFGMeasurementMelding:
                     print(f"  max|r| = {float(np.max(np.abs(r_pt))):.3f}")
 
             # Covariance + whitener sanity
-            C = m.covariance()
+            C = self._factor_covariance(m, T_opt if T_opt is not None else None)
             print("\nCovariance C (6x6):")
             print(C)
 
@@ -1370,13 +1582,14 @@ class StaticFGMeasurementMelding:
             print("Per-factor residual norms (raw + whitened)")
             print(sep)
 
-            for i, (m, W) in enumerate(zip(self.measurements, self.W)):
+            for i, m in enumerate(self.measurements):
                 print("\n" + sub)
                 print(f"[{i + 1}] {m.sensor.name}")
                 print(sub)
 
                 if T_init is not None:
                     r0 = _factor_residual(m, T_init)
+                    W = self._factor_whitener(m, T_init)
                     rw0 = W @ r0
                     print("Init:")
                     print(
@@ -1385,6 +1598,7 @@ class StaticFGMeasurementMelding:
 
                 if T_opt is not None:
                     r1 = _factor_residual(m, T_opt)
+                    W = self._factor_whitener(m, T_opt)
                     rw1 = W @ r1
                     print("Opt:")
                     print(
@@ -1447,10 +1661,10 @@ class StaticFGMeasurementMelding:
 
     def _stacked_whitened_residual(self, T_w_obj):
         chunks = []
-        for m, W in zip(self.measurements, self.W):
-            T_w_s = m.sensor.T_w_s
-            pred = se3_mul(se3_inv(T_w_s), T_w_obj)  # T_s_obj_pred
+        for m in self.measurements:
+            pred = self._predicted_measurement(m, T_w_obj)
             r = se3_residual(pred, m.T_s_obj)
+            W = self._factor_whitener(m, T_w_obj)
             chunks.append(W @ r)
         return np.hstack(chunks)
 
@@ -1458,35 +1672,57 @@ class StaticFGMeasurementMelding:
     def _cost(r_w: NDArray[np.float64]) -> float:
         return 0.5 * float(r_w @ r_w)
 
-    def numeric_jacobian(self, T_w_drg: np.ndarray, eps_t: float = 1e-4, eps_r: float = 1e-5) -> np.ndarray:
-        """
-        Numerical Jacobian of the stacked, whitened residual r(T) w.r.t. a 6D se(3) perturbation.
+    def _stacked_whitened_residual_with_fixed_whiteners(
+            self,
+            T_w_obj: np.ndarray,
+            W_list: list[np.ndarray],
+    ) -> np.ndarray:
+        chunks = []
+        for m, W in zip(self.measurements, W_list):
+            pred = self._predicted_measurement(m, T_w_obj)
+            r = se3_residual(pred, m.T_s_obj)
+            chunks.append(W @ r)
+        return np.hstack(chunks)
 
-        delta = [dt_x, dt_y, dt_z, dtheta_x, dtheta_y, dtheta_z]
-          - translation perturbed with eps_t (meters)
-          - rotation perturbed with eps_r (radians)
-
-        Returns:
-            J: (m x 6) where m is total residual length (e.g., 12 for 2 factors).
+    def numeric_jacobian(
+            self,
+            T_w_drg: np.ndarray,
+            eps_t: float = 1e-4,
+            eps_r: float = 1e-5,
+            freeze_whiteners: bool = False,
+    ) -> np.ndarray:
         """
-        r0 = self._stacked_whitened_residual(T_w_drg)  # shape (m,)
+        Numerical Jacobian of the stacked whitened residual.
+
+        If freeze_whiteners=True, whitening matrices are evaluated once at
+        T_w_drg and held fixed during finite differencing. This is usually the
+        preferred mode for posterior covariance estimation.
+        """
+        if freeze_whiteners:
+            W_ref = [self._factor_whitener(m, T_w_drg) for m in self.measurements]
+
+            def residual_at(T):
+                return self._stacked_whitened_residual_with_fixed_whiteners(T, W_ref)
+        else:
+            def residual_at(T):
+                return self._stacked_whitened_residual(T)
+
+        r0 = residual_at(T_w_drg)
         m = r0.size
         J = np.zeros((m, 6), dtype=float)
 
-        # Translation columns
         for i in range(3):
             d = np.zeros(6, dtype=float)
             d[i] = eps_t
             Tp = se3_perturb_left(T_w_drg, d)
-            rp = self._stacked_whitened_residual(Tp)
+            rp = residual_at(Tp)
             J[:, i] = (rp - r0) / eps_t
 
-        # Rotation columns
         for i in range(3):
             d = np.zeros(6, dtype=float)
             d[3 + i] = eps_r
             Tp = se3_perturb_left(T_w_drg, d)
-            rp = self._stacked_whitened_residual(Tp)
+            rp = residual_at(Tp)
             J[:, 3 + i] = (rp - r0) / eps_r
 
         return J
@@ -1500,18 +1736,26 @@ class StaticFGMeasurementMelding:
         # ---- translation info-weighted mean ----
         Wsum = np.zeros((3, 3), dtype=float)
         bsum = np.zeros(3, dtype=float)
+
         for m, T_w_obj in zip(self.measurements, lifts):
-            C = m.covariance()
-            Wi = np.linalg.inv(C[:3, :3])  # translation information
-            ti = T_w_obj[:3, 3]
-            Wsum += Wi
-            bsum += Wi @ ti
+            C_s = self._factor_covariance(m, T_w_obj)
+            C_tt_s = C_s[:3, :3]
+
+            R_w_s = m.sensor.T_w_s[:3, :3]
+            C_tt_w = R_w_s @ C_tt_s @ R_w_s.T
+
+            Wi_w = np.linalg.inv(C_tt_w)
+            ti_w = T_w_obj[:3, 3]
+
+            Wsum += Wi_w
+            bsum += Wi_w @ ti_w
+
         t0 = np.linalg.solve(Wsum, bsum)
 
         # ---- rotation chordal mean + projection ----
         M = np.zeros((3, 3), dtype=float)
         for m, T_w_obj in zip(self.measurements, lifts):
-            C = m.covariance()
+            C = self._factor_covariance(m, T_w_obj)
             Ri = T_w_obj[:3, :3]
             wi = 1.0 / float(np.clip(np.trace(C[3:6, 3:6]), 1e-12, np.inf))
             M += wi * Ri
@@ -1733,7 +1977,119 @@ def run_test(randomize: bool = False):
 
     fg.solve(max_iters=25, verbose_lm=True, eps_t=1e-5, eps_r=1e-5)
     fg.print_summary()
-    plot_all_fg_diagnostics(fg)
+    plot_all_fg_diagnostics(fg, save=True)
+
+
+def _mahalanobis_sq(x: np.ndarray, C: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    C = np.asarray(C, dtype=float)
+    try:
+        y = np.linalg.solve(C, x)
+    except np.linalg.LinAlgError:
+        y = np.linalg.pinv(C) @ x
+    return float(x @ y)
+
+
+def run_monte_carlo(
+        n_runs: int = 1000,
+        *,
+        nsig: float = 2.795,
+        seed: int = 1,
+        plot_example: bool = False,
+        verbose_every: int = 100,
+):
+    """
+    Run repeated randomized trials and check whether the true world translation
+    falls inside the fused translation covariance ellipsoid.
+
+    Containment test:
+        (t_true - t_hat)^T C_tt^{-1} (t_true - t_hat) <= nsig^2
+
+    For a calibrated 3D Gaussian covariance, nsig ~= 2.795 corresponds to
+    about 95% containment.
+    """
+    np.random.seed(seed)
+
+    threshold = float(nsig ** 2)
+    contain_count = 0
+    nees_vals = []
+    lm_converged = 0
+    final_costs = []
+    worst_md2 = -np.inf
+    worst_fg = None
+
+    for k in range(n_runs):
+        true_drg_pose, meas, truth = test_values(randomize=True)
+        true_eo_drgPose, true_lr_drgPose, true_mw_drgPose = truth
+
+        fg = StaticFGMeasurementMelding(meas)
+        fg.T_w_obj_true = true_drg_pose
+        fg.T_s_obj_true_by_sensor = {
+            "EO": true_eo_drgPose,
+            "LR": true_lr_drgPose,
+            "MW": true_mw_drgPose,
+        }
+
+        T_opt, info = fg.solve(max_iters=25, verbose_lm=False, eps_t=1e-5, eps_r=1e-5)
+
+        d = getattr(fg, "_diagnostics", {}) or {}
+        cov6 = np.asarray(d["cov6"], dtype=float)
+        C_tt = cov6[:3, :3]
+
+        t_hat = np.asarray(T_opt[:3, 3], dtype=float)
+        t_true = np.asarray(true_drg_pose[:3, 3], dtype=float)
+        err_t = t_true - t_hat
+        md2 = _mahalanobis_sq(err_t, C_tt)
+
+        nees_vals.append(md2)
+        final_costs.append(float(info.get("final_cost", np.nan)))
+        lm_converged += int(bool(info.get("converged", False)))
+
+        if md2 <= threshold:
+            contain_count += 1
+
+        if md2 > worst_md2:
+            worst_md2 = md2
+            worst_fg = fg
+
+        if verbose_every and ((k + 1) % verbose_every == 0 or (k + 1) == n_runs):
+            print(f"[MC] {k + 1}/{n_runs} runs complete")
+
+    containment = contain_count / float(n_runs)
+    nees_vals = np.asarray(nees_vals, dtype=float)
+    final_costs = np.asarray(final_costs, dtype=float)
+
+    print("\n" + "=" * 96)
+    print(f"Monte Carlo containment check ({n_runs} runs)")
+    print("=" * 96)
+    print(f"Containment threshold: md^2 <= {threshold:.6f}  (k = {nsig:.3f})")
+    print(f"Expected containment for calibrated 3D Gaussian: about 0.95")
+    print(f"Observed containment: {containment:.4f}  ({contain_count}/{n_runs})")
+    print(f"Translation NEES mean (expected ~= 3.0): {float(np.mean(nees_vals)):.4f}")
+    print(f"Translation NEES median: {float(np.median(nees_vals)):.4f}")
+    print(f"Translation NEES 95th pct: {float(np.percentile(nees_vals, 95.0)):.4f}")
+    print(f"LM converged: {lm_converged}/{n_runs} = {lm_converged / float(n_runs):.4f}")
+    print(f"Final cost mean: {float(np.nanmean(final_costs)):.6f}")
+    print(f"Worst translation md^2: {worst_md2:.4f}")
+    print("=" * 96)
+
+    if plot_example and worst_fg is not None:
+        worst_fg.print_summary()
+        plot_all_fg_diagnostics(worst_fg, show=True)
+
+    return {
+        "n_runs": n_runs,
+        "nsig": nsig,
+        "threshold": threshold,
+        "containment": containment,
+        "contain_count": contain_count,
+        "mean_nees_t": float(np.mean(nees_vals)),
+        "median_nees_t": float(np.median(nees_vals)),
+        "p95_nees_t": float(np.percentile(nees_vals, 95.0)),
+        "lm_converged_rate": lm_converged / float(n_runs),
+        "final_cost_mean": float(np.nanmean(final_costs)),
+        "worst_md2": float(worst_md2),
+    }
 
 
 def const_cov(C6x6: np.ndarray):
@@ -1769,9 +2125,12 @@ def inv_distance_cov(a_t, b_t, a_r, b_r, eps=1e-6):
     return model
 
 
-def main(test: bool = True) -> None:
+def main(test: bool = True, monte_carlo_runs: int = 1000) -> None:
     if test:
-        run_test(randomize=True)
+        if monte_carlo_runs > 1:
+            run_monte_carlo(n_runs=monte_carlo_runs, nsig=2.795, seed=1, plot_example=False, verbose_every=100)
+        else:
+            run_test(randomize=True)
         return
 
     # Example usage for your own data:
@@ -1787,6 +2146,14 @@ def main(test: bool = True) -> None:
                                            b_t=np.array([3.0, 2.0, 2.0]),
                                            a_r=np.array([0.05, 0.01, 0.01]),
                                            b_r=np.array([0.01, 0.01, 0.01])))
+
+    # Example for angle-driven translation specs:
+    # eo = Sensor("EO", T_w_s=eo_camPose,
+    #             cov_model=range_az_el_cov(sig_range=0.5,
+    #                                       sig_az=1.0,
+    #                                       sig_el=1.0,
+    #                                       sig_rot=np.array([0.05, 0.02, 0.02]),
+    #                                       angle_units="deg"))
 
     lr_camPose = np.eye(4)
     lr_camPose[:3, 3] = np.array([0.0, -3.0, 3.0])
@@ -1811,8 +2178,8 @@ def main(test: bool = True) -> None:
 
     fg.solve(max_iters=25, verbose_lm=True, eps_t=1e-4, eps_r=1e-5)
     fg.print_summary()
-    plot_all_fg_diagnostics(fg)
+    plot_all_fg_diagnostics(fg, save=True)
 
 
 if __name__ == '__main__':
-    main(test=True)
+    main(test=True, monte_carlo_runs=1)

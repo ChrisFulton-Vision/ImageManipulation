@@ -351,9 +351,14 @@ def save_demo_video(anim: FuncAnimation) -> Path:
     return output_path
 
 
+def configure_figure_layout(fig: plt.Figure) -> None:
+    fig.set_size_inches(12.0, 7.0, forward=True)
+    fig.subplots_adjust(left=0.10, right=0.72, bottom=0.10, top=0.90)
+
+
 def main() -> None:
-    fig, ax = plt.subplots()
-    fig.subplots_adjust(right=0.72)
+    fig, ax = plt.subplots(figsize=(12.0, 7.0))
+    configure_figure_layout(fig)
 
     stored_SE2, create_y_func = factor_graph()
     _, opt_res_mag = stored_SE2[-1]
@@ -480,6 +485,7 @@ def main() -> None:
         ]
 
     update(0)
+    configure_figure_layout(fig)
     fig.canvas.draw()
     snapshot_path = save_demo_snapshot(fig, "_initial")
     print(f"Saved initial snapshot to: {snapshot_path}")

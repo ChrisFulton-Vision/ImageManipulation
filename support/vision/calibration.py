@@ -237,32 +237,49 @@ class Calibration:
         if not hasattr(self, "scale"):
             self.scale = 1.0
 
-        if self._validMat_cache:
-            fx = self.scale * self.fx
-            fy = self.scale * self.fy
-            cx = self.scale * (self.cx + 0.5) - 0.5
-            cy = self.scale * (self.cy + 0.5) - 0.5
-            return np.array([[1.0 / fx, 0.0, -cx / fx],
-                             [0.0, 1.0 / fy, -cy / fy],
-                             [0.0, 0.0, 1.0]])
+        if not self._validCal_cache:
+            self._validCal_cache = self._compute_validCal()
+            if not self._validCal_cache:
+                return None
 
-        return None
+        if not self._validMat_cache:
+            self._validMat_cache = self._compute_validMat()
+            if not self._validMat_cache:
+                return None
+
+        fx = self.scale * self.fx
+        fy = self.scale * self.fy
+        cx = self.scale * (self.cx + 0.5) - 0.5
+        cy = self.scale * (self.cy + 0.5) - 0.5
+        return np.array([[1.0 / fx, 0.0, -cx / fx],
+                         [0.0, 1.0 / fy, -cy / fy],
+                         [0.0, 0.0, 1.0]])
 
     def getCameraMatrix(self):
         # Included for backwards compatibility
         if not hasattr(self, "scale"):
             self.scale = 1.0
 
-        if self._validMat_cache:
-            fx = self.scale * self.fx
-            fy = self.scale * self.fy
-            cx = self.scale * (self.cx + 0.5) - 0.5
-            cy = self.scale * (self.cy + 0.5) - 0.5
-            return np.array([[fx, 0.0, cx],
-                             [0.0, fy, cy],
-                             [0.0, 0.0, 1.0]])
+        if not self._validCal_cache:
+            self._validCal_cache = self._compute_validCal()
+            if not self._validCal_cache:
+                return None
 
-        return None
+        if not self._validMat_cache:
+            self._validMat_cache = self._compute_validMat()
+            if not self._validMat_cache:
+                return None
+
+        if not self._validMat_cache:
+            self._compute_validMat()
+
+        fx = self.scale * self.fx
+        fy = self.scale * self.fy
+        cx = self.scale * (self.cx + 0.5) - 0.5
+        cy = self.scale * (self.cy + 0.5) - 0.5
+        return np.array([[fx, 0.0, cx],
+                         [0.0, fy, cy],
+                         [0.0, 0.0, 1.0]])
 
     def setDistortion(self, dist=None, k1=None, k2=None, p1=None, p2=None, k3=None):
         if dist is not None and self.fisheye:
@@ -683,7 +700,7 @@ class Calibration:
 
         return nx * L + dx, ny * L + dy
 
-    def distort_point(self, pixel):
+    def distort_point(self, pixel) -> None:
         """
         Numba-accelerated version of distort_point.
 

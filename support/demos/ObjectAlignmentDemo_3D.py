@@ -8,7 +8,7 @@ from mpl_toolkits.mplot3d import proj3d
 LENGTH = 2
 WIDTH = 2
 HEIGHT = 5
-TAPER_SCALE = 1.2
+TAPER_SCALE = 1.
 
 N_FRAMES = 180
 FRAME_INTERVAL_MS = 40
@@ -281,8 +281,14 @@ def save_demo_video(anim: FuncAnimation) -> Path:
     return output_path
 
 
+def configure_figure_layout(fig: plt.Figure) -> None:
+    fig.set_size_inches(12.0, 7.0, forward=True)
+    fig.subplots_adjust(left=0.08, right=0.72, bottom=0.10, top=0.90)
+
+
 def main():
-    fig = plt.figure()
+    fig = plt.figure(figsize=(12.0, 7.0))
+    configure_figure_layout(fig)
     ax = fig.add_subplot(111, projection="3d")
 
 
@@ -424,8 +430,6 @@ def main():
             f"Trans-Error: {np.linalg.norm(error_SE3.tvec):8.3f}"
         )
 
-        plt.tight_layout()
-
         return [
             meas_artists["scatter"],
             state_artists["scatter"],
@@ -442,6 +446,7 @@ def main():
         ]
 
     update(0)
+    configure_figure_layout(fig)
     fig.canvas.draw()
     snapshot_path = save_demo_snapshot(fig, "_initial")
     print(f"Saved initial snapshot to: {snapshot_path}")
@@ -456,8 +461,6 @@ def main():
 
     video_path = save_demo_video(anim)
     print(f"Saved video to: {video_path}")
-
-    plt.tight_layout()
     plt.show()
 
 

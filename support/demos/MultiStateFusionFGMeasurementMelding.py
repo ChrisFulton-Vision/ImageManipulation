@@ -2,27 +2,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
 import matplotlib.pyplot as plt
 
-# Uses your existing Quaternion helper for synthetic data generation only.
-# If you don't have support.mathHelpers.quaternions in a given environment,
-# you can still use the fusion core by providing real SE(3) measurements.
-# Uses your existing Quaternion helper for synthetic data generation only.
-# If you don't have support.mathHelpers.quaternions available, you can still use the fusion core
-# by providing real SE(3) measurements and avoiding the synthetic test harness.
-try:
-    from support.mathHelpers.quaternions import Quaternion as q, random_quat_within_deg, from_SE3, mats2quats, \
+from support.mathHelpers.quaternions import Quaternion as q, random_quat_within_deg, from_SE3, mats2quats, \
         se3s2quats
-except Exception:  # pragma: no cover
-    q = None
-
-
-    def random_quat_within_deg(*args, **kwargs):
-        raise ImportError("support.mathHelpers.quaternions not found; synthetic test harness is unavailable.")
 
 np.set_printoptions(suppress=True, precision=6)
 
@@ -61,6 +49,17 @@ def quat_and_t_from_SE3(T: np.ndarray) -> Tuple["q", np.ndarray]:
         qq, tt = res
         return qq, np.asarray(tt, dtype=float).reshape(3)
     return res, np.asarray(T[:3, 3], dtype=float).reshape(3)
+
+
+def _default_plot_path(stem_suffix: str) -> Path:
+    return Path(__file__).with_name(f"{Path(__file__).stem}{stem_suffix}.pdf")
+
+
+def _save_figure(fig: plt.Figure, stem_suffix: str, *, dpi: int = 400) -> Path:
+    output_path = _default_plot_path(stem_suffix)
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    print(f"Saved figure to: {output_path}")
+    return output_path
 
 
 # =============================================================================
@@ -292,6 +291,134 @@ def rle_cov(sig_r_lat_el, sig_rot):
             R_s_rle = np.column_stack([u_r, u_lat, u_el])
             C_rle = np.diag([sig_r ** 2, sig_lat ** 2, sig_el ** 2])
             C_tt_s = R_s_rle @ C_rle @ R_s_rle.T
+
+        C = np.zeros((6, 6), dtype=float)
+        C[:3, :3] = C_tt_s
+        C[3:, 3:] = np.diag(sig_rot ** 2)
+        return C
+
+    return model
+
+
+def range_angular_cov(sig_range,
+                      sig_az,
+                      sig_el,
+                      sig_rot,
+                      *,
+                      angle_units: str = "rad",
+                      min_range: float = 1e-6):
+    """
+    Build covariance from one radial std-dev and two angular std-devs.
+
+    Translation is modeled in the same sensor-frame R/L/E basis as ``rle_cov``,
+    but the lateral/elevation components are derived from angular uncertainty:
+
+      sigma_lat ~= range * sigma_az
+      sigma_el  ~= range * sigma_el
+
+    This is the small-angle approximation for converting azimuth/elevation
+    error into cross-range distance error.
+    """
+    sig_range = float(sig_range)
+    sig_az = float(sig_az)
+    sig_el = float(sig_el)
+    if angle_units == "deg":
+        sig_az = np.deg2rad(sig_az)
+        sig_el = np.deg2rad(sig_el)
+    elif angle_units != "rad":
+        raise ValueError("angle_units must be 'rad' or 'deg'")
+
+    sig_rot = np.array(sig_rot, dtype=float).reshape(-1)
+    if sig_rot.size == 1:
+        sig_rot = np.repeat(sig_rot, 3)
+
+    def model(meas: TimedMeasurement) -> np.ndarray:
+        t = np.asarray(meas.T_s_obj[:3, 3], dtype=float)
+        d = max(float(np.linalg.norm(t)), float(min_range))
+
+        sig_lat = d * sig_az
+        sig_el_m = d * sig_el
+
+        if float(np.linalg.norm(t)) < 1e-9:
+            C_tt_s = np.diag([sig_range ** 2, sig_lat ** 2, sig_el_m ** 2])
+        else:
+            u_r = t / float(np.linalg.norm(t))
+
+            z_ref = np.array([0.0, 0.0, 1.0], dtype=float)
+            if abs(float(u_r @ z_ref)) > 0.95:
+                z_ref = np.array([1.0, 0.0, 0.0], dtype=float)
+
+            u_lat = np.cross(z_ref, u_r)
+            u_lat /= max(np.linalg.norm(u_lat), 1e-12)
+
+            u_el = np.cross(u_r, u_lat)
+            u_el /= max(np.linalg.norm(u_el), 1e-12)
+
+            R_s_rle = np.column_stack([u_r, u_lat, u_el])
+            C_rle = np.diag([sig_range ** 2, sig_lat ** 2, sig_el_m ** 2])
+            C_tt_s = R_s_rle @ C_rle @ R_s_rle.T
+
+        C = np.zeros((6, 6), dtype=float)
+        C[:3, :3] = C_tt_s
+        C[3:, 3:] = np.diag(sig_rot ** 2)
+        return C
+
+    return model
+
+
+def range_az_el_cov(sig_range,
+                    sig_az,
+                    sig_el,
+                    sig_rot,
+                    *,
+                    angle_units: str = "rad",
+                    min_range: float = 1e-6):
+    """
+    Build covariance from range / azimuth / elevation std-devs using Jacobian
+    propagation from spherical coordinates into sensor-frame Cartesian xyz.
+
+    Spherical convention used here:
+
+      x = r * cos(el) * cos(az)
+      y = r * cos(el) * sin(az)
+      z = r * sin(el)
+    """
+    sig_range = float(sig_range)
+    sig_az = float(sig_az)
+    sig_el = float(sig_el)
+    if angle_units == "deg":
+        sig_az = np.deg2rad(sig_az)
+        sig_el = np.deg2rad(sig_el)
+    elif angle_units != "rad":
+        raise ValueError("angle_units must be 'rad' or 'deg'")
+
+    sig_rot = np.array(sig_rot, dtype=float).reshape(-1)
+    if sig_rot.size == 1:
+        sig_rot = np.repeat(sig_rot, 3)
+
+    def model(meas: TimedMeasurement) -> np.ndarray:
+        t = np.asarray(meas.T_s_obj[:3, 3], dtype=float).reshape(3)
+        x, y, z = float(t[0]), float(t[1]), float(t[2])
+        r_meas = float(np.linalg.norm(t))
+        r = max(r_meas, float(min_range))
+
+        az = math.atan2(y, x)
+        rho = math.hypot(x, y)
+        el = math.atan2(z, rho)
+
+        cos_az = math.cos(az)
+        sin_az = math.sin(az)
+        cos_el = math.cos(el)
+        sin_el = math.sin(el)
+
+        J = np.array([
+            [cos_el * cos_az, -r * cos_el * sin_az, -r * sin_el * cos_az],
+            [cos_el * sin_az,  r * cos_el * cos_az, -r * sin_el * sin_az],
+            [sin_el,            0.0,                 r * cos_el],
+        ], dtype=float)
+
+        C_sph = np.diag([sig_range ** 2, sig_az ** 2, sig_el ** 2])
+        C_tt_s = J @ C_sph @ J.T
 
         C = np.zeros((6, 6), dtype=float)
         C[:3, :3] = C_tt_s
@@ -954,15 +1081,14 @@ def animate_trajectory_3d_loop(
     allp = np.vstack(pts)
     mins = allp.min(axis=0)
     maxs = allp.max(axis=0)
-    span = np.maximum(maxs - mins, 1e-6)
-    pad = 0.08 * span
+    center = 0.5 * (mins + maxs)
+    radius = 0.55 * float(np.max(np.maximum(maxs - mins, 1e-6)))
+    radius = max(radius, 1.0)
 
-    ax.set_xlim(mins[0] - pad[0], maxs[0] + pad[0])
-    ax.set_ylim(mins[1] - pad[1], maxs[1] + pad[1])
-    ax.set_zlim(mins[2] - pad[2], maxs[2] + pad[2])
-    ax.set_xlim([32.5, 55.0])
-    ax.set_ylim([7.5, 13.0])
-    ax.set_zlim([12.0, 35.0])
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1.0, 1.0, 1.0))
 
     # Artists
     (line_est,) = ax.plot([], [], [], linewidth=2, label="estimate")
@@ -1121,7 +1247,8 @@ def animate_trajectory_3d_loop(
 def plot_trajectory_3d(fg: MultiStateFusionFGMeasurementMelding,
                        *,
                        T_true_list: List[np.ndarray] | None = None,
-                       show: bool = True) -> None:
+                       show: bool = True,
+                       save: bool = False) -> plt.Figure:
     """
     3D plot:
       - fused trajectory (line)
@@ -1131,16 +1258,15 @@ def plot_trajectory_3d(fg: MultiStateFusionFGMeasurementMelding,
     t_meas, names, pos_meas = fg.lifted_measurements_world()
     pos_est, _ = fg.get_estimated_trajectory()
 
-    fig = plt.figure()
+    fig = plt.figure(figsize=(8.6, 6.2))
     ax = fig.add_subplot(111, projection="3d")
-    ax.set_title("Trajectory (world)")
 
-    ax.plot(pos_est[:, 0], pos_est[:, 1], pos_est[:, 2], linewidth=2, label="estimate")
+    ax.plot(pos_est[:, 0], pos_est[:, 1], pos_est[:, 2], linewidth=2.4, label="Estimate")
 
     # --- Sensor locations (static) ---
     sensor_names, sensor_pos = fg.sensor_positions_world()
     ax.scatter(sensor_pos[:, 0], sensor_pos[:, 1], sensor_pos[:, 2],
-               marker="*", s=180, alpha=0.9, label="sensors")
+               marker="*", s=120, alpha=0.95, label="Sensors")
 
     # Optional: label each one
     for nm, p in zip(sensor_names, sensor_pos):
@@ -1152,26 +1278,46 @@ def plot_trajectory_3d(fg: MultiStateFusionFGMeasurementMelding,
     for si, nm in enumerate(unique):
         idx = [i for i, n in enumerate(names) if n == nm]
         p = pos_meas[idx, :]
-        ax.scatter(p[:, 0], p[:, 1], p[:, 2], marker=markers[si % len(markers)], label=f"{nm} lifts")
+        ax.scatter(p[:, 0], p[:, 1], p[:, 2], marker=markers[si % len(markers)],
+                   s=18, alpha=0.75, label=f"{nm} measurements")
 
     if T_true_list is not None:
         pos_true = np.stack([T[:3, 3] for T in T_true_list], axis=0)
-        ax.plot(pos_true[:, 0], pos_true[:, 1], pos_true[:, 2], linewidth=2, linestyle="--", label="truth")
+        ax.plot(pos_true[:, 0], pos_true[:, 1], pos_true[:, 2],
+                linewidth=2.0, linestyle="--", label="Truth")
+
+    all_pos = [pos_est, sensor_pos, pos_meas]
+    if T_true_list is not None:
+        all_pos.append(pos_true)
+    bounds = np.vstack(all_pos)
+    mins = bounds.min(axis=0)
+    maxs = bounds.max(axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.55 * float(np.max(maxs - mins))
+    radius = max(radius, 1.0)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1.0, 1.0, 0.8))
 
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_zlabel("z")
-    ax.legend()
-    plt.tight_layout()
+    ax.legend(loc="best", fontsize=9, frameon=True)
+    fig.tight_layout()
+    if save:
+        _save_figure(fig, "_trajectory_3d")
     if show:
         plt.show()
+    return fig
 
 
 def plot_position_vs_time(
         fg: MultiStateFusionFGMeasurementMelding,
         *,
         T_true_list: List[np.ndarray] | None = None,
-        show: bool = True) -> None:
+        show: bool = True,
+        save: bool = False) -> plt.Figure:
     """
     Position components vs time for estimate, optional truth,
     and all lifted measurements (world frame).
@@ -1186,8 +1332,7 @@ def plot_position_vs_time(
     uniq = sorted(set(meas_names))
     markers = ["o", "^", "s", "d", "x", "+", "v", "<", ">"]
 
-    fig, axes = plt.subplots(3, 1, sharex=True)
-    fig.suptitle("Position vs time")
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(8.6, 7.2))
 
     labels = ["x", "y", "z"]
 
@@ -1195,12 +1340,12 @@ def plot_position_vs_time(
         ax = axes[i]
 
         # --- Estimate line ---
-        ax.plot(t_state, pos_est[:, i], label=f"{labels[i]} est")
+        ax.plot(t_state, pos_est[:, i], linewidth=2.1, label=f"{labels[i]} estimate")
 
         # --- Truth (optional) ---
         if T_true_list is not None:
             pos_true = np.stack([T[:3, 3] for T in T_true_list], axis=0)
-            ax.plot(t_state, pos_true[:, i], linestyle="--", label=f"{labels[i]} true")
+            ax.plot(t_state, pos_true[:, i], linewidth=1.8, linestyle="--", label=f"{labels[i]} truth")
 
         # --- Measurements (scatter by sensor) ---
         for si, nm in enumerate(uniq):
@@ -1211,34 +1356,38 @@ def plot_position_vs_time(
                 t_meas[idx],
                 pos_meas[idx, i],
                 marker=markers[si % len(markers)],
-                s=18,
+                s=20,
                 alpha=0.7,
                 label=f"{labels[i]} {nm} meas"
             )
 
-        ax.set_ylabel(labels[i])
-        ax.grid(True)
+        ax.set_ylabel(f"{labels[i]} [m]")
+        ax.grid(True, alpha=0.25, linewidth=0.8)
 
-    axes[-1].set_xlabel("t")
+    axes[-1].set_xlabel("Time [s]")
 
     # Avoid legend explosion: only show one combined legend
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right")
-
-    plt.tight_layout()
+    fig.legend(handles, labels, loc="upper center", ncol=min(len(handles), 4), frameon=True,
+               bbox_to_anchor=(0.5, 0.995))
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    if save:
+        _save_figure(fig, "_position_vs_time")
     if show:
         plt.show()
+    return fig
 
 
 def plot_orientation_error_vs_time(fg: MultiStateFusionFGMeasurementMelding,
                                    *,
                                    T_true_list: List[np.ndarray] | None = None,
-                                   show: bool = True) -> None:
+                                   show: bool = True,
+                                   save: bool = False) -> plt.Figure | None:
     """
     Orientation error angle (rad) vs time (if truth provided).
     """
     if T_true_list is None:
-        return
+        return None
     _, R_est = fg.get_estimated_trajectory()
     t = fg.times
 
@@ -1249,14 +1398,17 @@ def plot_orientation_error_vs_time(fg: MultiStateFusionFGMeasurementMelding,
         ang.append(_angle_from_R(dR))
     ang = np.array(ang, dtype=float)
 
-    plt.figure()
-    plt.title("Orientation error vs time")
-    plt.plot(t, ang)
-    plt.xlabel("t")
-    plt.ylabel("angle error (rad)")
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(8.6, 3.4))
+    ax.plot(t, ang, linewidth=2.1, color="tab:red")
+    ax.set_xlabel("Time [s]")
+    ax.set_ylabel("Angle error [rad]")
+    ax.grid(True, alpha=0.25, linewidth=0.8)
+    fig.tight_layout()
+    if save:
+        _save_figure(fig, "_orientation_error_vs_time")
     if show:
         plt.show()
+    return fig
 
 
 def _as_wxyz(q: np.ndarray) -> np.ndarray:
@@ -1352,6 +1504,97 @@ def plot_quat_s3_projections(q_est_list, q_true_list=None, title="Quaternion pro
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_quat_s3_projections_with_ijk_sphere(q_est_list, q_true_list=None, title="Quaternion projections",
+                                            *, show: bool = True, save: bool = False) -> plt.Figure:
+    """
+    q_*_list: iterable of quaternions (either wxyz or xyzw; adjust _as_wxyz)
+    Plots:
+      - (w,x) in Real-i disk
+      - (y,z) in j-k disk
+      - (x,y,z) in the i-j-k unit sphere
+    """
+    q_est = np.stack([_as_wxyz(q) for q in q_est_list], axis=0)
+    q_true = None
+    if q_true_list is not None:
+        q_true = np.stack([_as_wxyz(q) for q in q_true_list], axis=0)
+
+    if q_true is not None:
+        q_true = _make_continuous(q_true)
+        q_est = _make_continuous(q_est, ref_wxyz=q_true[0])
+    else:
+        q_est = _make_continuous(q_est)
+
+    fig = plt.figure(figsize=(13.8, 4.8))
+    ax1 = fig.add_subplot(1, 3, 1)
+    ax2 = fig.add_subplot(1, 3, 2)
+    ax3 = fig.add_subplot(1, 3, 3, projection="3d")
+    fig.suptitle(title)
+
+    th = np.linspace(0.0, 2.0 * np.pi, 400)
+    cx, cy = np.cos(th), np.sin(th)
+
+    ax1.plot(cx, cy, linewidth=1.0, color="0.55")
+    ax1.set_aspect("equal", "box")
+    ax1.set_title("Projection onto Real-i: (w, x)")
+    ax1.set_xlabel("w (real)")
+    ax1.set_ylabel("x (i)")
+    ax1.plot(q_est[:, 0], q_est[:, 1], linewidth=2.0, label="Estimate")
+    ax1.scatter(q_est[0, 0], q_est[0, 1], marker="o")
+    ax1.scatter(q_est[-1, 0], q_est[-1, 1], marker="x")
+    if q_true is not None:
+        ax1.plot(q_true[:, 0], q_true[:, 1], linewidth=1.8, linestyle="--", label="Truth")
+        ax1.scatter(q_true[0, 0], q_true[0, 1], marker="o")
+        ax1.scatter(q_true[-1, 0], q_true[-1, 1], marker="x")
+    ax1.scatter(0, 0, marker="+")
+    ax1.legend(loc="lower left")
+
+    ax2.plot(cx, cy, linewidth=1.0, color="0.55")
+    ax2.set_aspect("equal", "box")
+    ax2.set_title("Projection onto j-k: (y, z)")
+    ax2.set_xlabel("y (j)")
+    ax2.set_ylabel("z (k)")
+    ax2.plot(q_est[:, 2], q_est[:, 3], linewidth=2.0, label="Estimate")
+    ax2.scatter(q_est[0, 2], q_est[0, 3], marker="o")
+    ax2.scatter(q_est[-1, 2], q_est[-1, 3], marker="x")
+    ax2.scatter(0, 0, marker="+")
+    if q_true is not None:
+        ax2.plot(q_true[:, 2], q_true[:, 3], linewidth=1.8, linestyle="--", label="Truth")
+        ax2.scatter(q_true[0, 2], q_true[0, 3], marker="o")
+        ax2.scatter(q_true[-1, 2], q_true[-1, 3], marker="x")
+    ax2.legend(loc="lower left")
+
+    u = np.linspace(0.0, 2.0 * np.pi, 48)
+    v = np.linspace(0.0, np.pi, 24)
+    xs = np.outer(np.cos(u), np.sin(v))
+    ys = np.outer(np.sin(u), np.sin(v))
+    zs = np.outer(np.ones_like(u), np.cos(v))
+    ax3.plot_wireframe(xs, ys, zs, rstride=4, cstride=4, linewidth=0.45, alpha=0.18, color="0.5")
+    ax3.set_title("Quaternion vector part in i-j-k")
+    ax3.set_xlabel("x (i)")
+    ax3.set_ylabel("y (j)")
+    ax3.set_zlabel("z (k)")
+    ax3.set_xlim(-1.0, 1.0)
+    ax3.set_ylim(-1.0, 1.0)
+    ax3.set_zlim(-1.0, 1.0)
+    ax3.set_box_aspect((1.0, 1.0, 1.0))
+    ax3.plot(q_est[:, 1], q_est[:, 2], q_est[:, 3], linewidth=2.0, label="Estimate")
+    ax3.scatter(q_est[0, 1], q_est[0, 2], q_est[0, 3], marker="o")
+    ax3.scatter(q_est[-1, 1], q_est[-1, 2], q_est[-1, 3], marker="x")
+    ax3.scatter(0, 0, 0, marker="+")
+    if q_true is not None:
+        ax3.plot(q_true[:, 1], q_true[:, 2], q_true[:, 3], linewidth=1.8, linestyle="--", label="Truth")
+        ax3.scatter(q_true[0, 1], q_true[0, 2], q_true[0, 3], marker="o")
+        ax3.scatter(q_true[-1, 1], q_true[-1, 2], q_true[-1, 3], marker="x")
+    ax3.legend(loc="lower left")
+
+    fig.tight_layout()
+    if save:
+        _save_figure(fig, "_quat_projections")
+    if show:
+        plt.show()
+    return fig
 
 
 def hopf_projection_wxyz(q_wxyz: np.ndarray) -> np.ndarray:
@@ -1667,10 +1910,11 @@ def animate_quat_triad_on_s2(
 def plot_all_time_diagnostics(fg: MultiStateFusionFGMeasurementMelding,
                               *,
                               T_true_list: List[np.ndarray] | None = None,
-                              show: bool = True) -> None:
-    plot_trajectory_3d(fg, T_true_list=T_true_list, show=False)
-    plot_position_vs_time(fg, T_true_list=T_true_list, show=False)
-    plot_orientation_error_vs_time(fg, T_true_list=T_true_list, show=False)
+                              show: bool = True,
+                              save: bool = False) -> None:
+    plot_trajectory_3d(fg, T_true_list=T_true_list, show=False, save=save)
+    plot_position_vs_time(fg, T_true_list=T_true_list, show=False, save=save)
+    plot_orientation_error_vs_time(fg, T_true_list=T_true_list, show=False, save=save)
     if show:
         plt.show()
 
@@ -1826,7 +2070,7 @@ class SE3:
 
 def run_test(randomize: bool = True) -> None:
     np.random.seed(123)
-    times, T_true_list, v_true, w_true = generate_synthetic_trajectory(randomize=randomize, N=20, dt=0.2)
+    times, T_true_list, v_true, w_true = generate_synthetic_trajectory(randomize=randomize, N=50, dt=0.2)
     measurements, _ = generate_synthetic_measurements(times, T_true_list, randomize=randomize)
     print(measurements)
     fg = MultiStateFusionFGMeasurementMelding(
@@ -1844,12 +2088,12 @@ def run_test(randomize: bool = True) -> None:
                              save_path="Axis.gif",
                              fg=fg,
                              trail=120, elev=25, azim=-60)
-    plot_quat_s3_projections(q_est, q_true_list=q_true)
+    plot_quat_s3_projections_with_ijk_sphere(q_est, q_true_list=q_true, show=True, save=True)
 
     animate_trajectory_3d_loop(fg, T_true_list=T_true_list,
                                interval_ms=50,
                                trail=30)
-    plot_all_time_diagnostics(fg, T_true_list=T_true_list, show=True)
+    plot_all_time_diagnostics(fg, T_true_list=T_true_list, show=True, save=True)
 
 
 def kai_generate_cameras():
@@ -1914,13 +2158,13 @@ def kai_generate_cameras():
                              save_path="Axis.gif",
                              fg=fg,
                              trail=120, elev=25, azim=-60)
-    plot_quat_s3_projections(q_est, q_true_list=q_true)
+    plot_quat_s3_projections_with_ijk_sphere(q_est, q_true_list=q_true, show=True, save=True)
 
     animate_trajectory_3d_loop(fg, T_true_list=truth,
                                interval_ms=50,
                                trail=30)
     truth_win = truth[:len(fg.times)]
-    plot_all_time_diagnostics(fg, T_true_list=truth_win, show=True)
+    plot_all_time_diagnostics(fg, T_true_list=truth_win, show=True, save=True)
 
 
 def main(test: bool = True) -> None:
@@ -1933,4 +2177,4 @@ def main(test: bool = True) -> None:
 
 
 if __name__ == "__main__":
-    main(test=False)
+    main(test=True)

@@ -29,6 +29,9 @@ from support.mathHelpers.threeD_to_threeD import (
 )
 
 FloatArray = NDArray[np.float64]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_SOURCE_CSV = REPO_ROOT / "Data" / "lidar_data.csv"
+DEFAULT_TARGET_CSV = REPO_ROOT / "Data" / "mocap_data.csv"
 
 
 def load_points_csv(path: str | Path, *, points_are_columns: Optional[bool] = None) -> FloatArray:
@@ -36,6 +39,24 @@ def load_points_csv(path: str | Path, *, points_are_columns: Optional[bool] = No
 
     points = np.loadtxt(Path(path), delimiter=",")
     return as_points3(points, points_are_columns=points_are_columns)
+
+
+def resolve_input_csv(path: str | Path) -> Path:
+    """Resolve an input CSV against common project locations."""
+
+    candidate = Path(path).expanduser()
+    if candidate.exists():
+        return candidate
+
+    script_relative = REPO_ROOT / candidate
+    if script_relative.exists():
+        return script_relative
+
+    data_relative = REPO_ROOT / "Data" / candidate.name
+    if data_relative.exists():
+        return data_relative
+
+    return candidate
 
 
 def quaternion_to_array(quat) -> FloatArray:
@@ -46,36 +67,142 @@ def quaternion_to_array(quat) -> FloatArray:
     return np.asarray(quat, dtype=float).reshape(-1)
 
 
+def _format_csv_value(value: object) -> str:
+    """Format one value for human-readable CSV output."""
+
+    if isinstance(value, (float, np.floating)):
+        return f"{float(value):.12g}"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return str(value)
+
+
+def _write_csv_row(file_obj, *values: object) -> None:
+    """Write one CSV row with a space after each comma for readability."""
+
+    file_obj.write(", ".join(_format_csv_value(v) for v in values) + "\n")
+
+
+def _write_aligned_table(file_obj, rows: list[list[object]]) -> None:
+    """Write rows with padded columns so values line up vertically."""
+
+    if not rows:
+        file_obj.write("\n")
+        return
+
+    formatted_rows = [[_format_csv_value(value) for value in row] for row in rows]
+    num_cols = max(len(row) for row in formatted_rows)
+    padded_rows = [row + [""] * (num_cols - len(row)) for row in formatted_rows]
+    widths = [
+        max(len(row[col_idx]) for row in padded_rows)
+        for col_idx in range(num_cols)
+    ]
+
+    for row in padded_rows:
+        file_obj.write(", ".join(value.rjust(width) for value, width in zip(row, widths)) + "\n")
+
+
+def _write_labeled_matrix(file_obj, title: str, row_labels: list[str], matrix: ArrayLike) -> None:
+    """Write a small labeled matrix as CSV."""
+
+    arr = np.asarray(matrix, dtype=float)
+    _write_csv_row(file_obj, f"# {title}")
+    rows: list[list[object]] = [["label", *[f"c{n}" for n in range(arr.shape[1])]]]
+    for label, row in zip(row_labels, arr):
+        rows.append([label, *row])
+    _write_aligned_table(file_obj, rows)
+    _write_csv_row(file_obj)
+
+
+def _write_points_transposed(file_obj, title: str, points: ArrayLike) -> None:
+    """Write N x 3 points as transposed x/y/z rows for spreadsheet inspection."""
+
+    pts = as_points3(points)
+    _write_csv_row(file_obj, f"# {title}")
+    rows: list[list[object]] = [["axis", *[f"p{n}" for n in range(pts.shape[0])]]]
+    for axis_name, axis_values in zip(("x", "y", "z"), pts.T):
+        rows.append([axis_name, *axis_values])
+    _write_aligned_table(file_obj, rows)
+    _write_csv_row(file_obj)
+
+
 def save_solution_csv(fit: ThreeDToThreeD, path: str | Path = "solution.csv") -> None:
     """Save an estimated transform and residual diagnostics to a text CSV file."""
 
     residuals = fit.create_y(flatten=False)
+    source = as_points3(fit.source_points)
+    target = as_points3(fit.target_points)
     transformed = fit.transform_points(fit.source_points)
     inverse = fit.transform.inverse()
     target_in_source = inverse.transform_points(fit.target_points)
+    point_headers = [f"p{n}" for n in range(source.shape[0])]
 
     with Path(path).open("w", encoding="utf-8") as f:
-        write = lambda s="": f.write(f"{s}\n")
-        write("# Transform convention: target ~= R @ source + t")
-        write("# Rotation R")
-        np.savetxt(f, fit.R, delimiter=",", fmt="%.12g")
-        write("# Translation t")
-        np.savetxt(f, fit.t.reshape(1, 3), delimiter=",", fmt="%.12g")
-        write("# Quaternion [s, x, y, z]")
-        np.savetxt(f, quaternion_to_array(fit.q_sxyz).reshape(1, -1), delimiter=",", fmt="%.12g")
-        write("# Homogeneous SE3 matrix")
-        np.savetxt(f, fit.transform.matrix, delimiter=",", fmt="%.12g")
-        write("# Residual norms per point")
-        np.savetxt(f, fit.diagnostics.residual_norms.reshape(1, -1), delimiter=",", fmt="%.12g")
-        write("# Residual vectors: target - (R @ source + t)")
-        np.savetxt(f, residuals, delimiter=",", fmt="%.12g")
-        write("# Source points transformed into target frame")
-        np.savetxt(f, transformed, delimiter=",", fmt="%.12g")
-        write("# Target points transformed into source frame")
-        np.savetxt(f, target_in_source, delimiter=",", fmt="%.12g")
-        write(f"# RMSE,{fit.diagnostics.rmse:.12g}")
-        write(f"# Weighted RMSE,{fit.diagnostics.weighted_rmse:.12g}")
-        write(f"# Max error,{fit.diagnostics.max_error:.12g}")
+        _write_csv_row(f, "# Transform convention: target ~= R @ source + t")
+        _write_csv_row(f)
+
+        _write_csv_row(f, "# Summary")
+        _write_aligned_table(
+            f,
+            [
+                ["metric", "value"],
+                ["rmse", fit.diagnostics.rmse],
+                ["weighted_rmse", fit.diagnostics.weighted_rmse],
+                ["max_error", fit.diagnostics.max_error],
+            ],
+        )
+        _write_csv_row(f)
+
+        _write_labeled_matrix(f, "Rotation R", ["r0", "r1", "r2"], fit.R)
+        _write_labeled_matrix(f, "Homogeneous SE3 matrix", ["r0", "r1", "r2", "r3"], fit.transform.matrix)
+
+        _write_csv_row(f, "# Translation t")
+        _write_aligned_table(f, [["component", "x", "y", "z"], ["t", *fit.t]])
+        _write_csv_row(f)
+
+        quat = quaternion_to_array(fit.q_sxyz)
+        _write_csv_row(f, "# Quaternion [s, x, y, z]")
+        _write_aligned_table(f, [["component", "s", "x", "y", "z"], ["q", *quat]])
+        _write_csv_row(f)
+
+        _write_points_transposed(f, "Source points in source frame", source)
+        _write_points_transposed(f, "Target points in target frame", target)
+        _write_points_transposed(f, "Estimated source points transformed into target frame", transformed)
+        _write_points_transposed(f, "Estimated target points transformed into source frame", target_in_source)
+        _write_points_transposed(f, "Residual vectors: target - (R @ source + t)", residuals)
+
+        _write_csv_row(f, "# Target-frame comparison: measured target vs estimated transformed source")
+        comparison_rows: list[list[object]] = [[
+            "field",
+            *sum(([f"{p}_measured", f"{p}_estimated", f"{p}_delta"] for p in point_headers), []),
+        ]]
+        for axis_name, target_axis, transformed_axis, residual_axis in zip(("x", "y", "z"), target.T, transformed.T, residuals.T):
+            row: list[object] = [axis_name]
+            for measured, estimated, delta in zip(target_axis, transformed_axis, residual_axis):
+                row.extend((measured, estimated, delta))
+            comparison_rows.append(row)
+        comparison_rows.append(["norm", *sum((["", norm, ""] for norm in fit.diagnostics.residual_norms), [])])
+        _write_aligned_table(f, comparison_rows)
+        _write_csv_row(f)
+
+        source_recovery_error = source - target_in_source
+        _write_csv_row(f, "# Source-frame comparison: measured source vs estimated target mapped into source")
+        recovery_rows: list[list[object]] = [[
+            "field",
+            *sum(([f"{p}_measured", f"{p}_estimated", f"{p}_delta"] for p in point_headers), []),
+        ]]
+        for axis_name, source_axis, estimated_axis, delta_axis in zip(
+            ("x", "y", "z"),
+            source.T,
+            target_in_source.T,
+            source_recovery_error.T,
+        ):
+            row = [axis_name]
+            for measured, estimated, delta in zip(source_axis, estimated_axis, delta_axis):
+                row.extend((measured, estimated, delta))
+            recovery_rows.append(row)
+        _write_aligned_table(f, recovery_rows)
+        _write_csv_row(f)
 
 
 def fit_from_csv(
@@ -114,15 +241,18 @@ def quat_slerp(q0: q.Quaternion, q1: q.Quaternion, alpha: float):
     return q0.slerp_with(q1, alpha)
 
 
-def set_axes_equal_3d(ax, points: ArrayLike) -> None:
-    """Make a 3D axis use equal scaling in x, y, z."""
+def set_axes_equal_3d(ax, points: ArrayLike | list[ArrayLike], *, pad_fraction: float = 0.0) -> None:
+    """Make a 3D axis use equal scaling in x, y, z for one or more point clouds."""
 
-    pts = np.asarray(points, dtype=float)
+    if isinstance(points, list):
+        pts = np.vstack([np.asarray(cloud, dtype=float) for cloud in points])
+    else:
+        pts = np.asarray(points, dtype=float)
     mins = np.min(pts, axis=0)
     maxs = np.max(pts, axis=0)
     center = 0.5 * (mins + maxs)
     span = np.max(maxs - mins)
-    radius = max(0.5 * span, 1.0e-6)
+    radius = max(0.5 * span * (1.0 + pad_fraction), 1.0e-6)
 
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
@@ -159,6 +289,14 @@ def visualize_alignment(
     target = as_points3(target_points)
     source_final = transform.transform_points(source)
 
+    source_marker = "o"
+    target_marker = "^"
+    aligned_marker = "s"
+    source_color = "tab:blue"
+    target_color = "tab:orange"
+    aligned_color = "tab:green"
+    correspondence_color = "0.45"
+
     # Interpolate from identity transform to the estimated transform.
     q_identity = q.identity()
     q_final = transform.q_sxyz
@@ -180,29 +318,19 @@ def visualize_alignment(
     ax_anim = fig.add_subplot(1, 2, 1, projection="3d")
     ax_final = fig.add_subplot(1, 2, 2, projection="3d")
 
-    def set_axes_equal_3d_from_clouds(ax, clouds, pad_fraction: float = 0.15):
-        pts = np.vstack(clouds)
-        mins = np.min(pts, axis=0)
-        maxs = np.max(pts, axis=0)
-        center = 0.5 * (mins + maxs)
-        span = np.max(maxs - mins)
-        span = max(span, 1.0e-6)
-        radius = 0.5 * span * (1.0 + pad_fraction)
-
-        ax.set_xlim(center[0] - radius, center[0] + radius)
-        ax.set_ylim(center[1] - radius, center[1] + radius)
-        ax.set_zlim(center[2] - radius, center[2] + radius)
-
     ax_anim.scatter(
         source[:, 0], source[:, 1], source[:, 2],
         label=f"{source_label} (start)",
         alpha=0.22,
+        marker=source_marker,
+        color=source_color,
     )
 
     ax_anim.scatter(
         target[:, 0], target[:, 1], target[:, 2],
         label=f"{target_label}",
-        marker="^",
+        marker=target_marker,
+        color=target_color,
     )
 
     moving = ax_anim.scatter(
@@ -210,19 +338,21 @@ def visualize_alignment(
         animated_clouds[0][:, 1],
         animated_clouds[0][:, 2],
         label=f"{source_label} transformed",
+        marker=aligned_marker,
+        color=aligned_color,
     )
 
     ghost_artists = []
     for _ in range(max_ghosts):
-        ghost = ax_anim.scatter([], [], [], alpha=0.08)
+        ghost = ax_anim.scatter([], [], [], alpha=0.08, marker=aligned_marker, color=aligned_color)
         ghost_artists.append(ghost)
 
-    centroid_line, = ax_anim.plot([], [], [], linewidth=1.5, alpha=0.5)
+    centroid_line, = ax_anim.plot([], [], [], linewidth=1.5, alpha=0.5, color=aligned_color)
     centroids = np.array([pts.mean(axis=0) for pts in animated_clouds])
 
     anim_corr_lines = []
     for _ in range(source.shape[0]):
-        line, = ax_anim.plot([], [], [], alpha=0.20, linewidth=1.0)
+        line, = ax_anim.plot([], [], [], alpha=0.20, linewidth=1.0, color=correspondence_color)
         anim_corr_lines.append(line)
 
     ax_anim.set_title("Estimated transform animation")
@@ -230,16 +360,19 @@ def visualize_alignment(
     ax_anim.set_ylabel("Y")
     ax_anim.set_zlabel("Z")
     ax_anim.legend(loc="upper left")
-    set_axes_equal_3d_from_clouds(ax_anim, [source, target, animated_clouds[0]], pad_fraction=0.20)
+    set_axes_equal_3d(ax_anim, [source, target, animated_clouds[0]], pad_fraction=0.20)
 
     ax_final.scatter(
         target[:, 0], target[:, 1], target[:, 2],
         label=f"{target_label}",
-        marker="^",
+        marker=target_marker,
+        color=target_color,
     )
     ax_final.scatter(
         source_final[:, 0], source_final[:, 1], source_final[:, 2],
         label=f"{source_label} aligned",
+        marker=aligned_marker,
+        color=aligned_color,
     )
 
     for p_src, p_tgt in zip(source_final, target):
@@ -248,6 +381,7 @@ def visualize_alignment(
             [p_src[1], p_tgt[1]],
             [p_src[2], p_tgt[2]],
             alpha=0.35,
+            color=correspondence_color,
         )
 
     rmse = np.sqrt(np.mean(np.sum((target - source_final) ** 2, axis=1)))
@@ -257,7 +391,7 @@ def visualize_alignment(
     ax_final.set_ylabel("Y")
     ax_final.set_zlabel("Z")
     ax_final.legend(loc="upper left")
-    set_axes_equal_3d_from_clouds(ax_final, [target, source_final], pad_fraction=0.10)
+    set_axes_equal_3d(ax_final, [target, source_final], pad_fraction=0.10)
 
     def update(frame_idx: int):
         shown_idx = min(frame_idx, frames - 1)
@@ -290,7 +424,7 @@ def visualize_alignment(
         clouds_for_scale = [target, pts]
         if shown_idx < max(5, frames // 8):
             clouds_for_scale.append(source)
-        set_axes_equal_3d_from_clouds(ax_anim, clouds_for_scale, pad_fraction=0.20)
+        set_axes_equal_3d(ax_anim, clouds_for_scale, pad_fraction=0.20)
 
         if frame_idx < frames:
             ax_anim.set_title(
@@ -449,14 +583,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "source_csv",
         nargs="?",
-        default="lidar_data.csv",
-        help="CSV of source-frame points to transform. Default: lidar_data.csv",
+        default=str(DEFAULT_SOURCE_CSV),
+        help="CSV of source-frame points to transform. Default: <repo>/Data/lidar_data.csv",
     )
     parser.add_argument(
         "target_csv",
         nargs="?",
-        default="mocap_data.csv",
-        help="CSV of corresponding target-frame points. Default: mocap_data.csv",
+        default=str(DEFAULT_TARGET_CSV),
+        help="CSV of corresponding target-frame points. Default: <repo>/Data/mocap_data.csv",
     )
     parser.add_argument(
         "--output",
@@ -496,11 +630,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.demo:
         return run_demo(show_plot=not args.no_plot)
 
-    source_path = Path(args.source_csv)
-    target_path = Path(args.target_csv)
+    source_path = resolve_input_csv(args.source_csv)
+    target_path = resolve_input_csv(args.target_csv)
     if not source_path.exists() or not target_path.exists():
         print(
-            "Input CSV files were not found. Provide source_csv and target_csv, "
+            f"Input CSV files were not found.\n"
+            f"  source: {source_path}\n"
+            f"  target: {target_path}\n"
+            "Provide source_csv and target_csv, "
             "or run with --demo for a synthetic test."
         )
         return 2
@@ -536,4 +673,4 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(['--demo']))
+    raise SystemExit(main())

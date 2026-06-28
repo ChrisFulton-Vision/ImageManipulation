@@ -188,6 +188,17 @@ class DataProcessorRunner:
                     f"feat_{cid}_y1_dist",
                     f"feat_{cid}_x2_dist",
                     f"feat_{cid}_y2_dist",
+
+                    # Derived single-feature geometry, matching PoseRuntime.
+                    f"feat_{cid}_detected",
+                    f"feat_{cid}_cx_px",
+                    f"feat_{cid}_cy_px",
+                    f"feat_{cid}_bbox_w_px",
+                    f"feat_{cid}_bbox_h_px",
+                    f"feat_{cid}_range_m",
+                    f"feat_{cid}_x_cam_m",
+                    f"feat_{cid}_y_cam_m",
+                    f"feat_{cid}_z_cam_m",
                 ]
             else:
                 return [
@@ -354,12 +365,71 @@ class DataProcessorRunner:
                         sx, sy = (W / float(yW)), (H / float(yH))
 
                         if n_cls == 1:
+                            rec["feat_0_detected"] = 0.0
+                            rec["feat_0_cx_px"] = np.nan
+                            rec["feat_0_cy_px"] = np.nan
+                            rec["feat_0_bbox_w_px"] = np.nan
+                            rec["feat_0_bbox_h_px"] = np.nan
+                            rec["feat_0_range_m"] = np.nan
+                            rec["feat_0_x_cam_m"] = np.nan
+                            rec["feat_0_y_cam_m"] = np.nan
+                            rec["feat_0_z_cam_m"] = np.nan
+
                             if boxes:
-                                x1, y1, x2, y2 = boxes[0]
-                                rec["feat_0_x1_dist"] = float(x1) * sx / width
-                                rec["feat_0_y1_dist"] = float(y1) * sy / height
-                                rec["feat_0_x2_dist"] = float(x2) * sx / width
-                                rec["feat_0_y2_dist"] = float(y2) * sy / height
+                                # Select the highest-confidence whole-aircraft detection.
+                                try:
+                                    best_idx = int(np.argmax(np.asarray(scores, dtype=float)))
+                                except Exception:
+                                    best_idx = 0
+
+                                x1, y1, x2, y2 = boxes[best_idx]
+
+                                # Convert YOLO-input pixels back to original image pixels.
+                                x1_px = float(x1) * sx
+                                y1_px = float(y1) * sy
+                                x2_px = float(x2) * sx
+                                y2_px = float(y2) * sy
+
+                                cx_px = 0.5 * (x1_px + x2_px)
+                                cy_px = 0.5 * (y1_px + y2_px)
+                                bbox_w_px = x2_px - x1_px
+                                bbox_h_px = y2_px - y1_px
+
+                                rec["feat_0_x1_dist"] = x1_px / width
+                                rec["feat_0_y1_dist"] = y1_px / height
+                                rec["feat_0_x2_dist"] = x2_px / width
+                                rec["feat_0_y2_dist"] = y2_px / height
+
+                                rec["feat_0_detected"] = 1.0
+                                rec["feat_0_cx_px"] = cx_px
+                                rec["feat_0_cy_px"] = cy_px
+                                rec["feat_0_bbox_w_px"] = bbox_w_px
+                                rec["feat_0_bbox_h_px"] = bbox_h_px
+
+                                # Match PoseRuntime's whole-aircraft width model.
+                                aircraft_width_m = 4.07
+
+                                if bbox_w_px > 1e-6 and calibration is not None:
+                                    try:
+                                        K = np.asarray(calibration.getCameraMatrix(), dtype=float).copy()
+
+                                        # If the image size differs from the calibration size, scale K to this image.
+                                        calib_w = float(getattr(calibration, "width", W) or W)
+                                        calib_h = float(getattr(calibration, "height", H) or H)
+                                        if calib_w > 0 and calib_h > 0:
+                                            K[0, :] *= float(W) / calib_w
+                                            K[1, :] *= float(H) / calib_h
+
+                                        range_m = float(K[0, 0] * aircraft_width_m / bbox_w_px)
+                                        pix_h = np.array([cx_px, cy_px, 1.0], dtype=float)
+                                        xyz_cam = np.linalg.inv(K).dot(pix_h) * range_m
+
+                                        rec["feat_0_range_m"] = range_m
+                                        rec["feat_0_x_cam_m"] = float(xyz_cam[0])
+                                        rec["feat_0_y_cam_m"] = float(xyz_cam[1])
+                                        rec["feat_0_z_cam_m"] = float(xyz_cam[2])
+                                    except Exception as e:
+                                        LOG.warning("Single-feature range estimate failed for %s: %s", name, e)
                         else:
                             for (cx, cy), cid in zip(centers, classes):
                                 cidi = int(cid)
@@ -1251,9 +1321,22 @@ class DataProcessorRunner:
             else:
                 # Not enough features -> emit NaNs
                 row_pnp = {
-                    "image_name": image_name, "image_time": image_time,
-                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
-                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_solver": "none",
+                    "pnp_success": 0,
+                    "pnp_used_n": int(len(obj_pts)) if "obj_pts" in locals() else 0,
+                    "pnp_inlier_n": 0,
+                    "pnp_inlier_frac": np.nan,
+                    "pnp_inlier_ids": "",
+                    "pnp_reproj_rmse_px": np.nan,
+                    "pnp_qw": np.nan,
+                    "pnp_qx": np.nan,
+                    "pnp_qy": np.nan,
+                    "pnp_qz": np.nan,
+                    "pnp_x": np.nan,
+                    "pnp_y": np.nan,
+                    "pnp_z": np.nan,
                 }
                 row_qnp = {
                     "image_name": image_name, "image_time": image_time,
@@ -1300,9 +1383,22 @@ class DataProcessorRunner:
             if len(obj_pts) < 6:
                 # emit NaNs (same as above)
                 row_pnp = {
-                    "image_name": image_name, "image_time": image_time,
-                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
-                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_solver": "none",
+                    "pnp_success": 0,
+                    "pnp_used_n": int(len(obj_pts)) if "obj_pts" in locals() else 0,
+                    "pnp_inlier_n": 0,
+                    "pnp_inlier_frac": np.nan,
+                    "pnp_inlier_ids": "",
+                    "pnp_reproj_rmse_px": np.nan,
+                    "pnp_qw": np.nan,
+                    "pnp_qx": np.nan,
+                    "pnp_qy": np.nan,
+                    "pnp_qz": np.nan,
+                    "pnp_x": np.nan,
+                    "pnp_y": np.nan,
+                    "pnp_z": np.nan,
                 }
                 row_qnp = {
                     "image_name": image_name, "image_time": image_time,
@@ -1398,27 +1494,74 @@ class DataProcessorRunner:
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
 
-
             rvec = tvec = None
             quatPnP = vectPnP = None
             ret = False
+            inliers = None
+            pnp_solver = "RANSAC_ITERATIVE"
+
             t0 = time.perf_counter()
             try:
-                ret, rvec, tvec, _inliers = cv2.solvePnPRansac(
+                ret, rvec, tvec, inliers = cv2.solvePnPRansac(
                     objectPoints=obj_pts,
                     imagePoints=img_pts,
                     cameraMatrix=K,
                     distCoeffs=distCoeffs,
-                    flags=cv2.SOLVEPNP_ITERATIVE
+                    iterationsCount=1000,
+                    reprojectionError=2.0,
+                    confidence=0.9999,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
                 )
             except cv2.error as e:
                 LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
                 ret = False
             t_pnp += time.perf_counter() - t0
+
+            pnp_used_n = int(len(obj_pts))
+
+            if inliers is None:
+                inlier_idx = np.array([], dtype=int)
+            else:
+                inlier_idx = np.asarray(inliers, dtype=int).reshape(-1)
+
+            pnp_inlier_n = int(inlier_idx.size)
+            pnp_inlier_frac = float(pnp_inlier_n / max(1, pnp_used_n))
+            pnp_inlier_ids = ";".join(str(kept_ids[i]) for i in inlier_idx if 0 <= i < len(kept_ids))
+
+            pnp_reproj_rmse_px = np.nan
+            if ret:
+                try:
+                    proj, _ = cv2.projectPoints(
+                        obj_pts.astype(np.float32),
+                        rvec,
+                        tvec,
+                        K,
+                        distCoeffs,
+                    )
+                    proj = proj.reshape(-1, 2)
+                    err = img_pts.astype(np.float64) - proj.astype(np.float64)
+
+                    if inlier_idx.size > 0:
+                        err_eval = err[inlier_idx]
+                    else:
+                        err_eval = err
+
+                    pnp_reproj_rmse_px = float(np.sqrt(np.mean(np.sum(err_eval * err_eval, axis=1))))
+                except Exception as e:
+                    LOG.warning("PnP reprojection metric failed for %s: %s", image_name, e)
+
             if ret:
                 quatPnP, vectPnP = q.fromOpenCV_toAftr_rvec(rvec, tvec)
                 row_pnp = {
-                    "image_name": image_name, "image_time": image_time,
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_solver": pnp_solver,
+                    "pnp_success": 1,
+                    "pnp_used_n": pnp_used_n,
+                    "pnp_inlier_n": pnp_inlier_n,
+                    "pnp_inlier_frac": pnp_inlier_frac,
+                    "pnp_inlier_ids": pnp_inlier_ids,
+                    "pnp_reproj_rmse_px": pnp_reproj_rmse_px,
                     "pnp_qw": float(quatPnP.s),
                     "pnp_qx": float(quatPnP.vec[0]),
                     "pnp_qy": float(quatPnP.vec[1]),
@@ -1429,9 +1572,22 @@ class DataProcessorRunner:
                 }
             else:
                 row_pnp = {
-                    "image_name": image_name, "image_time": image_time,
-                    "pnp_qw": np.nan, "pnp_qx": np.nan, "pnp_qy": np.nan, "pnp_qz": np.nan,
-                    "pnp_x": np.nan, "pnp_y": np.nan, "pnp_z": np.nan,
+                    "image_name": image_name,
+                    "image_time": image_time,
+                    "pnp_solver": "none",
+                    "pnp_success": 0,
+                    "pnp_used_n": int(len(obj_pts)) if "obj_pts" in locals() else 0,
+                    "pnp_inlier_n": 0,
+                    "pnp_inlier_frac": np.nan,
+                    "pnp_inlier_ids": "",
+                    "pnp_reproj_rmse_px": np.nan,
+                    "pnp_qw": np.nan,
+                    "pnp_qx": np.nan,
+                    "pnp_qy": np.nan,
+                    "pnp_qz": np.nan,
+                    "pnp_x": np.nan,
+                    "pnp_y": np.nan,
+                    "pnp_z": np.nan,
                 }
 
             pnp_batch.append(row_pnp)

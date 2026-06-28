@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from support.vision.calibration import default_864_cam, Calibration
 import support.mathHelpers.quaternions as quat
+from support.mathHelpers.SE3 import SE3_q
+from support.mathHelpers.LevMarq import LevenbergMarquardt
+from support.mathHelpers.SE3TwoDtoTwoD_noModel import SE3TwoDtoTwoD_noModel
 from support.runtime.pixel_handler import Pixel as pxl
 from dataclasses import dataclass, field
 
@@ -11,7 +14,7 @@ np.random.seed(42)
 @dataclass
 class Sensor:
     camCal: Calibration = field(default_factory=lambda: default_864_cam().randomize())
-    SE3: quat.SE3_q = field(default_factory=quat.SE3_q)
+    SE3: SE3_q = field(default_factory=SE3_q)
 
     def __post_init__(self):
         """Randomize the sensor pose after default construction."""
@@ -122,28 +125,8 @@ def build_measurements(
 
     return np.asarray(points_cam1, dtype=float), np.asarray(pixels_cam2, dtype=float)
 
-
-def create_residual(
-        est_cam2_from_cam1: quat.SE3_q,
-        points_cam1: np.ndarray,
-        observed_pixels_cam2: np.ndarray,
-        cam2_cal: Calibration,
-) -> np.ndarray:
-    """Return stacked cam2 reprojection residuals for a candidate cam2-from-cam1 transform."""
-    pred_points_cam2 = est_cam2_from_cam1 * points_cam1
-    z = pred_points_cam2[:, 2]
-
-    if np.any(z <= 0):
-        return np.full((2 * len(points_cam1),), 1.0e9, dtype=float)
-
-    pred_pixels = np.empty((len(points_cam1), 2), dtype=float)
-    pred_pixels[:, 0] = cam2_cal.fx * pred_points_cam2[:, 0] / z + cam2_cal.cx
-    pred_pixels[:, 1] = cam2_cal.fy * pred_points_cam2[:, 1] / z + cam2_cal.cy
-    return (pred_pixels - observed_pixels_cam2).reshape(-1)
-
-
 def predict_pixels(
-        est_cam2_from_cam1: quat.SE3_q,
+        est_cam2_from_cam1: SE3_q,
         points_cam1: np.ndarray,
         cam2_cal: Calibration,
 ) -> np.ndarray:
@@ -156,102 +139,57 @@ def predict_pixels(
     return pred_pixels
 
 
-def create_jacobian(
-        est_cam2_from_cam1: quat.SE3_q,
-        points_cam1: np.ndarray,
-        cam2_cal: Calibration,
-) -> np.ndarray:
-    """Compute the analytic reprojection Jacobian for a left-perturbed SE(3) state."""
-    pred_points_cam2 = est_cam2_from_cam1 * points_cam1
-    J = np.zeros((2 * len(points_cam1), 6), dtype=float)
-
-    for idx, point_cam2 in enumerate(pred_points_cam2):
-        X, Y, Z = point_cam2
-        if Z <= 0:
-            continue
-
-        proj_jac = np.array([
-            [cam2_cal.fx / Z, 0.0, -cam2_cal.fx * X / (Z * Z)],
-            [0.0, cam2_cal.fy / Z, -cam2_cal.fy * Y / (Z * Z)],
-        ], dtype=float)
-
-        point_jac = np.hstack((-quat.skew(point_cam2), np.eye(3, dtype=float)))
-        J[2 * idx:2 * idx + 2, :] = proj_jac @ point_jac
-
-    return J
-
-
-def apply_se3_delta(est_cam2_from_cam1: quat.SE3_q, delta: np.ndarray) -> quat.SE3_q:
-    """Apply a small left perturbation with parameter order [dtheta, dt]."""
-    delta = np.asarray(delta, dtype=float).reshape(6)
-    dtheta = delta[:3]
-    dt = delta[3:]
-    delta_pose = quat.SE3_q(
-        quat=quat.Quaternion.exp_so3(dtheta),
-        tvec=dt,
-    )
-    return delta_pose * est_cam2_from_cam1
-
-
 def optimize(
         points_cam1: np.ndarray,
         observed_pixels_cam2: np.ndarray,
         cam2_cal: Calibration,
-        seed_cam2_from_cam1: quat.SE3_q | None = None,
+        seed_cam2_from_cam1: SE3_q | None = None,
         *,
         max_iters: int = 60,
         damping: float = 1.0e-2,
         step_tol: float = 1.0e-10,
         cost_tol: float = 1.0e-12,
-) -> tuple[quat.SE3_q, dict[str, float | int | bool]]:
+) -> tuple[SE3_q, dict[str, float | int | bool]]:
     """Solve for cam2-from-cam1 with a Levenberg-Marquardt reprojection fit."""
-    est = quat.SE3_q() if seed_cam2_from_cam1 is None else seed_cam2_from_cam1.copy()
-    lam = float(damping)
-    converged = False
-    last_step_norm = np.inf
-    prev_cost = np.inf
+    est = SE3_q() if seed_cam2_from_cam1 is None else seed_cam2_from_cam1.copy()
+    problem = SE3TwoDtoTwoD_noModel(
+        points_cam1=np.asarray(points_cam1, dtype=float),
+        observed_pixels_cam2=np.asarray(observed_pixels_cam2, dtype=float),
+        cam2_cal=cam2_cal,
+    )
 
-    for it in range(1, max_iters + 1):
-        residual = create_residual(est, points_cam1, observed_pixels_cam2, cam2_cal)
-        cost = 0.5 * float(residual @ residual)
-        jacobian = create_jacobian(est, points_cam1, cam2_cal)
+    solver = LevenbergMarquardt(
+        state=est,
+        problem=problem,
+        damping_enabled=True,
+        damping=float(damping),
+        adaptive=True,
+        damping_up=4.0,
+        damping_down=0.3,
+        min_damping=1.0e-10,
+        use_diagonal_damping=False,
+        tolerance=min(float(step_tol), float(cost_tol)),
+        max_steps=int(max_iters),
+        max_iter=int(max_iters),
+        accept_rho_min=1.0e-12,
+        good_rho_min=0.75,
+        bad_rho_max=0.25,
+        numerical_check=False,
+        store_y_mags=True,
+        store_states=False,
+    )
 
-        H = jacobian.T @ jacobian
-        g = jacobian.T @ residual
-
-        try:
-            step = -np.linalg.solve(H + lam * np.eye(6, dtype=float), g)
-        except np.linalg.LinAlgError:
-            lam = min(1.0e8, 10.0 * lam)
-            continue
-
-        trial = apply_se3_delta(est, step)
-        residual_trial = create_residual(trial, points_cam1, observed_pixels_cam2, cam2_cal)
-        cost_trial = 0.5 * float(residual_trial @ residual_trial)
-
-        if np.isfinite(cost_trial) and cost_trial < cost:
-            est = trial
-            last_step_norm = float(np.linalg.norm(step))
-            rel_cost = abs(cost - cost_trial) / max(1.0, cost)
-            lam = max(1.0e-10, 0.3 * lam)
-            prev_cost = cost_trial
-
-            if last_step_norm < step_tol or rel_cost < cost_tol:
-                converged = True
-                break
-        else:
-            lam = min(1.0e8, 4.0 * lam)
-            prev_cost = cost
+    final_cost = float(solver.final_cost)
 
     info = {
-        "iterations": it,
-        "converged": converged,
-        "cost": float(prev_cost),
-        "step_norm": float(last_step_norm),
-        "lambda": float(lam),
+        "iterations": int(solver.idx),
+        "converged": bool(solver.converged),
+        "cost": float(final_cost),
+        "step_norm": float(solver.last_step_norm),
+        "lambda": float(solver.damping),
         "num_points": int(len(points_cam1)),
     }
-    return est, info
+    return solver.state, info
 
 
 def create_solution_image(
@@ -294,7 +232,7 @@ def main():
 
     points_cam1, observed_pixels_cam2 = build_measurements(cam1, cam2, features, pixel_noise_std=1.0)
     true_SE3 = cam2.SE3.inv * cam1.SE3
-    seed_SE3 = quat.SE3_q(
+    seed_SE3 = SE3_q(
         quat=quat.random_quat_within_deg(5.0) * true_SE3.quat,
         tvec=true_SE3.tvec + np.array([0.1, -0.05, 0.15]),
     )
@@ -303,12 +241,14 @@ def main():
     solution_image = create_solution_image(cam2, observed_pixels_cam2, predicted_pixels_cam2)
 
     err_SE3 = est_SE3.inv * true_SE3
-    print(f"LM info: {info}")
-    print(f"True cam2_from_cam1:\n{true_SE3}")
-    print(f"Estimated cam2_from_cam1:\n{est_SE3}")
-    print(f"Rotation error deg: {err_SE3.quat.angle_betweenD(quat.identity()):.6f}")
-    print(f"Translation error: {np.linalg.norm(err_SE3.tvec):.6e}")
-    print("solution image: green=observed, red=predicted, white=residual")
+
+    from support.io.my_logging import LOG
+    LOG.info(f"LM info: {info}")
+    LOG.info(f"True cam2_from_cam1:\n{true_SE3}")
+    LOG.info(f"Estimated cam2_from_cam1:\n{est_SE3}")
+    LOG.info(f"Rotation error deg: {err_SE3.quat.angle_betweenD(quat.identity()):.6f}")
+    LOG.info(f"Translation error: {np.linalg.norm(err_SE3.tvec):.6e}")
+    LOG.info("solution image: green=observed, red=predicted, white=residual")
     cv2.imshow('solution', solution_image)
     cv2.waitKey(0)
 

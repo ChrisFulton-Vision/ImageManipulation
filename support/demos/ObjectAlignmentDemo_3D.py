@@ -1,9 +1,13 @@
 import numpy as np
 from pathlib import Path
-import support.mathHelpers.quaternions as q
 import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter, FuncAnimation
 from mpl_toolkits.mplot3d import proj3d
+from support.mathHelpers.LevMarq import LevenbergMarquardt
+from support.mathHelpers.SE3 import SE3_q
+import support.mathHelpers.quaternions as q
+
+from support.mathHelpers.SE3PointAlignmentProblem import SE3PointAlignmentProblem
 
 LENGTH = 2
 WIDTH = 2
@@ -68,7 +72,7 @@ NUM_STATES = 6
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-MEAS_SE3 = q.SE3_q.random(5.0)
+MEAS_SE3 = SE3_q.random(5.0)
 MEAS_VERTS = MEAS_SE3 * RECT_PRISM_VERTS
 
 NUM_ITERATIONS = 5
@@ -76,46 +80,48 @@ NUM_ITERATIONS = 5
 def factor_graph():
     pert_q = q.random_quat_within_deg(90.0)
     pert_t = np.random.rand(3,)*10.0
-    est_SE3 = q.SE3_q(pert_q * MEAS_SE3.quat, MEAS_SE3.tvec + pert_t)
+    est_SE3 = SE3_q(pert_q * MEAS_SE3.quat, MEAS_SE3.tvec + pert_t)
 
-    stored_SE3 = []
+    problem = SE3PointAlignmentProblem(
+        body_points=TAPERED_PRISM_VERTS,
+        measured_points=MEAS_VERTS,
+    )
+
+    solver = LevenbergMarquardt(
+        state=est_SE3,
+        problem=problem,
+        damping_enabled=True,
+        damping=1e0,
+        adaptive=True,
+        damping_up=10.0,
+        damping_down=0.3,
+        min_damping=1e-10,
+        use_diagonal_damping=True,
+        tolerance=1e-12,
+        max_steps=NUM_ITERATIONS,
+        max_iter=20,
+        accept_rho_min=1.0e-3,
+        good_rho_min=0.75,
+        bad_rho_max=0.25,
+        numerical_check=False,
+        store_y_mags=True,
+        store_states=True,
+    )
+
+    stored_SE3 = [
+        [pose.copy(), residual_mag ** 2]
+        for pose, residual_mag in zip(solver.states_hist, solver.y_mag_hist)
+    ]
+    target_len = NUM_ITERATIONS + 1
+    if stored_SE3:
+        final_pose, final_residual_mag = stored_SE3[-1]
+        while len(stored_SE3) < target_len:
+            stored_SE3.append([final_pose.copy(), float(final_residual_mag)])
 
     def create_y(SE3_input=None):
-        y = np.zeros((NUM_ELEMENTS,))
-
         if SE3_input is None:
-            SE3_input = est_SE3
-
-        for idx, verts in enumerate(zip(MEAS_VERTS, TAPERED_PRISM_VERTS)):
-            m_verts, s_verts = verts
-            y[3*idx:3*idx+3] = m_verts - SE3_input * s_verts
-
-        return y
-
-    def create_L():
-        L = np.zeros((NUM_ELEMENTS, NUM_STATES))
-        I3 = np.eye(3)
-        for idx, verts in enumerate(TAPERED_PRISM_VERTS):
-            L[3 * idx:3 * idx + 3, 0:3] = q.skew(est_SE3.quat * verts)
-            L[3 * idx:3 * idx + 3, 3:6] = -I3
-        return L
-
-    y = create_y()
-    L = create_L()
-    y_mag = y.T @ y
-    stored_SE3.append([est_SE3.copy(), y_mag])
-
-    for idx in range(NUM_ITERATIONS):
-        dx = -np.linalg.pinv(L) @ y
-        pert_q = q.Quaternion.exp_so3(dx[:3])
-        pert_t = dx[3:]
-        est_SE3.quat = pert_q * est_SE3.quat
-        est_SE3.tvec += pert_t
-
-        y = create_y()
-        L = create_L()
-        y_mag = y.T @ y
-        stored_SE3.append([est_SE3.copy(), y_mag])
+            SE3_input = solver.state
+        return problem.residual(SE3_input)
 
     return stored_SE3, create_y
 
@@ -182,7 +188,7 @@ def create_object_artists(ax, verts, edges, SE3, color, alpha=1.0, show_axes=Tru
     }
 
 
-def update_object_artists(artists: dict, SE3: q.SE3_q) -> np.ndarray:
+def update_object_artists(artists: dict, SE3: SE3_q) -> np.ndarray:
     ax = artists["ax"]
     world_verts = SE3 * artists["verts_model"]
     translation = SE3.tvec
@@ -246,18 +252,18 @@ def set_axes_equal(ax, mins: np.ndarray, maxs: np.ndarray) -> tuple[np.ndarray, 
     return center, radius
 
 
-def measurement_pose_at_frame(frame_idx: int, base_pose: q.SE3_q) -> q.SE3_q:
+def measurement_pose_at_frame(frame_idx: int, base_pose: SE3_q) -> SE3_q:
     del frame_idx
     return base_pose
 
 
-def state_pose_at_frame(frame_idx: int, meas_pose: q.SE3_q, initial_perturb: q.SE3_q) -> q.SE3_q:
+def state_pose_at_frame(frame_idx: int, meas_pose: SE3_q, initial_perturb: SE3_q) -> SE3_q:
     alpha = frame_idx / max(N_FRAMES - 1, 1)
 
     rot_vec = initial_perturb.quat.ln_so3.vec
     interp_quat = q.Quaternion.exp_so3((1.0 - alpha) * rot_vec)
     interp_tvec = (1.0 - alpha) * initial_perturb.tvec
-    interp_perturb = q.SE3_q(interp_quat, interp_tvec)
+    interp_perturb = SE3_q(interp_quat, interp_tvec)
 
     return interp_perturb * meas_pose
 
@@ -295,7 +301,7 @@ def main():
 
     pert_q = q.random_quat_within_deg(1.0)
     pert_t = np.random.rand(3)/100.0
-    pert_SE3 = q.SE3_q(pert_q, pert_t)
+    pert_SE3 = SE3_q(pert_q, pert_t)
 
     meas_pose_0 = measurement_pose_at_frame(0, MEAS_SE3)
     state_pose_0 = state_pose_at_frame(0, meas_pose_0, pert_SE3)
@@ -387,7 +393,7 @@ def main():
 
         quat = first_SE3.quat.slerp(second_SE3.quat, alpha)
         tvec = second_SE3.tvec * alpha + first_SE3.tvec * (1.0 - alpha)
-        state_SE3 = q.SE3_q(quat, tvec)
+        state_SE3 = SE3_q(quat, tvec)
         state_rpy = state_SE3.quat.eulerD()
         y = create_y_func(state_SE3)
         residual = y.T @ y

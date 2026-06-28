@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import cm
 from matplotlib.animation import FFMpegWriter, FuncAnimation
 from matplotlib.lines import Line2D
+from mpl_toolkits.mplot3d import proj3d
+
+from support.mathHelpers.LevMarq import LevenbergMarquardt
+from support.mathHelpers.SE2PointAlignmentProblem import SE2PointAlignmentProblem
+from support.mathHelpers.SE2 import SE2
 
 LENGTH = 4.0
 HEIGHT = 2.0
@@ -15,8 +20,18 @@ TAPER_SCALE = 0.95
 
 N_FRAMES = 180
 FRAME_INTERVAL_MS = 40
+MESH_GRID_SIZE = 90
+MESH_ELEV_DEG = 34.0
+MESH_AZIM_START_DEG = -95.0
+MESH_AZIM_END_DEG = -135.0
+MESH_Z_MIN = 0.0
+MESH_Z_MAX = 30.0
+MESH_LABEL_MIN_THETA_DEG = 6.0
+MESH_LABEL_MIN_RADIUS = 0.08
+MESH_LABEL_MIN_RESIDUAL = 0.35
+MESH_LABEL_Z_OFFSET = 0.6
 
-NUM_ITERATIONS = 5
+NUM_ITERATIONS = 15
 NUM_STATES = 3
 
 RANDOM_SEED = 42
@@ -25,17 +40,17 @@ np.random.seed(RANDOM_SEED)
 # Rectangle vertex order: lower-right, lower-left, upper-left, upper-right.
 # Keeping a consistent order is what makes the red correspondence lines meaningful.
 RECT_VERTS = np.array([
-    [ LENGTH / 2.0, -HEIGHT / 2.0],
+    [LENGTH / 2.0, -HEIGHT / 2.0],
     [-LENGTH / 2.0, -HEIGHT / 2.0],
-    [-LENGTH / 2.0,  HEIGHT / 2.0],
-    [ LENGTH / 2.0,  HEIGHT / 2.0],
+    [-LENGTH / 2.0, HEIGHT / 2.0],
+    [LENGTH / 2.0, HEIGHT / 2.0],
 ], dtype=np.float64)
 
 # A trapezoid that is close to the rectangle, but not exactly the same shape.
 # The optimizer can only use SE(2), so the final residual will generally not be zero.
 TRAPEZOID_VERTS = np.array([
-    [ LENGTH / (2.0 * TAPER_SCALE),
-      -HEIGHT * TAPER_SCALE / 2.0],
+    [LENGTH / (2.0 * TAPER_SCALE),
+     -HEIGHT * TAPER_SCALE / 2.0],
 
     [-LENGTH / (2.0 * TAPER_SCALE),
      -HEIGHT * TAPER_SCALE / 2.0],
@@ -43,8 +58,8 @@ TRAPEZOID_VERTS = np.array([
     [-LENGTH * TAPER_SCALE / 2.0,
      HEIGHT * TAPER_SCALE / 2.0],
 
-    [ LENGTH * TAPER_SCALE / 2.0,
-      HEIGHT * TAPER_SCALE / 2.0],
+    [LENGTH * TAPER_SCALE / 2.0,
+     HEIGHT * TAPER_SCALE / 2.0],
 ], dtype=np.float64)
 
 EDGES = np.array([
@@ -58,156 +73,227 @@ NUM_VERTS = len(RECT_VERTS)
 NUM_ELEMENTS = int(np.prod(RECT_VERTS.shape))
 
 
-def wrap_angle(theta: float) -> float:
+def wrap_angle_signed(theta_rad: float) -> float:
     """Wrap an angle to [-pi, pi)."""
-    return (theta + np.pi) % (2.0 * np.pi) - np.pi
+    return (theta_rad + np.pi) % (2.0 * np.pi) - np.pi
 
 
-@dataclass
-class SE2:
-    """A tiny SE(2) class for 2D rigid transforms.
-
-    The transform maps model points into world points as
-
-        p_world = R(theta) @ p_model + t.
-
-    Composition is left-to-right in the same style as the 3D demo:
-
-        world_point = pose * model_point
-        combined_pose = left_pose * right_pose
-    """
-
-    theta: float
-    tvec: np.ndarray
-
-    def __post_init__(self) -> None:
-        self.theta = float(wrap_angle(self.theta))
-        self.tvec = np.asarray(self.tvec, dtype=np.float64).reshape(2)
-
-    @property
-    def R(self) -> np.ndarray:
-        c = np.cos(self.theta)
-        s = np.sin(self.theta)
-        return np.array([[c, -s],
-                         [s,  c]], dtype=np.float64)
-
-    @classmethod
-    def identity(cls) -> SE2:
-        return cls(0.0, np.zeros(2, dtype=np.float64))
-
-    @classmethod
-    def random(cls, max_translation: float = 5.0, max_angle_deg: float = 180.0) -> SE2:
-        theta = np.deg2rad(np.random.uniform(-max_angle_deg, max_angle_deg))
-        tvec = np.random.uniform(-max_translation, max_translation, size=2)
-        return cls(theta, tvec)
-
-    @classmethod
-    def exp(cls, dx: np.ndarray) -> SE2:
-        """Small left perturbation used by the Gauss-Newton update.
-
-        This intentionally uses the first-order-friendly parameterization
-        dx = [dtheta, dtx, dty]. For this visualization, that keeps the
-        Jacobian easy to inspect and mirrors the lightweight style of the demo.
-        """
-        dx = np.asarray(dx, dtype=np.float64).reshape(3)
-        return cls(dx[0], dx[1:3])
-
-    def copy(self) -> SE2:
-        return SE2(self.theta, self.tvec.copy())
-
-    def inverse(self) -> SE2:
-        R_T = self.R.T
-        return SE2(-self.theta, -(R_T @ self.tvec))
-
-    @property
-    def inv(self) -> SE2:
-        """Return the inverse transform. Named to match the SE(3) demo style."""
-        return self.inverse()
-
-    def interpolate(self, other: SE2, alpha: float) -> SE2:
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-        dtheta = wrap_angle(other.theta - self.theta)
-        theta = wrap_angle(self.theta + alpha * dtheta)
-        tvec = (1.0 - alpha) * self.tvec + alpha * other.tvec
-        return SE2(theta, tvec)
-
-    def __mul__(self, other):
-        if isinstance(other, SE2):
-            theta = wrap_angle(self.theta + other.theta)
-            tvec = self.R @ other.tvec + self.tvec
-            return SE2(theta, tvec)
-
-        points = np.asarray(other, dtype=np.float64)
-        if points.shape == (2,):
-            return self.R @ points + self.tvec
-        if points.ndim == 2 and points.shape[1] == 2:
-            return points @ self.R.T + self.tvec
-        raise TypeError(f"SE2 can transform a 2-vector, an Nx2 array, or compose with SE2; got shape {points.shape}")
-
-    def __repr__(self) -> str:
-        return f"SE2(theta_deg={np.rad2deg(self.theta): .3f}, tvec=[{self.tvec[0]: .3f}, {self.tvec[1]: .3f}])"
+def wrap_angle_2pi(theta_rad: float) -> float:
+    """Wrap an angle to [0, 2pi)."""
+    return theta_rad % (2.0 * np.pi)
 
 
-MEAS_SE2 = SE2.random(max_translation=4.0, max_angle_deg=70.0)
+MEAS_SE2 = SE2.random(max_translation=4.0, max_angle_deg=0.0)
 MEAS_VERTS = MEAS_SE2 * RECT_VERTS
-
 
 def factor_graph() -> tuple[list[tuple[SE2, float]], Callable[[SE2 | None], np.ndarray]]:
     """Fit the trapezoid pose to the measured rectangle correspondences.
 
-    Residual for vertex i:
+    This version delegates the nonlinear least-squares solve to the generic
+    LevenbergMarquardt optimizer. The object-alignment problem only provides:
 
-        y_i = measured_i - estimated_pose * trapezoid_i
+        residual(state)
+        jacobian(state)
+        retract(state, dx)
 
-    The state is a left perturbation dx = [dtheta, dtx, dty]. For the current
-    world point p = estimated_pose * trapezoid_i,
-
-        d y_i / d dtheta = -J p = [p_y, -p_x]^T
-        d y_i / d dt     = -I
-
-    where J is the 2D generator [[0, -1], [1, 0]].
+    The optimizer no longer knows anything special about SE(2).
     """
-    initial_perturb = SE2.random(max_translation=3.0, max_angle_deg=90.0)
+
+    initial_perturb = SE2.random(max_translation=3.0, max_angle_deg=0.0)
+
+    # Keep the intentionally difficult near-180-degree initial condition.
+    EPSILON = np.deg2rad(0.1)
+    initial_perturb = SE2(np.pi - EPSILON, initial_perturb.tvec)
+
     est_SE2 = initial_perturb * MEAS_SE2
 
-    stored_SE2: list[tuple[SE2, float]] = []
+    problem = SE2PointAlignmentProblem(
+        model_verts=TRAPEZOID_VERTS,
+        measured_verts=MEAS_VERTS,
+    )
+
+    solver = LevenbergMarquardt(
+        state=est_SE2,
+        problem=problem,
+        damping_enabled=True,
+        damping=1e1,
+        adaptive=True,
+        damping_up=10.0,
+        damping_down=0.3,
+        min_damping=1e-10,
+        use_diagonal_damping=False,
+        tolerance=1e-9,
+        max_steps=NUM_ITERATIONS,
+        max_iter=10,
+        accept_rho_min=1.0e-3,
+        good_rho_min=0.75,
+        bad_rho_max=0.25,
+        numerical_check=False,
+        store_y_mags=True,
+        store_states=True,
+    )
+
+    stored_SE2 = [
+        (pose.copy(), residual_mag)
+        for pose, residual_mag in zip(solver.states_hist, solver.y_mag_hist)
+    ]
+    target_len = NUM_ITERATIONS + 1
+    if stored_SE2:
+        final_pose, final_residual_mag = stored_SE2[-1]
+        while len(stored_SE2) < target_len:
+            stored_SE2.append((final_pose.copy(), float(final_residual_mag)))
 
     def create_y(SE2_input: SE2 | None = None) -> np.ndarray:
-        y = np.zeros(NUM_ELEMENTS, dtype=np.float64)
-
         if SE2_input is None:
-            SE2_input = est_SE2
-
-        est_verts = SE2_input * TRAPEZOID_VERTS
-        for idx, (m_vert, s_vert) in enumerate(zip(MEAS_VERTS, est_verts)):
-            y[2 * idx:2 * idx + 2] = m_vert - s_vert
-        return y
-
-    def create_L() -> np.ndarray:
-        L = np.zeros((NUM_ELEMENTS, NUM_STATES), dtype=np.float64)
-        est_verts = est_SE2 * TRAPEZOID_VERTS
-        for idx, p_world in enumerate(est_verts):
-            x, y = p_world
-            L[2 * idx:2 * idx + 2, 0] = [y, -x]
-            L[2 * idx:2 * idx + 2, 1:3] = -np.eye(2)
-        return L
-    
-    y = create_y()
-    L = create_L()
-    y_mag = float(y.T @ y)
-    stored_SE2.append((est_SE2.copy(), y_mag))
-
-    for _ in range(NUM_ITERATIONS):
-        dx = -np.linalg.pinv(L) @ y
-        pert_SE2 = SE2.exp(dx)
-        est_SE2 = pert_SE2 * est_SE2
-
-        y = create_y()
-        L = create_L()
-        y_mag = float(y.T @ y)
-        stored_SE2.append((est_SE2.copy(), y_mag))
+            SE2_input = solver.state
+        return problem.residual(SE2_input)
 
     return stored_SE2, create_y
+
+
+def create_mesh_grid(
+    stored_SE2: list[tuple[SE2, float]],
+    create_y_func: Callable[[SE2 | None], np.ndarray],
+    ref_pose: SE2 | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Create a residual surface over theta and translation distance from the final pose.
+
+    The translation dimension is now:
+
+        ||t - t_ref||
+
+    where t_ref is the final optimized translation. This fixes the previous
+    behavior where the surface used:
+
+        | ||t|| - ||t_ref|| |
+
+    which could be near zero even when the current translation was visibly far
+    from the solution.
+    """
+    if ref_pose is None:
+        ref_pose = stored_SE2[-1][0]
+
+    ref_tvec = np.asarray(ref_pose.tvec, dtype=np.float64).reshape(2)
+
+    # Choose a fixed translation-slice direction. Use the direction from the
+    # final pose back toward the starting pose, because that makes the surface
+    # slice pass through the visually important initial condition.
+    start_tvec = np.asarray(stored_SE2[0][0].tvec, dtype=np.float64).reshape(2)
+    start_delta = start_tvec - ref_tvec
+    start_delta_norm = float(np.linalg.norm(start_delta))
+
+    if start_delta_norm < 1.0e-9:
+        # Fallback: use the largest stored translation displacement from the
+        # final pose. If every stored pose has the same translation, use +x.
+        deltas = np.array([
+            np.asarray(pose.tvec, dtype=np.float64).reshape(2) - ref_tvec
+            for pose, _ in stored_SE2
+        ])
+        delta_norms = np.linalg.norm(deltas, axis=1)
+        max_idx = int(np.argmax(delta_norms))
+
+        if float(delta_norms[max_idx]) < 1.0e-9:
+            trans_dir = np.array([1.0, 0.0], dtype=np.float64)
+        else:
+            trans_dir = deltas[max_idx] / float(delta_norms[max_idx])
+    else:
+        trans_dir = start_delta / start_delta_norm
+
+    translation_delta_vals = np.array([
+        float(np.linalg.norm(np.asarray(pose.tvec, dtype=np.float64).reshape(2) - ref_tvec))
+        for pose, _ in stored_SE2
+    ], dtype=np.float64)
+
+    max_translation_delta = float(np.max(translation_delta_vals)) if translation_delta_vals.size else 1.0
+    max_translation_delta = max(max_translation_delta, 1.0e-9)
+
+    translation_pad = max(0.5, 0.25 * max_translation_delta)
+
+    theta_grid, translation_delta_grid = np.meshgrid(
+        np.linspace(np.deg2rad(-90.0), np.deg2rad(450.0), MESH_GRID_SIZE),
+        np.linspace(0.0, max_translation_delta + translation_pad, MESH_GRID_SIZE),
+    )
+
+    residual_grid = np.zeros_like(theta_grid)
+    for row_idx in range(theta_grid.shape[0]):
+        for col_idx in range(theta_grid.shape[1]):
+            pose = create_slice_pose(
+                theta_grid[row_idx, col_idx],
+                translation_delta_grid[row_idx, col_idx],
+                trans_dir,
+                ref_tvec,
+            )
+            y = create_y_func(pose)
+            residual_grid[row_idx, col_idx] = float(np.linalg.norm(y))
+
+    return theta_grid, translation_delta_grid, residual_grid, trans_dir, ref_tvec
+
+
+def create_slice_pose(theta_rad: float, translation_delta: float, trans_dir: np.ndarray, ref_tvec: np.ndarray) -> SE2:
+    """Create a pose on the 1D translation slice through the final pose.
+
+    translation_delta = 0 means the final/ideal translation.
+
+    Positive translation_delta moves away from the final translation along the
+    fixed slice direction trans_dir.
+    """
+    trans_dir = np.asarray(trans_dir, dtype=np.float64).reshape(2)
+    ref_tvec = np.asarray(ref_tvec, dtype=np.float64).reshape(2)
+
+    translation_delta = max(0.0, float(translation_delta))
+    return SE2(theta_rad, ref_tvec + translation_delta * trans_dir)
+
+
+def select_mesh_label_indices(
+        path_theta_deg: np.ndarray,
+        path_radius: np.ndarray,
+        path_residual: np.ndarray,
+) -> list[int]:
+    keep: list[int] = []
+    for idx, (theta_deg, radius_val, residual_val) in enumerate(zip(path_theta_deg, path_radius, path_residual)):
+        if not keep:
+            keep.append(idx)
+            continue
+
+        last_idx = keep[-1]
+        if (
+            abs(float(theta_deg - path_theta_deg[last_idx])) < MESH_LABEL_MIN_THETA_DEG
+            and abs(float(radius_val - path_radius[last_idx])) < MESH_LABEL_MIN_RADIUS
+            and abs(float(residual_val - path_residual[last_idx])) < MESH_LABEL_MIN_RESIDUAL
+        ):
+            continue
+
+        keep.append(idx)
+
+    if keep[-1] != len(path_theta_deg) - 1:
+        keep.append(len(path_theta_deg) - 1)
+    return keep
+
+
+def create_projected_3d_label(ax, x: float, y: float, z: float, text: str):
+    x_proj, y_proj, _ = proj3d.proj_transform(x, y, z, ax.get_proj())
+    return ax.annotate(
+        text,
+        xy=(x_proj, y_proj),
+        xytext=(0, 0),
+        textcoords="offset points",
+        ha="center",
+        va="center",
+        color="black",
+        fontsize=8,
+        bbox={
+            "boxstyle": "round,pad=0.15",
+            "facecolor": "white",
+            "alpha": 0.9,
+            "edgecolor": "0.75",
+        },
+        zorder=1000,
+    )
+
+
+def update_projected_3d_label(ax, label, x: float, y: float, z: float) -> None:
+    x_proj, y_proj, _ = proj3d.proj_transform(x, y, z, ax.get_proj())
+    label.xy = (x_proj, y_proj)
 
 
 def compute_axis_length(verts: np.ndarray) -> float:
@@ -220,7 +306,7 @@ def create_object_artists(ax, verts, edges, pose: SE2, color: str, alpha: float 
                           show_axes: bool = True, point_size: int = 45) -> dict:
     world_verts = pose * verts
     translation = pose.tvec
-    axis_length = compute_axis_length(world_verts)
+    axis_length = compute_axis_length(verts)
     local_basis = np.eye(2, dtype=np.float64) * axis_length
     world_basis = pose * local_basis
 
@@ -269,7 +355,7 @@ def create_object_artists(ax, verts, edges, pose: SE2, color: str, alpha: float 
 def update_object_artists(artists: dict, pose: SE2) -> np.ndarray:
     world_verts = pose * artists["verts_model"]
     translation = pose.tvec
-    axis_length = compute_axis_length(world_verts)
+    axis_length = compute_axis_length(artists["verts_model"])
     local_basis = np.eye(2, dtype=np.float64) * axis_length
     world_basis = pose * local_basis
 
@@ -323,16 +409,19 @@ def set_axes_equal(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
     ax.set_aspect("equal", adjustable="box")
 
 
-def frame_to_alpha(frame_idx: int) -> tuple[int, int, float]:
-    phase_length = max(int(N_FRAMES * 0.9 / NUM_ITERATIONS), 1)
+def frame_to_alpha(frame_idx: int, num_segments: int) -> tuple[int, int, float]:
+    num_segments = max(int(num_segments), 1)
+
+    phase_length = max(int(N_FRAMES * 0.9 / num_segments), 1)
     pos = frame_idx / phase_length
+
     first_idx = int(pos)
     second_idx = first_idx + 1
     alpha = pos - first_idx
 
-    if second_idx > NUM_ITERATIONS:
-        first_idx = NUM_ITERATIONS - 1
-        second_idx = NUM_ITERATIONS
+    if second_idx > num_segments:
+        first_idx = num_segments - 1
+        second_idx = num_segments
         alpha = 1.0
 
     return first_idx, second_idx, alpha
@@ -352,16 +441,25 @@ def save_demo_video(anim: FuncAnimation) -> Path:
 
 
 def configure_figure_layout(fig: plt.Figure) -> None:
-    fig.set_size_inches(12.0, 7.0, forward=True)
-    fig.subplots_adjust(left=0.10, right=0.72, bottom=0.10, top=0.90)
+    fig.set_size_inches(16.0, 7.5, forward=True)
+    fig.subplots_adjust(left=0.06, right=0.97, bottom=0.10, top=0.90, wspace=0.28)
 
 
 def main() -> None:
-    fig, ax = plt.subplots(figsize=(12.0, 7.0))
+    fig = plt.figure(figsize=(16.0, 7.5))
+    ax = fig.add_subplot(1, 2, 1)
+    ax_res = fig.add_subplot(1, 2, 2, projection="3d")
     configure_figure_layout(fig)
 
     stored_SE2, create_y_func = factor_graph()
+    num_path_segments = max(len(stored_SE2) - 1, 1)
     _, opt_res_mag = stored_SE2[-1]
+
+    theta_grid, translation_delta_grid, residual_grid, trans_dir, ref_tvec = create_mesh_grid(
+        stored_SE2,
+        create_y_func,
+        ref_pose=stored_SE2[-1][0],
+    )
 
     meas_pose_0 = MEAS_SE2
     state_pose_0, _ = stored_SE2[0]
@@ -385,7 +483,7 @@ def main() -> None:
     set_axes_equal(ax, mins, maxs)
 
     status_text = ax.text(
-        1.02,
+        0.02,
         0.98,
         "",
         transform=ax.transAxes,
@@ -393,6 +491,12 @@ def main() -> None:
         va="top",
         family="monospace",
         clip_on=False,
+        bbox={
+            "boxstyle": "round,pad=0.3",
+            "facecolor": "white",
+            "alpha": 0.85,
+            "edgecolor": "0.8",
+        },
     )
 
     ghost_artists = []
@@ -436,30 +540,150 @@ def main() -> None:
     ]
     ax.legend(handles=legend_handles, loc="lower left")
 
+    surface = ax_res.plot_surface(
+        np.rad2deg(theta_grid),
+        translation_delta_grid,
+        residual_grid,
+        cmap=cm.viridis,
+        linewidth=0,
+        antialiased=True,
+        alpha=0.88,
+    )
+    fig.colorbar(surface, ax=ax_res, fraction=0.046, pad=0.08, shrink=0.78, label="Residual ||y||_2")
+
+    path_theta_deg = np.array([
+        np.rad2deg(wrap_angle_2pi(pose.theta_rad))
+        for pose, _ in stored_SE2
+    ], dtype=np.float64)
+
+    # This is the actual translation distance from the final/ideal pose.
+    # Unlike | ||t|| - ||t_ref|| |, this is only zero at the final translation.
+    path_translation_delta = np.array([
+        float(np.linalg.norm(np.asarray(pose.tvec, dtype=np.float64).reshape(2) - ref_tvec))
+        for pose, _ in stored_SE2
+    ], dtype=np.float64)
+
+    # Use the actual residual of the actual optimizer state.
+    # This keeps the black path consistent with the left-hand pose display.
+    path_residual = np.array([
+        float(np.linalg.norm(create_y_func(pose)))
+        for pose, _ in stored_SE2
+    ], dtype=np.float64)
+
+    ax_res.plot(
+        path_theta_deg,
+        path_translation_delta,
+        path_residual,
+        color="black",
+        linewidth=2.0,
+        marker="o",
+        markersize=4,
+    )
+    ax_res.scatter(path_theta_deg[0], path_translation_delta[0], path_residual[0], color="tab:red", s=60,
+                   depthshade=False)
+    ax_res.scatter(path_theta_deg[-1], path_translation_delta[-1], path_residual[-1], color="tab:green", s=60,
+                   depthshade=False)
+
+    labeled_indices = set(select_mesh_label_indices(path_theta_deg, path_translation_delta, path_residual))
+    path_labels = []
+    path_label_positions = []
+    for idx, (theta_deg, translation_delta_val, residual_val) in enumerate(
+            zip(path_theta_deg, path_translation_delta, path_residual)
+    ):
+        if idx not in labeled_indices:
+            continue
+
+        label_text = "Start" if idx == 0 else ("Final" if idx == len(path_theta_deg) - 1 else str(idx))
+        label_x = float(theta_deg)
+        label_y = float(translation_delta_val)
+        label_z = float(residual_val + MESH_LABEL_Z_OFFSET)
+        label = create_projected_3d_label(
+            ax_res,
+            label_x,
+            label_y,
+            label_z,
+            label_text,
+        )
+        path_labels.append(label)
+        path_label_positions.append((label_x, label_y, label_z))
+
+    interp_point = ax_res.scatter(
+        [path_theta_deg[0]],
+        [path_translation_delta[0]],
+        [path_residual[0]],
+        color="white",
+        edgecolors="black",
+        s=90,
+        linewidths=1.2,
+        depthshade=False,
+        zorder=10,
+    )
+
+    ax_res.set_xlabel("theta [deg]")
+    ax_res.set_ylabel("translation error ||t - t*||")
+    ax_res.set_zlabel("Residual ||y||_2")
+    ax_res.set_title("Residual Surface Over (theta, translation error)")
+    ax_res.set_ylim(0.0, float(translation_delta_grid.max()))
+    ax_res.set_zlim(MESH_Z_MIN, MESH_Z_MAX)
+    ax_res.view_init(elev=MESH_ELEV_DEG, azim=MESH_AZIM_START_DEG)
+    for label, (label_x, label_y, label_z) in zip(path_labels, path_label_positions):
+        update_projected_3d_label(ax_res, label, label_x, label_y, label_z)
+
+    dir_angle_deg = np.rad2deg(np.arctan2(trans_dir[1], trans_dir[0]))
+    ax_res.text2D(
+        0.03,
+        0.97,
+        f"translation slice dir: {dir_angle_deg:6.2f} deg",
+        transform=ax_res.transAxes,
+        va="top",
+    )
+
     def update(frame_idx: int):
-        first_idx, second_idx, alpha = frame_to_alpha(frame_idx)
+        first_idx, second_idx, alpha = frame_to_alpha(frame_idx, num_path_segments)
         first_SE2, first_res = stored_SE2[first_idx]
         second_SE2, second_res = stored_SE2[second_idx]
+        cam_progress = float(np.clip(frame_idx / max(N_FRAMES - 1, 1), 0.0, 1.0))
+        cam_azim_deg = (1.0 - cam_progress) * MESH_AZIM_START_DEG + cam_progress * MESH_AZIM_END_DEG
 
         state_pose = first_SE2.interpolate(second_SE2, alpha)
         y = create_y_func(state_pose)
-        residual = float(y.T @ y)
+        residual = float(np.linalg.norm(y))
+
         error_SE2 = state_pose.inv * MEAS_SE2
-        angle_error_deg = abs(np.rad2deg(wrap_angle(error_SE2.theta)))
+        angle_error_deg = abs(np.rad2deg(wrap_angle_signed(error_SE2.theta_rad)))
         trans_error = float(np.linalg.norm(error_SE2.tvec))
 
-        for ghost_idx, (ghost_artist, ghost_label) in enumerate(zip(ghost_artists, ghost_labels)):
-            visible = ghost_idx <= first_idx
-            set_artist_group_visible(ghost_artist, visible)
-            ghost_label.set_visible(visible)
+        interp_theta_deg = float(np.rad2deg(wrap_angle_2pi(state_pose.theta_rad)))
+        interp_translation_delta = float(
+            np.linalg.norm(np.asarray(state_pose.tvec, dtype=np.float64).reshape(2) - ref_tvec)
+        )
+
+        # Use the actual interpolated-state residual so the moving marker agrees
+        # with the left-hand pose view.
+        interp_residual = residual
+
+        for g_idx, (g_artist, g_label) in enumerate(zip(ghost_artists, ghost_labels)):
+            visible = g_idx <= first_idx
+            set_artist_group_visible(g_artist, visible)
+            g_label.set_visible(visible)
 
         meas_verts = update_object_artists(meas_artists, MEAS_SE2)
         state_verts = update_object_artists(state_artists, state_pose)
         update_connection_lines(connection_lines, meas_verts, state_verts)
 
+        interp_point._offsets3d = (
+            [interp_theta_deg],
+            [interp_translation_delta],
+            [interp_residual],
+        )
+
+        ax_res.view_init(elev=MESH_ELEV_DEG, azim=cam_azim_deg)
+        for label, (label_x, label_y, label_z) in zip(path_labels, path_label_positions):
+            update_projected_3d_label(ax_res, label, label_x, label_y, label_z)
+
         status_text.set_text(
             f"           Estimated | Solution\n"
-            f"Theta:       {np.rad2deg(state_pose.theta):8.3f}|{np.rad2deg(meas_pose_0.theta):8.3f} deg\n"
+            f"theta:       {np.rad2deg(state_pose.theta_rad):8.3f}|{np.rad2deg(meas_pose_0.theta_rad):8.3f} deg\n"
             f"t_x:         {state_pose.tvec[0]:8.3f}|{meas_pose_0.tvec[0]:8.3f}\n"
             f"t_y:         {state_pose.tvec[1]:8.3f}|{meas_pose_0.tvec[1]:8.3f}\n\n"
             f"Iteration:   {second_idx:8d}\n"
@@ -480,26 +704,31 @@ def main() -> None:
             *meas_artists["edge_lines"],
             *state_artists["edge_lines"],
             *connection_lines,
-            *(artist for ghost_artist in ghost_artists for artist in [ghost_artist["scatter"], *ghost_artist["edge_lines"]]),
+            interp_point,
+            *path_labels,
+            *(artist for g_artist in ghost_artists for artist in
+              [ghost_artist["scatter"], *ghost_artist["edge_lines"]]),
             *ghost_labels,
         ]
+
+    from support.io.my_logging import LOG
 
     update(0)
     configure_figure_layout(fig)
     fig.canvas.draw()
     snapshot_path = save_demo_snapshot(fig, "_initial")
-    print(f"Saved initial snapshot to: {snapshot_path}")
+    LOG.info(f"Saved initial snapshot to: {snapshot_path}")
 
     update(N_FRAMES - 1)
     fig.canvas.draw()
     snapshot_path = save_demo_snapshot(fig)
-    print(f"Saved final snapshot to: {snapshot_path}")
+    LOG.info(f"Saved final snapshot to: {snapshot_path}")
 
     anim = FuncAnimation(fig, update, frames=N_FRAMES, interval=FRAME_INTERVAL_MS, blit=False, repeat=True)
     fig._object_alignment_anim = anim
 
     video_path = save_demo_video(anim)
-    print(f"Saved video to: {video_path}")
+    LOG.info(f"Saved video to: {video_path}")
 
     plt.show()
 

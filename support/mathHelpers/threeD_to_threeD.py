@@ -29,84 +29,14 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 import support.mathHelpers.quaternions as q
+from support.mathHelpers.SE3 import SE3_q as SE3
 
 FloatArray = NDArray[np.float64]
 
 _EPS = 1.0e-12
 
 
-@dataclass(frozen=True)
-class SE3:
-    """Rigid transform from ``source_frame`` into ``target_frame``.
-
-    The transform convention is
-
-        p_target = R @ p_source + t
-
-    for column-vector mathematics. For an N x 3 point array, this is evaluated
-    efficiently as ``points @ R.T + t``.
-    """
-
-    R: FloatArray
-    t: FloatArray
-    source_frame: str = "source"
-    target_frame: str = "target"
-
-    def __post_init__(self) -> None:
-        R = np.asarray(self.R, dtype=float).reshape(3, 3)
-        t = np.asarray(self.t, dtype=float).reshape(3)
-        if not np.all(np.isfinite(R)) or not np.all(np.isfinite(t)):
-            raise ValueError("SE3 contains non-finite values.")
-        object.__setattr__(self, "R", R)
-        object.__setattr__(self, "t", t)
-
-    @property
-    def matrix(self) -> FloatArray:
-        """Return the 4 x 4 homogeneous matrix representation."""
-
-        T = np.eye(4, dtype=float)
-        T[:3, :3] = self.R
-        T[:3, 3] = self.t
-        return T
-
-    @property
-    def q_sxyz(self):
-        """Return the scalar-first project quaternion corresponding to ``R``."""
-
-        return q.mat2quat(self.R)
-
-    def inverse(self) -> "SE3":
-        """Return the inverse rigid transform."""
-
-        R_inv = self.R.T
-        t_inv = -R_inv @ self.t
-        return SE3(
-            R=R_inv,
-            t=t_inv,
-            source_frame=self.target_frame,
-            target_frame=self.source_frame,
-        )
-
-    def transform_points(
-        self,
-        points: ArrayLike,
-        *,
-        points_are_columns: Optional[bool] = None,
-    ) -> FloatArray:
-        """Apply the transform to points and return an N x 3 array."""
-
-        pts = as_points3(points, points_are_columns=points_are_columns)
-        return pts @ self.R.T + self.t
-
-    def as_project_quaternion(self):  # pragma: no cover - depends on local project package
-        """Return the project Quaternion object when support.mathHelpers is available."""
-
-        return q.mat2quat(self.R)
-
-    def as_project_SE3(self):  # pragma: no cover - depends on local project package
-        """Return the project SE3 object when the project Quaternion class supports it."""
-
-        return self.as_project_quaternion().to_SE3_given_position(self.t)
+# `SE3` now aliases the quaternion-backed implementation in `support.mathHelpers.SE3`.
 
 
 @dataclass(frozen=True)
@@ -309,7 +239,12 @@ def fit_se3_kabsch(
     R = project_to_so3(R)
     t = target_centroid - R @ source_centroid
 
-    transform = SE3(R=R, t=t, source_frame=source_frame, target_frame=target_frame)
+    transform = SE3(
+        quat=q.mat2quat(R),
+        tvec=t,
+        source_frame=source_frame,
+        target_frame=target_frame,
+    )
     residuals = target - transform.transform_points(source)
     residual_norms = np.linalg.norm(residuals, axis=1)
     rmse = float(np.sqrt(np.mean(np.sum(residuals * residuals, axis=1))))

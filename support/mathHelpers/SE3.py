@@ -5,18 +5,51 @@ import support.mathHelpers.quaternions as q
 
 _FLOAT_EPS = np.finfo(np.float64).eps
 
+
+def _as_points3(points: NDArray, *, points_are_columns: bool | None = None) -> NDArray:
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2:
+        raise ValueError(f"Expected a 2-D point array, got shape {pts.shape}.")
+
+    if points_are_columns is True:
+        if pts.shape[0] != 3:
+            raise ValueError(f"Expected a 3 x N array, got shape {pts.shape}.")
+        pts = pts.T
+    elif points_are_columns is False:
+        if pts.shape[1] != 3:
+            raise ValueError(f"Expected an N x 3 array, got shape {pts.shape}.")
+    else:
+        if pts.shape[1] == 3:
+            pass
+        elif pts.shape[0] == 3:
+            pts = pts.T
+        else:
+            raise ValueError(f"Expected N x 3 or 3 x N points, got shape {pts.shape}.")
+
+    return np.ascontiguousarray(pts, dtype=float)
+
 class SE3_q:
     def __init__(self,
                  quat: q.Quaternion | None = None,
-                 tvec: NDArray | None = None) -> None:
+                 tvec: NDArray | None = None,
+                 *,
+                 source_frame: str = "source",
+                 target_frame: str = "target") -> None:
         self.quat: q.Quaternion = q.identity() if quat is None else q.Quaternion(quat=quat, makeUnitQuat=False)
         self.tvec: NDArray = np.zeros((3,), dtype=float) if tvec is None else np.asarray(tvec, dtype=float).reshape(3)
+        self.source_frame: str = source_frame
+        self.target_frame: str = target_frame
 
     def __repr__(self) -> str:
         return f"SE3_q(quat={self.quat!r}, tvec={self.tvec!r})"
 
     def copy(self) -> "SE3_q":
-        return SE3_q(quat=self.quat.copy(), tvec=self.tvec.copy())
+        return SE3_q(
+            quat=self.quat.copy(),
+            tvec=self.tvec.copy(),
+            source_frame=self.source_frame,
+            target_frame=self.target_frame,
+        )
 
     def compose(self, other: "SE3_q") -> "SE3_q":
         if not isinstance(other, SE3_q):
@@ -24,6 +57,8 @@ class SE3_q:
         return SE3_q(
             quat=(self.quat * other.quat).normalize(),
             tvec=self.quat * other.tvec + self.tvec,
+            source_frame=other.source_frame,
+            target_frame=self.target_frame,
         )
 
     @overload
@@ -53,7 +88,12 @@ class SE3_q:
     @property
     def inv(self) -> "SE3_q":
         q_inv = self.quat.T
-        return SE3_q(quat=q_inv, tvec=-(q_inv * self.tvec))
+        return SE3_q(
+            quat=q_inv,
+            tvec=-(q_inv * self.tvec),
+            source_frame=self.target_frame,
+            target_frame=self.source_frame,
+        )
 
     def inverse(self) -> "SE3_q":
         return self.inv
@@ -67,8 +107,30 @@ class SE3_q:
         return self.array
 
     @property
+    def R(self) -> NDArray:
+        return self.quat.to_dcm()
+
+    @property
+    def t(self) -> NDArray:
+        return self.tvec.copy()
+
+    @property
+    def q_sxyz(self) -> q.Quaternion:
+        return self.quat
+
+    @property
     def minimal(self) -> NDArray:
         return np.concatenate((self.quat.ln_so3.vec, self.tvec))
+
+    def transform_points(self, points: NDArray, *, points_are_columns: bool | None = None) -> NDArray:
+        pts = _as_points3(points, points_are_columns=points_are_columns)
+        return self.quat * pts + self.tvec
+
+    def as_project_quaternion(self) -> q.Quaternion:
+        return self.quat.copy()
+
+    def as_project_SE3(self) -> NDArray:
+        return self.quat.to_SE3_given_position(self.tvec)
 
     def jacobian(self) -> NDArray:
         """

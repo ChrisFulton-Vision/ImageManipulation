@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.core.enums import ImageSource
+from support.io.attitude_interpreter import CAMERA_RPY_OFFSET_DEG
 import support.gui.UserSelectQueue as GuiQueue
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 from support.mathHelpers.twoD_to_threeD import solveQnP
@@ -30,10 +31,12 @@ class PoseRuntime:
         self._truth_lookup_source = None
         self._truth_lookup = None
         self._yolo_sessions_by_dir: dict[str, Any] = {}
+        self._active_yolo_dir: str | None = None
         self._feature_kfs: dict[int, PixelKalmanFilter] = {}
         self._feature_detection_timeout_s = 0.5
         self._feature_last_detection_time_s: dict[int, float] = {}
         self._last_feature_kf_time_s: float | None = None
+        self._feature_kf_stabilization_ref_R_wc: np.ndarray | None = None
 
     @staticmethod
     def _frame_time_s(ctx: GuiQueue.FrameCtx) -> float:
@@ -72,14 +75,120 @@ class PoseRuntime:
     def _reset_feature_kf_bank(self) -> None:
         self._feature_kfs.clear()
         self._feature_last_detection_time_s.clear()
+        self._feature_kf_stabilization_ref_R_wc = None
 
     def _disable_feature_kf_bank(self) -> None:
         self._reset_feature_kf_bank()
         self._last_feature_kf_time_s = None
 
+    def _reset_yolo_runtime_state(self) -> None:
+        self._disable_feature_kf_bank()
+        if self.owner.pnpDrawer is not None:
+            self.owner.pnpDrawer.last_q_vec = None
+            self.owner.pnpDrawer.last_t_vec = None
+            self.owner.pnpDrawer.last_wq_vec = None
+            self.owner.pnpDrawer.last_wt_vec = None
+            self.owner.pnpDrawer.last_pnp_rvec = None
+            self.owner.pnpDrawer.last_pnp_tvec = None
+
     @staticmethod
+    def _camera_offset_rotmat() -> np.ndarray:
+        roll_deg, pitch_deg, yaw_deg = CAMERA_RPY_OFFSET_DEG
+        rr = np.deg2rad(roll_deg)
+        rp = np.deg2rad(pitch_deg)
+        ry = np.deg2rad(yaw_deg)
+
+        cr, sr = np.cos(rr), np.sin(rr)
+        cp, sp = np.cos(rp), np.sin(rp)
+        cy, sy = np.cos(ry), np.sin(ry)
+
+        rx = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cr, -sr],
+            [0.0, sr, cr],
+        ], dtype=float)
+        ry_m = np.array([
+            [cp, 0.0, sp],
+            [0.0, 1.0, 0.0],
+            [-sp, 0.0, cp],
+        ], dtype=float)
+        rz = np.array([
+            [cy, -sy, 0.0],
+            [sy, cy, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+        return rz @ ry_m @ rx
+
+    @classmethod
+    def _camera_cv_from_body_rotmat(cls) -> np.ndarray:
+        r_cb = cls._camera_offset_rotmat().T
+        perm = np.array([
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ], dtype=float)
+        return perm @ r_cb
+
+    def _current_feature_stabilization_homographies(
+        self,
+        width_px: float,
+        height_px: float,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        attitude = getattr(self.owner, "own_attitude", None)
+        if attitude is None or not getattr(attitude, "valid", False):
+            return None
+
+        R_wr = attitude.rotmat_wr()
+        if R_wr is None:
+            return None
+
+        R_cam_from_body = self._camera_cv_from_body_rotmat()
+        R_body_from_cam = R_cam_from_body.T
+        R_wc = np.asarray(R_wr, dtype=float) @ R_body_from_cam
+
+        if self._feature_kf_stabilization_ref_R_wc is None:
+            self._feature_kf_stabilization_ref_R_wc = np.asarray(R_wc, dtype=float)
+
+        if self.owner.calibration is not None and self.owner.calibration.validCal:
+            K = np.asarray(self.owner.calibration.getCameraMatrix(), dtype=np.float64)
+        else:
+            cx = float(width_px) * 0.5
+            cy = float(height_px) * 0.5
+            fx = float(width_px)
+            fy = float(width_px)
+            K = np.array([
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float64)
+
+        try:
+            K_inv = np.linalg.inv(K)
+        except np.linalg.LinAlgError:
+            return None
+
+        H_stab_from_curr = K @ (self._feature_kf_stabilization_ref_R_wc.T @ R_wc) @ K_inv
+        H_curr_from_stab = K @ (R_wc.T @ self._feature_kf_stabilization_ref_R_wc) @ K_inv
+        return (
+            np.asarray(H_stab_from_curr, dtype=np.float64),
+            np.asarray(H_curr_from_stab, dtype=np.float64),
+        )
+
+    @staticmethod
+    def _apply_homography_point(H: np.ndarray | None, point_xy: np.ndarray) -> np.ndarray | None:
+        if H is None:
+            return np.asarray(point_xy, dtype=np.float64)
+        x = float(point_xy[0])
+        y = float(point_xy[1])
+        mapped = np.asarray(H, dtype=np.float64) @ np.array([x, y, 1.0], dtype=np.float64)
+        if abs(float(mapped[2])) < 1e-12:
+            return None
+        return np.asarray(mapped[:2] / mapped[2], dtype=np.float64)
+
     def _feature_track_metadata_from_kf(
+        self,
         kf: PixelKalmanFilter,
+        H_curr_from_stab: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float, bool, np.ndarray] | None:
         pos_cov_px = kf.position_covariance_px()
         gate_cov_px = kf.gate_ellipse_covariance_px()
@@ -100,6 +209,11 @@ class PoseRuntime:
             ],
             dtype=np.float64,
         )
+        if H_curr_from_stab is not None:
+            center_curr = self._apply_homography_point(H_curr_from_stab, center_px)
+            if center_curr is None or not np.all(np.isfinite(center_curr)):
+                return None
+            center_px = center_curr
         return pos_cov_px, gate_cov_px, float(kf.max_mahalanobis_sq), bool(kf.last_used_measurement), center_px
 
     def _build_feature_kf_metadata(self, prepared, frame_time_s: float, width_px: float, height_px: float, idsNamesLocs):
@@ -124,6 +238,9 @@ class PoseRuntime:
         ):
             freeze_only = True
         self._last_feature_kf_time_s = float(frame_time_s)
+        stab_h = self._current_feature_stabilization_homographies(width_px, height_px)
+        H_stab_from_curr = None if stab_h is None else stab_h[0]
+        H_curr_from_stab = None if stab_h is None else stab_h[1]
 
         seen_ids = set()
         sigma_yolo_2N = np.full((2 * len(prepared_pose_ids),), 1e6, dtype=np.float64)
@@ -157,6 +274,11 @@ class PoseRuntime:
             if not freeze_only:
                 if has_measurement:
                     center_px = meas_by_cid[cid]
+                    if H_stab_from_curr is not None:
+                        center_px_stab = self._apply_homography_point(H_stab_from_curr, center_px)
+                        if center_px_stab is None or not np.all(np.isfinite(center_px_stab)):
+                            continue
+                        center_px = center_px_stab
                     z = np.array([
                         float(center_px[0]) / max(width_px, 1.0),
                         float(center_px[1]) / max(height_px, 1.0),
@@ -166,7 +288,7 @@ class PoseRuntime:
                     z = None
                 kf.update_KF(new_time=frame_time_s, z=z)
 
-            meta = self._feature_track_metadata_from_kf(kf)
+            meta = self._feature_track_metadata_from_kf(kf, H_curr_from_stab=H_curr_from_stab)
             if meta is None:
                 continue
             pos_cov_px, gate_cov_px, gate_mahal_sq, used_now, center_px_now = meta
@@ -621,16 +743,24 @@ class PoseRuntime:
         requested = self._normalize_dir(yolo_folder.strip())
         self._validate_yolo_folder(requested)
 
+        switched_model = requested != self._active_yolo_dir
         session = self._yolo_sessions_by_dir.get(requested)
         if session is None:
             session = yolo.YOLO()
             session.setNewFolder(requested)
             session.set_calibration(self.owner.calibration)
             self._yolo_sessions_by_dir[requested] = session
+        elif switched_model:
+            session.setNewFolder(requested)
+            session.set_calibration(self.owner.calibration)
 
         session.iou = self.owner.camConfig.yolo_iou
         session.conf = self.owner.camConfig.yolo_conf
         session.set_calibration(self.owner.calibration)
+
+        if switched_model:
+            self._reset_yolo_runtime_state()
+            self._active_yolo_dir = requested
 
         self.owner.yoloSession = session
 

@@ -309,8 +309,8 @@ class KalmanFilter:
         self.height_px = height_px
 
         # --- Measurement noise (DEFINE IN PIXELS) ---
-        self.sigma_meas_px: float = 1.5
-        self.sigma_meas_py: float = 1.5
+        self.sigma_meas_px: float = 0.5
+        self.sigma_meas_py: float = 0.5
         self._update_meas_variances_from_px()
 
         # --- Jump gate (DEFINE IN PIXELS) ---

@@ -1,5 +1,6 @@
 # AttitudeInterpreter.py
 from support.io.my_logging import LOG
+from support.io.image_time_reader import _parse_log_timestamp_utc_seconds
 from support.core.enums import ControlMode
 
 import pandas as pd
@@ -172,6 +173,33 @@ class AttitudeReader:
                    img_folder_path: str | None = None,
                    update_time_offset_func=None):
 
+        def first_image_time_from_folder(path_like: str | None) -> float | None:
+            if not path_like:
+                return None
+
+            from pathlib import Path
+
+            path = Path(path_like)
+            folder = path if path.is_dir() else path.parent
+            try:
+                log_path = next(folder.glob("*.log"))
+            except StopIteration:
+                return None
+
+            try:
+                with open(log_path, newline='') as file_obj:
+                    for line in file_obj:
+                        row = line.strip()
+                        if not row:
+                            continue
+                        first_token = row.split()[0]
+                        if first_token == '#':
+                            continue
+                        return _parse_log_timestamp_utc_seconds(first_token, 7)
+            except OSError as exc:
+                LOG.warning("Failed to read image log '%s': %s", log_path, exc)
+            return None
+
         def read_from_csv(filename: str):
             try:
                 return pd.read_csv(join(csv_folder_path, filename))
@@ -211,7 +239,10 @@ class AttitudeReader:
         self.cmd_dict = self.cmd_dict.sort_values('timestamp').reset_index(drop=True)
         self.gps_dict = self.gps_dict.sort_values('timestamp').reset_index(drop=True)
 
-        # --- Read or synthesize time offset as a DataFrame consistently ---
+        first_sensor_time = float(self.spd_dict['timestamp'].iloc[0])
+        first_image_time = first_image_time_from_folder(img_folder_path)
+
+        # With absolute image timestamps, offset maps image time to sensor/log time.
         should_persist_offset = False
 
         try:
@@ -223,103 +254,39 @@ class AttitudeReader:
                         break
             if 'offset' not in offset_df.columns:
                 raise ValueError("__TIME_OFFSET.csv missing required 'offset' column")
+
+            raw_offset = float(offset_df['offset'][0])
+            if first_image_time is not None:
+                err_as_new = abs((first_image_time + raw_offset) - first_sensor_time)
+                err_as_legacy = abs(raw_offset - first_sensor_time)
+                if err_as_legacy + 1e-6 < err_as_new:
+                    converted_offset = raw_offset - first_image_time
+                    offset_df = pd.DataFrame({'offset': [converted_offset]})
+                    should_persist_offset = True
+                    LOG.info(
+                        "Converted legacy __TIME_OFFSET %.6f to absolute-image offset %.6f.",
+                        raw_offset,
+                        converted_offset,
+                    )
         except FileNotFoundError:
-
-            img_path = None
             offset_df = None
-
-            if img_folder_path is not None:
-                try:
-                    import os
-                    from pathlib import Path
-
-                    img_path = Path(img_folder_path)
-                    if not Path.is_dir(img_path):
-                        img_path = img_path.parent
-                    log_name = img_path.glob("*.log").__next__().name
-
-                    import re
-                    from datetime import datetime, timezone
-                    MONTHS = {
-                        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
-                        "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
-                        "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-                    }
-
-                    def parse_utc_log_timestamp(filename: str):
-                        pattern = re.compile(
-                            r"^___"
-                            r"(?P<year>\d{4})\."
-                            r"(?P<month>[A-Za-z]{3})\."
-                            r"(?P<day>\d{1,2})_"
-                            r"(?P<hour>\d{1,2})\."
-                            r"(?P<minute>\d{1,2})\."
-                            r"(?P<second>\d{1,2})\."
-                            r"(?P<frac>\d{1,9})"
-                            r"\.UTC"
-                            r"(?:\.log)?$"
-                        )
-
-                        m = pattern.match(filename)
-                        if not m:
-                            LOG.warning(f"LOG Filename does not match expected timestamp format: {filename}")
-                            return None
-
-                        month_str = m.group("month").title()
-                        if month_str not in MONTHS:
-                            LOG.warning(f"Invalid month abbreviation in filename: {month_str}")
-                            return None
-
-                        try:
-                            year = int(m.group("year"))
-                            month = MONTHS[month_str]
-                            day = int(m.group("day"))
-                            hour = int(m.group("hour"))
-                            minute = int(m.group("minute"))
-                            second = int(m.group("second"))
-
-                            frac_ns = int(m.group("frac").ljust(9, "0")[:9])
-
-                            dt = datetime(
-                                year, month, day,
-                                hour, minute, second,
-                                microsecond=frac_ns // 1000,
-                                tzinfo=timezone.utc,
-                            )
-
-                        except ValueError as valueError:
-                            LOG.warning(f"Invalid timestamp values in filename: {filename}")
-                            return None
-
-                        remaining_nanoseconds = frac_ns % 1000
-
-                        unix_seconds = dt.timestamp()
-                        unix_nanoseconds = int(unix_seconds * 1_000_000_000) + remaining_nanoseconds
-
-                        return {
-                            "datetime_utc": dt,
-                            "nanosecond": frac_ns,
-                            "remaining_nanoseconds": remaining_nanoseconds,
-                            "unix_seconds": unix_seconds + remaining_nanoseconds / 1e9,
-                            "unix_nanoseconds": unix_nanoseconds,
-                        }
-                    parsed = parse_utc_log_timestamp(log_name)
-                    if parsed is not None:
-                        offset_df = pd.DataFrame({'offset': [parsed['unix_seconds']]})
-                        should_persist_offset = True
-                        LOG.info("No __TIME_OFFSET.csv found; defaulting offset to LOG filename Time.")
-                except FileNotFoundError as e:
-                    pass
 
         except Exception as e:
             LOG.warning(f"Unexpected error while reading __TIME_OFFSET.csv:\n{e}")
             return False
 
         if offset_df is None:
-            LOG.info("No __TIME_OFFSET.csv found; defaulting offset to first ARSP timestamp.")
-            t0 = float(self.spd_dict['timestamp'].iloc[0])
-            offset_df = pd.DataFrame({'offset': [t0]})
-            should_persist_offset = True
+            if first_image_time is not None:
+                inferred_offset = first_sensor_time - first_image_time
+                offset_df = pd.DataFrame({'offset': [inferred_offset]})
+                should_persist_offset = True
+                LOG.info(
+                    "No __TIME_OFFSET.csv found; aligning first image time to first log time with offset %.6f.",
+                    inferred_offset,
+                )
+            else:
+                LOG.info("No __TIME_OFFSET.csv found and no image log available; defaulting offset to 0.0s.")
+                offset_df = pd.DataFrame({'offset': [0.0]})
 
         self.offset = float(offset_df['offset'][0])
         if should_persist_offset and update_time_offset_func is not None:

@@ -1,6 +1,13 @@
 import csv, os
 import datetime
 
+
+def _parse_log_timestamp_utc_seconds(raw_ts: str, trim_chars: int) -> float:
+    dt = datetime.datetime.strptime(raw_ts[:-trim_chars], '%Y.%b.%d_%H.%M.%S.%f')
+    dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
 class ImageTimeReader:
     def __init__(self, filename:str = None):
         self.filename = filename
@@ -31,12 +38,12 @@ class ImageTimeReader:
             for row in reader:
                 rowList = row[0].split(sep=' ')
                 if rowList[0] != '#':
-                    image_time = datetime.datetime.strptime(rowList[0][0:-7], '%Y.%b.%d_%H.%M.%S.%f')
+                    image_time = _parse_log_timestamp_utc_seconds(rowList[0], 7)
                     if self.startTimeUTC is None:
                         self.startTimeUTC = image_time
                     id = int(rowList[1])
                     imgName = rowList[2]
-                    self.idsTimes.append([imgName, (image_time-self.startTimeUTC).total_seconds()])
+                    self.idsTimes.append([imgName, image_time])
                     self.endTimeUTC = image_time
         return True
 
@@ -61,12 +68,12 @@ class CarrierTimeReader(ImageTimeReader):
             for rowList in reader:
                 if rowList[0] != '#':
 
-                    image_time = datetime.datetime.strptime(rowList[0][0:-5], '%Y.%b.%d_%H.%M.%S.%f')
+                    image_time = _parse_log_timestamp_utc_seconds(rowList[0], 5)
                     if self.startTimeUTC is None:
                         self.startTimeUTC = image_time
                     id = int(rowList[1])
                     self.idsTimes.append(
-                        [id, (image_time - self.startTimeUTC).total_seconds(), float(rowList[2]), float(rowList[3]),
+                        [id, image_time, float(rowList[2]), float(rowList[3]),
                          float(rowList[4]), float(rowList[5]), float(rowList[6]), float(rowList[7])])
                     self.endTimeUTC = image_time
 

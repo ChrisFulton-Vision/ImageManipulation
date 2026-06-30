@@ -154,7 +154,7 @@ class PlaybackController:
             cv2.namedWindow(self.owner.windowName, cv2.WINDOW_NORMAL)
 
             directory = Path(self.owner.camConfig.imageFilepath).parent
-            paths, t = self._build_sequence_and_timebase(directory)
+            paths, t_playback, ts_analysis = self._build_sequence_and_timebase(directory)
             num_images = len(paths)
 
             self.playback.speed = 1
@@ -193,12 +193,7 @@ class PlaybackController:
 
             self.pause_cache.clear()
 
-            # Load persisted/base offset, but keep UI delta at zero on startup.
-            loaded_offset = self.load_time_offset(directory)
-
-            if self.owner.hud_marker is not None:
-                self.owner.hud_marker.update_offset(loaded_offset)
-
+            # Base image-to-log alignment lives in AttitudeReader; this is only the live delta.
             self.owner.camConfig.cam_to_log_time_offset = 0.0
 
             from support.runtime.buffer_image_loader import BufferedImageLoader as imgBuf
@@ -218,10 +213,10 @@ class PlaybackController:
             if (
                 self.owner.camConfig.playback_mode == PlaybackSpeed.Real_time
                 and num_images > 0
-                and len(t) > 0
+                and len(t_playback) > 0
             ):
                 rs = float(self.owner.camConfig.rt_speed) or 1e-6
-                wall_start = time.monotonic() - (t[self.playback.curr_idx] / rs)
+                wall_start = time.monotonic() - (t_playback[self.playback.curr_idx] / rs)
 
             if self.owner.camConfig.playback_mode == PlaybackSpeed.Fixed_fps and num_images > 0:
                 period = 1.0 / max(0.001, float(self.owner.camConfig.target_fps))
@@ -334,22 +329,26 @@ class PlaybackController:
                     ):
                         rs = float(self.owner.camConfig.rt_speed) or 1e-6
                         elapsed = (time.monotonic() - wall_start) * rs
-                        elapsed_ref = (t[-1] - elapsed) if self.last_nonzero_sign < 0 else elapsed
+                        elapsed_ref = (
+                            (t_playback[-1] - elapsed) if self.last_nonzero_sign < 0 else elapsed
+                        )
 
-                        if elapsed_ref < t[0]:
+                        if elapsed_ref < t_playback[0]:
                             idx_target = num_images - 1
                             wall_start = time.monotonic() - (
-                                (t[idx_target] - t[0]) / rs if self.last_nonzero_sign >= 0
-                                else ((t[-1] - t[idx_target]) / rs)
+                                (t_playback[idx_target] - t_playback[0]) / rs
+                                if self.last_nonzero_sign >= 0
+                                else ((t_playback[-1] - t_playback[idx_target]) / rs)
                             )
-                        elif elapsed_ref > t[-1]:
+                        elif elapsed_ref > t_playback[-1]:
                             idx_target = 0
                             wall_start = time.monotonic() - (
-                                (t[idx_target] - t[0]) / rs if self.last_nonzero_sign >= 0
-                                else ((t[-1] - t[idx_target]) / rs)
+                                (t_playback[idx_target] - t_playback[0]) / rs
+                                if self.last_nonzero_sign >= 0
+                                else ((t_playback[-1] - t_playback[idx_target]) / rs)
                             )
                         else:
-                            idx_target = int(np.searchsorted(t, elapsed_ref, side="right") - 1)
+                            idx_target = int(np.searchsorted(t_playback, elapsed_ref, side="right") - 1)
 
                         idx_target = max(0, min(idx_target, num_images - 1))
                         if idx_target != self.playback.curr_idx:
@@ -360,7 +359,7 @@ class PlaybackController:
 
                         pending_keys.extend(self._poll_keys(1))
 
-                    ts = self.owner.ImageTimeReader.idsTimes[self.playback.curr_idx][1]
+                    ts = ts_analysis[self.playback.curr_idx]
                     box_around = (
                         self.owner.camConfig.start_export_idx
                         <= self.playback.curr_idx
@@ -375,7 +374,7 @@ class PlaybackController:
                     else:
                         self.owner.analyze_image(
                             frame,
-                            ts + self.owner.camConfig.cam_to_log_time_offset,
+                            float(ts) + self.owner.camConfig.cam_to_log_time_offset,
                             name,
                             box_around=box_around,
                         )
@@ -388,7 +387,7 @@ class PlaybackController:
                         args,
                         loader=loader,
                         curr_idx=self.playback.curr_idx,
-                        t=t,
+                        t=t_playback,
                         wall_start=wall_start,
                     )
 
@@ -406,7 +405,7 @@ class PlaybackController:
                             args,
                             loader=loader,
                             curr_idx=self.playback.curr_idx,
-                            t=t,
+                            t=t_playback,
                             wall_start=wall_start,
                         )
 
@@ -861,10 +860,10 @@ class PlaybackController:
         directory: str | Path | None = None,
     ) -> None:
         if offset_value is None:
-            if self.owner.hud_marker is None:
-                return
-            self.owner.hud_marker.update_offset(self.owner.camConfig.cam_to_log_time_offset)
-            offset_value = float(self.owner.hud_marker.offset)
+            base_offset = 0.0
+            if self.owner.hud_marker is not None:
+                base_offset = float(self.owner.hud_marker.offset)
+            offset_value = base_offset + float(self.owner.camConfig.cam_to_log_time_offset)
 
         out_csv = self._resolve_time_offset_csv_path(directory)
         if out_csv is None:
@@ -875,6 +874,8 @@ class PlaybackController:
         import pandas as pd
         pd.DataFrame({"offset": [float(offset_value)]}).to_csv(out_csv, index=False)
         LOG.info("Saved offset %.6f to %s", float(offset_value), out_csv)
+        if self.owner.hud_marker is not None:
+            self.owner.hud_marker.attRdr.offset = float(offset_value)
         self.owner.camConfig.cam_to_log_time_offset = 0.0
 
     @staticmethod
@@ -947,16 +948,7 @@ class PlaybackController:
             p = Path(rec[0])
             paths.append(p if p.is_absolute() else (Path(directory) / p))
 
-        base_offset = 0.0
-        if self.owner.hud_marker is not None:
-            base_offset = float(getattr(self.owner.hud_marker, "offset", 0.0) or 0.0)
+        ts_raw = [None if ts is None else float(ts) for _name, ts in self.owner.ImageTimeReader.idsTimes]
 
-        delta_offset = float(getattr(self.owner.camConfig, "cam_to_log_time_offset", 0.0) or 0.0)
-        total_offset = base_offset + delta_offset
-
-        ts_raw = []
-        for _name, ts in self.owner.ImageTimeReader.idsTimes:
-            ts_raw.append(None if ts is None else float(ts) + total_offset)
-
-        t = self._make_timebase(ts_raw, self.owner.camConfig.target_fps, len(paths))
-        return paths, t
+        t_playback = self._make_timebase(ts_raw, self.owner.camConfig.target_fps, len(paths))
+        return paths, t_playback, ts_raw

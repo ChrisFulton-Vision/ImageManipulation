@@ -624,17 +624,20 @@ class HUD_Marker:
         h, w = image.shape[:2]
         match mode:
             case ControlMode.controller:
-                cv2.putText(image, "MODE: CNTL", self.controlMode_text_loc,
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(h), (255, 150, 0), med_thick(h))
+                txt = "MODE: CNTL"
+                display_clr = (255, 150, 0)
             case ControlMode.manual:
-                cv2.putText(image, "MODE: MAN", self.controlMode_text_loc,
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(h), (255, 255, 0), med_thick(h))
+                txt = "MODE: MAN"
+                display_clr = (255, 255, 0)
             case ControlMode.auto:
-                cv2.putText(image, "MODE: AUTO", self.controlMode_text_loc,
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.HUD_GREEN, med_thick(h))
+                txt = "MODE: AUTO"
+                display_clr = clr.HUD_GREEN
             case _:
-                cv2.putText(image, "MODE: ERR", self.controlMode_text_loc,
-                            cv2.FONT_HERSHEY_SIMPLEX, med_text(h), (0, 0, 255), med_thick(h))
+                txt = "MODE: ERR"
+                display_clr = (0, 0, 255)
+
+        cv2.putText(image, txt, self.controlMode_text_loc,
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(h), display_clr, med_thick(h))
 
     @staticmethod
     def draw_playbackStats(image, lowPassFPS, target_fps, playback_mode, rt_speed, cam_to_log_time_offset, last_nonzero_sign):
@@ -671,18 +674,24 @@ def draw_name_on_image(name, frame):
                                             med_text(h), lrg_thick(h))
     pad = int(0.3 * height)
     cv2.putText(frame, name, (w - width - pad, h - height),
+                cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
+    cv2.putText(frame, name, (w - width - pad, h - height),
                 cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.HUD_GREEN, med_thick(h))
 
 
 def draw_time_on_image(frame, time_str):
     h, w = frame.shape[:2]
-    (time_width, time_height), base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
-                                                      med_text(h), lrg_thick(h))
+    (time_width, _time_height), _base = cv2.getTextSize(time_str, cv2.FONT_HERSHEY_SIMPLEX,
+                                                        med_text(h), lrg_thick(h))
+    (_ref_width, ref_height), _ref_base = cv2.getTextSize("I", cv2.FONT_HERSHEY_SIMPLEX,
+                                                          med_text(h), lrg_thick(h))
 
-    pad = int(0.5 * time_height)
-    img_w, img_h, *_ = frame.shape
-    # cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
-    #             cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
+    pad = int(0.3 * ref_height)
+    row_height = ref_height + pad
+    x = w - time_width - pad
+    y = h - row_height - ref_height
 
-    cv2.putText(frame, time_str, (img_w - time_width - pad, img_h - 2 * time_height - pad),
+    cv2.putText(frame, time_str, (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.BLACK, lrg_thick(h))
+    cv2.putText(frame, time_str, (x, y),
                 cv2.FONT_HERSHEY_SIMPLEX, med_text(h), clr.HUD_GREEN, med_thick(h))

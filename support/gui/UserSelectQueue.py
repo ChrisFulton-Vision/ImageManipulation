@@ -93,16 +93,19 @@ class AprilTagDetectOpts:
 class YoloOpts:
     want_pnp: bool = False
     want_qnp: bool = False
-    want_wqnp: bool = False
+    want_wqnp_yolo: bool = False
+    want_wqnp_kfest: bool = False
     factor_graph: bool = False
     hyper_focus: bool = False
     feature_circles: bool = False
     inference_source: YoloInferenceSource = YoloInferenceSource.ORIGINAL
+    display_feature_ids: str = ""
     model_folder: str = ""
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("PnP", "want_pnp", bool, False),
         ArgBinding("QnP", "want_qnp", bool, False),
-        ArgBinding("wQnP", "want_wqnp", bool, False),
+        ArgBinding("wQnP_yolo", "want_wqnp_yolo", bool, False),
+        ArgBinding("wQnP_KFest", "want_wqnp_kfest", bool, False),
         ArgBinding("Factor Graph", "factor_graph", bool, False),
         ArgBinding("Hyper Attention", "hyper_focus", bool, False),
         ArgBinding("Feature Circles", "feature_circles", bool, False),
@@ -112,9 +115,11 @@ class YoloOpts:
     # Derived, guaranteed consistent
     ARG_SPECS: ClassVar[tuple["ArgSpec", ...]] = (
         *(ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS),
+        ArgSpec("Display Features", str, ""),
         ArgSpec("YOLO Folder", str, "", path_kind="directory"),
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+    KEYMAP["Display Features"] = "display_feature_ids"
     KEYMAP["YOLO Folder"] = "model_folder"
 
 

@@ -17,29 +17,71 @@ class PoseOutput:
 
     qnp_q: q = None  # Quaternion object from solveQnP
     qnp_tvec: NDArray | None = None
+    wqnp_yolo_q: q = None
+    wqnp_yolo_tvec: NDArray | None = None
+    wqnp_kfest_q: q = None
+    wqnp_kfest_tvec: NDArray | None = None
 
     object_points: NDArray | None = None
     image_points: NDArray | None = None
     class_ids: list[int] | None = None
+    feature_gate_covariances_px: NDArray | None = None
+    feature_gate_mahal_sq: NDArray | None = None
+    feature_kf_used: NDArray | None = None
+
+
+@dataclass(slots=True)
+class PreparedPoseInputs:
+    centers_for_draw: NDArray
+    centers_for_pnp: NDArray
+    boxes_for_draw: list
+    class_ids: list[int]
+    pose_class_ids: list[int]
+    scores: list[float]
+    object_points: NDArray
+    image_points: NDArray
+    kfest_object_points: NDArray | None = None
+    kfest_image_points: NDArray | None = None
+    kfest_class_ids: list[int] | None = None
 
 
 class twoToThreeSelectedAlgorithms:
     def __init__(self):
         self.use_pnp = False
         self.use_qnp = False
-        self.use_wqnp = False
+        self.use_wqnp_yolo = False
+        self.use_wqnp_kfest = False
+        self.display_feature_ids: set[int] | None = None
 
 
 class pnp_qnp_draw:
     def __init__(self):
         self.last_q_vec = None
         self.last_t_vec = None
+        self.last_wq_vec = None
+        self.last_wt_vec = None
         self.last_pnp_rvec = None
         self.last_pnp_tvec = None
 
         # -----------------------------
         # NEW: estimation-only helpers
         # -----------------------------
+
+    @staticmethod
+    def _empty_prepared_inputs() -> PreparedPoseInputs:
+        return PreparedPoseInputs(
+            centers_for_draw=np.empty((0, 2), dtype=np.float64),
+            centers_for_pnp=np.empty((0, 2), dtype=np.float64),
+            boxes_for_draw=[],
+            class_ids=[],
+            pose_class_ids=[],
+            scores=[],
+            object_points=np.empty((0, 3), dtype=np.float64),
+            image_points=np.empty((0, 2), dtype=np.float64),
+            kfest_object_points=None,
+            kfest_image_points=None,
+            kfest_class_ids=[],
+        )
 
     def _estimate_pnp(self,
                       object_points: NDArray,
@@ -58,34 +100,38 @@ class pnp_qnp_draw:
         camera_matrix = calibration.getCameraMatrix()
         dist_coeffs = np.zeros((5,))
 
-        if self.last_pnp_rvec is not None and self.last_pnp_tvec is not None:
-            ret, rvec, tvec = cv2.solvePnP(
-                objectPoints=object_points,
-                imagePoints=image_points,
-                cameraMatrix=camera_matrix,
-                distCoeffs=dist_coeffs,
-                rvec=self.last_pnp_rvec,
-                tvec=self.last_pnp_tvec,
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE,
-            )
-            if ret:
-                self.last_pnp_rvec = rvec
-                self.last_pnp_tvec = tvec
-                return rvec, tvec
+        # if self.last_pnp_rvec is not None and self.last_pnp_tvec is not None:
+        #
+        #     ret, rvec, tvec = cv2.solvePnP(
+        #         objectPoints=object_points,
+        #         imagePoints=image_points,
+        #         cameraMatrix=camera_matrix,
+        #         distCoeffs=dist_coeffs,
+        #         rvec=self.last_pnp_rvec,
+        #         tvec=self.last_pnp_tvec,
+        #         useExtrinsicGuess=True,
+        #         flags=cv2.SOLVEPNP_ITERATIVE,
+        #     )
+        #     if ret:
+        #         self.last_pnp_rvec = rvec
+        #         self.last_pnp_tvec = tvec
+        #         return rvec, tvec
 
-        fast_flag = cv2.SOLVEPNP_SQPNP if hasattr(cv2, "SOLVEPNP_SQPNP") else cv2.SOLVEPNP_EPNP
-        ret, rvec, tvec = cv2.solvePnP(
-            objectPoints=object_points,
-            imagePoints=image_points,
-            cameraMatrix=camera_matrix,
-            distCoeffs=dist_coeffs,
-            flags=fast_flag,
-        )
-        if ret:
-            self.last_pnp_rvec = rvec
-            self.last_pnp_tvec = tvec
-            return rvec, tvec
+        # fast_flag = cv2.SOLVEPNP_SQPNP if hasattr(cv2, "SOLVEPNP_SQPNP") else cv2.SOLVEPNP_EPNP
+        # ret, rvec, tvec = cv2.solvePnP(
+        #     objectPoints=object_points,
+        #     imagePoints=image_points,
+        #     cameraMatrix=camera_matrix,
+        #     distCoeffs=dist_coeffs,
+        #     flags=fast_flag,
+        # )
+        # if ret:
+        #     self.last_pnp_rvec = rvec
+        #     self.last_pnp_tvec = tvec
+        #     return rvec, tvec
+
+        rvec = self.last_pnp_rvec
+        tvec = self.last_pnp_tvec
 
         ret, rvec, tvec, _inliers = cv2.solvePnPRansac(
             objectPoints=object_points,
@@ -106,7 +152,9 @@ class pnp_qnp_draw:
                       image_points: NDArray,
                       calibration: Calibration,
                       seed_rvec=None,
-                      seed_tvec=None):
+                      seed_tvec=None,
+                      sigma_2N=None,
+                      weighted: bool = False):
         """
         Returns (q_rvec, q_tvec) from solveQnP, or None if it fails.
 
@@ -130,14 +178,18 @@ class pnp_qnp_draw:
             # Otherwise, convert Rodrigues -> quat here and pass that.
             user_seed_q = q().from_rodrigues(seed_rvec)
             user_seed_t = np.squeeze(seed_tvec)
-        elif self.last_q_vec is not None and self.last_t_vec is not None:
-            user_seed_q = self.last_q_vec
-            user_seed_t = self.last_t_vec
+        else:
+            prev_q = self.last_wq_vec if weighted else self.last_q_vec
+            prev_t = self.last_wt_vec if weighted else self.last_t_vec
+            if prev_q is not None and prev_t is not None:
+                user_seed_q = prev_q
+                user_seed_t = prev_t
 
         q_rvec, q_tvec = solveQnP(
             object_pts=object_points,
             img_pts=image_points,
             cal=calibration,
+            sigma_2N=sigma_2N,
             user_seed_q=user_seed_q,
             user_seed_t=user_seed_t,
             # Turn this off because we are explicitly controlling the seed now.
@@ -145,28 +197,28 @@ class pnp_qnp_draw:
         )
 
         # Persist last good solution
-        self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
+        if weighted:
+            self.last_wq_vec, self.last_wt_vec = q_rvec, q_tvec
+        else:
+            self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
         return q_rvec, q_tvec
 
-    def markUpImage(self,
-                    image: NDArray,
-                    output: tuple[list, list, list, list, float],
-                    markup_is_undistorted: bool,
-                    calibration: Calibration,
-                    conf: float,
-                    iou: float,
-                    yoloSize: tuple[int, int],
-                    idsNamesLocs,
-                    usedAlgos: twoToThreeSelectedAlgorithms,
-                    originalSize: tuple[int, int],
-                    circles_not_features: bool = False) -> PoseOutput | None:
-
+    def prepare_pose_inputs(self,
+                            image: NDArray,
+                            output: tuple[list, list, list, list, float],
+                            markup_is_undistorted: bool,
+                            calibration: Calibration,
+                            conf: float,
+                            iou: float,
+                            yoloSize: tuple[int, int],
+                            idsNamesLocs,
+                            originalSize: tuple[int, int]) -> PreparedPoseInputs | None:
         h, w, _ = image.shape
         h_ori, w_ori = originalSize
 
-        centers_dist, boxes, scores, class_ids, time = output
+        centers_dist, boxes, scores, class_ids, _time = output
         if len(centers_dist) < 1:
-            return None
+            return self._empty_prepared_inputs()
         y_h, y_w = yoloSize
         sx = w_ori / float(y_w)
         sy = h_ori / float(y_h)
@@ -185,19 +237,6 @@ class pnp_qnp_draw:
             b[:, 1] *= sy
             b[:, 3] *= sy
             boxes_for_draw = b.tolist()
-
-        text = f'Inference time: {time:.3f}s'
-        (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
-        pad = int(0.3 * txt_height)
-        cv2.putText(image, text,
-                    (pad, pad + int(txt_height)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, lrg_thick(h))
-        cv2.putText(image, text,
-                    (pad, pad + int(txt_height)),
-                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, med_thick(h))
-
-        if calibration is not None:
-            calibration.scaleCalibration(w_ori)  # K now matches 'image' pixel space, returns early if already correct
 
         centers_for_draw = centers_px.copy()
         centers_for_pnp = centers_px.copy()
@@ -237,12 +276,7 @@ class pnp_qnp_draw:
                 ymin = float(np.min(und_corners[:, 1]))
                 ymax = float(np.max(und_corners[:, 1]))
 
-                undist_boxes.append([
-                    xmin,
-                    ymin,
-                    xmax,
-                    ymax,
-                ])
+                undist_boxes.append([xmin, ymin, xmax, ymax])
 
             boxes_for_draw = undist_boxes
 
@@ -257,9 +291,7 @@ class pnp_qnp_draw:
             boxes_for_draw = boxes_arr.tolist()
 
         if len(class_ids) == 0:
-            return None
-
-        boxes_for_draw = boxes_for_draw if boxes_for_draw is not None else boxes
+            return self._empty_prepared_inputs()
 
         boxes_for_nms = []
         for box in boxes_for_draw:
@@ -271,24 +303,101 @@ class pnp_qnp_draw:
                 float(y2 - y1),
             ])
 
-        if len(class_ids) == 0:
-            return None
-
         indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores, conf, iou)
-
         if len(indices) == 0:
-            return None
+            return self._empty_prepared_inputs()
 
         keep = np.array(
             [int(i[0]) if hasattr(i, "__len__") else int(i) for i in indices],
             dtype=np.int32
         )
 
-        newCentersForDraw = centers_for_draw[keep]
-        newCentersForPnp = centers_for_pnp[keep]
-        newBoxes = boxes_for_draw[keep] if isinstance(boxes_for_draw, np.ndarray) else [boxes_for_draw[i] for i in keep]
-        newClass_ids = [class_ids[i] for i in keep]
-        newScores = [scores[i] for i in keep]
+        new_centers_for_draw = centers_for_draw[keep]
+        new_centers_for_pnp = centers_for_pnp[keep]
+        new_boxes = boxes_for_draw[keep] if isinstance(boxes_for_draw, np.ndarray) else [boxes_for_draw[i] for i in keep]
+        new_class_ids = [class_ids[i] for i in keep]
+        new_scores = [scores[i] for i in keep]
+
+        object_points, image_points, pose_class_ids = self._collect_objPts_and_imgPts(
+            new_class_ids,
+            new_centers_for_pnp,
+            idsNamesLocs,
+        )
+
+        return PreparedPoseInputs(
+            centers_for_draw=new_centers_for_draw,
+            centers_for_pnp=new_centers_for_pnp,
+            boxes_for_draw=new_boxes,
+            class_ids=list(new_class_ids),
+            pose_class_ids=list(pose_class_ids),
+            scores=list(new_scores),
+            object_points=object_points,
+            image_points=image_points,
+            kfest_object_points=None,
+            kfest_image_points=None,
+            kfest_class_ids=[],
+        )
+
+    def markUpImage(self,
+                    image: NDArray,
+                    output: tuple[list, list, list, list, float],
+                    markup_is_undistorted: bool,
+                    calibration: Calibration,
+                    conf: float,
+                    iou: float,
+                    yoloSize: tuple[int, int],
+                    idsNamesLocs,
+                    usedAlgos: twoToThreeSelectedAlgorithms,
+                    originalSize: tuple[int, int],
+                    circles_not_features: bool = False,
+                    prepared: PreparedPoseInputs | None = None,
+                    sigma_2N_px: NDArray | None = None,
+                    sigma_2N_kfest_px: NDArray | None = None,
+                    feature_gate_covariances_px: NDArray | None = None,
+                    feature_gate_mahal_sq: NDArray | None = None,
+                    feature_kf_used: NDArray | None = None,
+                    kfest_gate_covariances_px: NDArray | None = None,
+                    kfest_gate_mahal_sq: NDArray | None = None,
+                    kfest_kf_used: NDArray | None = None) -> PoseOutput | None:
+
+        h, w, _ = image.shape
+        h_ori, w_ori = originalSize
+
+        centers_dist, _boxes, _scores, _class_ids, time = output
+
+        text = f'Inference time: {time:.3f}s'
+        (txt_width, txt_height), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, med_text(w), 4)
+        pad = int(0.3 * txt_height)
+        cv2.putText(image, text,
+                    (pad, pad + int(txt_height)),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.BLACK, lrg_thick(h))
+        cv2.putText(image, text,
+                    (pad, pad + int(txt_height)),
+                    cv2.FONT_HERSHEY_SIMPLEX, med_text(w), clr.LIGHTBLUE, med_thick(h))
+
+        if calibration is not None:
+            calibration.scaleCalibration(w_ori)  # K now matches 'image' pixel space, returns early if already correct
+
+        if prepared is None:
+            prepared = self.prepare_pose_inputs(
+                image=image,
+                output=output,
+                markup_is_undistorted=markup_is_undistorted,
+                calibration=calibration,
+                conf=conf,
+                iou=iou,
+                yoloSize=yoloSize,
+                idsNamesLocs=idsNamesLocs,
+                originalSize=originalSize,
+            )
+            if prepared is None:
+                return None
+
+        newCentersForDraw = prepared.centers_for_draw
+        newCentersForPnp = prepared.centers_for_pnp
+        newBoxes = prepared.boxes_for_draw
+        newClass_ids = prepared.class_ids
+        newScores = prepared.scores
 
         self._drawBoxes(
             image,
@@ -297,27 +406,43 @@ class pnp_qnp_draw:
             newClass_ids,
             newScores,
             draw_as_circles=circles_not_features,
+            feature_gate_covariances_px=feature_gate_covariances_px,
+            feature_gate_mahal_sq=feature_gate_mahal_sq,
+            feature_kf_used=feature_kf_used,
+            display_feature_ids=usedAlgos.display_feature_ids,
         )
+        if (
+            usedAlgos.use_wqnp_kfest
+            and prepared.kfest_image_points is not None
+            and prepared.kfest_class_ids is not None
+            and len(prepared.kfest_class_ids) > 0
+        ):
+            self._draw_kfest_estimates(
+                image=image,
+                kfest_image_points=prepared.kfest_image_points,
+                kfest_class_ids=prepared.kfest_class_ids,
+                measured_class_ids=newClass_ids,
+                draw_as_circles=circles_not_features,
+                kfest_gate_covariances_px=kfest_gate_covariances_px,
+                kfest_gate_mahal_sq=kfest_gate_mahal_sq,
+                kfest_kf_used=kfest_kf_used,
+                display_feature_ids=usedAlgos.display_feature_ids,
+            )
+        object_points = prepared.object_points
+        image_points = prepared.image_points
 
-        if len(set(indices)) <= 5:
-            return None
-
-        object_points, image_points = self._collect_objPts_and_imgPts(newClass_ids,
-                                                                      newCentersForPnp,
-                                                                      idsNamesLocs)
-        if len(object_points) < 6:
-            return None
+        have_pose_correspondences = len(object_points) >= 6
 
         # 1) Estimate PnP (optional)
         pnp_pose = None
-        if usedAlgos.use_pnp:
+        if usedAlgos.use_pnp and have_pose_correspondences:
             pnp_pose = self._estimate_pnp(object_points,
                                           image_points,
                                           calibration)
 
         # 2) Estimate QnP (optional) seeded by PnP if available
         qnp_pose = None
-        if usedAlgos.use_qnp:
+        if usedAlgos.use_qnp and have_pose_correspondences:
             if pnp_pose is not None:
                 seed_rvec, seed_tvec = pnp_pose
             else:
@@ -328,8 +453,91 @@ class pnp_qnp_draw:
                                           seed_rvec,
                                           seed_tvec)
 
+        wqnp_yolo_pose = None
+        if usedAlgos.use_wqnp_yolo and sigma_2N_px is not None and have_pose_correspondences:
+            if pnp_pose is not None:
+                seed_rvec, seed_tvec = pnp_pose
+            else:
+                seed_rvec, seed_tvec = None, None
+            wqnp_yolo_pose = self._estimate_qnp(
+                object_points,
+                image_points,
+                calibration,
+                seed_rvec,
+                seed_tvec,
+                sigma_2N=sigma_2N_px,
+                weighted=True,
+            )
+
+        wqnp_kfest_pose = None
+        if (
+            usedAlgos.use_wqnp_kfest
+            and sigma_2N_kfest_px is not None
+            and prepared.kfest_object_points is not None
+            and prepared.kfest_image_points is not None
+            and len(prepared.kfest_object_points) >= 6
+            and np.all(np.isfinite(prepared.kfest_image_points))
+        ):
+            if pnp_pose is not None:
+                seed_rvec, seed_tvec = pnp_pose
+            else:
+                seed_rvec, seed_tvec = None, None
+            wqnp_kfest_pose = self._estimate_qnp(
+                prepared.kfest_object_points,
+                prepared.kfest_image_points,
+                calibration,
+                seed_rvec,
+                seed_tvec,
+                sigma_2N=sigma_2N_kfest_px,
+                weighted=True,
+            )
+
         # 3) Draw in desired order (match your idx stacking)
         idx = 0
+        if usedAlgos.use_wqnp_kfest and wqnp_kfest_pose is not None:
+            q_rvec, q_tvec = wqnp_kfest_pose
+            self._drawQnP_from_pose(
+                image=image,
+                y_class_ids=prepared.kfest_class_ids or [],
+                y_centers=prepared.kfest_image_points,
+                object_points=prepared.kfest_object_points,
+                q_rvec=q_rvec,
+                q_tvec=q_tvec,
+                markup_is_undistorted=markup_is_undistorted,
+                calibration=calibration,
+                yoloSize=yoloSize,
+                idsNamesLocs=idsNamesLocs,
+                originalSize=originalSize,
+                idx=idx,
+                txt_color=clr.YELLOWGREEN,
+                title_prefix="WQNP_KF",
+                draw_as_circles=circles_not_features,
+                display_feature_ids=usedAlgos.display_feature_ids,
+            )
+            idx += 1
+
+        if usedAlgos.use_wqnp_yolo and wqnp_yolo_pose is not None:
+            q_rvec, q_tvec = wqnp_yolo_pose
+            self._drawQnP_from_pose(
+                image=image,
+                y_class_ids=newClass_ids,
+                y_centers=newCentersForPnp,
+                object_points=object_points,
+                q_rvec=q_rvec,
+                q_tvec=q_tvec,
+                markup_is_undistorted=markup_is_undistorted,
+                calibration=calibration,
+                yoloSize=yoloSize,
+                idsNamesLocs=idsNamesLocs,
+                originalSize=originalSize,
+                idx=idx,
+                txt_color=clr.YELLOWGREEN,
+                title_prefix="WQNP_YOLO",
+                draw_as_circles=circles_not_features,
+                display_feature_ids=usedAlgos.display_feature_ids,
+            )
+            idx += 1
+
         if usedAlgos.use_qnp and qnp_pose is not None:
             q_rvec, q_tvec = qnp_pose
             self._drawQnP_from_pose(
@@ -346,6 +554,7 @@ class pnp_qnp_draw:
                 originalSize=originalSize,
                 idx=idx,
                 draw_as_circles=circles_not_features,
+                display_feature_ids=usedAlgos.display_feature_ids,
             )
             idx += 1
 
@@ -365,24 +574,41 @@ class pnp_qnp_draw:
                 originalSize=originalSize,
                 idx=idx,
                 draw_as_circles=circles_not_features,
+                display_feature_ids=usedAlgos.display_feature_ids,
             )
             idx += 1
+
+        self._draw_overlay_legend(
+            image=image,
+            used_algos=usedAlgos,
+        )
 
         return PoseOutput(
             pnp_rvec=pnp_pose[0] if pnp_pose is not None else None,
             pnp_tvec=pnp_pose[1] if pnp_pose is not None else None,
             qnp_q=qnp_pose[0] if qnp_pose is not None else None,
             qnp_tvec=qnp_pose[1] if qnp_pose is not None else None,
-            object_points=object_points,
-            image_points=image_points,
-            class_ids=list(newClass_ids),
+            wqnp_yolo_q=wqnp_yolo_pose[0] if wqnp_yolo_pose is not None else None,
+            wqnp_yolo_tvec=wqnp_yolo_pose[1] if wqnp_yolo_pose is not None else None,
+            wqnp_kfest_q=wqnp_kfest_pose[0] if wqnp_kfest_pose is not None else None,
+            wqnp_kfest_tvec=wqnp_kfest_pose[1] if wqnp_kfest_pose is not None else None,
+            object_points=prepared.kfest_object_points if wqnp_kfest_pose is not None else object_points,
+            image_points=prepared.kfest_image_points if wqnp_kfest_pose is not None else image_points,
+            class_ids=list(prepared.kfest_class_ids) if wqnp_kfest_pose is not None and prepared.kfest_class_ids is not None else list(newClass_ids),
+            feature_gate_covariances_px=feature_gate_covariances_px,
+            feature_gate_mahal_sq=feature_gate_mahal_sq,
+            feature_kf_used=feature_kf_used,
         )
 
     @staticmethod
     def _drawBoxes(image: NDArray, newCenters: NDArray, newBoxes: NDArray,
                    newClass_ids: list, newScores: list,
-                   draw_as_circles: bool = True,
-                   circle_radius_px: int | None = None,) -> None:
+                    draw_as_circles: bool = True,
+                   circle_radius_px: int | None = None,
+                   feature_gate_covariances_px: NDArray | None = None,
+                   feature_gate_mahal_sq: NDArray | None = None,
+                   feature_kf_used: NDArray | None = None,
+                   display_feature_ids: set[int] | None = None,) -> None:
         '''
         Draws yolo boxes
         :param image: Original OpenCV image
@@ -395,7 +621,9 @@ class pnp_qnp_draw:
         '''
         h, w, _ = image.shape
 
-        for (centers, box, class_id, score) in zip(newCenters, newBoxes, newClass_ids, newScores):
+        for idx, (centers, box, class_id, score) in enumerate(zip(newCenters, newBoxes, newClass_ids, newScores)):
+            if display_feature_ids is not None and int(class_id) not in display_feature_ids:
+                continue
             x, y = centers
             x1, y1, x2, y2 = box
             x = int(round(x))
@@ -409,6 +637,20 @@ class pnp_qnp_draw:
                 r = int(circle_radius_px) if circle_radius_px is not None else max(2, int(round(0.002 * w)))
                 cv2.circle(image, (x, y), r + 2, clr.BLACK, -1)
                 cv2.circle(image, (x, y), r, clr.LIGHTBLUE, -1)
+                if feature_gate_covariances_px is not None and idx < len(feature_gate_covariances_px):
+                    cov = np.asarray(feature_gate_covariances_px[idx], dtype=np.float64)
+                    if cov.shape == (2, 2) and np.all(np.isfinite(cov)):
+                        eigvals, eigvecs = np.linalg.eigh(cov)
+                        eigvals = np.maximum(eigvals, 0.0)
+                        gate_msq = 1.0
+                        if feature_gate_mahal_sq is not None and idx < len(feature_gate_mahal_sq):
+                            gate_msq = max(float(feature_gate_mahal_sq[idx]), 0.0)
+                        major = max(1, int(round(np.sqrt(gate_msq * eigvals[1]))))
+                        minor = max(1, int(round(np.sqrt(gate_msq * eigvals[0]))))
+                        angle = float(np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1])))
+                        used = True if feature_kf_used is None else bool(feature_kf_used[idx])
+                        color = clr.YELLOWGREEN if used else clr.ORANGE
+                        cv2.ellipse(image, (x, y), (major, minor), angle, 0, 360, color, 1)
             else:
                 label = f"{class_id}"
                 cv2.rectangle(image, (x1, y1), (x2, y2), clr.LIGHTBLUE, small_thick(h))
@@ -444,15 +686,151 @@ class pnp_qnp_draw:
                     med_text(w), clr.LIGHTBLUE, med_thick(h))
 
     @staticmethod
+    def _draw_kfest_estimates(
+        image: NDArray,
+        kfest_image_points: NDArray,
+        kfest_class_ids: list[int],
+        measured_class_ids: list[int],
+        draw_as_circles: bool = True,
+        kfest_gate_covariances_px: NDArray | None = None,
+        kfest_gate_mahal_sq: NDArray | None = None,
+        kfest_kf_used: NDArray | None = None,
+        display_feature_ids: set[int] | None = None,
+    ) -> None:
+        h, w, _ = image.shape
+        measured_ids = {int(cid) for cid in measured_class_ids}
+        radius = max(3, int(round(0.0035 * w)))
+
+        for idx, (center, class_id) in enumerate(zip(np.asarray(kfest_image_points, dtype=np.float64), kfest_class_ids)):
+            if display_feature_ids is not None and int(class_id) not in display_feature_ids:
+                continue
+            if len(center) < 2 or not np.all(np.isfinite(center[:2])):
+                continue
+            x = int(round(float(center[0])))
+            y = int(round(float(center[1])))
+            current_measurement = int(class_id) in measured_ids
+            color = clr.GREEN if current_measurement else clr.PINK
+
+            cv2.circle(image, (x, y), radius + 2, clr.BLACK, 1)
+            cv2.circle(image, (x, y), radius, color, 1)
+            if kfest_gate_covariances_px is not None and idx < len(kfest_gate_covariances_px):
+                cov = np.asarray(kfest_gate_covariances_px[idx], dtype=np.float64)
+                if cov.shape == (2, 2) and np.all(np.isfinite(cov)):
+                    eigvals, eigvecs = np.linalg.eigh(cov)
+                    eigvals = np.maximum(eigvals, 0.0)
+                    gate_msq = 1.0
+                    if kfest_gate_mahal_sq is not None and idx < len(kfest_gate_mahal_sq):
+                        gate_msq = max(float(kfest_gate_mahal_sq[idx]), 0.0)
+                    major = max(1, int(round(np.sqrt(gate_msq * eigvals[1]))))
+                    minor = max(1, int(round(np.sqrt(gate_msq * eigvals[0]))))
+                    angle = float(np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1])))
+                    used = True if kfest_kf_used is None else bool(kfest_kf_used[idx])
+                    ellipse_color = clr.YELLOWGREEN if used else clr.ORANGE
+                    cv2.ellipse(image, (x, y), (major, minor), angle, 0, 360, ellipse_color, 1)
+            if not draw_as_circles:
+                cv2.line(image, (x - radius, y), (x + radius, y), color, 1)
+                cv2.line(image, (x, y - radius), (x, y + radius), color, 1)
+
+        (_txt_width, txt_height), _base = cv2.getTextSize(
+            'K',
+            cv2.FONT_HERSHEY_SIMPLEX,
+            med_text(w),
+            med_thick(h),
+        )
+        pad = int(0.3 * txt_height)
+        txt_height_per_row = txt_height + pad
+        loc = (pad, h - 5 * txt_height_per_row - pad)
+
+        cv2.putText(image, 'KF Estimate',
+                    loc,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.BLACK, lrg_thick(h))
+        cv2.putText(image, 'KF Estimate',
+                    loc,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    med_text(w), clr.GREEN, med_thick(h))
+
+    @staticmethod
     def _collect_objPts_and_imgPts(y_class_ids, y_centers, idsNamesLocs):
         object_points = []
         image_points = []
+        pose_class_ids = []
         for idx, cid in enumerate(y_class_ids):
             if cid < len(idsNamesLocs):
                 x, y, z = idsNamesLocs[cid][2:]
                 object_points.append([x, y, z])
                 image_points.append(y_centers[idx])  # <-- must match scaled K pixel space
-        return np.asarray(object_points, dtype=np.float64), np.asarray(image_points, dtype=np.float64)
+                pose_class_ids.append(int(cid))
+        return (
+            np.asarray(object_points, dtype=np.float64),
+            np.asarray(image_points, dtype=np.float64),
+            pose_class_ids,
+        )
+
+    @staticmethod
+    def _draw_overlay_legend(
+        image: NDArray,
+        used_algos: twoToThreeSelectedAlgorithms,
+    ) -> None:
+        h, w, _ = image.shape
+        x0 = int(0.84 * w)
+        bottom_margin = int(0.12 * h)
+        row_h = max(16, int(0.034 * h))
+        icon_r = max(3, int(0.004 * w))
+        font_scale = med_text(w)
+        text_thick = med_thick(h)
+        legend_rows = 2
+        if used_algos.use_wqnp_yolo or used_algos.use_wqnp_kfest:
+            legend_rows += 4
+        y0 = h - bottom_margin - (legend_rows - 1) * row_h
+
+        def draw_label(row_idx: int, text: str, color) -> None:
+            y = y0 + row_idx * row_h
+            cv2.putText(image, text, (x0, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, clr.BLACK, lrg_thick(h))
+            cv2.putText(image, text, (x0, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thick)
+
+        def draw_circle_marker(row_idx: int, color, filled: bool, crosshair: bool = False) -> None:
+            cy = y0 + row_idx * row_h - int(0.35 * row_h)
+            cx = x0 - int(0.025 * w)
+            cv2.circle(image, (cx, cy), icon_r + 2, clr.BLACK, 1)
+            cv2.circle(image, (cx, cy), icon_r, color, -1 if filled else 1)
+            if crosshair:
+                cv2.line(image, (cx - icon_r, cy), (cx + icon_r, cy), color, 1)
+                cv2.line(image, (cx, cy - icon_r), (cx, cy + icon_r), color, 1)
+
+        def draw_ellipse_marker(row_idx: int, color) -> None:
+            cy = y0 + row_idx * row_h - int(0.35 * row_h)
+            cx = x0 - int(0.025 * w)
+            cv2.ellipse(image, (cx, cy), (icon_r * 2, icon_r), 20.0, 0, 360, color, 1)
+
+        row_idx = 0
+        draw_label(row_idx, "Legend", clr.WHITE)
+        row_idx += 1
+        draw_circle_marker(row_idx, clr.LIGHTBLUE, filled=True)
+        draw_label(row_idx, "YOLO", clr.LIGHTBLUE)
+        row_idx += 1
+
+        if used_algos.use_wqnp_yolo or used_algos.use_wqnp_kfest:
+            draw_circle_marker(row_idx, clr.GREEN, filled=False)
+            draw_label(row_idx, "mKFest", clr.GREEN)
+            row_idx += 1
+            draw_circle_marker(row_idx, clr.PINK, filled=False)
+            draw_label(row_idx, "pKFest", clr.PINK)
+            row_idx += 1
+            draw_ellipse_marker(row_idx, clr.YELLOWGREEN)
+            draw_label(row_idx, "mGate", clr.YELLOWGREEN)
+            row_idx += 1
+            draw_ellipse_marker(row_idx, clr.ORANGE)
+            draw_label(row_idx, "pGate", clr.ORANGE)
+            row_idx += 1
+
+        if used_algos.display_feature_ids is None:
+            filter_text = "Feats: all"
+        else:
+            filter_text = "Feats: " + ",".join(str(v) for v in sorted(used_algos.display_feature_ids))
+        draw_label(row_idx, filter_text, clr.WHITE)
 
     def _drawPnP_from_pose(self,
                            image,
@@ -467,7 +845,8 @@ class pnp_qnp_draw:
                            idsNamesLocs,
                            originalSize,
                            idx=0,
-                           draw_as_circles=False):
+                           draw_as_circles=False,
+                           display_feature_ids: set[int] | None = None):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -494,6 +873,7 @@ class pnp_qnp_draw:
             txt_scale=0.75,
             draw_as_circles=draw_as_circles,
             circle_radius_px=int(round(scale * w)),
+            display_feature_ids=display_feature_ids,
         )
 
     def _drawQnP_from_pose(self,
@@ -505,11 +885,14 @@ class pnp_qnp_draw:
                            q_tvec,
                            markup_is_undistorted,
                            calibration,
-                           yoloSize,
-                           idsNamesLocs,
-                           originalSize,
-                           idx=0,
-                           draw_as_circles=False):
+                            yoloSize,
+                            idsNamesLocs,
+                            originalSize,
+                            idx=0,
+                            txt_color=clr.ORANGE,
+                            title_prefix="QNP",
+                            draw_as_circles=False,
+                            display_feature_ids: set[int] | None = None):
         h, w, _ = image.shape
 
         if idx == 0:
@@ -531,11 +914,12 @@ class pnp_qnp_draw:
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
             originalSize=originalSize,
-            title=f'QNP: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({np.linalg.norm(q_tvec):6.3f})',
+            title=f'{title_prefix}: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({np.linalg.norm(q_tvec):6.3f})',
             rowIDX=idx,
-            txt_color=clr.ORANGE,
+            txt_color=txt_color,
             draw_as_circles=draw_as_circles,
             circle_radius_px=int(round(scale * w)),
+            display_feature_ids=display_feature_ids,
         )
 
     @staticmethod
@@ -555,7 +939,8 @@ class pnp_qnp_draw:
                   txt_color=clr.YELLOW,
                   txt_scale=1.0,
                   draw_as_circles: bool = False,
-                  circle_radius_px: int | None = None):
+                  circle_radius_px: int | None = None,
+                  display_feature_ids: set[int] | None = None):
 
         h, w, _ = image.shape
         h_ori, w_ori = originalSize
@@ -577,6 +962,8 @@ class pnp_qnp_draw:
                     cv2.FONT_HERSHEY_SIMPLEX,
                     med_text(w), txt_color, med_thick(h))
         for y_class_id, y_center in zip(y_class_ids, y_centers):
+            if display_feature_ids is not None and int(y_class_id) not in display_feature_ids:
+                continue
 
             # for idNameLoc in idsNamesLocs:
             id = idsNamesLocs[y_class_id][0]

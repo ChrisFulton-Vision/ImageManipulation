@@ -24,7 +24,10 @@ def quat_slerp(q0: q.Quaternion, q1: q.Quaternion, alpha: float):
     return q0.slerp_with(q1, alpha)
 
 
-def set_axes_equal_3d(ax, points: ArrayLike | list[ArrayLike], *, pad_fraction: float = 0.0) -> None:
+def set_axes_equal_3d(ax,
+                      points: ArrayLike | list[ArrayLike],
+                      *,
+                      pad_fraction: float = 0.0) -> None:
     if isinstance(points, list):
         pts = np.vstack([np.asarray(cloud, dtype=float) for cloud in points])
     else:
@@ -411,7 +414,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     save_solution_csv(fit, args.output)
 
-    np.set_printoptions(suppress=True, threshold=np.inf, precision=5)
+    np.set_printoptions(suppress=True, threshold=int(np.inf), precision=5)
     print("Transform convention: target ~= R @ source + t")
     print("R:\n", fit.R)
     print("t:", fit.t)

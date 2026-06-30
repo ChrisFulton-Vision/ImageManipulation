@@ -1,10 +1,12 @@
 from typing import Any
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 
+from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.core.enums import ImageSource
 import support.gui.UserSelectQueue as GuiQueue
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
@@ -28,6 +30,228 @@ class PoseRuntime:
         self._truth_lookup_source = None
         self._truth_lookup = None
         self._yolo_sessions_by_dir: dict[str, Any] = {}
+        self._feature_kfs: dict[int, PixelKalmanFilter] = {}
+        self._feature_detection_timeout_s = 0.5
+        self._feature_last_detection_time_s: dict[int, float] = {}
+        self._last_feature_kf_time_s: float | None = None
+
+    @staticmethod
+    def _frame_time_s(ctx: GuiQueue.FrameCtx) -> float:
+        if ctx.img_time is not None:
+            return float(ctx.img_time)
+        return time.monotonic()
+
+    @staticmethod
+    def _parse_display_feature_ids(raw_value: str) -> set[int] | None:
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip()
+        if text == "":
+            return None
+        feature_ids: set[int] = set()
+        for token in text.split(","):
+            item = token.strip()
+            if item == "":
+                continue
+            try:
+                feature_ids.add(int(item))
+            except ValueError:
+                continue
+        return feature_ids if len(feature_ids) > 0 else None
+
+    def _get_feature_kf(self, class_id: int, width_px: float, height_px: float) -> PixelKalmanFilter:
+        kf = self._feature_kfs.get(int(class_id))
+        if kf is None:
+            kf = PixelKalmanFilter(width_px=width_px, height_px=height_px)
+            kf.set_image_size(width_px, height_px)
+            self._feature_kfs[int(class_id)] = kf
+        else:
+            kf.set_image_size(width_px, height_px)
+        return kf
+
+    def _reset_feature_kf_bank(self) -> None:
+        self._feature_kfs.clear()
+        self._feature_last_detection_time_s.clear()
+
+    def _disable_feature_kf_bank(self) -> None:
+        self._reset_feature_kf_bank()
+        self._last_feature_kf_time_s = None
+
+    @staticmethod
+    def _feature_track_metadata_from_kf(
+        kf: PixelKalmanFilter,
+    ) -> tuple[np.ndarray, np.ndarray, float, bool, np.ndarray] | None:
+        pos_cov_px = kf.position_covariance_px()
+        gate_cov_px = kf.gate_ellipse_covariance_px()
+        if (
+            pos_cov_px is None
+            or pos_cov_px.shape != (2, 2)
+            or not np.all(np.isfinite(pos_cov_px))
+            or gate_cov_px is None
+            or gate_cov_px.shape != (2, 2)
+            or not np.all(np.isfinite(gate_cov_px))
+            or kf.x is None
+        ):
+            return None
+        center_px = np.array(
+            [
+                float(kf.x[0]) * float(kf.width_px),
+                float(kf.x[1]) * float(kf.height_px),
+            ],
+            dtype=np.float64,
+        )
+        return pos_cov_px, gate_cov_px, float(kf.max_mahalanobis_sq), bool(kf.last_used_measurement), center_px
+
+    def _build_feature_kf_metadata(self, prepared, frame_time_s: float, width_px: float, height_px: float, idsNamesLocs):
+        if prepared is None:
+            prepared_class_ids = []
+            prepared_centers = np.empty((0, 2), dtype=np.float64)
+            prepared_pose_ids = []
+        else:
+            prepared_class_ids = list(prepared.class_ids)
+            prepared_centers = np.asarray(prepared.centers_for_pnp, dtype=np.float64)
+            prepared_pose_ids = list(prepared.pose_class_ids)
+
+        freeze_only = False
+        if (
+            self._last_feature_kf_time_s is not None
+            and frame_time_s < float(self._last_feature_kf_time_s)
+        ):
+            self._reset_feature_kf_bank()
+        elif (
+            self._last_feature_kf_time_s is not None
+            and frame_time_s == float(self._last_feature_kf_time_s)
+        ):
+            freeze_only = True
+        self._last_feature_kf_time_s = float(frame_time_s)
+
+        seen_ids = set()
+        sigma_yolo_2N = np.full((2 * len(prepared_pose_ids),), 1e6, dtype=np.float64)
+        feature_gate_covs = np.full((len(prepared_class_ids), 2, 2), np.nan, dtype=np.float64)
+        feature_gate_mahal_sq = np.full((len(prepared_class_ids),), np.nan, dtype=np.float64)
+        feature_used = np.zeros((len(prepared_class_ids),), dtype=bool)
+        tracker_stats: dict[int, tuple[np.ndarray, np.ndarray, float, bool, np.ndarray]] = {}
+
+        meas_by_cid: dict[int, np.ndarray] = {}
+        for class_id, center_px in zip(prepared_class_ids, prepared_centers):
+            meas_by_cid[int(class_id)] = np.asarray(center_px, dtype=np.float64)
+
+        active_ids = sorted(set(self._feature_kfs.keys()) | set(meas_by_cid.keys()))
+        for cid in active_ids:
+            seen_ids.add(cid)
+            has_measurement = cid in meas_by_cid
+            if not has_measurement and cid not in self._feature_kfs:
+                continue
+            kf = self._get_feature_kf(cid, width_px, height_px)
+            last_detection_time_s = self._feature_last_detection_time_s.get(cid)
+
+            if (
+                not freeze_only
+                and last_detection_time_s is not None
+                and (frame_time_s - float(last_detection_time_s)) > self._feature_detection_timeout_s
+            ):
+                kf.reset()
+                self._feature_last_detection_time_s.pop(cid, None)
+                last_detection_time_s = None
+
+            if not freeze_only:
+                if has_measurement:
+                    center_px = meas_by_cid[cid]
+                    z = np.array([
+                        float(center_px[0]) / max(width_px, 1.0),
+                        float(center_px[1]) / max(height_px, 1.0),
+                    ], dtype=np.float64)
+                    self._feature_last_detection_time_s[cid] = float(frame_time_s)
+                else:
+                    z = None
+                kf.update_KF(new_time=frame_time_s, z=z)
+
+            meta = self._feature_track_metadata_from_kf(kf)
+            if meta is None:
+                continue
+            pos_cov_px, gate_cov_px, gate_mahal_sq, used_now, center_px_now = meta
+            tracker_stats[cid] = (
+                pos_cov_px,
+                gate_cov_px,
+                gate_mahal_sq,
+                used_now,
+                center_px_now,
+            )
+
+        for idx, cid in enumerate(prepared_class_ids):
+            stat = tracker_stats.get(int(cid))
+            if stat is None:
+                continue
+            _pos_cov_px, gate_cov_px, gate_mahal_sq, used, _center_px = stat
+            feature_gate_covs[idx] = gate_cov_px
+            feature_gate_mahal_sq[idx] = gate_mahal_sq
+            feature_used[idx] = used
+
+        for idx, cid in enumerate(prepared_pose_ids):
+            stat = tracker_stats.get(int(cid))
+            if stat is None:
+                continue
+            _pos_cov_px, gate_cov_px, _gate_mahal_sq, used, _center_px = stat
+            sigmas = np.sqrt(np.maximum(np.diag(gate_cov_px), 1e-6))
+            if not used:
+                sigmas *= 2.0
+            sigma_yolo_2N[2 * idx: 2 * idx + 2] = sigmas
+
+        kfest_object_points: list[list[float]] = []
+        kfest_image_points: list[list[float]] = []
+        kfest_class_ids: list[int] = []
+        kfest_sigma_2N: list[float] = []
+        kfest_gate_covs: list[np.ndarray] = []
+        kfest_gate_mahal_sq: list[float] = []
+        kfest_used: list[bool] = []
+        for cid in sorted(tracker_stats.keys()):
+            if cid < 0 or cid >= len(idsNamesLocs):
+                continue
+            last_detection_time_s = self._feature_last_detection_time_s.get(cid)
+            if last_detection_time_s is None:
+                continue
+            if (frame_time_s - float(last_detection_time_s)) > self._feature_detection_timeout_s:
+                continue
+            x, y, z = idsNamesLocs[cid][2:]
+            _pos_cov_px, gate_cov_px, _gate_mahal_sq, used, center_px = tracker_stats[cid]
+            kfest_object_points.append([x, y, z])
+            kfest_image_points.append([float(center_px[0]), float(center_px[1])])
+            kfest_class_ids.append(int(cid))
+            kfest_gate_covs.append(np.asarray(gate_cov_px, dtype=np.float64))
+            kfest_gate_mahal_sq.append(float(_gate_mahal_sq))
+            kfest_used.append(bool(used))
+            sigmas = np.sqrt(np.maximum(np.diag(gate_cov_px), 1e-6))
+            if not used:
+                sigmas *= 2.0
+            kfest_sigma_2N.extend([float(sigmas[0]), float(sigmas[1])])
+
+        stale_ids = []
+        for cid, kf in self._feature_kfs.items():
+            if freeze_only or cid in seen_ids or kf.lastStateTime is None:
+                continue
+            last_detection_time_s = self._feature_last_detection_time_s.get(cid)
+            if last_detection_time_s is None:
+                stale_ids.append(cid)
+                continue
+            if (frame_time_s - float(last_detection_time_s)) > self._feature_detection_timeout_s:
+                stale_ids.append(cid)
+        for cid in stale_ids:
+            self._feature_kfs.pop(cid, None)
+            self._feature_last_detection_time_s.pop(cid, None)
+
+        return (
+            sigma_yolo_2N,
+            feature_gate_covs,
+            feature_gate_mahal_sq,
+            feature_used,
+            np.asarray(kfest_object_points, dtype=np.float64),
+            np.asarray(kfest_image_points, dtype=np.float64),
+            kfest_class_ids,
+            np.asarray(kfest_sigma_2N, dtype=np.float64),
+            np.asarray(kfest_gate_covs, dtype=np.float64),
+            np.asarray(kfest_gate_mahal_sq, dtype=np.float64),
+            np.asarray(kfest_used, dtype=bool),
+        )
 
     @staticmethod
     def _draw_bottom_left_text(
@@ -429,7 +653,45 @@ class PoseRuntime:
         algos = pnp_drw.twoToThreeSelectedAlgorithms()
         algos.use_pnp = opts.want_pnp
         algos.use_qnp = opts.want_qnp
-        algos.use_wqnp = opts.want_wqnp
+        algos.use_wqnp_yolo = opts.want_wqnp_yolo
+        algos.use_wqnp_kfest = opts.want_wqnp_kfest
+        algos.display_feature_ids = self._parse_display_feature_ids(opts.display_feature_ids)
+        want_weighted_kf = bool(opts.want_wqnp_yolo or opts.want_wqnp_kfest)
+
+        prepared = self.owner.pnpDrawer.prepare_pose_inputs(
+            image=markup_frame,
+            output=output,
+            markup_is_undistorted=ctx.undistorted.get_or(False),
+            calibration=self.owner.calibration,
+            conf=self.owner.camConfig.yolo_conf,
+            iou=self.owner.camConfig.yolo_iou,
+            yoloSize=self.owner.yoloSession.yoloSize,
+            idsNamesLocs=self.owner.yoloSession.reader.idsNamesLocs,
+            originalSize=(int(infer_frame.shape[0]), int(infer_frame.shape[1])),
+        )
+        sigma_2N_px = None
+        feature_gate_covariances_px = None
+        feature_gate_mahal_sq = None
+        feature_kf_used = None
+        kfest_gate_covariances_px = None
+        kfest_gate_mahal_sq = None
+        kfest_kf_used = None
+        if want_weighted_kf:
+            frame_time_s = self._frame_time_s(ctx)
+            sigma_2N_px, feature_gate_covariances_px, feature_gate_mahal_sq, feature_kf_used, kfest_object_points, kfest_image_points, kfest_class_ids, sigma_2N_kfest_px, kfest_gate_covariances_px, kfest_gate_mahal_sq, kfest_kf_used = self._build_feature_kf_metadata(
+                prepared,
+                frame_time_s,
+                float(infer_frame.shape[1]),
+                float(infer_frame.shape[0]),
+                self.owner.yoloSession.reader.idsNamesLocs,
+            )
+            if prepared is not None:
+                prepared.kfest_object_points = kfest_object_points
+                prepared.kfest_image_points = kfest_image_points
+                prepared.kfest_class_ids = kfest_class_ids
+        else:
+            self._disable_feature_kf_bank()
+            sigma_2N_kfest_px = None
 
         pose_output = self.owner.pnpDrawer.markUpImage(
             image=markup_frame,
@@ -443,6 +705,15 @@ class PoseRuntime:
             usedAlgos=algos,
             originalSize=(int(infer_frame.shape[0]), int(infer_frame.shape[1])),
             circles_not_features=opts.feature_circles,
+            prepared=prepared,
+            sigma_2N_px=sigma_2N_px,
+            sigma_2N_kfest_px=sigma_2N_kfest_px,
+            feature_gate_covariances_px=feature_gate_covariances_px,
+            feature_gate_mahal_sq=feature_gate_mahal_sq,
+            feature_kf_used=feature_kf_used,
+            kfest_gate_covariances_px=kfest_gate_covariances_px,
+            kfest_gate_mahal_sq=kfest_gate_mahal_sq,
+            kfest_kf_used=kfest_kf_used,
         )
 
         if pose_output is not None:
@@ -455,12 +726,38 @@ class PoseRuntime:
             } if pose_output.pnp_rvec is not None and pose_output.pnp_tvec is not None else None
 
             self.owner.qnpResult = {
-                "q": pose_output.qnp_q,
-                "tvec": pose_output.qnp_tvec,
+                "q": (
+                    pose_output.wqnp_kfest_q
+                    if pose_output.wqnp_kfest_q is not None
+                    else pose_output.wqnp_yolo_q
+                    if pose_output.wqnp_yolo_q is not None
+                    else pose_output.qnp_q
+                ),
+                "tvec": (
+                    pose_output.wqnp_kfest_tvec
+                    if pose_output.wqnp_kfest_tvec is not None
+                    else pose_output.wqnp_yolo_tvec
+                    if pose_output.wqnp_yolo_tvec is not None
+                    else pose_output.qnp_tvec
+                ),
                 "object_points": pose_output.object_points,
                 "image_points": pose_output.image_points,
                 "class_ids": pose_output.class_ids,
-            } if pose_output.qnp_q is not None and pose_output.qnp_tvec is not None else None
+                "weighted_mode": (
+                    "kfest"
+                    if pose_output.wqnp_kfest_q is not None and pose_output.wqnp_kfest_tvec is not None
+                    else "yolo"
+                    if pose_output.wqnp_yolo_q is not None and pose_output.wqnp_yolo_tvec is not None
+                    else None
+                ),
+                "feature_gate_covariances_px": pose_output.feature_gate_covariances_px,
+                "feature_gate_mahal_sq": pose_output.feature_gate_mahal_sq,
+                "feature_kf_used": pose_output.feature_kf_used,
+            } if (
+                (pose_output.wqnp_kfest_q is not None and pose_output.wqnp_kfest_tvec is not None)
+                or (pose_output.wqnp_yolo_q is not None and pose_output.wqnp_yolo_tvec is not None)
+                or (pose_output.qnp_q is not None and pose_output.qnp_tvec is not None)
+            ) else None
         else:
             self.owner.pnpResult = None
             self.owner.qnpResult = None

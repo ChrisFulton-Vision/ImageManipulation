@@ -293,7 +293,8 @@ def _kf_step_inplace_with_nis(
 class KalmanFilter:
     def __init__(self, width_px: float = 864.0, height_px: float = 864.0):
         self.x = None
-        self.lastMeasTime = None
+        self.lastStateTime = None
+        self.lastMeasurementTime = None
 
         # Image size for px<->normalized conversions
         self.width_px = float(width_px)
@@ -324,6 +325,8 @@ class KalmanFilter:
         self.max_mahalanobis_sq: float = 13.82
 
         self.last_used_measurement: bool = False
+        self.lastDeltaTime: float = float(self.dt)
+        self.lastGateCovNorm: np.ndarray | None = None
 
         # NIS Tracking
         self.last_nis = float("nan")
@@ -442,6 +445,66 @@ class KalmanFilter:
         self.update_F(new_delta_t)
         self.update_Q(new_delta_t)
 
+    def reset(self):
+        self.x = None
+        self.lastStateTime = None
+        self.lastMeasurementTime = None
+        self.last_used_measurement = False
+        self.lastDeltaTime = float(self.dt)
+        self.lastGateCovNorm = None
+        self.last_nis = float("nan")
+        self.P = np.eye(4, dtype=np.float64) * 10.0
+
+    def position_covariance_norm(self) -> np.ndarray | None:
+        if self.x is None or self.P is None:
+            return None
+        return np.asarray(self.P[:2, :2], dtype=np.float64).copy()
+
+    def position_covariance_px(self) -> np.ndarray | None:
+        cov_norm = self.position_covariance_norm()
+        if cov_norm is None:
+            return None
+        scale = np.diag([float(self.width_px) ** 2, float(self.height_px) ** 2])
+        return scale @ cov_norm
+
+    def _build_F_Q(self, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        F = np.eye(4, dtype=np.float64)
+        F[0, 2] = dt
+        F[1, 3] = dt
+
+        dt_sq = dt * dt
+        dt_cb = dt_sq * dt
+        dt_qu = dt_cb * dt
+        Q = np.zeros((4, 4), dtype=np.float64)
+        Q[0, 0] = 0.25 * dt_qu * self.var_proc
+        Q[1, 1] = 0.25 * dt_qu * self.var_proc
+        Q[0, 2] = 0.50 * dt_cb * self.var_proc
+        Q[1, 3] = 0.50 * dt_cb * self.var_proc
+        Q[2, 0] = 0.50 * dt_cb * self.var_proc
+        Q[3, 1] = 0.50 * dt_cb * self.var_proc
+        Q[2, 2] = dt_sq * self.var_proc
+        Q[3, 3] = dt_sq * self.var_proc
+        return F, Q
+
+    def predicted_measurement_covariance_norm(self, dt: float | None = None) -> np.ndarray | None:
+        if self.x is None or self.P is None:
+            return None
+        if dt is None and self.lastGateCovNorm is not None:
+            return np.asarray(self.lastGateCovNorm, dtype=np.float64).copy()
+        if dt is None:
+            dt = float(self.dt)
+        dt = max(float(dt), 0.0)
+        F, Q = self._build_F_Q(dt)
+        P_pred = F @ np.asarray(self.P, dtype=np.float64) @ F.T + Q
+        return np.asarray(P_pred[:2, :2] + self.R, dtype=np.float64)
+
+    def gate_ellipse_covariance_px(self, dt: float | None = None) -> np.ndarray | None:
+        cov_norm = self.predicted_measurement_covariance_norm(dt=dt)
+        if cov_norm is None:
+            return None
+        scale = np.diag([float(self.width_px), float(self.height_px)])
+        return scale @ cov_norm @ scale.T
+
     def update_F(self, new_delta_t: float):
         self.F[[0, 1], [2, 3]] = new_delta_t
 
@@ -458,6 +521,10 @@ class KalmanFilter:
     def update_KF(self, new_time=None, z: np.array = None):
         """
         Same signature as before, but uses a Numba-accelerated core.
+
+        Timing semantics:
+        - lastStateTime advances on every successful predict/update step.
+        - lastMeasurementTime advances only when a real measurement is accepted.
         """
 
         self.last_used_measurement = False
@@ -469,22 +536,27 @@ class KalmanFilter:
             self.x = np.zeros(4, dtype=np.float64)
             self.x[0:2] = z[0:2]
             self.P = np.eye(4, dtype=np.float64) * 10.0  # matches your init :contentReference[oaicite:9]{index=9}
-            self.lastMeasTime = new_time
+            self.lastStateTime = new_time
+            self.lastMeasurementTime = new_time
+            self.lastDeltaTime = 0.0
+            self.lastGateCovNorm = np.asarray(self.P[:2, :2] + self.R, dtype=np.float64)
             self.last_used_measurement = True
             return self.updated_state()
 
         # default time
         if new_time is None:
-            new_time = self.dt + self.lastMeasTime
+            new_time = self.dt + self.lastStateTime
 
-        delta_t = new_time - self.lastMeasTime
+        delta_t = new_time - self.lastStateTime
         if isinstance(delta_t, timedelta):
             delta_t = delta_t.total_seconds()
 
         if delta_t < 0.001:
             return self.updated_state()
 
-        self.lastMeasTime = new_time
+        self.lastDeltaTime = float(delta_t)
+        self.lastGateCovNorm = self.predicted_measurement_covariance_norm(dt=float(delta_t))
+        self.lastStateTime = new_time
 
         # measurement presence + scalar extract
         if z is None:
@@ -504,12 +576,16 @@ class KalmanFilter:
             z0, z1, has_meas,
             float(self.var_proc), float(self.var_meas_x), float(self.var_meas_y),
             float(max_jump_norm), float(self.max_mahalanobis_sq),
-            self._nis_buf
+            self._nis_buf,
+            np.empty(1, dtype=np.float64),
+            np.empty(1, dtype=np.float64),
         )
 
         m_sq = float(self._nis_buf[0])
         self.last_nis = m_sq if m_sq >= 0.0 else float("nan")
         self.last_used_measurement = bool(used)
+        if self.last_used_measurement:
+            self.lastMeasurementTime = new_time
 
         return self.updated_state()
 

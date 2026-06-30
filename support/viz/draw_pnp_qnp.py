@@ -432,7 +432,7 @@ class pnp_qnp_draw:
                                                         med_text(w), med_thick(h))
         pad = int(0.3 * txt_height)
         txt_height_perRow = txt_height + pad
-        loc = (pad, h - 4 * txt_height_perRow - pad)
+        loc = (pad, h - 6 * txt_height_perRow - pad)
 
         cv2.putText(image, 'Direct Inference',
                     loc,

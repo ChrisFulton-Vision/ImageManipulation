@@ -1,4 +1,4 @@
-from typing import Protocol, TypeVar, Generic
+from typing import Protocol, TypeVar, Generic, Literal
 import numpy as np
 from dataclasses import dataclass
 from copy import deepcopy
@@ -21,6 +21,8 @@ class LeastSquaresProblem(Protocol[StateT]):
 class LevenbergMarquardt(Generic[StateT]):
     state: StateT
     problem: LeastSquaresProblem[StateT]
+    robust_loss: Literal["none", "huber", "cauchy", "tukey"] = "none"
+    robust_scale: float = 1.0
     damping_enabled: bool = False
     damping: float = 1e-1
     adaptive: bool = True
@@ -39,6 +41,9 @@ class LevenbergMarquardt(Generic[StateT]):
     store_states: bool = False
 
     def __post_init__(self):
+        if self.robust_scale <= 0.0:
+            raise ValueError(f"robust_scale must be positive, got {self.robust_scale}")
+
         self.idx: int = 0
         self.reject_count: int = 0
         self.converged: bool = False
@@ -158,11 +163,58 @@ class LevenbergMarquardt(Generic[StateT]):
         y = np.asarray(y, dtype=np.float64).reshape(-1)
         return float(np.linalg.norm(y))
 
+    def _robust_weight_sqrt_and_cost(self, y: np.ndarray) -> tuple[np.ndarray, float]:
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+        if self.robust_loss == "none":
+            return np.ones_like(y), 0.5 * float(y.T @ y)
+
+        abs_y = np.abs(y)
+        scale = self.robust_scale
+
+        if self.robust_loss == "huber":
+            weights = np.ones_like(y)
+            mask = abs_y > scale
+            weights[mask] = scale / abs_y[mask]
+
+            cost_terms = np.empty_like(y)
+            cost_terms[~mask] = 0.5 * y[~mask] ** 2
+            cost_terms[mask] = scale * (abs_y[mask] - 0.5 * scale)
+            return np.sqrt(weights), float(np.sum(cost_terms))
+
+        scaled_sq = (y / scale) ** 2
+
+        if self.robust_loss == "cauchy":
+            weights = 1.0 / (1.0 + scaled_sq)
+            cost = 0.5 * (scale ** 2) * float(np.sum(np.log1p(scaled_sq)))
+            return np.sqrt(weights), cost
+
+        if self.robust_loss == "tukey":
+            inside = scaled_sq < 1.0
+            weights = np.zeros_like(y)
+            weights[inside] = (1.0 - scaled_sq[inside]) ** 2
+
+            cost_terms = np.full_like(y, (scale ** 2) / 6.0)
+            cost_terms[inside] = (scale ** 2 / 6.0) * (1.0 - (1.0 - scaled_sq[inside]) ** 3)
+            return np.sqrt(weights), float(np.sum(cost_terms))
+
+        raise ValueError(f"Unsupported robust_loss: {self.robust_loss}")
+
+    def _weighted_system(self, L: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        L = np.asarray(L, dtype=np.float64)
+
+        sqrt_w, cost = self._robust_weight_sqrt_and_cost(y)
+        weighted_y = sqrt_w * y
+        weighted_L = sqrt_w[:, None] * L
+        return weighted_L, weighted_y, cost
+
     def _record_history(self, state: StateT, y: np.ndarray | None = None) -> None:
         if self.store_y_mags:
             if y is None:
                 y = self.problem.residual(state)
-            self.y_mag_hist.append(self._y_mag_from_y(y))
+            _, weighted_y, _ = self._weighted_system(self.problem.jacobian(state), y)
+            self.y_mag_hist.append(self._y_mag_from_y(weighted_y))
 
         if self.store_states:
             self.states_hist.append(self._copy_state(state))
@@ -214,10 +266,8 @@ class LevenbergMarquardt(Generic[StateT]):
 
         for step_idx in range(self.max_steps):
             orig_step_y = create_y(x)
-            orig_step_cost = 0.5 * float(orig_step_y.T @ orig_step_y)
-
-            y = orig_step_y
-            L = create_L(x)
+            raw_L = create_L(x)
+            L, y, orig_step_cost = self._weighted_system(raw_L, orig_step_y)
 
             keep_lm_going = True
 
@@ -232,7 +282,7 @@ class LevenbergMarquardt(Generic[StateT]):
 
                 trial_x = update(x, dx)
                 pert_y = create_y(trial_x)
-                pert_cost = 0.5 * float(pert_y.T @ pert_y)
+                _, _, pert_cost = self._weighted_system(create_L(trial_x), pert_y)
 
                 actual_improve = orig_step_cost - pert_cost
                 rho = actual_improve / pred_improve if pred_improve > 0.0 else -np.inf
@@ -264,7 +314,7 @@ class LevenbergMarquardt(Generic[StateT]):
 
         if not np.isfinite(self.final_cost):
             final_y = create_y(x)
-            self.final_cost = 0.5 * float(final_y.T @ final_y)
+            _, _, self.final_cost = self._weighted_system(create_L(x), final_y)
 
         self.converged = converged
         return x

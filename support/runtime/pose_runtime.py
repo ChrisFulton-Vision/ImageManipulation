@@ -29,6 +29,43 @@ class PoseRuntime:
         self._truth_lookup = None
         self._yolo_sessions_by_dir: dict[str, Any] = {}
 
+    @staticmethod
+    def _draw_bottom_left_text(
+        markup_frame: NDArray,
+        text: str,
+        row_idx: int,
+        color,
+    ) -> None:
+        h, w, _ = markup_frame.shape
+        (_txt_width, txt_height), _base = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            med_text(w),
+            med_thick(h),
+        )
+        pad = int(0.3 * txt_height)
+        txt_height_per_row = txt_height + pad
+        loc = (pad, h - (row_idx + 1) * txt_height_per_row - pad)
+
+        cv2.putText(
+            markup_frame,
+            text,
+            loc,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            med_text(markup_frame.shape[0]),
+            clr.BLACK,
+            lrg_thick(h),
+        )
+        cv2.putText(
+            markup_frame,
+            text,
+            loc,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            med_text(markup_frame.shape[0]),
+            color,
+            med_thick(h),
+        )
+
     def _get_truth_lookup(self) -> dict[int, np.ndarray]:
         if self.owner.ThreeDTruthPoints is None:
             self.owner.loadTruthPoints()
@@ -461,35 +498,27 @@ class PoseRuntime:
             self.owner.calibration.scaleCalibration(infer_w)
             K = self.owner.calibration.getCameraMatrix()
             two_d_points = np.array([center_infer[0], center_infer[1], 1.0])
-            dist_est = self.owner.calibration.fx * 4.07 / bbox_size_infer[0]
+            dist_est = self.owner.calibration.fx * 3.52636931926423 / bbox_size_infer[0]  #4.07 for cub
 
             if self.check_above_horizon(last_yolo_center):
                 last_yolo_3d_estimate = np.linalg.inv(K).dot(two_d_points) * dist_est
-                w, h, _ = markup_frame.shape
-                (_txt_width, txt_height), _base = cv2.getTextSize(
-                    "I",
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(w),
-                    med_thick(h),
-                )
-                pad = int(0.3 * txt_height)
-                cv2.putText(
+                bb_color = (50, 255, 255)
+                # self._draw_bottom_left_text(
+                #     markup_frame,
+                #     "BB-Width Solution",
+                #     row_idx=3,
+                #     color=bb_color,
+                # )
+                self._draw_bottom_left_text(
                     markup_frame,
-                    "BB-Width Solution",
-                    (pad, w - 2 * pad - txt_height),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(markup_frame.shape[0]),
-                    (50, 255, 255),
-                    med_thick(h),
-                )
-                cv2.putText(
-                    markup_frame,
-                    f"x:{last_yolo_3d_estimate[0]:+.3f}, y:{last_yolo_3d_estimate[1]:+.3f}, z:{last_yolo_3d_estimate[2]:+.3f}",
-                    (pad, h - pad),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    med_text(markup_frame.shape[0]),
-                    (50, 255, 255),
-                    med_thick(h),
+                    (
+                        f"BBS: {last_yolo_3d_estimate[0]:+6.3f}, "
+                        f"{last_yolo_3d_estimate[1]:+6.3f}, "
+                        f"{last_yolo_3d_estimate[2]:+6.3f} "
+                        f"({np.linalg.norm(last_yolo_3d_estimate):6.3f})"
+                    ),
+                    row_idx=2,
+                    color=bb_color,
                 )
 
         ctx.yolo.set(

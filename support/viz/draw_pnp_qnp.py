@@ -7,6 +7,7 @@ import support.viz.colors as clr
 from support.viz.CVFontScaling import med_text, small_thick, med_thick, lrg_thick
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.mathHelpers.quaternions import Quaternion as q
+from support.core.enums import robust_cost
 
 
 @dataclass(slots=True)
@@ -34,6 +35,33 @@ class PoseOutput:
     kf_track_class_ids: list[int] | None = None
     kf_track_estimates_px: NDArray | None = None
     kf_track_position_covariances_px: NDArray | None = None
+    pnp_residual_stats: "ResidualSummary | None" = None
+    qnp_residual_stats: "ResidualSummary | None" = None
+    wqnp_yolo_residual_stats: "ResidualSummary | None" = None
+    wqnp_kfest_residual_stats: "ResidualSummary | None" = None
+    qnp_cov6: NDArray | None = None
+    wqnp_yolo_cov6: NDArray | None = None
+    wqnp_kfest_cov6: NDArray | None = None
+    pnp_inlier_count: int = 0
+    pnp_outlier_count: int = 0
+    kf_track_count: int = 0
+    kf_accepted_measurement_count: int = 0
+    kf_rejected_measurement_count: int = 0
+    feature_spread_rms_px: float | None = None
+    feature_spread_mean_radius_px: float | None = None
+    apparent_target_bbox_width_px: float | None = None
+    apparent_target_bbox_height_px: float | None = None
+    apparent_target_bbox_diag_px: float | None = None
+    apparent_target_bbox_area_px: float | None = None
+
+
+@dataclass(slots=True)
+class ResidualSummary:
+    rmse_px: float
+    mean_px: float
+    median_px: float
+    p95_px: float
+    robust_cost: float
 
 
 @dataclass(slots=True)
@@ -121,6 +149,120 @@ class pnp_qnp_draw:
             kfest_class_ids=[],
         )
 
+    @staticmethod
+    def _project_points(
+        object_points: NDArray,
+        calibration: Calibration,
+        rvec: NDArray,
+        tvec: NDArray,
+    ) -> NDArray | None:
+        if calibration is None or object_points is None or len(object_points) == 0:
+            return None
+        try:
+            proj, _ = cv2.projectPoints(
+                np.asarray(object_points, dtype=np.float64),
+                np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+                np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+                calibration.getCameraMatrix(),
+                np.zeros((5, 1), dtype=np.float64),
+            )
+        except Exception:
+            return None
+        return np.asarray(proj, dtype=np.float64).reshape(-1, 2)
+
+    @staticmethod
+    def _robust_cost_from_residuals(
+        residual_norms: NDArray,
+        robust_kind: robust_cost = robust_cost.huber,
+        robust_param: float = 2.0,
+    ) -> float:
+        vals = np.asarray(residual_norms, dtype=np.float64).reshape(-1)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return float("nan")
+        c = max(float(robust_param), 1e-12)
+        if robust_kind == robust_cost.none:
+            return float(0.5 * np.sum(vals * vals))
+        if robust_kind == robust_cost.huber:
+            quad = vals <= c
+            return float(np.sum(0.5 * vals[quad] * vals[quad]) + np.sum(c * (vals[~quad] - 0.5 * c)))
+        if robust_kind == robust_cost.cauchy:
+            return float(np.sum(0.5 * (c ** 2) * np.log1p((vals / c) ** 2)))
+        clipped = np.minimum(vals / c, 1.0)
+        inside = clipped < 1.0
+        cost = np.full_like(clipped, (c ** 2) / 6.0, dtype=np.float64)
+        cost[inside] = (c ** 2) / 6.0 * (1.0 - (1.0 - clipped[inside] ** 2) ** 3)
+        return float(np.sum(cost))
+
+    @classmethod
+    def _compute_residual_summary(
+        cls,
+        object_points: NDArray,
+        image_points: NDArray,
+        calibration: Calibration,
+        rvec: NDArray,
+        tvec: NDArray,
+        sigma_2N: NDArray | None = None,
+        robust_kind: robust_cost = robust_cost.huber,
+        robust_param: float = 2.0,
+    ) -> ResidualSummary | None:
+        if object_points is None or image_points is None or len(object_points) == 0 or len(image_points) == 0:
+            return None
+        proj = cls._project_points(object_points, calibration, rvec, tvec)
+        if proj is None or len(proj) != len(image_points):
+            return None
+        meas = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+        residual_xy = meas - proj
+        residual_mag = np.linalg.norm(residual_xy, axis=1)
+        residual_mag = residual_mag[np.isfinite(residual_mag)]
+        if residual_mag.size == 0:
+            return None
+
+        if sigma_2N is not None:
+            sigma = np.asarray(sigma_2N, dtype=np.float64).reshape(-1)
+            if sigma.size >= 2 * len(meas):
+                sigma_pairs = sigma[: 2 * len(meas)].reshape(-1, 2)
+                sigma_pairs = np.maximum(sigma_pairs, 1e-6)
+                whitened = residual_xy / sigma_pairs
+                robust_norms = np.linalg.norm(whitened, axis=1)
+            else:
+                robust_norms = residual_mag
+        else:
+            robust_norms = residual_mag
+
+        return ResidualSummary(
+            rmse_px=float(np.sqrt(np.mean(residual_mag ** 2))),
+            mean_px=float(np.mean(residual_mag)),
+            median_px=float(np.median(residual_mag)),
+            p95_px=float(np.percentile(residual_mag, 95)),
+            robust_cost=cls._robust_cost_from_residuals(robust_norms, robust_kind=robust_kind, robust_param=robust_param),
+        )
+
+    @staticmethod
+    def _compute_feature_geometry(image_points: NDArray | None) -> tuple[float | None, float | None, float | None, float | None, float | None, float | None]:
+        if image_points is None:
+            return None, None, None, None, None, None
+        pts = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+        pts = pts[np.all(np.isfinite(pts), axis=1)]
+        if len(pts) == 0:
+            return None, None, None, None, None, None
+        centroid = np.mean(pts, axis=0)
+        radii = np.linalg.norm(pts - centroid, axis=1)
+        mins = np.min(pts, axis=0)
+        maxs = np.max(pts, axis=0)
+        width = float(maxs[0] - mins[0])
+        height = float(maxs[1] - mins[1])
+        diag = float(np.hypot(width, height))
+        area = float(width * height)
+        return (
+            float(np.sqrt(np.mean(radii ** 2))) if len(radii) > 0 else None,
+            float(np.mean(radii)) if len(radii) > 0 else None,
+            width,
+            height,
+            diag,
+            area,
+        )
+
     def _estimate_pnp(self,
                       object_points: NDArray,
                       image_points: NDArray,
@@ -194,7 +336,7 @@ class pnp_qnp_draw:
                       sigma_2N=None,
                       weighted: bool = False):
         """
-        Returns (q_rvec, q_tvec) from solveQnP, or None if it fails.
+        Returns (q_rvec, q_tvec, q_stats) from solveQnP, or None if it fails.
 
         seed_rvec/seed_tvec are intended to come from solvePnP.
         If your solveQnP expects quaternion seed instead of Rodrigues,
@@ -223,10 +365,11 @@ class pnp_qnp_draw:
                 user_seed_q = prev_q
                 user_seed_t = prev_t
 
-        q_rvec, q_tvec = solveQnP(
+        q_rvec, q_tvec, q_stats = solveQnP(
             object_pts=object_points,
             img_pts=image_points,
             cal=calibration,
+            return_stats=True,
             sigma_2N=sigma_2N,
             user_seed_q=user_seed_q,
             user_seed_t=user_seed_t,
@@ -239,7 +382,7 @@ class pnp_qnp_draw:
             self.last_wq_vec, self.last_wt_vec = q_rvec, q_tvec
         else:
             self.last_q_vec, self.last_t_vec = q_rvec, q_tvec
-        return q_rvec, q_tvec
+        return q_rvec, q_tvec, q_stats
 
     def prepare_pose_inputs(self,
                             image: NDArray,
@@ -486,6 +629,14 @@ class pnp_qnp_draw:
             )
         object_points = prepared.object_points
         image_points = prepared.image_points
+        (
+            feature_spread_rms_px,
+            feature_spread_mean_radius_px,
+            apparent_target_bbox_width_px,
+            apparent_target_bbox_height_px,
+            apparent_target_bbox_diag_px,
+            apparent_target_bbox_area_px,
+        ) = self._compute_feature_geometry(image_points)
 
         have_pose_correspondences = len(object_points) >= 6
         pnp_inlier_class_ids: list[int] = []
@@ -570,10 +721,59 @@ class pnp_qnp_draw:
                 weighted=True,
             )
 
+        pnp_residual_stats = None
+        if pnp_pose is not None:
+            pnp_residual_stats = self._compute_residual_summary(
+                object_points,
+                image_points,
+                calibration,
+                pnp_pose[0],
+                pnp_pose[1],
+                sigma_2N=None,
+                robust_kind=robust_cost.huber,
+                robust_param=2.0,
+            )
+        qnp_residual_stats = None
+        if qnp_pose is not None:
+            qnp_residual_stats = self._compute_residual_summary(
+                object_points,
+                image_points,
+                calibration,
+                qnp_pose[0].to_rodrigues(),
+                qnp_pose[1],
+                sigma_2N=None,
+                robust_kind=robust_cost.huber,
+                robust_param=2.0,
+            )
+        wqnp_yolo_residual_stats = None
+        if wqnp_yolo_pose is not None:
+            wqnp_yolo_residual_stats = self._compute_residual_summary(
+                object_points,
+                image_points,
+                calibration,
+                wqnp_yolo_pose[0].to_rodrigues(),
+                wqnp_yolo_pose[1],
+                sigma_2N=sigma_2N_px,
+                robust_kind=robust_cost.huber,
+                robust_param=2.0,
+            )
+        wqnp_kfest_residual_stats = None
+        if wqnp_kfest_pose is not None:
+            wqnp_kfest_residual_stats = self._compute_residual_summary(
+                prepared.kfest_object_points,
+                prepared.kfest_image_points,
+                calibration,
+                wqnp_kfest_pose[0].to_rodrigues(),
+                wqnp_kfest_pose[1],
+                sigma_2N=sigma_2N_kfest_px,
+                robust_kind=robust_cost.huber,
+                robust_param=2.0,
+            )
+
         # 3) Draw in desired order (match your idx stacking)
         idx = 0
         if usedAlgos.use_wqnp_kfest and wqnp_kfest_pose is not None:
-            q_rvec, q_tvec = wqnp_kfest_pose
+            q_rvec, q_tvec = wqnp_kfest_pose[0], wqnp_kfest_pose[1]
             self._drawQnP_from_pose(
                 image=image,
                 y_class_ids=prepared.kfest_class_ids or [],
@@ -595,7 +795,7 @@ class pnp_qnp_draw:
             idx += 1
 
         if usedAlgos.use_wqnp_yolo and wqnp_yolo_pose is not None:
-            q_rvec, q_tvec = wqnp_yolo_pose
+            q_rvec, q_tvec = wqnp_yolo_pose[0], wqnp_yolo_pose[1]
             self._drawQnP_from_pose(
                 image=image,
                 y_class_ids=newClass_ids,
@@ -617,7 +817,7 @@ class pnp_qnp_draw:
             idx += 1
 
         if usedAlgos.use_qnp and qnp_pose is not None:
-            q_rvec, q_tvec = qnp_pose
+            q_rvec, q_tvec = qnp_pose[0], qnp_pose[1]
             self._drawQnP_from_pose(
                 image=image,
                 y_class_ids=newClass_ids,
@@ -682,6 +882,24 @@ class pnp_qnp_draw:
             kf_track_class_ids=list(prepared.kfest_class_ids) if prepared.kfest_class_ids is not None else [],
             kf_track_estimates_px=prepared.kfest_image_points,
             kf_track_position_covariances_px=kfest_position_covariances_px,
+            pnp_residual_stats=pnp_residual_stats,
+            qnp_residual_stats=qnp_residual_stats,
+            wqnp_yolo_residual_stats=wqnp_yolo_residual_stats,
+            wqnp_kfest_residual_stats=wqnp_kfest_residual_stats,
+            qnp_cov6=None if qnp_pose is None or qnp_pose[2] is None else np.asarray(qnp_pose[2].cov6, dtype=np.float64),
+            wqnp_yolo_cov6=None if wqnp_yolo_pose is None or wqnp_yolo_pose[2] is None else np.asarray(wqnp_yolo_pose[2].cov6, dtype=np.float64),
+            wqnp_kfest_cov6=None if wqnp_kfest_pose is None or wqnp_kfest_pose[2] is None else np.asarray(wqnp_kfest_pose[2].cov6, dtype=np.float64),
+            pnp_inlier_count=len(pnp_inlier_class_ids),
+            pnp_outlier_count=len(pnp_outlier_class_ids),
+            kf_track_count=0 if prepared.kfest_class_ids is None else len(prepared.kfest_class_ids),
+            kf_accepted_measurement_count=0 if feature_kf_used is None else int(np.count_nonzero(feature_kf_used)),
+            kf_rejected_measurement_count=len(kf_rejected_measurement_class_ids),
+            feature_spread_rms_px=feature_spread_rms_px,
+            feature_spread_mean_radius_px=feature_spread_mean_radius_px,
+            apparent_target_bbox_width_px=apparent_target_bbox_width_px,
+            apparent_target_bbox_height_px=apparent_target_bbox_height_px,
+            apparent_target_bbox_diag_px=apparent_target_bbox_diag_px,
+            apparent_target_bbox_area_px=apparent_target_bbox_area_px,
         )
 
     @staticmethod
@@ -693,7 +911,7 @@ class pnp_qnp_draw:
                    feature_gate_mahal_sq: NDArray | None = None,
                    feature_kf_used: NDArray | None = None,
                    display_feature_ids: set[int] | None = None,) -> None:
-        '''
+        """
         Draws yolo boxes
         :param image: Original OpenCV image
         :param newCenters: center of bounding box
@@ -702,7 +920,7 @@ class pnp_qnp_draw:
         :param newScores: onnxruntime confidence
         :param color: color of box
         :return:
-        '''
+        """
         h, w, _ = image.shape
 
         for idx, (centers, box, class_id, score) in enumerate(zip(newCenters, newBoxes, newClass_ids, newScores)):
@@ -999,7 +1217,7 @@ class pnp_qnp_draw:
             yoloSize=yoloSize,
             idsNamesLocs=idsNamesLocs,
             originalSize=originalSize,
-            title=f'{title_prefix}: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({np.linalg.norm(q_tvec):6.3f})',
+            title=f'{title_prefix}: {q_tvec[0]:+6.3f}, {q_tvec[1]:+6.3f}, {q_tvec[2]:+6.3f} ({float(np.linalg.norm(q_tvec)):6.3f})',
             rowIDX=idx,
             txt_color=txt_color,
             draw_as_circles=draw_as_circles,

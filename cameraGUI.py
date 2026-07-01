@@ -1020,6 +1020,25 @@ class CameraGui(ctk.CTkFrame):
         return ";".join(text for _cid, text in sorted(items, key=lambda item: item[0]))
 
     @staticmethod
+    def _format_matrix(matrix) -> str:
+        if matrix is None:
+            return ""
+        arr = np.asarray(matrix, dtype=np.float64)
+        if arr.ndim != 2 or not np.all(np.isfinite(arr)):
+            return ""
+        return ";".join(",".join(f"{float(v):.6f}" for v in row) for row in arr)
+
+    @staticmethod
+    def _residual_stats_dict(stats, prefix: str) -> dict[str, float | None]:
+        return {
+            f"{prefix}_rmse_px": None if stats is None else float(stats.rmse_px),
+            f"{prefix}_mean_px": None if stats is None else float(stats.mean_px),
+            f"{prefix}_median_px": None if stats is None else float(stats.median_px),
+            f"{prefix}_p95_px": None if stats is None else float(stats.p95_px),
+            f"{prefix}_robust_cost": None if stats is None else float(stats.robust_cost),
+        }
+
+    @staticmethod
     def _is_yolo_queue_step(func) -> bool:
         return getattr(func, "__func__", func) is CameraGui.run_yolo
 
@@ -1202,21 +1221,39 @@ class CameraGui(ctk.CTkFrame):
                 "pnp_valid",
                 "pnp_qw", "pnp_qx", "pnp_qy", "pnp_qz",
                 "pnp_tvec_x", "pnp_tvec_y", "pnp_tvec_z",
+                "pnp_rmse_px", "pnp_mean_px", "pnp_median_px", "pnp_p95_px", "pnp_robust_cost",
                 "qnp_valid",
                 "qnp_qw", "qnp_qx", "qnp_qy", "qnp_qz",
                 "qnp_tvec_x", "qnp_tvec_y", "qnp_tvec_z",
+                "qnp_rmse_px", "qnp_mean_px", "qnp_median_px", "qnp_p95_px", "qnp_robust_cost",
+                "qnp_cov6",
                 "wqnp_yolo_valid",
                 "wqnp_yolo_qw", "wqnp_yolo_qx", "wqnp_yolo_qy", "wqnp_yolo_qz",
                 "wqnp_yolo_tvec_x", "wqnp_yolo_tvec_y", "wqnp_yolo_tvec_z",
+                "wqnp_yolo_rmse_px", "wqnp_yolo_mean_px", "wqnp_yolo_median_px", "wqnp_yolo_p95_px", "wqnp_yolo_robust_cost",
+                "wqnp_yolo_cov6",
                 "wqnp_kfest_valid",
                 "wqnp_kfest_qw", "wqnp_kfest_qx", "wqnp_kfest_qy", "wqnp_kfest_qz",
                 "wqnp_kfest_tvec_x", "wqnp_kfest_tvec_y", "wqnp_kfest_tvec_z",
+                "wqnp_kfest_rmse_px", "wqnp_kfest_mean_px", "wqnp_kfest_median_px", "wqnp_kfest_p95_px", "wqnp_kfest_robust_cost",
+                "wqnp_kfest_cov6",
                 "pnp_inlier_class_ids",
                 "pnp_outlier_class_ids",
+                "pnp_inlier_count",
+                "pnp_outlier_count",
                 "kf_rejected_measurement_class_ids",
+                "kf_track_count",
+                "kf_rejected_measurement_count",
+                "kf_accepted_measurement_count",
                 "kf_track_class_ids",
                 "kf_track_estimates_px",
                 "kf_track_position_covariances_px",
+                "feature_spread_rms_px",
+                "feature_spread_mean_radius_px",
+                "apparent_target_bbox_width_px",
+                "apparent_target_bbox_height_px",
+                "apparent_target_bbox_diag_px",
+                "apparent_target_bbox_area_px",
                 "pose_feature_count",
                 "pose_class_ids",
             ]
@@ -1256,6 +1293,10 @@ class CameraGui(ctk.CTkFrame):
                         None if pose_output is None else pose_output.kf_track_class_ids,
                         None if pose_output is None else pose_output.kf_track_position_covariances_px,
                     )
+                    pnp_residual_stats = self._residual_stats_dict(None if pose_output is None else pose_output.pnp_residual_stats, "pnp")
+                    qnp_residual_stats = self._residual_stats_dict(None if pose_output is None else pose_output.qnp_residual_stats, "qnp")
+                    wqnp_yolo_residual_stats = self._residual_stats_dict(None if pose_output is None else pose_output.wqnp_yolo_residual_stats, "wqnp_yolo")
+                    wqnp_kfest_residual_stats = self._residual_stats_dict(None if pose_output is None else pose_output.wqnp_kfest_residual_stats, "wqnp_kfest")
 
                     pnp_qw, pnp_qx, pnp_qy, pnp_qz = self._pose_rvec_quat_wxyz(None if pose_output is None else pose_output.pnp_rvec)
                     pnp_tvec_x, pnp_tvec_y, pnp_tvec_z = self._pose_tvec_xyz(None if pose_output is None else pose_output.pnp_tvec)
@@ -1278,6 +1319,7 @@ class CameraGui(ctk.CTkFrame):
                         "pnp_tvec_x": pnp_tvec_x,
                         "pnp_tvec_y": pnp_tvec_y,
                         "pnp_tvec_z": pnp_tvec_z,
+                        **pnp_residual_stats,
                         "qnp_valid": bool(pose_output is not None and pose_output.qnp_q is not None and pose_output.qnp_tvec is not None),
                         "qnp_qw": qnp_qw,
                         "qnp_qx": qnp_qx,
@@ -1286,6 +1328,8 @@ class CameraGui(ctk.CTkFrame):
                         "qnp_tvec_x": qnp_tvec_x,
                         "qnp_tvec_y": qnp_tvec_y,
                         "qnp_tvec_z": qnp_tvec_z,
+                        **qnp_residual_stats,
+                        "qnp_cov6": self._format_matrix(None if pose_output is None else pose_output.qnp_cov6),
                         "wqnp_yolo_valid": bool(pose_output is not None and pose_output.wqnp_yolo_q is not None and pose_output.wqnp_yolo_tvec is not None),
                         "wqnp_yolo_qw": wqnp_yolo_qw,
                         "wqnp_yolo_qx": wqnp_yolo_qx,
@@ -1294,6 +1338,8 @@ class CameraGui(ctk.CTkFrame):
                         "wqnp_yolo_tvec_x": wqnp_yolo_tvec_x,
                         "wqnp_yolo_tvec_y": wqnp_yolo_tvec_y,
                         "wqnp_yolo_tvec_z": wqnp_yolo_tvec_z,
+                        **wqnp_yolo_residual_stats,
+                        "wqnp_yolo_cov6": self._format_matrix(None if pose_output is None else pose_output.wqnp_yolo_cov6),
                         "wqnp_kfest_valid": bool(pose_output is not None and pose_output.wqnp_kfest_q is not None and pose_output.wqnp_kfest_tvec is not None),
                         "wqnp_kfest_qw": wqnp_kfest_qw,
                         "wqnp_kfest_qx": wqnp_kfest_qx,
@@ -1302,12 +1348,25 @@ class CameraGui(ctk.CTkFrame):
                         "wqnp_kfest_tvec_x": wqnp_kfest_tvec_x,
                         "wqnp_kfest_tvec_y": wqnp_kfest_tvec_y,
                         "wqnp_kfest_tvec_z": wqnp_kfest_tvec_z,
+                        **wqnp_kfest_residual_stats,
+                        "wqnp_kfest_cov6": self._format_matrix(None if pose_output is None else pose_output.wqnp_kfest_cov6),
                         "pnp_inlier_class_ids": ";".join(str(v) for v in pnp_inlier_class_ids),
                         "pnp_outlier_class_ids": ";".join(str(v) for v in pnp_outlier_class_ids),
+                        "pnp_inlier_count": 0 if pose_output is None else int(pose_output.pnp_inlier_count),
+                        "pnp_outlier_count": 0 if pose_output is None else int(pose_output.pnp_outlier_count),
                         "kf_rejected_measurement_class_ids": ";".join(str(v) for v in kf_rejected_measurement_class_ids),
+                        "kf_track_count": 0 if pose_output is None else int(pose_output.kf_track_count),
+                        "kf_rejected_measurement_count": 0 if pose_output is None else int(pose_output.kf_rejected_measurement_count),
+                        "kf_accepted_measurement_count": 0 if pose_output is None else int(pose_output.kf_accepted_measurement_count),
                         "kf_track_class_ids": ";".join(str(v) for v in kf_track_class_ids),
                         "kf_track_estimates_px": kf_track_estimates_px,
                         "kf_track_position_covariances_px": kf_track_position_covariances_px,
+                        "feature_spread_rms_px": None if pose_output is None else pose_output.feature_spread_rms_px,
+                        "feature_spread_mean_radius_px": None if pose_output is None else pose_output.feature_spread_mean_radius_px,
+                        "apparent_target_bbox_width_px": None if pose_output is None else pose_output.apparent_target_bbox_width_px,
+                        "apparent_target_bbox_height_px": None if pose_output is None else pose_output.apparent_target_bbox_height_px,
+                        "apparent_target_bbox_diag_px": None if pose_output is None else pose_output.apparent_target_bbox_diag_px,
+                        "apparent_target_bbox_area_px": None if pose_output is None else pose_output.apparent_target_bbox_area_px,
                         "pose_feature_count": pose_feature_count,
                         "pose_class_ids": ";".join(str(v) for v in sorted(int(v) for v in pose_class_ids)),
                     })

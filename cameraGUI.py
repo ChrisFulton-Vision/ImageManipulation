@@ -1,4 +1,5 @@
 import copy
+import csv
 import time
 import sys
 import threading
@@ -111,7 +112,7 @@ class CameraGui(ctk.CTkFrame):
 
         self._loading_config = True
 
-        self.func_that_refits = None
+        self.func_that_refits: Callable | None = None
         self.list_of_image_process_functors: List[tuple[Callable, dict]] = []
 
         # Debounced cache writes
@@ -280,6 +281,7 @@ class CameraGui(ctk.CTkFrame):
         self.exportToGifButton = None
         self.exportToVidButton = None
         self.exportToConfigButton = None
+        self.exportToNavCalcsButton = None
 
         self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
@@ -495,11 +497,23 @@ class CameraGui(ctk.CTkFrame):
         self.exportToGifButton = ctk.CTkButton(self.export_frame, text="Export to Gif")
         self.exportToVidButton = ctk.CTkButton(self.export_frame, text="Export to Vid")
         self.exportToConfigButton = ctk.CTkButton(self.export_frame, text="Export to Config")
+        self.exportToNavCalcsButton = ctk.CTkButton(self.export_frame, text="Export NavCalcs")
         self.exportToGifButton.configure(command=self.exportToGif)
         self.exportToVidButton.configure(command=self.exportToVid)
         self.exportToConfigButton.configure(command=self.exportToNewConfig)
+        self.exportToNavCalcsButton.configure(command=self.exportNavCalcs)
 
-        self.grid_sideBySide(rowID, self.exportToGifButton, self.exportToVidButton, self.exportToConfigButton)
+        self.grid_sideBySide(
+            rowID,
+            self.exportToGifButton,
+            self.exportToVidButton,
+        )
+        rowID += 1
+        self.grid_sideBySide(
+            rowID,
+            self.exportToConfigButton,
+            self.exportToNavCalcsButton,
+        )
         rowID += 1
 
         self.grid_sideBySide(rowID, self.exportStartFrame, self.exportEndFrame)
@@ -728,7 +742,7 @@ class CameraGui(ctk.CTkFrame):
             self.hud_marker.update_offset(loaded_offset)
         self.camConfig.cam_to_log_time_offset = 0.0
 
-        paths, timebase = self.playback_controller._build_sequence_and_timebase(directory)
+        paths, timebase, _ts_analysis = self.playback_controller._build_sequence_and_timebase(directory)
 
         cv_imgs: list[NDArray] = []
         selected_times: list[float] = []
@@ -821,13 +835,15 @@ class CameraGui(ctk.CTkFrame):
         sample_idx = np.clip(sample_idx, 0, frame_count - 1)
         return fps, sample_idx.tolist()
 
-    def _set_export_buttons_busy(self, gif_text: str, vid_text: str, cfg_text: str) -> None:
+    def _set_export_buttons_busy(self, gif_text: str, vid_text: str, cfg_text: str, nav_text: str) -> None:
         if self.exportToGifButton is not None:
             self.exportToGifButton.configure(text=gif_text, state='disabled', fg_color=clr.CTK_BLUE)
         if self.exportToVidButton is not None:
             self.exportToVidButton.configure(text=vid_text, state='disabled', fg_color=clr.CTK_BLUE)
         if self.exportToConfigButton is not None:
             self.exportToConfigButton.configure(text=cfg_text, state='disabled', fg_color=clr.CTK_BLUE)
+        if self.exportToNavCalcsButton is not None:
+            self.exportToNavCalcsButton.configure(text=nav_text, state='disabled', fg_color=clr.CTK_BLUE)
 
     def _restore_export_buttons(self) -> None:
         if self.exportToGifButton is not None:
@@ -836,6 +852,8 @@ class CameraGui(ctk.CTkFrame):
             self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
         if self.exportToConfigButton is not None:
             self.exportToConfigButton.configure(text="Export to Config", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        if self.exportToNavCalcsButton is not None:
+            self.exportToNavCalcsButton.configure(text="Export NavCalcs", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
         self.making_gifOrVid = False
 
     def _selected_export_paths(self) -> list[Path]:
@@ -850,7 +868,7 @@ class CameraGui(ctk.CTkFrame):
         if self.making_gifOrVid:
             return
 
-        self._set_export_buttons_busy("Making gif...", "Making gif...", "Making gif...")
+        self._set_export_buttons_busy("Making gif...", "Making gif...", "Making gif...", "Making gif...")
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToGif_worker,
@@ -863,7 +881,7 @@ class CameraGui(ctk.CTkFrame):
         if self.making_gifOrVid:
             return
 
-        self._set_export_buttons_busy("Making vid...", "Making vid...", "Making vid...")
+        self._set_export_buttons_busy("Making vid...", "Making vid...", "Making vid...", "Making vid...")
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToVid_worker,
@@ -926,13 +944,158 @@ class CameraGui(ctk.CTkFrame):
         if not config_path:
             return
 
-        self._set_export_buttons_busy("Exporting...", "Exporting...", "Exporting...")
+        self._set_export_buttons_busy("Exporting...", "Exporting...", "Exporting...", "Exporting...")
         self.making_gifOrVid = True
 
         t = threading.Thread(
             target=self.exportToNewConfig_worker,
             daemon=True,
             args=(export_dir_path, Path(config_path)),
+        )
+        t.start()
+
+    @staticmethod
+    def _pose_tvec_xyz(tvec) -> tuple[float, float, float] | tuple[None, None, None]:
+        if tvec is None:
+            return None, None, None
+        arr = np.asarray(tvec, dtype=np.float64).reshape(-1)
+        if arr.size < 3:
+            return None, None, None
+        return float(arr[0]), float(arr[1]), float(arr[2])
+
+    @staticmethod
+    def _pose_rvec_quat_wxyz(rvec) -> tuple[float, float, float, float] | tuple[None, None, None, None]:
+        if rvec is None:
+            return None, None, None, None
+        from support.mathHelpers.quaternions import Quaternion as q
+        q_obj = q.from_rodrigues(np.asarray(rvec, dtype=np.float64))
+        return float(q_obj.s), float(q_obj.vec[0]), float(q_obj.vec[1]), float(q_obj.vec[2])
+
+    @staticmethod
+    def _pose_quat_wxyz(quat) -> tuple[float, float, float, float] | tuple[None, None, None, None]:
+        if quat is None:
+            return None, None, None, None
+        return float(quat.s), float(quat.vec[0]), float(quat.vec[1]), float(quat.vec[2])
+
+    @staticmethod
+    def _format_kf_track_estimates(
+        class_ids,
+        estimates_px,
+    ) -> str:
+        if class_ids is None or estimates_px is None:
+            return ""
+        items = []
+        for class_id, estimate in zip(class_ids, np.asarray(estimates_px, dtype=np.float64)):
+            if len(estimate) < 2 or not np.all(np.isfinite(estimate[:2])):
+                continue
+            items.append(
+                (
+                    int(class_id),
+                    f"{int(class_id)}:{float(estimate[0]):.6f},{float(estimate[1]):.6f}",
+                )
+            )
+        return ";".join(text for _cid, text in sorted(items, key=lambda item: item[0]))
+
+    @staticmethod
+    def _format_kf_track_covariances(
+        class_ids,
+        covariances_px,
+    ) -> str:
+        if class_ids is None or covariances_px is None:
+            return ""
+        items = []
+        for class_id, cov in zip(class_ids, np.asarray(covariances_px, dtype=np.float64)):
+            if np.asarray(cov).shape != (2, 2) or not np.all(np.isfinite(cov)):
+                continue
+            items.append(
+                (
+                    int(class_id),
+                    (
+                        f"{int(class_id)}:"
+                        f"{float(cov[0, 0]):.6f},{float(cov[0, 1]):.6f},"
+                        f"{float(cov[1, 0]):.6f},{float(cov[1, 1]):.6f}"
+                    ),
+                )
+            )
+        return ";".join(text for _cid, text in sorted(items, key=lambda item: item[0]))
+
+    @staticmethod
+    def _is_yolo_queue_step(func) -> bool:
+        return getattr(func, "__func__", func) is CameraGui.run_yolo
+
+    def _build_navcalcs_yolo_args(self) -> dict:
+        forced_args = {
+            "PnP": True,
+            "QnP": True,
+            "wQnP_yolo": True,
+            "wQnP_KFest": True,
+            "Factor Graph": False,
+            "Hyper Attention": False,
+            "YOLO Folder": self.camConfig.yoloFilepath or "",
+        }
+
+        for func, args in self.list_of_image_process_functors:
+            if self._is_yolo_queue_step(func):
+                base_args = copy.deepcopy(args if isinstance(args, dict) else {})
+                base_args.update(forced_args)
+                return base_args
+
+        return forced_args
+
+    def _run_navcalc_pose_on_frame(self, frame, img_time=None, name=None) -> PoseOutput | None:
+        ctx = GuiQueue.FrameCtx(
+            img_time=img_time,
+            name=name,
+            display_in_realtime=False,
+        )
+
+        self.pnpResult = None
+        self.qnpResult = None
+        self.curr_frame_gray = None
+
+        markup_frame = frame.copy()
+        yolo_args = self._build_navcalcs_yolo_args()
+        ran_yolo = False
+
+        for func, args in self.list_of_image_process_functors:
+            step_args = args if isinstance(args, dict) else {}
+            if not bool(step_args.get("state", True)):
+                continue
+            if self._is_yolo_queue_step(func):
+                func(frame, markup_frame, ctx, yolo_args)
+                ran_yolo = True
+            else:
+                func(frame, markup_frame, ctx, step_args)
+
+        if not ran_yolo:
+            self.run_yolo(frame, markup_frame, ctx, yolo_args)
+
+        yolo_output = ctx.yolo.get_or(None)
+        return None if yolo_output is None else yolo_output.pose
+
+    def exportNavCalcs(self):
+        """Run YOLO and all nav-calculation pose solvers across the selected frame range and save one CSV."""
+        if self.making_gifOrVid:
+            return
+        if not self.camConfig.imageFilepath:
+            messagebox.showerror("No Images", "Select an image folder before exporting NavCalcs.")
+            return
+        if not self.camConfig.yoloFilepath:
+            messagebox.showerror("No YOLO Folder", "Select a YOLO folder on the main page before exporting NavCalcs.")
+            return
+
+        selected_paths = self._selected_export_paths()
+        if not selected_paths:
+            messagebox.showerror("No Frames", "The selected export range does not contain any source images.")
+            return
+
+        self._set_export_buttons_busy("NavCalcs...", "NavCalcs...", "NavCalcs...", "NavCalcs...")
+        self.making_gifOrVid = True
+
+        t = threading.Thread(
+            target=self.exportNavCalcs_worker,
+            daemon=True,
+            args=(),
         )
         t.start()
 
@@ -1016,6 +1179,146 @@ class CameraGui(ctk.CTkFrame):
             self.after(0, self._exportToGifOrVid_done)
             if success_message is not None:
                 self.after(0, lambda msg=success_message: messagebox.showinfo("Export Complete", msg))
+
+    def exportNavCalcs_worker(self) -> None:
+        success_message = None
+        try:
+            output_dir = self._get_export_output_dir(create=True)
+            yolo_name = Path(self.camConfig.yoloFilepath).name or "yolo"
+            output_csv = output_dir / f"navcalcs_{yolo_name}.csv"
+            selected_paths = self._selected_export_paths()
+            source_dir = Path(self.camConfig.imageFilepath).parent
+            _paths, _t_playback, ts_analysis = self.playback_controller._build_sequence_and_timebase(source_dir)
+
+            self.reset_runtime_state(reset_fg=True)
+            self.pose_runtime._reset_yolo_runtime_state()
+            self.own_attitude = None
+            self.pose_runtime._ensure_yolo_session(self.camConfig.yoloFilepath)
+
+            fieldnames = [
+                "frame_idx",
+                "image_name",
+                "image_time",
+                "pnp_valid",
+                "pnp_qw", "pnp_qx", "pnp_qy", "pnp_qz",
+                "pnp_tvec_x", "pnp_tvec_y", "pnp_tvec_z",
+                "qnp_valid",
+                "qnp_qw", "qnp_qx", "qnp_qy", "qnp_qz",
+                "qnp_tvec_x", "qnp_tvec_y", "qnp_tvec_z",
+                "wqnp_yolo_valid",
+                "wqnp_yolo_qw", "wqnp_yolo_qx", "wqnp_yolo_qy", "wqnp_yolo_qz",
+                "wqnp_yolo_tvec_x", "wqnp_yolo_tvec_y", "wqnp_yolo_tvec_z",
+                "wqnp_kfest_valid",
+                "wqnp_kfest_qw", "wqnp_kfest_qx", "wqnp_kfest_qy", "wqnp_kfest_qz",
+                "wqnp_kfest_tvec_x", "wqnp_kfest_tvec_y", "wqnp_kfest_tvec_z",
+                "pnp_inlier_class_ids",
+                "pnp_outlier_class_ids",
+                "kf_rejected_measurement_class_ids",
+                "kf_track_class_ids",
+                "kf_track_estimates_px",
+                "kf_track_position_covariances_px",
+                "pose_feature_count",
+                "pose_class_ids",
+            ]
+
+            start = max(0, int(self.camConfig.start_export_idx))
+            with open(output_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+
+                for row_idx, img_path in enumerate(selected_paths, start=start):
+                    frame = cv2.imread(str(img_path))
+                    if frame is None:
+                        continue
+
+                    ts = ts_analysis[row_idx] if row_idx < len(ts_analysis) else None
+                    pose_output = self._run_navcalc_pose_on_frame(
+                        frame,
+                        img_time=(float(ts) if ts is not None else None),
+                        name=self.ImageTimeReader.idsTimes[row_idx][0] if row_idx < len(self.ImageTimeReader.idsTimes) else img_path.name,
+                    )
+
+                    if pose_output is None:
+                        pose_class_ids = []
+                        pose_feature_count = 0
+                    else:
+                        pose_class_ids = [] if pose_output.class_ids is None else list(pose_output.class_ids)
+                        pose_feature_count = len(pose_class_ids)
+                    pnp_inlier_class_ids = [] if pose_output is None or pose_output.pnp_inlier_class_ids is None else sorted(int(v) for v in pose_output.pnp_inlier_class_ids)
+                    pnp_outlier_class_ids = [] if pose_output is None or pose_output.pnp_outlier_class_ids is None else sorted(int(v) for v in pose_output.pnp_outlier_class_ids)
+                    kf_rejected_measurement_class_ids = [] if pose_output is None or pose_output.kf_rejected_measurement_class_ids is None else sorted(int(v) for v in pose_output.kf_rejected_measurement_class_ids)
+                    kf_track_class_ids = [] if pose_output is None or pose_output.kf_track_class_ids is None else sorted(int(v) for v in pose_output.kf_track_class_ids)
+                    kf_track_estimates_px = self._format_kf_track_estimates(
+                        None if pose_output is None else pose_output.kf_track_class_ids,
+                        None if pose_output is None else pose_output.kf_track_estimates_px,
+                    )
+                    kf_track_position_covariances_px = self._format_kf_track_covariances(
+                        None if pose_output is None else pose_output.kf_track_class_ids,
+                        None if pose_output is None else pose_output.kf_track_position_covariances_px,
+                    )
+
+                    pnp_qw, pnp_qx, pnp_qy, pnp_qz = self._pose_rvec_quat_wxyz(None if pose_output is None else pose_output.pnp_rvec)
+                    pnp_tvec_x, pnp_tvec_y, pnp_tvec_z = self._pose_tvec_xyz(None if pose_output is None else pose_output.pnp_tvec)
+                    qnp_qw, qnp_qx, qnp_qy, qnp_qz = self._pose_quat_wxyz(None if pose_output is None else pose_output.qnp_q)
+                    qnp_tvec_x, qnp_tvec_y, qnp_tvec_z = self._pose_tvec_xyz(None if pose_output is None else pose_output.qnp_tvec)
+                    wqnp_yolo_qw, wqnp_yolo_qx, wqnp_yolo_qy, wqnp_yolo_qz = self._pose_quat_wxyz(None if pose_output is None else pose_output.wqnp_yolo_q)
+                    wqnp_yolo_tvec_x, wqnp_yolo_tvec_y, wqnp_yolo_tvec_z = self._pose_tvec_xyz(None if pose_output is None else pose_output.wqnp_yolo_tvec)
+                    wqnp_kfest_qw, wqnp_kfest_qx, wqnp_kfest_qy, wqnp_kfest_qz = self._pose_quat_wxyz(None if pose_output is None else pose_output.wqnp_kfest_q)
+                    wqnp_kfest_tvec_x, wqnp_kfest_tvec_y, wqnp_kfest_tvec_z = self._pose_tvec_xyz(None if pose_output is None else pose_output.wqnp_kfest_tvec)
+
+                    writer.writerow({
+                        "frame_idx": row_idx,
+                        "image_name": img_path.name,
+                        "image_time": None if ts is None else float(ts),
+                        "pnp_valid": bool(pose_output is not None and pose_output.pnp_rvec is not None and pose_output.pnp_tvec is not None),
+                        "pnp_qw": pnp_qw,
+                        "pnp_qx": pnp_qx,
+                        "pnp_qy": pnp_qy,
+                        "pnp_qz": pnp_qz,
+                        "pnp_tvec_x": pnp_tvec_x,
+                        "pnp_tvec_y": pnp_tvec_y,
+                        "pnp_tvec_z": pnp_tvec_z,
+                        "qnp_valid": bool(pose_output is not None and pose_output.qnp_q is not None and pose_output.qnp_tvec is not None),
+                        "qnp_qw": qnp_qw,
+                        "qnp_qx": qnp_qx,
+                        "qnp_qy": qnp_qy,
+                        "qnp_qz": qnp_qz,
+                        "qnp_tvec_x": qnp_tvec_x,
+                        "qnp_tvec_y": qnp_tvec_y,
+                        "qnp_tvec_z": qnp_tvec_z,
+                        "wqnp_yolo_valid": bool(pose_output is not None and pose_output.wqnp_yolo_q is not None and pose_output.wqnp_yolo_tvec is not None),
+                        "wqnp_yolo_qw": wqnp_yolo_qw,
+                        "wqnp_yolo_qx": wqnp_yolo_qx,
+                        "wqnp_yolo_qy": wqnp_yolo_qy,
+                        "wqnp_yolo_qz": wqnp_yolo_qz,
+                        "wqnp_yolo_tvec_x": wqnp_yolo_tvec_x,
+                        "wqnp_yolo_tvec_y": wqnp_yolo_tvec_y,
+                        "wqnp_yolo_tvec_z": wqnp_yolo_tvec_z,
+                        "wqnp_kfest_valid": bool(pose_output is not None and pose_output.wqnp_kfest_q is not None and pose_output.wqnp_kfest_tvec is not None),
+                        "wqnp_kfest_qw": wqnp_kfest_qw,
+                        "wqnp_kfest_qx": wqnp_kfest_qx,
+                        "wqnp_kfest_qy": wqnp_kfest_qy,
+                        "wqnp_kfest_qz": wqnp_kfest_qz,
+                        "wqnp_kfest_tvec_x": wqnp_kfest_tvec_x,
+                        "wqnp_kfest_tvec_y": wqnp_kfest_tvec_y,
+                        "wqnp_kfest_tvec_z": wqnp_kfest_tvec_z,
+                        "pnp_inlier_class_ids": ";".join(str(v) for v in pnp_inlier_class_ids),
+                        "pnp_outlier_class_ids": ";".join(str(v) for v in pnp_outlier_class_ids),
+                        "kf_rejected_measurement_class_ids": ";".join(str(v) for v in kf_rejected_measurement_class_ids),
+                        "kf_track_class_ids": ";".join(str(v) for v in kf_track_class_ids),
+                        "kf_track_estimates_px": kf_track_estimates_px,
+                        "kf_track_position_covariances_px": kf_track_position_covariances_px,
+                        "pose_feature_count": pose_feature_count,
+                        "pose_class_ids": ";".join(str(v) for v in sorted(int(v) for v in pose_class_ids)),
+                    })
+
+            success_message = f"NavCalcs CSV written:\n{output_csv}"
+        except Exception as exc:
+            self.after(0, lambda e=exc: messagebox.showerror("NavCalcs Export Failed", str(e)))
+        finally:
+            self.after(0, self._exportToGifOrVid_done)
+            if success_message is not None:
+                self.after(0, lambda msg=success_message: messagebox.showinfo("NavCalcs Export Complete", msg))
 
     def _exportToGifOrVid_done(self):
         self._restore_export_buttons()

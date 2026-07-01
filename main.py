@@ -460,11 +460,12 @@ class App(ctk.CTk):
         return handler
 
     def passToChild_fit_to_content(self, page):
-        return partial(self._fit_to_content, page, True, snap=True)
+        return partial(self._fit_to_content, page, True, snap=True, allow_width_shrink=False)
 
     def _fit_to_content(self, page, show_subnav: bool,
                         smooth_transition_tuple: tuple[list, tuple[int, int]] = (None, (None, None)),
-                        snap: bool = False):
+                        snap: bool = False,
+                        allow_width_shrink: bool = True):
         # prevent overlapping animations
         if getattr(self, "_resize_inflight", False):
             return
@@ -499,6 +500,8 @@ class App(ctk.CTk):
 
             # Child-triggered content changes should not visibly animate.
             if snap or abs(dw) + abs(dh) <= 12:
+                if snap and not allow_width_shrink:
+                    target_w = max(curr_w, target_w)
                 self.geometry(f"{target_w}x{target_h}")
                 return
 

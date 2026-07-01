@@ -323,6 +323,7 @@ class PoseRuntime:
         kfest_image_points: list[list[float]] = []
         kfest_class_ids: list[int] = []
         kfest_sigma_2N: list[float] = []
+        kfest_position_covs: list[np.ndarray] = []
         kfest_gate_covs: list[np.ndarray] = []
         kfest_gate_mahal_sq: list[float] = []
         kfest_used: list[bool] = []
@@ -335,10 +336,11 @@ class PoseRuntime:
             if (frame_time_s - float(last_detection_time_s)) > self._feature_detection_timeout_s:
                 continue
             x, y, z = idsNamesLocs[cid][2:]
-            _pos_cov_px, gate_cov_px, _gate_mahal_sq, used, center_px = tracker_stats[cid]
+            pos_cov_px, gate_cov_px, _gate_mahal_sq, used, center_px = tracker_stats[cid]
             kfest_object_points.append([x, y, z])
             kfest_image_points.append([float(center_px[0]), float(center_px[1])])
             kfest_class_ids.append(int(cid))
+            kfest_position_covs.append(np.asarray(pos_cov_px, dtype=np.float64))
             kfest_gate_covs.append(np.asarray(gate_cov_px, dtype=np.float64))
             kfest_gate_mahal_sq.append(float(_gate_mahal_sq))
             kfest_used.append(bool(used))
@@ -370,6 +372,7 @@ class PoseRuntime:
             np.asarray(kfest_image_points, dtype=np.float64),
             kfest_class_ids,
             np.asarray(kfest_sigma_2N, dtype=np.float64),
+            np.asarray(kfest_position_covs, dtype=np.float64),
             np.asarray(kfest_gate_covs, dtype=np.float64),
             np.asarray(kfest_gate_mahal_sq, dtype=np.float64),
             np.asarray(kfest_used, dtype=bool),
@@ -803,12 +806,13 @@ class PoseRuntime:
         feature_gate_covariances_px = None
         feature_gate_mahal_sq = None
         feature_kf_used = None
+        kfest_position_covariances_px = None
         kfest_gate_covariances_px = None
         kfest_gate_mahal_sq = None
         kfest_kf_used = None
         if want_weighted_kf:
             frame_time_s = self._frame_time_s(ctx)
-            sigma_2N_px, feature_gate_covariances_px, feature_gate_mahal_sq, feature_kf_used, kfest_object_points, kfest_image_points, kfest_class_ids, sigma_2N_kfest_px, kfest_gate_covariances_px, kfest_gate_mahal_sq, kfest_kf_used = self._build_feature_kf_metadata(
+            sigma_2N_px, feature_gate_covariances_px, feature_gate_mahal_sq, feature_kf_used, kfest_object_points, kfest_image_points, kfest_class_ids, sigma_2N_kfest_px, kfest_position_covariances_px, kfest_gate_covariances_px, kfest_gate_mahal_sq, kfest_kf_used = self._build_feature_kf_metadata(
                 prepared,
                 frame_time_s,
                 float(infer_frame.shape[1]),
@@ -841,6 +845,7 @@ class PoseRuntime:
             feature_gate_covariances_px=feature_gate_covariances_px,
             feature_gate_mahal_sq=feature_gate_mahal_sq,
             feature_kf_used=feature_kf_used,
+            kfest_position_covariances_px=kfest_position_covariances_px,
             kfest_gate_covariances_px=kfest_gate_covariances_px,
             kfest_gate_mahal_sq=kfest_gate_mahal_sq,
             kfest_kf_used=kfest_kf_used,

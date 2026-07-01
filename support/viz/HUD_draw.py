@@ -259,6 +259,8 @@ class HUD_Marker:
         if h != self.last_xy[0] or w != self.last_xy[1]:
             self.update_storage(h, w)
 
+        self.attRdr.mode_channel = int(opts.mode_channel)
+        self.attRdr.reverse_throttle_pwm = bool(opts.reverse_throttle_pwm)
         att = self.attRdr.get_attitude_at(img_time)
 
         if draw_crosshairs:

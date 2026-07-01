@@ -122,7 +122,7 @@ class AttitudeReader:
         self.alt_t = self.alt = None                      # BARO.csv
         self.pitch = self.despitch = None                 # ATT.csv
         self.yaw = self.desyaw = None                     # ATT.csv
-        self.cmd_t = self.c4 = self.c5 = self.c10 = None  # RCOU.csv
+        self.cmd_t = self.c4 = self.c5 = self.c8 = self.c10 = None  # RCOU.csv
         self.cmd_throttle_perc = None                     # pre-mapped throttle %
 
         # GPS.csv
@@ -163,6 +163,8 @@ class AttitudeReader:
         self.runway_corners_map_m = None
         self.runway_rect_map_m = None
 
+        self.mode_channel = 10
+        self.reverse_throttle_pwm = False
         self.offset = 0.0
         self.ready = False
         if csv_folder_path is not None:
@@ -225,8 +227,11 @@ class AttitudeReader:
         if not {'timestamp', 'Roll', 'DesRoll', 'Pitch', 'DesPitch', 'Yaw', 'DesYaw'}.issubset(self.roll_dict.columns):
             LOG.warning("ATT.csv file not in expected format.")
             return False
-        if not {'timestamp', 'C1', 'C5', 'C10'}.issubset(self.cmd_dict.columns):
+        if not {'timestamp', 'C5'}.issubset(self.cmd_dict.columns):
             LOG.warning("RCOU.csv file not in expected format.")
+            return False
+        if 'C8' not in self.cmd_dict.columns and 'C10' not in self.cmd_dict.columns:
+            LOG.warning("RCOU.csv missing both C8 and C10 mode channels.")
             return False
         if not {'timestamp', 'Lat', 'Lng'}.issubset(self.gps_dict.columns):
             LOG.warning("GPS.csv file not in expected format. Ignoring GPS.")
@@ -314,8 +319,12 @@ class AttitudeReader:
 
         self.cmd_t = convert_to_numpy(self.cmd_dict['timestamp'], np.float64)
         self.c5 = convert_to_numpy(self.cmd_dict['C5'])  # throttle pwm
-        self.c10 = convert_to_numpy(self.cmd_dict['C10'])  # mode pwm
-        self.cmd_throttle_perc = self.throttle_pwm_to_perc(self.c5).astype(np.float32)
+        self.c8 = convert_to_numpy(self.cmd_dict['C8']) if 'C8' in self.cmd_dict.columns else None  # mode pwm old
+        self.c10 = convert_to_numpy(self.cmd_dict['C10']) if 'C10' in self.cmd_dict.columns else None  # mode pwm new
+        self.cmd_throttle_perc = self.throttle_pwm_to_perc(
+            self.c5,
+            reverse=self.reverse_throttle_pwm,
+        ).astype(np.float32)
 
         # --- GPS handling ---
         self.has_gps = False
@@ -485,8 +494,24 @@ class AttitudeReader:
         cmd_pitch = np.interp(t, self.att_t, self.despitch)
         yaw = np.interp(t, self.att_t, self.yaw)
         cmd_yaw = np.interp(t, self.att_t, self.desyaw)
-        thr_perc = np.interp(t, self.cmd_t, self.cmd_throttle_perc)
-        mode = self.ch10_pwm_to_mode(np.interp(t, self.cmd_t, self.c10))
+        thr_pwm = np.interp(t, self.cmd_t, self.c5)
+        thr_perc = float(self.throttle_pwm_to_perc(
+            np.asarray([thr_pwm], dtype=np.float64),
+            reverse=self.reverse_throttle_pwm,
+        )[0])
+
+        flip_order = False
+        if int(self.mode_channel) == 8 and self.c8 is not None:
+            mode_pwm = np.interp(t, self.cmd_t, self.c8)
+            flip_order = True
+        elif self.c10 is not None:
+            mode_pwm = np.interp(t, self.cmd_t, self.c10)
+        elif self.c8 is not None:
+            mode_pwm = np.interp(t, self.cmd_t, self.c8)
+            flip_order = True
+        else:
+            mode_pwm = np.nan
+        mode = self.pwm_to_mode(mode_pwm, flip_order = True)
 
         gps_valid = False
         lat_deg = 0.0
@@ -546,7 +571,7 @@ class AttitudeReader:
             cmd_pitch_deg=float(cmd_pitch),
             yaw_deg=float(yaw),
             cmd_yaw_deg=float(cmd_yaw),
-            throttle_pct=float(thr_perc),
+            throttle_pct=thr_perc,
             mode=mode,
             gps_valid=gps_valid,
             lat_deg=lat_deg,
@@ -678,17 +703,24 @@ class AttitudeReader:
         )
 
     @staticmethod
-    def ch10_pwm_to_mode(ch8):
-        if 950 < ch8 < 1250:
+    def pwm_to_mode(mode_pwm, flip_order:bool = False):
+        if 950 < mode_pwm < 1250:
+            if flip_order:
+                return ControlMode.controller
             return ControlMode.manual
-        if 1250 <= ch8 < 1750:
+        if 1250 <= mode_pwm < 1750:
             return ControlMode.auto
-        if 1750 <= ch8 < 2050:
+        if 1750 <= mode_pwm < 2050:
+            if flip_order:
+                return ControlMode.manual
             return ControlMode.controller
         return ControlMode.error
 
     @staticmethod
-    def throttle_pwm_to_perc(throttle_pwm: NDArray) -> NDArray:
+    def throttle_pwm_to_perc(throttle_pwm: NDArray, reverse: bool = False) -> NDArray:
         MIN_THROTTLE = 1000.0
         MAX_THROTTLE = 2000.0
-        return (throttle_pwm - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE) * 100.0
+        perc = (throttle_pwm - MIN_THROTTLE) / (MAX_THROTTLE - MIN_THROTTLE) * 100.0
+        if reverse:
+            perc = 100.0 - perc
+        return perc

@@ -3,6 +3,7 @@ import time
 import sys
 import threading
 import os
+import shutil
 from dataclasses import dataclass
 
 import numpy as np
@@ -10,7 +11,8 @@ import numpy as np
 from numpy.typing import NDArray
 from typing import List, Any, Callable
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import messagebox, filedialog, simpledialog
+from yaml import dump
 
 import customtkinter as ctk
 import cv2
@@ -275,6 +277,9 @@ class CameraGui(ctk.CTkFrame):
         )
 
         self.making_gifOrVid = False
+        self.exportToGifButton = None
+        self.exportToVidButton = None
+        self.exportToConfigButton = None
 
         self.exportStartFrame = ctk.CTkLabel(self.export_frame, text=f'Start Frame: {self.camConfig.start_export_idx}')
         self.exportEndFrame = ctk.CTkLabel(self.export_frame, text=f'End Frame: {self.camConfig.end_export_idx}')
@@ -487,14 +492,14 @@ class CameraGui(ctk.CTkFrame):
         self.grid_sideBySide(rowID, qualityLabel, self.exportQualityCombo)
         rowID += 1
 
-        exportToGifButton = ctk.CTkButton(self.export_frame, text="Export to Gif")
-        exportToVidButton = ctk.CTkButton(self.export_frame, text="Export to Vid")
-        exportToGifButton.configure(
-            command=lambda gif=exportToGifButton, vid=exportToVidButton: self.exportToGif(gif, vid))
-        exportToVidButton.configure(
-            command=lambda gif=exportToGifButton, vid=exportToVidButton: self.exportToVid(gif, vid))
+        self.exportToGifButton = ctk.CTkButton(self.export_frame, text="Export to Gif")
+        self.exportToVidButton = ctk.CTkButton(self.export_frame, text="Export to Vid")
+        self.exportToConfigButton = ctk.CTkButton(self.export_frame, text="Export to Config")
+        self.exportToGifButton.configure(command=self.exportToGif)
+        self.exportToVidButton.configure(command=self.exportToVid)
+        self.exportToConfigButton.configure(command=self.exportToNewConfig)
 
-        self.grid_sideBySide(rowID, exportToGifButton, exportToVidButton)
+        self.grid_sideBySide(rowID, self.exportToGifButton, self.exportToVidButton, self.exportToConfigButton)
         rowID += 1
 
         self.grid_sideBySide(rowID, self.exportStartFrame, self.exportEndFrame)
@@ -816,36 +821,123 @@ class CameraGui(ctk.CTkFrame):
         sample_idx = np.clip(sample_idx, 0, frame_count - 1)
         return fps, sample_idx.tolist()
 
-    def exportToGif(self, exportToGifButton, exportToVidButton):
+    def _set_export_buttons_busy(self, gif_text: str, vid_text: str, cfg_text: str) -> None:
+        if self.exportToGifButton is not None:
+            self.exportToGifButton.configure(text=gif_text, state='disabled', fg_color=clr.CTK_BLUE)
+        if self.exportToVidButton is not None:
+            self.exportToVidButton.configure(text=vid_text, state='disabled', fg_color=clr.CTK_BLUE)
+        if self.exportToConfigButton is not None:
+            self.exportToConfigButton.configure(text=cfg_text, state='disabled', fg_color=clr.CTK_BLUE)
+
+    def _restore_export_buttons(self) -> None:
+        if self.exportToGifButton is not None:
+            self.exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        if self.exportToVidButton is not None:
+            self.exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        if self.exportToConfigButton is not None:
+            self.exportToConfigButton.configure(text="Export to Config", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
+        self.making_gifOrVid = False
+
+    def _selected_export_paths(self) -> list[Path]:
+        directory = Path(self.camConfig.imageFilepath).parent
+        paths, _t_playback, _ts_analysis = self.playback_controller._build_sequence_and_timebase(directory)
+        start = max(0, int(self.camConfig.start_export_idx - 1))
+        end = min(len(paths), int(self.camConfig.end_export_idx))
+        return list(paths[start:end])
+
+    def exportToGif(self):
         """Begin asynchronous GIF/APNG export for the current frame range."""
         if self.making_gifOrVid:
             return
 
-        exportToGifButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
-        exportToVidButton.configure(text="Making gif...", state='disabled', fg_color=clr.CTK_BLUE)
+        self._set_export_buttons_busy("Making gif...", "Making gif...", "Making gif...")
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToGif_worker,
                              daemon=True,
-                             args=(exportToGifButton, exportToVidButton))
+                             args=())
         t.start()
 
-    def exportToVid(self, exportToGifButton, exportToVidButton):
+    def exportToVid(self):
         """Begin asynchronous video export for the current frame range."""
         if self.making_gifOrVid:
             return
 
-        exportToGifButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
-        exportToVidButton.configure(text="Making vid...", state='disabled', fg_color=clr.CTK_BLUE)
+        self._set_export_buttons_busy("Making vid...", "Making vid...", "Making vid...")
         self.making_gifOrVid = True
 
         t = threading.Thread(target=self.exportToVid_worker,
                              daemon=True,
-                             args=(exportToGifButton, exportToVidButton))
+                             args=())
+        t.start()
+
+    def exportToNewConfig(self):
+        """Copy the selected raw export range to a new image folder and write a matching YAML config."""
+        if self.making_gifOrVid:
+            return
+        if not self.camConfig.imageFilepath:
+            messagebox.showerror("No Images", "Select an image folder before exporting a new config.")
+            return
+
+        selected_paths = self._selected_export_paths()
+        if not selected_paths:
+            messagebox.showerror("No Frames", "The selected export range does not contain any source images.")
+            return
+        source_dir = Path(self.camConfig.imageFilepath).parent
+        export_parent_dir = filedialog.askdirectory(
+            initialdir=str(source_dir),
+            title="Select parent folder for export images",
+        )
+        if not export_parent_dir:
+            return
+
+        suggested_name = f"{source_dir.name}_export_{self.camConfig.start_export_idx}_{self.camConfig.end_export_idx}"
+        export_folder_name = simpledialog.askstring(
+            "Export Folder Name",
+            "Enter new export folder name:",
+            initialvalue=suggested_name,
+            parent=self.winfo_toplevel(),
+        )
+        if export_folder_name is None:
+            return
+        export_folder_name = export_folder_name.strip()
+        if not export_folder_name:
+            messagebox.showerror("Export Folder Error", "Export folder name cannot be blank.")
+            return
+
+        export_dir_path = Path(export_parent_dir) / export_folder_name
+        if not export_dir_path.exists():
+            try:
+                export_dir_path.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror(
+                    "Export Folder Error",
+                    f"Could not create export folder:\n{export_dir_path}\n\n{exc}",
+                )
+                return
+
+        config_path = filedialog.asksaveasfilename(
+            initialdir=str(Path.cwd() / "Configs"),
+            title="Select new YAML config",
+            defaultextension=".yaml",
+            filetypes=[("YAML", "*.yaml"), ("All files", "*.*")],
+            confirmoverwrite=False,
+        )
+        if not config_path:
+            return
+
+        self._set_export_buttons_busy("Exporting...", "Exporting...", "Exporting...")
+        self.making_gifOrVid = True
+
+        t = threading.Thread(
+            target=self.exportToNewConfig_worker,
+            daemon=True,
+            args=(export_dir_path, Path(config_path)),
+        )
         t.start()
 
     def exportToGif_worker(self,
-                           exportToGifButton, exportToVidButton):
+                           ):
         try:
             frames = self._gather_annotated_frames()
             # from support.io.convert_to_gif import make_gif
@@ -854,11 +946,10 @@ class CameraGui(ctk.CTkFrame):
             output_path = self._get_export_output_dir(create=True) / 'output'
             make_apng(frames, 60, name=str(output_path), infinite=True, quality=self.camConfig.export_quality)
         finally:
-            self.after(0, self._exportToGifOrVid_done,
-                       exportToGifButton, exportToVidButton)
+            self.after(0, self._exportToGifOrVid_done)
 
     def exportToVid_worker(self,
-                           exportToGifButton, exportToVidButton):
+                           ):
         try:
             frames, frame_times = self._gather_annotated_frames_and_timebase()
             if not frames:
@@ -878,14 +969,56 @@ class CameraGui(ctk.CTkFrame):
                 out.write(f)
             out.release()
         finally:
-            self.after(0, self._exportToGifOrVid_done,
-                       exportToGifButton, exportToVidButton)
+            self.after(0, self._exportToGifOrVid_done)
 
-    def _exportToGifOrVid_done(self,
-                               exportToGifButton, exportToVidButton):
-        exportToGifButton.configure(text="Export to GIF", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
-        exportToVidButton.configure(text="Export to Vid", state='normal', fg_color=clr.CTK_BUTTON_GREEN)
-        self.making_gifOrVid = False
+    def exportToNewConfig_worker(self, export_dir: Path, config_path: Path) -> None:
+        success_message = None
+        try:
+            source_dir = Path(self.camConfig.imageFilepath).parent
+            selected_paths = self._selected_export_paths()
+            export_dir.mkdir(parents=True, exist_ok=True)
+
+            copied_paths: list[Path] = []
+            for src_path in selected_paths:
+                dst_path = export_dir / src_path.name
+                shutil.copy2(src_path, dst_path)
+                copied_paths.append(dst_path)
+
+            log_paths = sorted(source_dir.glob("*.log"))
+            if log_paths:
+                src_log = log_paths[0]
+                with open(src_log, "r", newline="") as f:
+                    lines = f.readlines()
+
+                comment_lines = [line for line in lines if line.lstrip().startswith("#")]
+                data_lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+                start = max(0, int(self.camConfig.start_export_idx - 1))
+                end = min(len(data_lines), int(self.camConfig.end_export_idx))
+                trimmed_lines = comment_lines + data_lines[start:end]
+
+                with open(export_dir / src_log.name, "w", newline="") as f:
+                    f.writelines(trimmed_lines)
+
+            new_cfg = copy.deepcopy(self.camConfig)
+            new_cfg.imageFilepath = str(copied_paths[0]) if copied_paths else ""
+            new_cfg.configFilepath = str(config_path)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, "w") as f:
+                dump(new_cfg.toDict, f)
+
+            success_message = (
+                f"Exported {len(copied_paths)} images to:\n{export_dir}\n\n"
+                f"Wrote config:\n{config_path}"
+            )
+        except Exception as exc:
+            self.after(0, lambda e=exc: messagebox.showerror("Export Failed", str(e)))
+        finally:
+            self.after(0, self._exportToGifOrVid_done)
+            if success_message is not None:
+                self.after(0, lambda msg=success_message: messagebox.showinfo("Export Complete", msg))
+
+    def _exportToGifOrVid_done(self):
+        self._restore_export_buttons()
 
     def screenshot(self):
         self.screenshot_impending = True

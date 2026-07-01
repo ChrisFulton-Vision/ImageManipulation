@@ -126,6 +126,8 @@ class YoloOpts:
 @dataclass(slots=True)
 class HudOpts:
     store_attitude: bool = True
+    mode_channel: int = 10
+    reverse_throttle_pwm: bool = False
     map_transparency: float = 0.35
     draw_attitude: bool = True
     draw_as_alt: bool = True
@@ -134,6 +136,8 @@ class HudOpts:
     draw_mode: bool = True
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("Store Attitude for FG", "store_attitude", bool, True),
+        ArgBinding("Mode Channel", "mode_channel", int, 10),
+        ArgBinding("Reverse Throttle PWM", "reverse_throttle_pwm", bool, False),
         ArgBinding("Map Alpha", "map_transparency", float, 0.35, 0.0, 1.0),
         ArgBinding("Attitude", "draw_attitude", bool, True),
         ArgBinding("Airspeed/Alt", "draw_as_alt", bool, True),

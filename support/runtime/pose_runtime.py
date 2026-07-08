@@ -11,6 +11,10 @@ from support.core.enums import ImageSource
 from support.io.attitude_interpreter import CAMERA_RPY_OFFSET_DEG
 import support.gui.UserSelectQueue as GuiQueue
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
+from support.mathHelpers.single_feature_geometry import (
+    camera_matrix_from_calibration,
+    estimate_single_feature_from_center_width,
+)
 from support.mathHelpers.twoD_to_threeD import solveQnP
 from support.runtime.fg_singleTarget import (
     build_factor_graph_output,
@@ -37,6 +41,7 @@ class PoseRuntime:
         self._feature_last_detection_time_s: dict[int, float] = {}
         self._last_feature_kf_time_s: float | None = None
         self._feature_kf_stabilization_ref_R_wc: np.ndarray | None = None
+        self._feature_kf_sigma_proc: float = 0.5
 
     @staticmethod
     def _frame_time_s(ctx: GuiQueue.FrameCtx) -> float:
@@ -62,15 +67,27 @@ class PoseRuntime:
                 continue
         return feature_ids if len(feature_ids) > 0 else None
 
+    def _configure_feature_kf(self, kf: PixelKalmanFilter, width_px: float, height_px: float) -> None:
+        kf.set_image_size(width_px, height_px)
+        kf.set_sigma_proc(self._feature_kf_sigma_proc)
+
     def _get_feature_kf(self, class_id: int, width_px: float, height_px: float) -> PixelKalmanFilter:
         kf = self._feature_kfs.get(int(class_id))
         if kf is None:
             kf = PixelKalmanFilter(width_px=width_px, height_px=height_px)
-            kf.set_image_size(width_px, height_px)
+            self._configure_feature_kf(kf, width_px, height_px)
             self._feature_kfs[int(class_id)] = kf
         else:
-            kf.set_image_size(width_px, height_px)
+            self._configure_feature_kf(kf, width_px, height_px)
         return kf
+
+    def _set_feature_kf_sigma_proc(self, sigma_proc: float, width_px: float, height_px: float) -> None:
+        sigma_proc = float(sigma_proc)
+        if self._feature_kf_sigma_proc == sigma_proc and not self._feature_kfs:
+            return
+        self._feature_kf_sigma_proc = sigma_proc
+        for kf in self._feature_kfs.values():
+            self._configure_feature_kf(kf, width_px, height_px)
 
     def _reset_feature_kf_bank(self) -> None:
         self._feature_kfs.clear()
@@ -737,7 +754,7 @@ class PoseRuntime:
                 f"{yolo_folder}"
             )
 
-    def _ensure_yolo_session(self, yolo_folder: str) -> None:
+    def _ensure_yolo_session(self, yolo_folder: str, *, force_reload: bool = False) -> None:
         from support.vision import yolo
 
         if not yolo_folder:
@@ -747,13 +764,16 @@ class PoseRuntime:
         self._validate_yolo_folder(requested)
 
         switched_model = requested != self._active_yolo_dir
+        if force_reload:
+            self._yolo_sessions_by_dir.pop(requested, None)
+
         session = self._yolo_sessions_by_dir.get(requested)
         if session is None:
             session = yolo.YOLO()
             session.setNewFolder(requested)
             session.set_calibration(self.owner.calibration)
             self._yolo_sessions_by_dir[requested] = session
-        elif switched_model:
+        elif switched_model or force_reload:
             session.setNewFolder(requested)
             session.set_calibration(self.owner.calibration)
 
@@ -761,7 +781,7 @@ class PoseRuntime:
         session.conf = self.owner.camConfig.yolo_conf
         session.set_calibration(self.owner.calibration)
 
-        if switched_model:
+        if switched_model or force_reload:
             self._reset_yolo_runtime_state()
             self._active_yolo_dir = requested
 
@@ -811,6 +831,11 @@ class PoseRuntime:
         kfest_gate_mahal_sq = None
         kfest_kf_used = None
         if want_weighted_kf:
+            self._set_feature_kf_sigma_proc(
+                opts.sigma_proc,
+                float(infer_frame.shape[1]),
+                float(infer_frame.shape[0]),
+            )
             frame_time_s = self._frame_time_s(ctx)
             sigma_2N_px, feature_gate_covariances_px, feature_gate_mahal_sq, feature_kf_used, kfest_object_points, kfest_image_points, kfest_class_ids, sigma_2N_kfest_px, kfest_position_covariances_px, kfest_gate_covariances_px, kfest_gate_mahal_sq, kfest_kf_used = self._build_feature_kf_metadata(
                 prepared,
@@ -927,31 +952,37 @@ class PoseRuntime:
                 int(round(center_infer[1] * draw_sy)),
             )
 
-            self.owner.calibration.scaleCalibration(infer_w)
-            K = self.owner.calibration.getCameraMatrix()
-            two_d_points = np.array([center_infer[0], center_infer[1], 1.0])
-            dist_est = self.owner.calibration.fx * 3.52636931926423 / bbox_size_infer[0]  #4.07 for cub
-
             if self.check_above_horizon(last_yolo_center):
-                last_yolo_3d_estimate = np.linalg.inv(K).dot(two_d_points) * dist_est
-                bb_color = (50, 255, 255)
-                # self._draw_bottom_left_text(
-                #     markup_frame,
-                #     "BB-Width Solution",
-                #     row_idx=3,
-                #     color=bb_color,
-                # )
-                self._draw_bottom_left_text(
-                    markup_frame,
-                    (
-                        f"BBS: {last_yolo_3d_estimate[0]:+6.3f}, "
-                        f"{last_yolo_3d_estimate[1]:+6.3f}, "
-                        f"{last_yolo_3d_estimate[2]:+6.3f} "
-                        f"({np.linalg.norm(last_yolo_3d_estimate):6.3f})"
+                estimate = estimate_single_feature_from_center_width(
+                    center_px=(float(center_infer[0]), float(center_infer[1])),
+                    bbox_w_px=float(bbox_size_infer[0]),
+                    bbox_h_px=float(bbox_size_infer[1]),
+                    K=camera_matrix_from_calibration(
+                        self.owner.calibration,
+                        image_size_px=(float(infer_w), float(infer_h)),
+                        scale_to_image=True,
                     ),
-                    row_idx=2,
-                    color=bb_color,
                 )
+                if estimate is not None:
+                    last_yolo_3d_estimate = np.asarray(estimate.xyz_cam_m, dtype=float)
+                    bb_color = (50, 255, 255)
+                    # self._draw_bottom_left_text(
+                    #     markup_frame,
+                    #     "BB-Width Solution",
+                    #     row_idx=3,
+                    #     color=bb_color,
+                    # )
+                    self._draw_bottom_left_text(
+                        markup_frame,
+                        (
+                            f"BBS: {last_yolo_3d_estimate[0]:+6.3f}, "
+                            f"{last_yolo_3d_estimate[1]:+6.3f}, "
+                            f"{last_yolo_3d_estimate[2]:+6.3f} "
+                            f"({np.linalg.norm(last_yolo_3d_estimate):6.3f})"
+                        ),
+                        row_idx=2,
+                        color=bb_color,
+                    )
 
         ctx.yolo.set(
             self.owner.yolo_output_type(

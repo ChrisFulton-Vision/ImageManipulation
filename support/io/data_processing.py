@@ -16,6 +16,10 @@ from sympy import false
 
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.io.my_logging import LOG
+from support.mathHelpers.single_feature_geometry import (
+    camera_matrix_from_calibration,
+    estimate_single_feature_from_center_width,
+)
 
 
 def natural_sort(l):
@@ -406,28 +410,24 @@ class DataProcessorRunner:
                                 rec["feat_0_bbox_w_px"] = bbox_w_px
                                 rec["feat_0_bbox_h_px"] = bbox_h_px
 
-                                # Match PoseRuntime's whole-aircraft width model.
-                                aircraft_width_m = 4.07
-
                                 if bbox_w_px > 1e-6 and calibration is not None:
                                     try:
-                                        K = np.asarray(calibration.getCameraMatrix(), dtype=float).copy()
-
-                                        # If the image size differs from the calibration size, scale K to this image.
-                                        calib_w = float(getattr(calibration, "width", W) or W)
-                                        calib_h = float(getattr(calibration, "height", H) or H)
-                                        if calib_w > 0 and calib_h > 0:
-                                            K[0, :] *= float(W) / calib_w
-                                            K[1, :] *= float(H) / calib_h
-
-                                        range_m = float(K[0, 0] * aircraft_width_m / bbox_w_px)
-                                        pix_h = np.array([cx_px, cy_px, 1.0], dtype=float)
-                                        xyz_cam = np.linalg.inv(K).dot(pix_h) * range_m
-
-                                        rec["feat_0_range_m"] = range_m
-                                        rec["feat_0_x_cam_m"] = float(xyz_cam[0])
-                                        rec["feat_0_y_cam_m"] = float(xyz_cam[1])
-                                        rec["feat_0_z_cam_m"] = float(xyz_cam[2])
+                                        K = camera_matrix_from_calibration(
+                                            calibration,
+                                            image_size_px=(float(W), float(H)),
+                                            scale_to_image=True,
+                                        )
+                                        estimate = estimate_single_feature_from_center_width(
+                                            center_px=(cx_px, cy_px),
+                                            bbox_w_px=bbox_w_px,
+                                            bbox_h_px=bbox_h_px,
+                                            K=K,
+                                        )
+                                        if estimate is not None:
+                                            rec["feat_0_range_m"] = float(estimate.range_m)
+                                            rec["feat_0_x_cam_m"] = float(estimate.xyz_cam_m[0])
+                                            rec["feat_0_y_cam_m"] = float(estimate.xyz_cam_m[1])
+                                            rec["feat_0_z_cam_m"] = float(estimate.xyz_cam_m[2])
                                     except Exception as e:
                                         LOG.warning("Single-feature range estimate failed for %s: %s", name, e)
                         else:

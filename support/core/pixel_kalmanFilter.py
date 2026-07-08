@@ -360,6 +360,11 @@ class KalmanFilter:
         self.R[0, 0] = self.var_meas_x
         self.R[1, 1] = self.var_meas_y
 
+    def set_sigma_proc(self, sigma_proc: float):
+        self.sigma_proc = float(sigma_proc)
+        self.var_proc = self.sigma_proc ** 2.0
+        self.update_Q(self.dt)
+
     def set_max_pixel_jump_px(self, jump_px: float):
         self.max_pixel_jump_px = float(jump_px)
         self._update_jump_gate_from_px()

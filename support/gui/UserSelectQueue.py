@@ -101,6 +101,7 @@ class YoloOpts:
     inference_source: YoloInferenceSource = YoloInferenceSource.ORIGINAL
     display_feature_ids: str = ""
     model_folder: str = ""
+    sigma_proc: float = 0.5
     BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
         ArgBinding("PnP", "want_pnp", bool, False),
         ArgBinding("QnP", "want_qnp", bool, False),
@@ -110,6 +111,7 @@ class YoloOpts:
         ArgBinding("Hyper Attention", "hyper_focus", bool, False),
         ArgBinding("Feature Circles", "feature_circles", bool, False),
         ArgBinding("Inference Source", "inference_source", YoloInferenceSource, YoloInferenceSource.ORIGINAL),
+        ArgBinding("Sigma Proc", "sigma_proc", float, 0.5, 0.00001, 10.0),
     )
 
     # Derived, guaranteed consistent

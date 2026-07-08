@@ -36,6 +36,20 @@ The QnP / wQnP measurement factors use their CSV covariance columns when present
 OpenCV SolvePnP does not usually have an exported pose covariance, so it uses a
 conservative heuristic covariance based on range and reprojection RMSE.
 
+An empirical covariance-inflation model is also available.  The reported pose
+covariance can be inflated as
+
+    C_eff = D C D + diag(s_floor_t^2, s_floor_t^2, s_floor_t^2,
+                         s_floor_r^2, s_floor_r^2, s_floor_r^2)
+
+where D applies alpha-style variance scaling and
+
+    s_floor_t^2 = floor_trans^2 + (range_sigma_frac * ||t||)^2 .
+
+The range term intentionally grows uncertainty for more distant camera-to-object
+solutions.  This inflation is meant to represent an effective truth-calibrated
+uncertainty model, not a physical decomposition of individual error sources.
+
 The script appends columns such as:
     pnp_fg_tvec_x, pnp_fg_tvec_y, pnp_fg_tvec_z
     pnp_fg_qw, pnp_fg_qx, pnp_fg_qy, pnp_fg_qz
@@ -384,18 +398,58 @@ def tangent_to_quaternion(phi: np.ndarray, q0: np.ndarray) -> np.ndarray:
 @dataclass
 class SmootherConfig:
     process_sigma_pos: float = 0.08
-    process_sigma_rot: float = math.radians(0.25)
-    process_sigma_vel: float = 0.35
-    process_sigma_omega: float = math.radians(2.5)
+    process_sigma_rot: float = math.radians(0.10)
+    process_sigma_vel: float = 0.02
+    process_sigma_omega: float = math.radians(0.75)
 
-    velocity_prior_sigma: float = 10.0
-    omega_prior_sigma: float = math.radians(60.0)
+    velocity_prior_sigma: float = 5.0
+    omega_prior_sigma: float = math.radians(5.0)
 
     pnp_sigma_pos_base: float = 0.35
     pnp_sigma_pos_range_frac: float = 0.003
     pnp_sigma_pos_rmse_scale: float = 0.006
     pnp_sigma_rot_deg_base: float = 0.75
     pnp_sigma_rot_deg_rmse_scale: float = 0.025
+
+    # Empirical covariance inflation.  The alpha terms are variance multipliers.
+    # A value of 9.0 means the corresponding 1-sigma width triples.
+    #
+    # Translation floor is added in variance form as
+    #     sigma_floor_t(r)^2 = floor_trans^2 + (range_sigma_frac * ||t||)^2
+    # so distant pose estimates naturally receive larger range uncertainty.
+    #
+    # raw_* tunes exported <method>_cov6_effective columns for the original pose
+    # methods. fg_* tunes exported <method>_fg_cov6 uncertainty columns.
+    #
+    # meas_* tunes the actual graph measurement weights.  This is intentionally
+    # separate from fg_* because the FG covariance envelope may need to be broad
+    # for dissertation coverage plots, while the smoother itself usually only
+    # needs a moderate de-gospeling of QnP Hessian covariances.
+    raw_cov_alpha_trans: float = 16.0
+    raw_cov_alpha_rot: float = 4.0
+    raw_cov_floor_trans: float = 0.22
+    raw_cov_floor_rot: float = math.radians(0.35)
+    raw_cov_range_sigma_frac: float = 0.0025
+
+    fg_cov_alpha_trans: float = 1.5
+    fg_cov_alpha_rot: float = 2.0
+    fg_cov_floor_trans: float = 0.25
+    fg_cov_floor_rot: float = math.radians(0.25)
+    fg_cov_range_sigma_frac: float = 0.0015
+
+    # Measurement-weight inflation is applied by default only to methods that
+    # supply solver covariance columns, i.e., the QnP / weighted-QnP family.
+    # OpenCV SolvePnP already uses the conservative heuristic covariance below.
+    meas_cov_alpha_trans: float = 9.0
+    meas_cov_alpha_rot: float = 2.0
+    meas_cov_floor_trans: float = 0.30
+    meas_cov_floor_rot: float = math.radians(0.25)
+    meas_cov_range_sigma_frac: float = 0.0025
+
+    inflate_measurement_covariances: bool = True
+    inflate_pnp_measurement_covariance: bool = False
+    inflate_reported_covariances: bool = True
+    write_inflated_raw_covariances: bool = True
 
     min_trans_sigma: float = 0.003
     min_rot_sigma: float = 1e-4
@@ -451,7 +505,67 @@ def add_factor(
             add_block(H, idx_i, idx_j, A_i.T @ WA_j)
 
 
-def measurement_covariance_for_row(
+def regularize_covariance_for_config(C: np.ndarray, cfg: SmootherConfig) -> np.ndarray:
+    return nearest_positive_definite(
+        C,
+        min_trans_sigma=cfg.min_trans_sigma,
+        min_rot_sigma=cfg.min_rot_sigma,
+        max_trans_sigma=cfg.max_trans_sigma,
+        max_rot_sigma=cfg.max_rot_sigma,
+        eig_floor=cfg.cov_eig_floor,
+    )
+
+
+def covariance_inflation_matrix(alpha_trans: float, alpha_rot: float) -> np.ndarray:
+    """Return diagonal square-root variance scaling for alpha inflation."""
+    alpha_t = max(float(alpha_trans), 0.0)
+    alpha_r = max(float(alpha_rot), 0.0)
+    return np.diag([math.sqrt(alpha_t)] * 3 + [math.sqrt(alpha_r)] * 3)
+
+
+def covariance_floor_matrix(
+    z_pose: np.ndarray,
+    floor_trans: float,
+    floor_rot: float,
+    range_sigma_frac: float,
+) -> np.ndarray:
+    """Return additive covariance floor for one 6-DOF pose measurement/state.
+
+    The translation floor increases with range.  This is intentionally isotropic
+    in translation coordinates so downstream range-sigma diagnostics that only
+    read covariance diagonals still see the added uncertainty.
+    """
+    z_pose = np.asarray(z_pose, dtype=float)
+    rng = float(np.linalg.norm(z_pose[:3])) if z_pose.size >= 3 else 0.0
+    if not np.isfinite(rng):
+        rng = 0.0
+
+    sig_t2 = float(floor_trans) ** 2 + (float(range_sigma_frac) * rng) ** 2
+    sig_r2 = float(floor_rot) ** 2
+    sig_t2 = max(sig_t2, 0.0)
+    sig_r2 = max(sig_r2, 0.0)
+    return np.diag([sig_t2] * 3 + [sig_r2] * 3)
+
+
+def inflate_pose_covariance(
+    C: np.ndarray,
+    z_pose: np.ndarray,
+    cfg: SmootherConfig,
+    *,
+    alpha_trans: float,
+    alpha_rot: float,
+    floor_trans: float,
+    floor_rot: float,
+    range_sigma_frac: float,
+) -> np.ndarray:
+    """Apply alpha + additive floor empirical covariance inflation."""
+    C = np.asarray(C, dtype=float)
+    D = covariance_inflation_matrix(alpha_trans, alpha_rot)
+    C_eff = D @ C @ D.T + covariance_floor_matrix(z_pose, floor_trans, floor_rot, range_sigma_frac)
+    return regularize_covariance_for_config(C_eff, cfg)
+
+
+def nominal_measurement_covariance_for_row(
     row: pd.Series,
     method: MethodSpec,
     z_pose: np.ndarray,
@@ -460,14 +574,7 @@ def measurement_covariance_for_row(
     if method.cov_col is not None and method.cov_col in row.index:
         C = parse_cov6(row[method.cov_col])
         if C is not None:
-            return nearest_positive_definite(
-                C,
-                min_trans_sigma=cfg.min_trans_sigma,
-                min_rot_sigma=cfg.min_rot_sigma,
-                max_trans_sigma=cfg.max_trans_sigma,
-                max_rot_sigma=cfg.max_rot_sigma,
-                eig_floor=cfg.cov_eig_floor,
-            )
+            return regularize_covariance_for_config(C, cfg)
 
     # Conservative PnP / fallback covariance.
     rng = float(np.linalg.norm(z_pose[:3]))
@@ -485,6 +592,37 @@ def measurement_covariance_for_row(
     sig_t = float(np.clip(sig_t, cfg.min_trans_sigma, cfg.max_trans_sigma))
     sig_r = float(np.clip(np.deg2rad(sig_r_deg), cfg.min_rot_sigma, cfg.max_rot_sigma))
     return np.diag([sig_t ** 2, sig_t ** 2, sig_t ** 2, sig_r ** 2, sig_r ** 2, sig_r ** 2])
+
+
+def measurement_covariance_for_row(
+    row: pd.Series,
+    method: MethodSpec,
+    z_pose: np.ndarray,
+    cfg: SmootherConfig,
+) -> np.ndarray:
+    C = nominal_measurement_covariance_for_row(row, method, z_pose, cfg)
+
+    # The QnP-family covariance columns are often Hessian/local-fit covariances.
+    # They can be much too confident as truth-level measurement weights, which
+    # pins the FG state to the raw estimate and makes the smoother visually do
+    # nothing.  PnP has no exported covariance and already uses the conservative
+    # heuristic fallback, so leave PnP alone unless explicitly requested.
+    should_inflate = bool(cfg.inflate_measurement_covariances)
+    if method.cov_col is None and not bool(cfg.inflate_pnp_measurement_covariance):
+        should_inflate = False
+
+    if should_inflate:
+        C = inflate_pose_covariance(
+            C,
+            z_pose,
+            cfg,
+            alpha_trans=cfg.meas_cov_alpha_trans,
+            alpha_rot=cfg.meas_cov_alpha_rot,
+            floor_trans=cfg.meas_cov_floor_trans,
+            floor_rot=cfg.meas_cov_floor_rot,
+            range_sigma_frac=cfg.meas_cov_range_sigma_frac,
+        )
+    return C
 
 
 def build_initial_rates(times: np.ndarray, z_filled: np.ndarray) -> np.ndarray:
@@ -588,6 +726,9 @@ def solve_factor_graph_for_method(
         solver_status = "lsqr"
 
     cov_blocks = covariance_blocks_from_hessian(H_csc, N, cfg)
+    if cfg.inflate_reported_covariances:
+        pose_states = np.asarray(x, dtype=float)[: 6 * N].reshape(N, 6)
+        cov_blocks = inflate_covariance_blocks(cov_blocks, pose_states, cfg)
 
     info = {
         "solver_status": solver_status,
@@ -595,6 +736,19 @@ def solve_factor_graph_for_method(
         "n_state": int(n_state),
         "measurement_valid_count": int(np.sum(valid)),
         "covariance_mode": cfg.covariance_mode,
+        "cov_alpha_trans": float(cfg.fg_cov_alpha_trans),
+        "cov_alpha_rot": float(cfg.fg_cov_alpha_rot),
+        "cov_floor_trans": float(cfg.fg_cov_floor_trans),
+        "cov_floor_rot": float(cfg.fg_cov_floor_rot),
+        "cov_range_sigma_frac": float(cfg.fg_cov_range_sigma_frac),
+        "meas_cov_alpha_trans": float(cfg.meas_cov_alpha_trans),
+        "meas_cov_alpha_rot": float(cfg.meas_cov_alpha_rot),
+        "meas_cov_floor_trans": float(cfg.meas_cov_floor_trans),
+        "meas_cov_floor_rot": float(cfg.meas_cov_floor_rot),
+        "meas_cov_range_sigma_frac": float(cfg.meas_cov_range_sigma_frac),
+        "inflate_measurement_covariances": bool(cfg.inflate_measurement_covariances),
+        "inflate_pnp_measurement_covariance": bool(cfg.inflate_pnp_measurement_covariance),
+        "inflate_reported_covariances": bool(cfg.inflate_reported_covariances),
     }
 
     return SmootherResult(
@@ -606,6 +760,28 @@ def solve_factor_graph_for_method(
         measurement_valid_count=int(np.sum(valid)),
         solve_info=info,
     )
+
+
+def inflate_covariance_blocks(covs: np.ndarray, pose_states: np.ndarray, cfg: SmootherConfig) -> np.ndarray:
+    """Apply empirical inflation to a stack of pose covariance blocks."""
+    covs = np.asarray(covs, dtype=float)
+    pose_states = np.asarray(pose_states, dtype=float)
+    out = np.array(covs, dtype=float, copy=True)
+    for k in range(len(out)):
+        if out[k].shape != (6, 6) or not np.all(np.isfinite(out[k])):
+            continue
+        z_pose = pose_states[k] if k < len(pose_states) else np.zeros(6, dtype=float)
+        out[k] = inflate_pose_covariance(
+            out[k],
+            z_pose,
+            cfg,
+            alpha_trans=cfg.fg_cov_alpha_trans,
+            alpha_rot=cfg.fg_cov_alpha_rot,
+            floor_trans=cfg.fg_cov_floor_trans,
+            floor_rot=cfg.fg_cov_floor_rot,
+            range_sigma_frac=cfg.fg_cov_range_sigma_frac,
+        )
+    return out
 
 
 def covariance_blocks_from_hessian(H: sp.csc_matrix, N: int, cfg: SmootherConfig) -> np.ndarray:
@@ -656,6 +832,80 @@ def available_methods(df: pd.DataFrame) -> list[MethodSpec]:
     return found
 
 
+def append_inflated_raw_covariance_columns(
+    df: pd.DataFrame,
+    methods: list[MethodSpec],
+    cfg: SmootherConfig,
+) -> pd.DataFrame:
+    """Append <method>_cov6_effective and sigma columns for raw pose methods.
+
+    These columns preserve the original Hessian/heuristic covariance columns and
+    provide a separate truth-diagnostic covariance that includes empirical
+    alpha/floor/range inflation.
+    """
+    if not cfg.write_inflated_raw_covariances:
+        return df
+
+    out = df.copy()
+    sigma_names = ["x", "y", "z", "rx", "ry", "rz"]
+
+    for method in methods:
+        if not have_cols(out, [method.valid_col, *method.t_cols]):
+            continue
+
+        t_raw = numeric(out, method.t_cols)
+        valid = as_bool(out[method.valid_col]) & finite_rows(t_raw)
+        if have_cols(out, method.q_cols):
+            valid &= finite_rows(numeric(out, method.q_cols))
+
+        cov_strings: list[str] = []
+        sigmas = np.full((len(out), 6), np.nan, dtype=float)
+        range_floor_sigma = np.full(len(out), np.nan, dtype=float)
+
+        for k in range(len(out)):
+            if not valid[k]:
+                cov_strings.append("")
+                continue
+
+            z_pose = np.zeros(6, dtype=float)
+            z_pose[:3] = t_raw[k]
+            C_nom = nominal_measurement_covariance_for_row(out.iloc[int(k)], method, z_pose, cfg)
+            C_eff = (
+                inflate_pose_covariance(
+                    C_nom,
+                    z_pose,
+                    cfg,
+                    alpha_trans=cfg.raw_cov_alpha_trans,
+                    alpha_rot=cfg.raw_cov_alpha_rot,
+                    floor_trans=cfg.raw_cov_floor_trans,
+                    floor_rot=cfg.raw_cov_floor_rot,
+                    range_sigma_frac=cfg.raw_cov_range_sigma_frac,
+                )
+                if cfg.inflate_reported_covariances
+                else C_nom
+            )
+            cov_strings.append(matrix_to_string(C_eff))
+            sigmas[k] = np.sqrt(np.clip(np.diag(C_eff), 0.0, np.inf))
+
+            rng = float(np.linalg.norm(z_pose[:3]))
+            range_floor_sigma[k] = math.sqrt(
+                max(float(cfg.raw_cov_floor_trans) ** 2 + (float(cfg.raw_cov_range_sigma_frac) * rng) ** 2, 0.0)
+            )
+
+        prefix = method.key
+        out[f"{prefix}_cov6_effective"] = cov_strings
+        for i, name in enumerate(sigma_names):
+            out[f"{prefix}_sigma_{name}_effective"] = sigmas[:, i]
+        out[f"{prefix}_range_sigma_floor_effective"] = range_floor_sigma
+        out[f"{prefix}_cov_alpha_trans_effective"] = float(cfg.raw_cov_alpha_trans)
+        out[f"{prefix}_cov_alpha_rot_effective"] = float(cfg.raw_cov_alpha_rot)
+        out[f"{prefix}_cov_floor_trans_effective"] = float(cfg.raw_cov_floor_trans)
+        out[f"{prefix}_cov_floor_rot_effective"] = float(cfg.raw_cov_floor_rot)
+        out[f"{prefix}_cov_range_sigma_frac_effective"] = float(cfg.raw_cov_range_sigma_frac)
+
+    return out
+
+
 def append_result_columns(df: pd.DataFrame, method: MethodSpec, result: SmootherResult) -> pd.DataFrame:
     out = df.copy()
     N = len(out)
@@ -693,6 +943,18 @@ def append_result_columns(df: pd.DataFrame, method: MethodSpec, result: Smoother
         out[f"{prefix}_sigma_{name}"] = sig[:, i]
 
     out[f"{prefix}_cov6"] = [matrix_to_string(covs[k]) for k in range(N)]
+    out[f"{prefix}_cov_alpha_trans"] = float(result.solve_info.get("cov_alpha_trans", np.nan))
+    out[f"{prefix}_cov_alpha_rot"] = float(result.solve_info.get("cov_alpha_rot", np.nan))
+    out[f"{prefix}_cov_floor_trans"] = float(result.solve_info.get("cov_floor_trans", np.nan))
+    out[f"{prefix}_cov_floor_rot"] = float(result.solve_info.get("cov_floor_rot", np.nan))
+    out[f"{prefix}_cov_range_sigma_frac"] = float(result.solve_info.get("cov_range_sigma_frac", np.nan))
+    out[f"{prefix}_cov_inflated"] = bool(result.solve_info.get("inflate_reported_covariances", False))
+    out[f"{prefix}_measurement_covariances_inflated"] = bool(result.solve_info.get("inflate_measurement_covariances", False))
+    out[f"{prefix}_measurement_cov_alpha_trans"] = float(result.solve_info.get("meas_cov_alpha_trans", np.nan))
+    out[f"{prefix}_measurement_cov_alpha_rot"] = float(result.solve_info.get("meas_cov_alpha_rot", np.nan))
+    out[f"{prefix}_measurement_cov_floor_trans"] = float(result.solve_info.get("meas_cov_floor_trans", np.nan))
+    out[f"{prefix}_measurement_cov_floor_rot"] = float(result.solve_info.get("meas_cov_floor_rot", np.nan))
+    out[f"{prefix}_measurement_cov_range_sigma_frac"] = float(result.solve_info.get("meas_cov_range_sigma_frac", np.nan))
     out[f"{prefix}_measurement_count"] = result.measurement_valid_count
     out[f"{prefix}_covariance_mode"] = result.solve_info["covariance_mode"]
     out[f"{prefix}_solver_status"] = result.solve_info["solver_status"]
@@ -710,6 +972,19 @@ def build_summary_rows(method: MethodSpec, result: SmootherResult) -> dict[str, 
         "fg_valid_count": int(np.sum(result.valid)),
         "solver_status": result.solve_info["solver_status"],
         "covariance_mode": result.solve_info["covariance_mode"],
+        "cov_alpha_trans": result.solve_info.get("cov_alpha_trans", np.nan),
+        "cov_alpha_rot": result.solve_info.get("cov_alpha_rot", np.nan),
+        "cov_floor_trans": result.solve_info.get("cov_floor_trans", np.nan),
+        "cov_floor_rot_rad": result.solve_info.get("cov_floor_rot", np.nan),
+        "cov_range_sigma_frac": result.solve_info.get("cov_range_sigma_frac", np.nan),
+        "meas_cov_alpha_trans": result.solve_info.get("meas_cov_alpha_trans", np.nan),
+        "meas_cov_alpha_rot": result.solve_info.get("meas_cov_alpha_rot", np.nan),
+        "meas_cov_floor_trans": result.solve_info.get("meas_cov_floor_trans", np.nan),
+        "meas_cov_floor_rot_rad": result.solve_info.get("meas_cov_floor_rot", np.nan),
+        "meas_cov_range_sigma_frac": result.solve_info.get("meas_cov_range_sigma_frac", np.nan),
+        "inflate_measurement_covariances": result.solve_info.get("inflate_measurement_covariances", False),
+        "inflate_pnp_measurement_covariance": result.solve_info.get("inflate_pnp_measurement_covariance", False),
+        "inflate_reported_covariances": result.solve_info.get("inflate_reported_covariances", False),
     }
 
 
@@ -743,42 +1018,66 @@ def choose_csv_with_dialog() -> Path | None:
 
 
 def parse_args() -> argparse.Namespace:
+    cfg = SmootherConfig()
     p = argparse.ArgumentParser(description="Append independent SE(3) factor-graph smoothing columns to a navcalcs CSV.")
     p.add_argument("--csv", type=Path, default=None, help="Input navcalcs CSV. If omitted, a file dialog opens.")
     p.add_argument("--output", type=Path, default=None, help="Optional output CSV. Default overwrites input.")
     p.add_argument("--no-backup", action="store_true", help="Do not create a timestamped backup before overwriting input.")
     p.add_argument("--methods", nargs="*", default=["pnp", "qnp", "wqnp_yolo", "wqnp_kfest"], help="Methods to smooth.")
 
-    p.add_argument("--process-sigma-pos", type=float, default=0.08, help="Position process sigma for pose dynamics residual [m].")
-    p.add_argument("--process-sigma-rot-deg", type=float, default=0.25, help="Rotation process sigma for pose dynamics residual [deg].")
-    p.add_argument("--process-sigma-vel", type=float, default=0.35, help="Velocity random-walk sigma [m/s].")
-    p.add_argument("--process-sigma-omega-deg", type=float, default=2.5, help="Angular-rate random-walk sigma [deg/s].")
+    p.add_argument("--process-sigma-pos", type=float, default=cfg.process_sigma_pos, help="Position process sigma for pose dynamics residual [m].")
+    p.add_argument("--process-sigma-rot-deg", type=float, default=math.degrees(cfg.process_sigma_rot), help="Rotation process sigma for pose dynamics residual [deg].")
+    p.add_argument("--process-sigma-vel", type=float, default=cfg.process_sigma_vel, help="Velocity random-walk sigma [m/s].")
+    p.add_argument("--process-sigma-omega-deg", type=float, default=math.degrees(cfg.process_sigma_omega), help="Angular-rate random-walk sigma [deg/s].")
 
-    p.add_argument("--velocity-prior-sigma", type=float, default=10.0, help="Weak prior sigma for initial translational rate [m/s].")
-    p.add_argument("--omega-prior-sigma-deg", type=float, default=60.0, help="Weak prior sigma for initial angular rate [deg/s].")
+    p.add_argument("--velocity-prior-sigma", type=float, default=cfg.velocity_prior_sigma, help="Weak prior sigma for initial translational rate [m/s].")
+    p.add_argument("--omega-prior-sigma-deg", type=float, default=math.degrees(cfg.omega_prior_sigma), help="Weak prior sigma for initial angular rate [deg/s].")
 
-    p.add_argument("--min-trans-sigma", type=float, default=0.003, help="Minimum translation sigma accepted from cov6 [m].")
-    p.add_argument("--min-rot-sigma", type=float, default=1e-4, help="Minimum rotation sigma accepted from cov6 [rad].")
-    p.add_argument("--max-trans-sigma", type=float, default=30.0, help="Maximum translation sigma accepted from cov6 [m].")
-    p.add_argument("--max-rot-deg", type=float, default=60.0, help="Maximum rotation sigma accepted from cov6 [deg].")
-    p.add_argument("--cov-eig-floor", type=float, default=1e-12, help="Eigenvalue floor used while regularizing cov6.")
+    p.add_argument("--min-trans-sigma", type=float, default=cfg.min_trans_sigma, help="Minimum translation sigma accepted from cov6 [m].")
+    p.add_argument("--min-rot-sigma", type=float, default=cfg.min_rot_sigma, help="Minimum rotation sigma accepted from cov6 [rad].")
+    p.add_argument("--max-trans-sigma", type=float, default=cfg.max_trans_sigma, help="Maximum translation sigma accepted from cov6 [m].")
+    p.add_argument("--max-rot-deg", type=float, default=math.degrees(cfg.max_rot_sigma), help="Maximum rotation sigma accepted from cov6 [deg].")
+    p.add_argument("--cov-eig-floor", type=float, default=cfg.cov_eig_floor, help="Eigenvalue floor used while regularizing cov6.")
 
-    p.add_argument("--hessian-damping", type=float, default=1e-9, help="Small diagonal damping added to the normal equations.")
+    p.add_argument("--hessian-damping", type=float, default=cfg.hessian_damping, help="Small diagonal damping added to the normal equations.")
     p.add_argument(
         "--covariance-mode",
         choices=["block", "selected", "none"],
-        default="block",
+        default=cfg.covariance_mode,
         help=(
             "Covariance estimate mode. 'block' is fast local inverse of each pose Hessian block. "
             "'selected' computes selected diagonal inverse blocks of the full Hessian and is slower."
         ),
     )
 
-    p.add_argument("--pnp-sigma-pos-base", type=float, default=0.35)
-    p.add_argument("--pnp-sigma-pos-range-frac", type=float, default=0.003)
-    p.add_argument("--pnp-sigma-pos-rmse-scale", type=float, default=0.006)
-    p.add_argument("--pnp-sigma-rot-deg-base", type=float, default=0.75)
-    p.add_argument("--pnp-sigma-rot-deg-rmse-scale", type=float, default=0.025)
+    p.add_argument("--raw-cov-alpha-trans", type=float, default=cfg.raw_cov_alpha_trans, help="Raw effective covariance translation variance multiplier. 9.0 triples 1-sigma.")
+    p.add_argument("--raw-cov-alpha-rot", type=float, default=cfg.raw_cov_alpha_rot, help="Raw effective covariance rotation variance multiplier. 4.0 doubles 1-sigma.")
+    p.add_argument("--raw-cov-floor-trans", type=float, default=cfg.raw_cov_floor_trans, help="Raw effective covariance translation sigma floor [m].")
+    p.add_argument("--raw-cov-floor-rot-deg", type=float, default=math.degrees(cfg.raw_cov_floor_rot), help="Raw effective covariance rotation sigma floor [deg].")
+    p.add_argument("--raw-cov-range-sigma-frac", type=float, default=cfg.raw_cov_range_sigma_frac, help="Raw effective covariance extra translation sigma fraction times range, e.g. 0.005 gives 0.5 m at 100 m.")
+    p.add_argument("--fg-cov-alpha-trans", type=float, default=cfg.fg_cov_alpha_trans, help="Exported FG covariance translation variance multiplier. 9.0 triples 1-sigma.")
+    p.add_argument("--fg-cov-alpha-rot", type=float, default=cfg.fg_cov_alpha_rot, help="Exported FG covariance rotation variance multiplier. 4.0 doubles 1-sigma.")
+    p.add_argument("--fg-cov-floor-trans", type=float, default=cfg.fg_cov_floor_trans, help="Exported FG covariance translation sigma floor [m].")
+    p.add_argument("--fg-cov-floor-rot-deg", type=float, default=math.degrees(cfg.fg_cov_floor_rot), help="Exported FG covariance rotation sigma floor [deg].")
+    p.add_argument("--fg-cov-range-sigma-frac", type=float, default=cfg.fg_cov_range_sigma_frac, help="Exported FG covariance extra translation sigma fraction times range, e.g. 0.005 gives 0.5 m at 100 m.")
+
+    meas_group = p.add_mutually_exclusive_group()
+    meas_group.add_argument("--inflate-measurement-covariances", dest="inflate_measurement_covariances", action="store_true", default=cfg.inflate_measurement_covariances, help="Use meas-cov inflation as FG measurement weights for covariance-exporting methods. Enabled by default.")
+    meas_group.add_argument("--no-inflate-measurement-covariances", dest="inflate_measurement_covariances", action="store_false", help="Use nominal exported QnP/wQnP covariance columns directly as FG measurement weights.")
+    p.add_argument("--inflate-pnp-measurement-covariance", action="store_true", default=cfg.inflate_pnp_measurement_covariance, help="Also apply meas-cov inflation to OpenCV SolvePnP's heuristic measurement covariance.")
+    p.add_argument("--meas-cov-alpha-trans", type=float, default=cfg.meas_cov_alpha_trans, help="Measurement-weight covariance translation variance multiplier for covariance-exporting methods.")
+    p.add_argument("--meas-cov-alpha-rot", type=float, default=cfg.meas_cov_alpha_rot, help="Measurement-weight covariance rotation variance multiplier for covariance-exporting methods.")
+    p.add_argument("--meas-cov-floor-trans", type=float, default=cfg.meas_cov_floor_trans, help="Measurement-weight covariance translation sigma floor [m].")
+    p.add_argument("--meas-cov-floor-rot-deg", type=float, default=math.degrees(cfg.meas_cov_floor_rot), help="Measurement-weight covariance rotation sigma floor [deg].")
+    p.add_argument("--meas-cov-range-sigma-frac", type=float, default=cfg.meas_cov_range_sigma_frac, help="Measurement-weight covariance extra translation sigma fraction times range.")
+    p.add_argument("--no-inflate-reported-covariances", action="store_true", help="Disable raw and FG alpha/floor/range inflation on exported covariance columns.")
+    p.add_argument("--no-write-inflated-raw-covariances", action="store_true", help="Do not append <method>_cov6_effective raw covariance columns.")
+
+    p.add_argument("--pnp-sigma-pos-base", type=float, default=cfg.pnp_sigma_pos_base)
+    p.add_argument("--pnp-sigma-pos-range-frac", type=float, default=cfg.pnp_sigma_pos_range_frac)
+    p.add_argument("--pnp-sigma-pos-rmse-scale", type=float, default=cfg.pnp_sigma_pos_rmse_scale)
+    p.add_argument("--pnp-sigma-rot-deg-base", type=float, default=cfg.pnp_sigma_rot_deg_base)
+    p.add_argument("--pnp-sigma-rot-deg-rmse-scale", type=float, default=cfg.pnp_sigma_rot_deg_rmse_scale)
 
     return p.parse_args()
 
@@ -823,6 +1122,25 @@ def main() -> None:
         pnp_sigma_pos_rmse_scale=float(args.pnp_sigma_pos_rmse_scale),
         pnp_sigma_rot_deg_base=float(args.pnp_sigma_rot_deg_base),
         pnp_sigma_rot_deg_rmse_scale=float(args.pnp_sigma_rot_deg_rmse_scale),
+        raw_cov_alpha_trans=float(args.raw_cov_alpha_trans),
+        raw_cov_alpha_rot=float(args.raw_cov_alpha_rot),
+        raw_cov_floor_trans=float(args.raw_cov_floor_trans),
+        raw_cov_floor_rot=math.radians(float(args.raw_cov_floor_rot_deg)),
+        raw_cov_range_sigma_frac=float(args.raw_cov_range_sigma_frac),
+        fg_cov_alpha_trans=float(args.fg_cov_alpha_trans),
+        fg_cov_alpha_rot=float(args.fg_cov_alpha_rot),
+        fg_cov_floor_trans=float(args.fg_cov_floor_trans),
+        fg_cov_floor_rot=math.radians(float(args.fg_cov_floor_rot_deg)),
+        fg_cov_range_sigma_frac=float(args.fg_cov_range_sigma_frac),
+        meas_cov_alpha_trans=float(args.meas_cov_alpha_trans),
+        meas_cov_alpha_rot=float(args.meas_cov_alpha_rot),
+        meas_cov_floor_trans=float(args.meas_cov_floor_trans),
+        meas_cov_floor_rot=math.radians(float(args.meas_cov_floor_rot_deg)),
+        meas_cov_range_sigma_frac=float(args.meas_cov_range_sigma_frac),
+        inflate_measurement_covariances=bool(args.inflate_measurement_covariances),
+        inflate_pnp_measurement_covariance=bool(args.inflate_pnp_measurement_covariance),
+        inflate_reported_covariances=not bool(args.no_inflate_reported_covariances),
+        write_inflated_raw_covariances=not bool(args.no_write_inflated_raw_covariances),
         min_trans_sigma=float(args.min_trans_sigma),
         min_rot_sigma=float(args.min_rot_sigma),
         max_trans_sigma=float(args.max_trans_sigma),
@@ -839,6 +1157,7 @@ def main() -> None:
 
     summary_rows: list[dict[str, object]] = []
     out_df = df.copy()
+    out_df = append_inflated_raw_covariance_columns(out_df, methods, cfg)
 
     print(f"Input CSV: {csv_path}")
     print(f"Rows: {len(df)}")
@@ -864,11 +1183,11 @@ def main() -> None:
     if not summary_rows:
         raise SystemExit("No factor-graph results were generated.")
 
-    if output_path.resolve() == csv_path.resolve() and not args.no_backup:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = csv_path.with_name(f"{csv_path.stem}_before_fg_{stamp}{csv_path.suffix}")
-        shutil.copy2(csv_path, backup)
-        print(f"\nBackup written: {backup}")
+    # if output_path.resolve() == csv_path.resolve() and not args.no_backup:
+    #     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    #     backup = csv_path.with_name(f"{csv_path.stem}_before_fg_{stamp}{csv_path.suffix}")
+        # shutil.copy2(csv_path, backup)
+        # print(f"\nBackup written: {backup}")
 
     out_df.to_csv(output_path, index=False)
 

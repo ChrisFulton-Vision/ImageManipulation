@@ -511,7 +511,7 @@ class AttitudeReader:
             flip_order = True
         else:
             mode_pwm = np.nan
-        mode = self.pwm_to_mode(mode_pwm, flip_order = True)
+        mode = self.pwm_to_mode(mode_pwm, flip_order=flip_order)
 
         gps_valid = False
         lat_deg = 0.0

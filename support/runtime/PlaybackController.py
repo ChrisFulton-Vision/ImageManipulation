@@ -943,12 +943,36 @@ class PlaybackController:
     def _build_sequence_and_timebase(self, directory):
         self.populate_ids_times(str(directory))
 
+        records = list(self.owner.ImageTimeReader.idsTimes)
+
+        # Preferred: timestamp order when all/most timestamps are available.
+        # Fallback: preserve existing natural/index order when timestamps are missing.
+        if any(len(rec) > 1 and rec[1] is not None for rec in records):
+            records = sorted(
+                records,
+                key=lambda rec: (
+                    float("inf") if len(rec) <= 1 or rec[1] is None else float(rec[1]),
+                    str(rec[0]),
+                ),
+            )
+
         paths = []
-        for rec in self.owner.ImageTimeReader.idsTimes:
+        for rec in records:
             p = Path(rec[0])
             paths.append(p if p.is_absolute() else (Path(directory) / p))
 
-        ts_raw = [None if ts is None else float(ts) for _name, ts in self.owner.ImageTimeReader.idsTimes]
+        ts_raw = [
+            None if len(rec) <= 1 or rec[1] is None else float(rec[1])
+            for rec in records
+        ]
 
-        t_playback = self._make_timebase(ts_raw, self.owner.camConfig.target_fps, len(paths))
+        # Keep ImageTimeReader aligned with the playback order.
+        self.owner.ImageTimeReader.idsTimes = records
+
+        t_playback = self._make_timebase(
+            ts_raw,
+            self.owner.camConfig.target_fps,
+            len(paths),
+        )
+
         return paths, t_playback, ts_raw

@@ -398,14 +398,6 @@ class CameraGui(ctk.CTkFrame):
         self.config_runtime.sync_dp_from_model()
 
     def _on_queue_changed(self, new_queue):
-        def queue_change_resize():
-            print('Testing...')
-            if self.imgProcQueue_editor is not None and self.imgProcQueue_editor.winfo_exists():
-                print(self.imgProcQueue_editor.winfo_reqheight())
-                print('Test2')
-            if self.func_that_refits is not None:
-                self.func_that_refits()
-
         self.config_runtime.on_queue_changed(new_queue)
 
     def _sync_queue_from_model(self):
@@ -1061,7 +1053,7 @@ class CameraGui(ctk.CTkFrame):
 
         return forced_args
 
-    def _run_navcalc_pose_on_frame(self, frame, img_time=None, name=None) -> PoseOutput | None:
+    def _run_navcalc_pose_on_frame(self, frame, img_time=None, name=None) -> YoloOutput | None:
         ctx = GuiQueue.FrameCtx(
             img_time=img_time,
             name=name,
@@ -1089,8 +1081,7 @@ class CameraGui(ctk.CTkFrame):
         if not ran_yolo:
             self.run_yolo(frame, markup_frame, ctx, yolo_args)
 
-        yolo_output = ctx.yolo.get_or(None)
-        return None if yolo_output is None else yolo_output.pose
+        return ctx.yolo.get_or(None)
 
     def exportNavCalcs(self):
         """Run YOLO and all nav-calculation pose solvers across the selected frame range and save one CSV."""
@@ -1218,6 +1209,13 @@ class CameraGui(ctk.CTkFrame):
                 "frame_idx",
                 "image_name",
                 "image_time",
+                "single_feature_centroid_x_px",
+                "single_feature_centroid_y_px",
+                "single_feature_bbox_width_px",
+                "single_feature_estimated_tvec_x",
+                "single_feature_estimated_tvec_y",
+                "single_feature_estimated_tvec_z",
+                "single_feature_estimated_range",
                 "pnp_valid",
                 "pnp_qw", "pnp_qx", "pnp_qy", "pnp_qz",
                 "pnp_tvec_x", "pnp_tvec_y", "pnp_tvec_z",
@@ -1262,6 +1260,10 @@ class CameraGui(ctk.CTkFrame):
             with open(output_csv, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
+                is_single_feature_yolo = bool(
+                    self.yoloSession is not None
+                    and getattr(getattr(self.yoloSession, "reader", None), "numClasses", None) == 1
+                )
 
                 for row_idx, img_path in enumerate(selected_paths, start=start):
                     frame = cv2.imread(str(img_path))
@@ -1269,15 +1271,35 @@ class CameraGui(ctk.CTkFrame):
                         continue
 
                     ts = ts_analysis[row_idx] if row_idx < len(ts_analysis) else None
-                    pose_output = self._run_navcalc_pose_on_frame(
+                    yolo_output = self._run_navcalc_pose_on_frame(
                         frame,
                         img_time=(float(ts) if ts is not None else None),
                         name=self.ImageTimeReader.idsTimes[row_idx][0] if row_idx < len(self.ImageTimeReader.idsTimes) else img_path.name,
                     )
+                    pose_output = None if yolo_output is None else yolo_output.pose
+
+                    single_feature_centroid_x_px = None
+                    single_feature_centroid_y_px = None
+                    single_feature_bbox_width_px = None
+                    single_feature_estimated_tvec_x = None
+                    single_feature_estimated_tvec_y = None
+                    single_feature_estimated_tvec_z = None
+                    single_feature_estimated_range = None
+                    if is_single_feature_yolo and yolo_output is not None:
+                        if yolo_output.last_yolo_center is not None:
+                            single_feature_centroid_x_px = float(yolo_output.last_yolo_center[0])
+                            single_feature_centroid_y_px = float(yolo_output.last_yolo_center[1])
+                        if yolo_output.last_bounding_box_size is not None:
+                            single_feature_bbox_width_px = float(yolo_output.last_bounding_box_size[0])
+                        if yolo_output.last_yolo_3d_estimate is not None:
+                            single_feature_estimated_tvec_x, single_feature_estimated_tvec_y, single_feature_estimated_tvec_z = self._pose_tvec_xyz(
+                                yolo_output.last_yolo_3d_estimate
+                            )
+                            single_feature_estimated_range = float(np.linalg.norm(yolo_output.last_yolo_3d_estimate))
 
                     if pose_output is None:
                         pose_class_ids = []
-                        pose_feature_count = 0
+                        pose_feature_count = 1 if single_feature_centroid_x_px is not None else 0
                     else:
                         pose_class_ids = [] if pose_output.class_ids is None else list(pose_output.class_ids)
                         pose_feature_count = len(pose_class_ids)
@@ -1311,6 +1333,13 @@ class CameraGui(ctk.CTkFrame):
                         "frame_idx": row_idx,
                         "image_name": img_path.name,
                         "image_time": None if ts is None else float(ts),
+                        "single_feature_centroid_x_px": single_feature_centroid_x_px,
+                        "single_feature_centroid_y_px": single_feature_centroid_y_px,
+                        "single_feature_bbox_width_px": single_feature_bbox_width_px,
+                        "single_feature_estimated_tvec_x": single_feature_estimated_tvec_x,
+                        "single_feature_estimated_tvec_y": single_feature_estimated_tvec_y,
+                        "single_feature_estimated_tvec_z": single_feature_estimated_tvec_z,
+                        "single_feature_estimated_range": single_feature_estimated_range,
                         "pnp_valid": bool(pose_output is not None and pose_output.pnp_rvec is not None and pose_output.pnp_tvec is not None),
                         "pnp_qw": pnp_qw,
                         "pnp_qx": pnp_qx,

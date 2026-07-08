@@ -57,6 +57,17 @@ class ConfigRuntime:
         self.owner.list_of_image_process_functors = normalized_queue
 
         if sig_did_change:
+            if hasattr(self.owner, "reset_runtime_state"):
+                self.owner.reset_runtime_state(reset_fg=True)
+            if hasattr(self.owner, "pose_runtime") and self.owner.pose_runtime is not None:
+                self.owner.pose_runtime._reset_yolo_runtime_state()
+            if hasattr(self.owner, "markup_frame"):
+                self.owner.markup_frame = None
+            if hasattr(self.owner, "pnpResult"):
+                self.owner.pnpResult = None
+            if hasattr(self.owner, "qnpResult"):
+                self.owner.qnpResult = None
+
             self.owner.camConfig.image_processing_queue = self.queue_to_config(normalized_queue)
             self.save_to_cache()
 
@@ -272,8 +283,14 @@ class ConfigRuntime:
         return loaded
 
     def update_yolo_model(self) -> None:
-        if self.owner.camConfig.yoloFilepath and self.owner.yoloSession is not None:
-            self.owner.yoloSession.setNewFolder(self.owner.camConfig.yoloFilepath)
+        yolo_path = str(getattr(self.owner.camConfig, "yoloFilepath", "") or "").strip()
+        if not yolo_path:
+            return
+
+        if hasattr(self.owner, "pose_runtime") and self.owner.pose_runtime is not None:
+            self.owner.pose_runtime._ensure_yolo_session(yolo_path, force_reload=True)
+        elif self.owner.yoloSession is not None:
+            self.owner.yoloSession.setNewFolder(yolo_path)
 
     def load_truth_points(self) -> None:
         if not self.owner.camConfig.ThreeDTruthFilepath:

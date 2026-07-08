@@ -1003,8 +1003,43 @@ def _newton_update_in_place(
     x[do] -= del_x
     y[do] -= del_y
 
-def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
+def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14, fp_steps=None, newton_steps=None):
     """
+    Undistort pixel points with explicit iteration control.
+
+    Parameters
+    ----------
+    cal
+        Calibration object providing camera intrinsics and distortion.
+    pts_px_dist
+        Distorted pixel coordinates as either ``(2,)`` or ``(N, 2)``.
+    mode
+        Backward-compatible solver preset.
+
+        Brown-Conrady:
+        - ``"opencv"`` defaults to ``fp_steps=5``, ``newton_steps=0``
+        - any other value defaults to ``fp_steps=2``, ``newton_steps=1``
+
+        Fisheye:
+        - ``"newton"`` uses pure Newton theta inversion by default
+        - ``"precise"``, ``"fisheye_precise"``, ``"fp_newton"``, and
+          ``"hybrid"`` use fixed-point warm start plus Newton refinement
+    eps_px
+        Residual threshold for early Newton termination in the Brown-Conrady
+        path.
+    fp_steps
+        Number of fixed-point iterations. ``None`` preserves the default for the
+        selected ``mode``.
+    newton_steps
+        Number of Newton refinement iterations. ``None`` preserves the default
+        for the selected ``mode``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Undistorted pixel coordinates with the same scalar-vs-batch shape
+        convention as the input.
+
     Fisheye doctest: inverse then forward round-trip.
 
     >>> cal = default_fisheye_cam()
@@ -1033,6 +1068,10 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
     ...     ours = undistort_points_px(cal, pts)
     ...     float(np.max(np.sqrt(np.sum((ours - ocv)**2, axis=1)))) < 1e-9
     True
+
+    Example overrides:
+
+    >>> _ = undistort_points_px(cal, pts, fp_steps=3, newton_steps=10)
     """
     pts = np.asarray(pts_px_dist, dtype=np.float64)
     scalar = (pts.ndim == 1)
@@ -1046,19 +1085,34 @@ def undistort_points_px(cal, pts_px_dist, mode="precise", eps_px=1e-14):
         # (You can add more strings later without touching the callers.)
         mode_l = str(mode).lower()
         use_precise = (mode_l in ("precise", "fisheye_precise", "fp_newton", "hybrid"))
+        resolved_fp_steps = 2 if fp_steps is None else int(fp_steps)
+        resolved_newton_steps = 8 if newton_steps is None else int(newton_steps)
+        if resolved_fp_steps < 0:
+            raise ValueError("fp_steps must be >= 0")
+        if resolved_newton_steps < 0:
+            raise ValueError("newton_steps must be >= 0")
         out = undistort_points_px_fisheye_numba(
             pts,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
             float(cal.k1), float(cal.k2), float(cal.k3), float(cal.k4),
             bool(use_precise),
+            resolved_fp_steps,
+            resolved_newton_steps,
         )
     else:
+        resolved_fp_steps = (5 if mode == "opencv" else 2) if fp_steps is None else int(fp_steps)
+        resolved_newton_steps = (0 if mode == "opencv" else 1) if newton_steps is None else int(newton_steps)
+        if resolved_fp_steps < 0:
+            raise ValueError("fp_steps must be >= 0")
+        if resolved_newton_steps < 0:
+            raise ValueError("newton_steps must be >= 0")
         out = undistort_points_px_numba_dispatch(
             pts,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
             float(cal.k1), float(cal.k2), float(cal.p1), float(cal.p2), float(cal.k3),
             bool(cal.has_tangential),
-            mode_opencv_5fp=(mode == "opencv"),
+            fp_steps=resolved_fp_steps,
+            newton_steps=resolved_newton_steps,
             eps_px=float(eps_px),
         )
 
@@ -1070,7 +1124,8 @@ def undistort_points_px_numba(
     fx, fy, cx, cy,
     k1, k2, p1, p2, k3,
     has_tangential,
-    mode_opencv_5fp,         # True => 5 FP, False => 2 FP + gated Newton
+    fp_steps,
+    newton_steps,
     eps_px
 ):
     N = pts_px_dist.shape[0]
@@ -1081,8 +1136,6 @@ def undistort_points_px_numba(
 
     kMinAbsL = 1e-12
     kMinAbsDet = 1e-18
-
-    iters = 5 if mode_opencv_5fp else 2
 
     for i in prange(N):
         u = pts_px_dist[i, 0]
@@ -1095,7 +1148,7 @@ def undistort_points_px_numba(
         y = y_d
 
         # ----- fixed point -----
-        for _ in range(iters):
+        for _ in range(fp_steps):
             x2 = x*x
             y2 = y*y
             r2 = x2 + y2
@@ -1116,56 +1169,59 @@ def undistort_points_px_numba(
             y = (y_d - dy) / L
 
         # ----- optional Newton cleanup -----
-        if not mode_opencv_5fp:
+        for _ in range(newton_steps):
             x2 = x*x
             y2 = y*y
             r2 = x2 + y2
             r4 = r2*r2
             r6 = r4*r2
             L = 1.0 + k1*r2 + k2*r4 + k3*r6
-            if abs(L) >= kMinAbsL:
-                dx = 0.0
-                dy = 0.0
-                ddx_dx = ddx_dy = ddy_dx = ddy_dy = 0.0
+            if abs(L) < kMinAbsL:
+                break
+            dx = 0.0
+            dy = 0.0
+            ddx_dx = ddx_dy = ddy_dx = ddy_dy = 0.0
 
-                if has_tangential:
-                    xy = x*y
-                    dx = 2.0*p1*xy + p2*(r2 + 2.0*x2)
-                    dy = p1*(r2 + 2.0*y2) + 2.0*p2*xy
+            if has_tangential:
+                xy = x*y
+                dx = 2.0*p1*xy + p2*(r2 + 2.0*x2)
+                dy = p1*(r2 + 2.0*y2) + 2.0*p2*xy
 
-                    ddx_dx = 2.0*p1*y + 6.0*p2*x
-                    ddx_dy = 2.0*p1*x + 2.0*p2*y
-                    ddy_dx = 2.0*p1*x + 2.0*p2*y
-                    ddy_dy = 6.0*p1*y + 2.0*p2*x
+                ddx_dx = 2.0*p1*y + 6.0*p2*x
+                ddx_dy = 2.0*p1*x + 2.0*p2*y
+                ddy_dx = 2.0*p1*x + 2.0*p2*y
+                ddy_dy = 6.0*p1*y + 2.0*p2*x
 
-                gx = (x*L + dx) - x_d
-                gy = (y*L + dy) - y_d
+            gx = (x*L + dx) - x_d
+            gy = (y*L + dy) - y_d
 
-                # pixel-based gate
-                res_px = (abs(gx) + abs(gy)) * (fx if fx > fy else fy)
-                if res_px >= eps_px:
-                    dL_dr2 = k1 + 2.0*k2*r2 + 3.0*k3*r4
-                    dL_dx = 2.0*x*dL_dr2
-                    dL_dy = 2.0*y*dL_dr2
+            # pixel-based gate
+            res_px = (abs(gx) + abs(gy)) * (fx if fx > fy else fy)
+            if res_px < eps_px:
+                break
+            dL_dr2 = k1 + 2.0*k2*r2 + 3.0*k3*r4
+            dL_dx = 2.0*x*dL_dr2
+            dL_dy = 2.0*y*dL_dr2
 
-                    if has_tangential:
-                        J11 = L + x*dL_dx + ddx_dx
-                        J12 = x*dL_dy + ddx_dy
-                        J21 = y*dL_dx + ddy_dx
-                        J22 = L + y*dL_dy + ddy_dy
-                    else:
-                        J11 = L + x*dL_dx
-                        J12 = x*dL_dy
-                        J21 = y*dL_dx
-                        J22 = L + y*dL_dy
+            if has_tangential:
+                J11 = L + x*dL_dx + ddx_dx
+                J12 = x*dL_dy + ddx_dy
+                J21 = y*dL_dx + ddy_dx
+                J22 = L + y*dL_dy + ddy_dy
+            else:
+                J11 = L + x*dL_dx
+                J12 = x*dL_dy
+                J21 = y*dL_dx
+                J22 = L + y*dL_dy
 
-                    det = J11*J22 - J12*J21
-                    if abs(det) >= kMinAbsDet:
-                        inv_det = 1.0 / det
-                        del_x = (gx*J22 - gy*J12) * inv_det
-                        del_y = (-gx*J21 + gy*J11) * inv_det
-                        x -= del_x
-                        y -= del_y
+            det = J11*J22 - J12*J21
+            if abs(det) < kMinAbsDet:
+                break
+            inv_det = 1.0 / det
+            del_x = (gx*J22 - gy*J12) * inv_det
+            del_y = (-gx*J21 + gy*J11) * inv_det
+            x -= del_x
+            y -= del_y
 
         out[i, 0] = x*fx + cx
         out[i, 1] = y*fy + cy
@@ -1409,7 +1465,7 @@ def undistort_2fp_newton_tan(pts_px_dist, fx, fy, cx, cy, k1, k2, p1, p2, k3, ep
     return out
 
 @njit(cache=True, fastmath=True)
-def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4):
+def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4, newton_steps):
     """
     Solve theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = theta_d
     via Newton iterations.
@@ -1421,7 +1477,7 @@ def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4):
     theta = theta_d
 
     # Newton iterations (OpenCV does something similar internally)
-    for _ in range(8):
+    for _ in range(newton_steps):
         t2 = theta * theta
         t4 = t2 * t2
         t6 = t4 * t2
@@ -1451,7 +1507,7 @@ def _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4):
     return theta
 
 @njit(cache=True, fastmath=True)
-def _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4):
+def _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4, fp_steps, newton_steps):
     """
     Solve theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8) = theta_d
 
@@ -1467,7 +1523,7 @@ def _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4):
     # ------------------------------------------------------------
     theta = theta_d  # good initial guess for small angles
 
-    for _ in range(2):  # hard-coded FP iters (tune later)
+    for _ in range(fp_steps):
         t2 = theta * theta
         t4 = t2 * t2
         t6 = t4 * t2
@@ -1484,7 +1540,7 @@ def _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4):
     # ------------------------------------------------------------
     # Newton refinement (as you already had)
     # ------------------------------------------------------------
-    for _ in range(8):
+    for _ in range(newton_steps):
         t2 = theta * theta
         t4 = t2 * t2
         t6 = t4 * t2
@@ -1517,6 +1573,8 @@ def undistort_points_px_fisheye_numba(
     fx, fy, cx, cy,
     k1, k2, k3, k4,
     use_precise: bool,
+    fp_steps: int,
+    newton_steps: int,
 ):
     """
     Inverse of OpenCV fisheye distortion model.
@@ -1546,9 +1604,9 @@ def undistort_points_px_fisheye_numba(
         else:
             theta_d = rd
             if use_precise:
-                theta = _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4)
+                theta = _fisheye_theta_from_theta_d_precise(theta_d, k1, k2, k3, k4, fp_steps, newton_steps)
             else:
-                theta = _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4)
+                theta = _fisheye_theta_from_theta_d(theta_d, k1, k2, k3, k4, newton_steps)
             r = np.tan(theta)
 
             scale = r / rd
@@ -1610,39 +1668,77 @@ def undistort_points_px_numba_dispatch(
     fx, fy, cx, cy,
     k1, k2, p1, p2, k3,
     has_tangential: bool,
-    mode_opencv_5fp: bool,
+    fp_steps: int,
+    newton_steps: int,
     eps_px: float
 ):
     pts = np.asarray(pts_px_dist, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 2:
         raise ValueError("pts_px_dist must be (N,2)")
 
-    if mode_opencv_5fp:
+    if fp_steps < 0:
+        raise ValueError("fp_steps must be >= 0")
+    if newton_steps < 0:
+        raise ValueError("newton_steps must be >= 0")
+
+    # Fast OpenCV-style path: exactly 5 fixed-point iterations.
+    if fp_steps == 5 and newton_steps == 0:
         if has_tangential:
-            return undistort_5fp_tan(pts, fx, fy, cx, cy, k1, k2, p1, p2, k3)
-        else:
-            return undistort_5fp_no_tan(pts, fx, fy, cx, cy, k1, k2, k3)
-    else:
+            return undistort_5fp_tan(
+                pts, fx, fy, cx, cy,
+                k1, k2, p1, p2, k3,
+            )
+        return undistort_5fp_no_tan(
+            pts, fx, fy, cx, cy,
+            k1, k2, k3,
+        )
+
+    # Fast hybrid path: exactly 2 fixed-point iterations + 1 Newton/GN cleanup.
+    if fp_steps == 2 and newton_steps == 1:
         if has_tangential:
-            return undistort_2fp_newton_tan(pts, fx, fy, cx, cy, k1, k2, p1, p2, k3, eps_px)
-        else:
-            return undistort_2fp_newton_no_tan(pts, fx, fy, cx, cy, k1, k2, k3, eps_px)
+            return undistort_2fp_newton_tan(
+                pts, fx, fy, cx, cy,
+                k1, k2, p1, p2, k3,
+                eps_px,
+            )
+        return undistort_2fp_newton_no_tan(
+            pts, fx, fy, cx, cy,
+            k1, k2, k3,
+            eps_px,
+        )
+
+    # General path: arbitrary user-selected iteration counts.
+    return undistort_points_px_numba(
+        pts, fx, fy, cx, cy,
+        k1, k2, p1, p2, k3,
+        has_tangential,
+        fp_steps,
+        newton_steps,
+        eps_px,
+    )
 
 def default_864_cam():
     cal = Calibration()
+
+    cal.width = 864
+    cal.height = 864
+
     cal.fx = cal.fy = 941.75
-    cal.cx = cal.cy = 432.0
+    cal.cx = 0.5 * (cal.width - 1.0)
+    cal.cy = 0.5 * (cal.height - 1.0)
+
     cal.k1 = -0.186
     cal.k2 = 0.137
     cal.p1 = -0.000232
     cal.p2 = 0.000432
     cal.k3 = -0.0137
+
     cal.calTime = 0.0
     cal.numCBUsed = 0
     cal.rmsError = 0.0
     cal.hfov = 0.0
-    cal.width = 864
-    cal.height = 864
+
+    _ = cal.validCal
     return cal
 
 def default_fisheye_cam():
@@ -1664,19 +1760,26 @@ def default_fisheye_cam():
 
 def default_2848_cam():
     cal = Calibration()
+
+    cal.width = 2848
+    cal.height = 2848
+
     cal.fx = cal.fy = 3085.026
-    cal.cx = cal.cy = 1423.5
+    cal.cx = 0.5 * (cal.width - 1.0)
+    cal.cy = 0.5 * (cal.height - 1.0)
+
     cal.k1 = -0.187
     cal.k2 = 0.137
     cal.p1 = -0.000232
     cal.p2 = 0.000432
     cal.k3 = -0.000269
+
     cal.calTime = 0.0
     cal.numCBUsed = 0
     cal.rmsError = 0.0
     cal.hfov = 0.0
-    cal.width = 2848
-    cal.height = 2848
+
+    _ = cal.validCal
     return cal
 
 

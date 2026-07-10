@@ -115,6 +115,12 @@ class CameraGui(ctk.CTkFrame):
         self.func_that_refits: Callable | None = None
         self.list_of_image_process_functors: List[tuple[Callable, dict]] = []
 
+        # Calibration adjustment state. The base copy remains unchanged while
+        # queue values are expressed as additive deltas from the loaded file.
+        self._loaded_calibration = None
+        self._effective_calibration_signature = None
+        self._undistort_map_signature = None
+
         # Debounced cache writes
         self._save_debounce_id = None
 
@@ -148,6 +154,12 @@ class CameraGui(ctk.CTkFrame):
         self._init_flag_vars()
 
         self.step_options: List[GuiQueue.StepOption] = [
+            GuiQueue.StepOption(
+                label="Adjust Calibration",
+                fn=self.adjust_calibration,
+                arg_specs_fn=self.calibration_adjust_arg_specs,
+                keymap=GuiQueue.CalibrationAdjustOpts.KEYMAP,
+            ),
             GuiQueue.StepOption(label="Undistort",
                                 fn=self.undistort,
                                 arg_specs=GuiQueue.UndistortOpts.ARG_SPECS,
@@ -399,6 +411,7 @@ class CameraGui(ctk.CTkFrame):
 
     def _on_queue_changed(self, new_queue):
         self.config_runtime.on_queue_changed(new_queue)
+        self._sync_calibration_adjustment(new_queue)
 
     def _sync_queue_from_model(self):
         self.config_runtime.sync_queue_from_model()
@@ -421,7 +434,10 @@ class CameraGui(ctk.CTkFrame):
         return self.config_runtime.load_from_cache()
 
     def update_post_newCamConfig(self):
-        self.config_runtime.update_post_new_config()
+        result = self.config_runtime.update_post_new_config()
+        self._capture_loaded_calibration()
+        self._sync_calibration_adjustment(self.list_of_image_process_functors)
+        return result
 
     def saveToCache(self,
                     immediate: bool = False,
@@ -441,7 +457,10 @@ class CameraGui(ctk.CTkFrame):
         self.config_runtime.update_quality(qualityValue)
 
     def ingestCalibration(self):
-        self.config_runtime.ingest_calibration()
+        result = self.config_runtime.ingest_calibration()
+        self._capture_loaded_calibration()
+        self._sync_calibration_adjustment(self.list_of_image_process_functors)
+        return result
 
     def setupFrame(self):
         """Build the major secondary UI sections for export, data, and playback."""
@@ -1476,6 +1495,175 @@ class CameraGui(ctk.CTkFrame):
 
         return obj
 
+    @staticmethod
+    def _calibration_signature(calibration: Calibration | None) -> tuple | None:
+        if calibration is None:
+            return None
+        names = (
+            "fx", "fy", "cx", "cy",
+            "k1", "k2", "p1", "p2", "k3", "k4",
+            "width", "height", "scale", "fisheye",
+        )
+        return tuple(getattr(calibration, name, None) for name in names)
+
+    def _capture_loaded_calibration(self) -> None:
+        """Snapshot a newly loaded calibration as the zero-delta reference."""
+        if not hasattr(self, "calibration") or not self.calibration.validCal:
+            self._loaded_calibration = None
+            self._effective_calibration_signature = None
+            self._invalidate_calibration_products()
+            return
+
+        current_sig = self._calibration_signature(self.calibration)
+        # update_post_newCamConfig can also run for non-calibration changes. Do
+        # not accidentally promote our already-adjusted calibration to the new
+        # baseline and apply the same deltas a second time.
+        if (self._loaded_calibration is not None
+                and current_sig == self._effective_calibration_signature):
+            editor = getattr(self, "imgProcQueue_editor", None)
+            if editor is not None:
+                editor.refresh_dynamic_args()
+            return
+
+        self._loaded_calibration = self.calibration.copy()
+        self._effective_calibration_signature = current_sig
+        self._invalidate_calibration_products()
+
+        editor = getattr(self, "imgProcQueue_editor", None)
+        if editor is not None:
+            editor.refresh_dynamic_args()
+
+    def calibration_adjust_arg_specs(self, _args=None) -> tuple[GuiQueue.ArgSpec, ...]:
+        """Return distortion fields for the active calibration model only."""
+        calibration = self._loaded_calibration or getattr(self, "calibration", None)
+        fisheye = bool(getattr(calibration, "fisheye", False))
+        return GuiQueue.CalibrationAdjustOpts.arg_specs(fisheye=fisheye)
+
+    @staticmethod
+    def _is_calibration_adjust_step(fn: Callable) -> bool:
+        return getattr(fn, "__func__", fn) is CameraGui.adjust_calibration
+
+    def _combined_calibration_adjustment(self, queue) -> dict | None:
+        combined: dict[str, float] = {}
+        found = False
+        for fn, args in queue or ():
+            if not self._is_calibration_adjust_step(fn) or not bool(args.get("state", True)):
+                continue
+            found = True
+            opts: GuiQueue.CalibrationAdjustOpts = self.parse_args(
+                args, GuiQueue.CalibrationAdjustOpts()
+            )
+            for field in ("fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4"):
+                combined[field] = combined.get(field, 0.0) + float(getattr(opts, field))
+        return combined if found else None
+
+    def _invalidate_calibration_products(self) -> None:
+        self.map1 = None
+        self.map2 = None
+        self._undistort_map_signature = None
+        # The cubemap manager may cache model-specific projection maps.
+        if hasattr(self, "fisheye_mgr"):
+            self.fisheye_mgr = FisheyeCubemapManager()
+
+    def _restore_loaded_calibration(self) -> None:
+        if self._loaded_calibration is None:
+            return
+        base_sig = self._calibration_signature(self._loaded_calibration)
+        if self._calibration_signature(self.calibration) == base_sig:
+            self._effective_calibration_signature = base_sig
+            return
+        self.calibration.copy_from(self._loaded_calibration)
+        self._effective_calibration_signature = base_sig
+        self._invalidate_calibration_products()
+
+    def _apply_calibration_adjustment(self, args: dict) -> None:
+        if self._loaded_calibration is None:
+            if not self.calibration.validCal:
+                return
+            self._capture_loaded_calibration()
+
+        opts: GuiQueue.CalibrationAdjustOpts = self.parse_args(
+            args, GuiQueue.CalibrationAdjustOpts()
+        )
+        adjusted = self._loaded_calibration.copy()
+
+        deltas = dict(
+            fx=opts.fx, fy=opts.fy, cx=opts.cx, cy=opts.cy,
+            k1=opts.k1, k2=opts.k2, k3=opts.k3,
+        )
+        if adjusted.fisheye:
+            deltas["k4"] = opts.k4
+        else:
+            deltas["p1"] = opts.p1
+            deltas["p2"] = opts.p2
+
+        try:
+            adjusted.apply_parameter_deltas(**deltas)
+        except ValueError as exc:
+            LOG.warning("Calibration adjustment ignored: %s", exc)
+            self._restore_loaded_calibration()
+            return
+
+        new_sig = self._calibration_signature(adjusted)
+        if self._calibration_signature(self.calibration) == new_sig:
+            self._effective_calibration_signature = new_sig
+            return
+
+        self.calibration.copy_from(adjusted)
+        self._effective_calibration_signature = new_sig
+        self._invalidate_calibration_products()
+
+    def _sync_calibration_adjustment(self, queue) -> None:
+        if not hasattr(self, "calibration"):
+            return
+        args = self._combined_calibration_adjustment(queue)
+        if args is None:
+            self._restore_loaded_calibration()
+        else:
+            self._apply_calibration_adjustment(args)
+
+    def adjust_calibration(
+            self,
+            frame: NDArray,
+            markupFrame: NDArray,
+            ctx: GuiQueue.FrameCtx,
+            args: dict,
+    ) -> None:
+        """Declarative queue marker; changes are applied when queue state changes."""
+        # Keeping this as a no-op makes the adjustment global for the frame and
+        # independent of where the marker appears relative to Undistort/PnP.
+        return None
+
+    def _ensure_undistort_maps(self, frame_shape: tuple[int, ...]) -> None:
+        """Rebuild Brown-Conrady remap tables when calibration values change."""
+        if self.calibration.fisheye:
+            return
+
+        height, width = frame_shape[:2]
+        signature = (
+            self._calibration_signature(self.calibration),
+            int(width),
+            int(height),
+        )
+        if (self.map1 is not None and self.map2 is not None
+                and self._undistort_map_signature == signature):
+            return
+
+        camera_matrix = self.calibration.getCameraMatrix()
+        distortion = self.calibration.getDistortion()
+        if camera_matrix is None or distortion is None:
+            raise ValueError("No valid Brown-Conrady calibration loaded!")
+
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            camera_matrix,
+            distortion,
+            None,
+            camera_matrix,
+            (int(width), int(height)),
+            cv2.CV_32FC1,
+        )
+        self._undistort_map_signature = signature
+
     def createDetector(self):
         if self.detector is None:
             self.arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36H11)
@@ -1763,8 +1951,7 @@ class CameraGui(ctk.CTkFrame):
             _mark_undistorted()
             return
 
-        if self.map1 is None or self.map2 is None:
-            raise ValueError("No calibration loaded!")
+        self._ensure_undistort_maps(markupFrame.shape)
 
         tmp = cv2.remap(
             markupFrame,

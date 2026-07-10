@@ -214,5 +214,13 @@ def apply_filter(img: NDArray,
         gabor_gui.close()
         gabor_gui = None
 
+    if kernel == ImageKernel.Greyscale:
+        if len(img.shape) == 2 or (len(img.shape) == 3 and img.shape[2] == 1):
+            return None
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR, dst=img)
+        return None
+
     _apply_convolution_filter(img, kernel, None, gain, brightness)
     return None

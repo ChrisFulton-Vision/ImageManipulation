@@ -27,6 +27,8 @@ class ArgSpec:
     min: float | None = None
     max: float | None = None
     path_kind: str | None = None
+    editor: str = "auto"
+    decimals: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,65 @@ class UndistortOpts:
         ArgSpec(b.label, b.object_type, b.default, b.min, b.max) for b in BINDINGS
     )
     KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in BINDINGS}
+
+
+@dataclass(slots=True)
+class CalibrationAdjustOpts:
+    """Additive changes relative to the most recently loaded calibration."""
+
+    fx: float = 0.0
+    fy: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    k1: float = 0.0
+    k2: float = 0.0
+    p1: float = 0.0
+    p2: float = 0.0
+    k3: float = 0.0
+    k4: float = 0.0
+
+    COMMON_BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Δfx from loaded (px)", "fx", float, 0.0),
+        ArgBinding("Δfy from loaded (px)", "fy", float, 0.0),
+        ArgBinding("Δcx from loaded (px)", "cx", float, 0.0),
+        ArgBinding("Δcy from loaded (px)", "cy", float, 0.0),
+    )
+    BROWN_CONRADY_BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Δk1 (Brown-Conrady)", "k1", float, 0.0),
+        ArgBinding("Δk2 (Brown-Conrady)", "k2", float, 0.0),
+        ArgBinding("Δp1 (Brown-Conrady)", "p1", float, 0.0),
+        ArgBinding("Δp2 (Brown-Conrady)", "p2", float, 0.0),
+        ArgBinding("Δk3 (Brown-Conrady)", "k3", float, 0.0),
+    )
+    FISHEYE_BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        ArgBinding("Δk1 (fisheye)", "k1", float, 0.0),
+        ArgBinding("Δk2 (fisheye)", "k2", float, 0.0),
+        ArgBinding("Δk3 (fisheye)", "k3", float, 0.0),
+        ArgBinding("Δk4 (fisheye)", "k4", float, 0.0),
+    )
+
+    ALL_BINDINGS: ClassVar[tuple[ArgBinding, ...]] = (
+        *COMMON_BINDINGS,
+        *BROWN_CONRADY_BINDINGS,
+        *FISHEYE_BINDINGS,
+    )
+    KEYMAP: ClassVar[dict[str, str]] = {b.label: b.field for b in ALL_BINDINGS}
+
+    @classmethod
+    def arg_specs(cls, *, fisheye: bool) -> tuple["ArgSpec", ...]:
+        distortion = cls.FISHEYE_BINDINGS if fisheye else cls.BROWN_CONRADY_BINDINGS
+        return tuple(
+            ArgSpec(
+                b.label,
+                b.object_type,
+                b.default,
+                b.min,
+                b.max,
+                editor="entry",
+                decimals=10 if b.field.startswith(("k", "p")) else 4,
+            )
+            for b in (*cls.COMMON_BINDINGS, *distortion)
+        )
 
 
 @dataclass(slots=True)
@@ -330,6 +391,10 @@ class StepSpecQueueEditor(ctk.CTkFrame):
         return f"{name}{args}"
 
     # -------- public API --------
+
+    def refresh_dynamic_args(self) -> None:
+        """Re-render argument controls whose schema depends on external state."""
+        self._render_args_panel()
 
     def get_queue(self) -> List[StepSpec]:
         out: List[StepSpec] = []
@@ -718,19 +783,48 @@ class StepSpecQueueEditor(ctk.CTkFrame):
                 sw.grid(row=i, column=1, sticky="w", pady=4)
                 continue
 
+            # Precise float entry. This is preferable for small calibration
+            # coefficients, where a coarse slider would hide meaningful digits.
+            if isinstance(val, float) and spec.editor == "entry":
+                decimals = spec.decimals if spec.decimals is not None else 10
+                svar = ctk.StringVar(value=f"{float(val):.{decimals}g}")
+                ent = ctk.CTkEntry(self._args_body, textvariable=svar)
+                ent.grid(row=i, column=1, sticky="ew", pady=4)
+
+                spec_name = spec.name
+
+                def _commit_float(
+                        _evt=None,
+                        n=spec_name,
+                        sv=svar,
+                        old=float(val),
+                        dec=decimals,
+                ):
+                    try:
+                        newv = float(sv.get())
+                    except ValueError:
+                        sv.set(f"{old:.{dec}g}")
+                        return
+                    self._set_arg(n, newv)
+
+                ent.bind("<Return>", _commit_float)
+                ent.bind("<FocusOut>", _commit_float)
+                continue
+
             # float -> slider (default 0..1 unless bounds provided)
             if isinstance(val, float):
                 min_v = spec.min if getattr(spec, "min", None) is not None else 0.0
                 max_v = spec.max if getattr(spec, "max", None) is not None else 1.0
+                decimals = spec.decimals if spec.decimals is not None else 2
 
-                lbl_var = ctk.StringVar(value=f"{name}: {float(val):8.2f}")
+                lbl_var = ctk.StringVar(value=f"{name}: {float(val):8.{decimals}f}")
                 lbl.configure(textvariable=lbl_var)
 
                 fvar = ctk.DoubleVar(value=float(val))
 
-                def _on_slider(v, n=spec.name, lv=lbl_var, label=name):
+                def _on_slider(v, n=spec.name, lv=lbl_var, label=name, dec=decimals):
                     fv = float(v)
-                    lv.set(f"{label}: {fv:8.2f}")
+                    lv.set(f"{label}: {fv:8.{dec}f}")
                     self._set_arg(n, fv)
 
                 slider = ctk.CTkSlider(

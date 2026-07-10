@@ -15,7 +15,11 @@ class Calibration:
         self._validCal_dirty = True
         self._validCal_cache = False
         self._validMat_cache = False
-        self._VALID_FIELDS = ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'width', 'height']
+        self._VALID_FIELDS = [
+            'fx', 'fy', 'cx', 'cy',
+            'k1', 'k2', 'p1', 'p2', 'k3', 'k4',
+            'width', 'height', 'fisheye',
+        ]
 
         self.fx = None
         self.fy = None
@@ -62,6 +66,78 @@ class Calibration:
             return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.p1, self.p2, self.k3
         else:
             return self.fx, self.fy, self.cx, self.cy, self.k1, self.k2, self.k3, self.k4
+
+    @property
+    def distortion_parameter_names(self) -> tuple[str, ...]:
+        """Names of the coefficients used by the active distortion model."""
+        if self.fisheye:
+            return 'k1', 'k2', 'k3', 'k4'
+        return 'k1', 'k2', 'p1', 'p2', 'k3'
+
+    def apply_parameter_deltas(
+            self,
+            *,
+            fx: float = 0.0,
+            fy: float = 0.0,
+            cx: float = 0.0,
+            cy: float = 0.0,
+            k1: float = 0.0,
+            k2: float = 0.0,
+            p1: float = 0.0,
+            p2: float = 0.0,
+            k3: float = 0.0,
+            k4: float = 0.0,
+    ):
+        """Apply additive parameter changes in the calibration's native units.
+
+        The caller is expected to apply these deltas to a copy of the loaded
+        calibration. Brown-Conrady calibrations accept ``k1, k2, p1, p2, k3``;
+        fisheye calibrations accept ``k1, k2, k3, k4``.
+        """
+        if not self.validCal:
+            raise ValueError("Cannot adjust an invalid calibration.")
+
+        delta_values = np.asarray(
+            [fx, fy, cx, cy, k1, k2, p1, p2, k3, k4],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(delta_values)):
+            raise ValueError("Calibration deltas must all be finite numbers.")
+
+        self.fx = float(self.fx) + float(fx)
+        self.fy = float(self.fy) + float(fy)
+        self.cx = float(self.cx) + float(cx)
+        self.cy = float(self.cy) + float(cy)
+
+        if not np.all(np.isfinite([self.fx, self.fy, self.cx, self.cy])):
+            raise ValueError("Adjusted camera intrinsics must remain finite.")
+        if self.fx <= 0.0 or self.fy <= 0.0:
+            raise ValueError("Adjusted fx and fy must remain positive.")
+
+        self.k1 = float(self.k1) + float(k1)
+        self.k2 = float(self.k2) + float(k2)
+        self.k3 = float(self.k3) + float(k3)
+
+        if self.fisheye:
+            if p1 != 0.0 or p2 != 0.0:
+                raise ValueError("Fisheye calibration does not use p1 or p2.")
+            self.k4 = float(self.k4) + float(k4)
+        else:
+            if k4 != 0.0:
+                raise ValueError("Brown-Conrady calibration does not use k4.")
+            self.p1 = float(self.p1) + float(p1)
+            self.p2 = float(self.p2) + float(p2)
+
+        if self.width is not None:
+            self.hfov = float(2.0 * np.degrees(
+                np.arctan((float(self.width) * 0.5) / float(self.fx))
+            ))
+
+        # Force validity and has_tangential to be refreshed immediately.
+        self._validCal_dirty = True
+        if not self.validCal:
+            raise ValueError("Parameter deltas produced an invalid calibration.")
+        return self
 
     def randomize(
             self,
@@ -503,7 +579,7 @@ class Calibration:
             self.width is None, self.height is None, self.hfov is None
         ]):
             return False
-        self.has_tangential = self.p1 != 0.0 or self.p2 != 0.0
+        self.has_tangential = False if self.fisheye else (self.p1 != 0.0 or self.p2 != 0.0)
         return True
 
     def _compute_validMat(self) -> bool:

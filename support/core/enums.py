@@ -52,6 +52,7 @@ class ImageKernel(Enum):
     Invert = 'Invert'
     Gain = 'Gain'
     Brightness = 'Brightness'
+    Greyscale = 'Greyscale'
 
     @staticmethod
     def get_convolution(imageKernel):

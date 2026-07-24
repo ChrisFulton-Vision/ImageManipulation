@@ -24,8 +24,8 @@ from support.mathHelpers.threeD_to_threeD import (
 
 FloatArray = NDArray[np.float64]
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SOURCE_CSV = REPO_ROOT / "Data" / "lidar_data.csv"
-DEFAULT_TARGET_CSV = REPO_ROOT / "Data" / "mocap_data.csv"
+DEFAULT_SOURCE_CSV = REPO_ROOT / "Data" / "mia_offset.csv"
+DEFAULT_TARGET_CSV = REPO_ROOT / "Data" / "mia_mocap.csv"
 
 
 def load_points_csv(path: str | Path, *, points_are_columns: Optional[bool] = None) -> FloatArray:

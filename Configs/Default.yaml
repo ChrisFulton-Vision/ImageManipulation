@@ -20,17 +20,17 @@ hideAprilTags: true
 hud: false
 hud_data_filepath: ''
 hyper_focus: false
-imageFilepath: C:/repos/aburn/usr/jarvis_submodules/camera_calibration_python/Images/MOCAP
+imageFilepath: C:/repos/jarvis_submodules/camera_calibration_python/Images/MOCAP
   Test/2025.Nov.12_16.02.58.6195201.UTC_CALIBTEST/2025.Nov.12_16.02.58.6195201.UTC_CALIBTEST/1.bmp
 imageSource: Stream from Folder
-lidarFilepath: C:/repos/aburn/usr/jarvis_submodules/camera_calibration_python/LIDAR_Truth_Points.pkl
+lidarFilepath: C:/repos/jarvis_submodules/camera_calibration_python/LIDAR_Truth_Points.pkl
 phase_correlation: false
 playback_mode: fixed_fps
 pnpLidarPoints: false
 processingKernel: Unfiltered
 qnpLidarPoints: false
 rt_speed: 1.0
-saveFolder: C:/repos/aburn/usr/jarvis_submodules/camera_calibration_python/ProcessedImages/CalspanSubset/Conf0.4
+saveFolder: C:/repos/jarvis_submodules/camera_calibration_python/ProcessedImages/CalspanSubset/Conf0.4
 secondsBetweenImages: 1.0
 start_export_idx: 0
 target_fps: 20.0

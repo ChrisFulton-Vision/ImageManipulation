@@ -5,7 +5,6 @@ from typing import Callable
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from matplotlib.animation import FFMpegWriter, FuncAnimation
 from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import proj3d
@@ -13,6 +12,7 @@ from mpl_toolkits.mplot3d import proj3d
 from support.mathHelpers.LevMarq import LevenbergMarquardt
 from support.mathHelpers.SE2PointAlignmentProblem import SE2PointAlignmentProblem
 from support.mathHelpers.SE2 import SE2
+from support.viz.plots import add_colorbar, apply_theme, get_cmap, get_theme
 
 LENGTH = 4.0
 HEIGHT = 2.0
@@ -33,6 +33,7 @@ MESH_LABEL_Z_OFFSET = 0.6
 
 NUM_ITERATIONS = 15
 NUM_STATES = 3
+DEMO_THEME_NAME = "presentation"
 
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
@@ -85,6 +86,10 @@ def wrap_angle_2pi(theta_rad: float) -> float:
 
 MEAS_SE2 = SE2.random(max_translation=4.0, max_angle_deg=0.0)
 MEAS_VERTS = MEAS_SE2 * RECT_VERTS
+
+
+def get_demo_theme():
+    return get_theme(DEMO_THEME_NAME)
 
 def factor_graph() -> tuple[list[tuple[SE2, float]], Callable[[SE2 | None], np.ndarray]]:
     """Fit the trapezoid pose to the measured rectangle correspondences.
@@ -271,6 +276,7 @@ def select_mesh_label_indices(
 
 
 def create_projected_3d_label(ax, x: float, y: float, z: float, text: str):
+    theme = get_demo_theme()
     x_proj, y_proj, _ = proj3d.proj_transform(x, y, z, ax.get_proj())
     return ax.annotate(
         text,
@@ -279,13 +285,13 @@ def create_projected_3d_label(ax, x: float, y: float, z: float, text: str):
         textcoords="offset points",
         ha="center",
         va="center",
-        color="black",
+        color=theme.background,
         fontsize=8,
         bbox={
             "boxstyle": "round,pad=0.15",
-            "facecolor": "white",
-            "alpha": 0.9,
-            "edgecolor": "0.75",
+            "facecolor": theme.foreground,
+            "alpha": 0.92,
+            "edgecolor": theme.foreground,
         },
         zorder=1000,
     )
@@ -373,11 +379,12 @@ def update_object_artists(artists: dict, pose: SE2) -> np.ndarray:
 
 
 def create_connection_lines(ax, verts_a: np.ndarray, verts_b: np.ndarray) -> list[Line2D]:
+    theme = get_demo_theme()
     lines: list[Line2D] = []
     for vert_a, vert_b in zip(verts_a, verts_b):
         line, = ax.plot([vert_a[0], vert_b[0]],
                         [vert_a[1], vert_b[1]],
-                        color="darkred",
+                        color=theme.color_cycle[2],
                         linewidth=1.5,
                         alpha=0.75,
                         zorder=1)
@@ -429,7 +436,13 @@ def frame_to_alpha(frame_idx: int, num_segments: int) -> tuple[int, int, float]:
 
 def save_demo_snapshot(fig: plt.Figure, stem_suffix: str = "_final") -> Path:
     output_path = Path(__file__).with_name(f"{Path(__file__).stem}{stem_suffix}.pdf")
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(
+        output_path,
+        dpi=200,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+        edgecolor=fig.get_edgecolor(),
+    )
     return output_path
 
 
@@ -446,9 +459,19 @@ def configure_figure_layout(fig: plt.Figure) -> None:
 
 
 def main() -> None:
-    fig = plt.figure(figsize=(16.0, 7.5))
+    theme = get_demo_theme()
+    palette = list(theme.color_cycle)
+    measured_color = palette[0]
+    estimated_color = palette[1]
+    residual_color = palette[2]
+    start_color = "#f08a3c"
+    final_color = theme.foreground
+
+    fig = plt.figure(figsize=(16.0, 7.5), facecolor=theme.background)
     ax = fig.add_subplot(1, 2, 1)
     ax_res = fig.add_subplot(1, 2, 2, projection="3d")
+    apply_theme(ax, theme, is_3d=False)
+    apply_theme(ax_res, theme, is_3d=True)
     configure_figure_layout(fig)
 
     stored_SE2, create_y_func = factor_graph()
@@ -464,8 +487,8 @@ def main() -> None:
     meas_pose_0 = MEAS_SE2
     state_pose_0, _ = stored_SE2[0]
 
-    meas_artists = create_object_artists(ax, RECT_VERTS, EDGES, meas_pose_0, "tab:blue")
-    state_artists = create_object_artists(ax, TRAPEZOID_VERTS, EDGES, state_pose_0, "tab:orange")
+    meas_artists = create_object_artists(ax, RECT_VERTS, EDGES, meas_pose_0, measured_color)
+    state_artists = create_object_artists(ax, TRAPEZOID_VERTS, EDGES, state_pose_0, estimated_color)
 
     meas_verts_0 = meas_pose_0 * RECT_VERTS
     state_verts_0 = state_pose_0 * TRAPEZOID_VERTS
@@ -493,10 +516,11 @@ def main() -> None:
         clip_on=False,
         bbox={
             "boxstyle": "round,pad=0.3",
-            "facecolor": "white",
-            "alpha": 0.85,
-            "edgecolor": "0.8",
+            "facecolor": theme.background,
+            "alpha": 0.88,
+            "edgecolor": theme.foreground,
         },
+        color=theme.foreground,
     )
 
     ghost_artists = []
@@ -507,7 +531,7 @@ def main() -> None:
             TRAPEZOID_VERTS,
             EDGES,
             ghost_SE2,
-            "tab:orange",
+            estimated_color,
             alpha=0.18,
             show_axes=False,
             point_size=25,
@@ -522,7 +546,7 @@ def main() -> None:
             label_pos[0],
             label_pos[1],
             label_text,
-            color="tab:orange",
+            color=estimated_color,
             alpha=0.55,
         )
         ghost_label.set_visible(False)
@@ -534,22 +558,35 @@ def main() -> None:
     ax.grid(True, alpha=0.25)
 
     legend_handles = [
-        Line2D([0], [0], color="tab:blue", lw=2, marker="o", label="Measured rectangle"),
-        Line2D([0], [0], color="tab:orange", lw=2, marker="o", label="Estimated trapezoid"),
-        Line2D([0], [0], color="darkred", lw=1.5, label="Correspondence residuals"),
+        Line2D([0], [0], color=measured_color, lw=2, marker="o", label="Measured rectangle"),
+        Line2D([0], [0], color=estimated_color, lw=2, marker="o", label="Estimated trapezoid"),
+        Line2D([0], [0], color=residual_color, lw=1.5, label="Correspondence residuals"),
     ]
-    ax.legend(handles=legend_handles, loc="lower left")
+    legend = ax.legend(handles=legend_handles, loc="lower left")
+    legend.get_frame().set_facecolor(theme.background)
+    legend.get_frame().set_edgecolor(theme.foreground)
+    for text in legend.get_texts():
+        text.set_color(theme.foreground)
 
     surface = ax_res.plot_surface(
         np.rad2deg(theta_grid),
         translation_delta_grid,
         residual_grid,
-        cmap=cm.viridis,
+        cmap=get_cmap(theme.cmap),
         linewidth=0,
         antialiased=True,
         alpha=0.88,
     )
-    fig.colorbar(surface, ax=ax_res, fraction=0.046, pad=0.08, shrink=0.78, label="Residual ||y||_2")
+    add_colorbar(
+        fig,
+        ax_res,
+        surface,
+        theme=theme,
+        shrink=0.78,
+        pad=0.08,
+        label="Residual ||y||_2",
+        fraction=0.046,
+    )
 
     path_theta_deg = np.array([
         np.rad2deg(wrap_angle_2pi(pose.theta_rad))
@@ -574,15 +611,27 @@ def main() -> None:
         path_theta_deg,
         path_translation_delta,
         path_residual,
-        color="black",
+        color=theme.foreground,
         linewidth=2.0,
         marker="o",
         markersize=4,
     )
-    ax_res.scatter(path_theta_deg[0], path_translation_delta[0], path_residual[0], color="tab:red", s=60,
-                   depthshade=False)
-    ax_res.scatter(path_theta_deg[-1], path_translation_delta[-1], path_residual[-1], color="tab:green", s=60,
-                   depthshade=False)
+    ax_res.scatter(
+        path_theta_deg[0],
+        path_translation_delta[0],
+        path_residual[0],
+        color=start_color,
+        s=60,
+        depthshade=False,
+    )
+    ax_res.scatter(
+        path_theta_deg[-1],
+        path_translation_delta[-1],
+        path_residual[-1],
+        color=final_color,
+        s=60,
+        depthshade=False,
+    )
 
     labeled_indices = set(select_mesh_label_indices(path_theta_deg, path_translation_delta, path_residual))
     path_labels = []
@@ -611,8 +660,8 @@ def main() -> None:
         [path_theta_deg[0]],
         [path_translation_delta[0]],
         [path_residual[0]],
-        color="white",
-        edgecolors="black",
+        color=theme.foreground,
+        edgecolors=theme.background,
         s=90,
         linewidths=1.2,
         depthshade=False,
@@ -636,6 +685,7 @@ def main() -> None:
         f"translation slice dir: {dir_angle_deg:6.2f} deg",
         transform=ax_res.transAxes,
         va="top",
+        color=theme.foreground,
     )
 
     def update(frame_idx: int):

@@ -486,12 +486,15 @@ class CameraGui(ctk.CTkFrame):
         Adds controls for screenshots, saved imagery, export cadence, quality,
         GIF/video export, export frame bounds, and checkerboard launching.
         """
+        self.export_frame.grid_columnconfigure(0, weight=1)
+        self.export_frame.grid_columnconfigure(1, weight=1)
+
         rowID = 0
         self.recordOff()
         self.grid_sideBySide(rowID, self.recordButton, self.printButton)
         rowID += 1
 
-        self.screenshotButton.grid(row=rowID, column=0, padx=5, pady=5, sticky='ew')
+        self.screenshotButton.grid(row=rowID, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
         rowID += 1
 
         activeEntryButton = ctk.CTkButton(self.export_frame, text="Time Between Saved Frames",

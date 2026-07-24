@@ -1,5 +1,6 @@
 import argparse
-from support.vision.calibration import Calibration, default_2848_cam, distort_points_px, undistort_points_px
+import math
+from support.vision.calibration import Calibration, default_864_cam, distort_points_px, undistort_points_px
 import numpy as np
 import cv2
 from functools import partial
@@ -11,16 +12,41 @@ from PIL import Image
 
 DIST_TIME = 5
 FPS = 30
-PAUSE_TIME = 1.0
+PAUSE_TIME = 5.0
 
 GUI_PARAM_NAMES = ("k1", "k2", "p1", "p2", "k3")
 GUI_PARAM_RANGES = {
-    "k1": (-2.0, 2.0),
-    "k2": (-2.0, 2.0),
-    "p1": (-0.05, 0.05),
-    "p2": (-0.05, 0.05),
+    "k1": (-5.0, 5.0),
+    "k2": (-5.0, 5.0),
+    "p1": (-0.10, 0.10),
+    "p2": (-0.10, 0.10),
     "k3": (-2.0, 2.0),
 }
+GUI_RANDOMIZER_PERIODS_S = {
+    "k1": (9.0, 11.0),
+    "k2": (8.0, 13.0),
+    "p1": (7.0, 15.0),
+    "p2": (6.0, 17.0),
+    "k3": (5.0, 19.0),
+}
+GUI_RANDOMIZER_MIX = {
+    "k1": (0.72, 0.23),
+    "k2": (0.58, 0.31),
+    "p1": (0.70, 0.22),
+    "p2": (0.62, 0.26),
+    "k3": (0.66, 0.28),
+}
+GUI_RANDOMIZER_PHASES = {
+    "k1": (0.0, 0.8),
+    "k2": (1.3, 2.6),
+    "p1": (2.1, 4.2),
+    "p2": (3.4, 1.1),
+    "k3": (4.5, 3.0),
+}
+GUI_DEFAULT_NUM_COL_LINES = 21
+GUI_DEFAULT_NUM_ROW_LINES = 21
+GUI_MIN_GRID_LINES = 2
+GUI_MAX_GRID_LINES = 101
 
 
 def _mesh_grid_positions(
@@ -129,7 +155,7 @@ def distort_mesh_points(calibration: Calibration, points: np.ndarray) -> np.ndar
 
 
 def build_preview_calibration(*, preview_size: int = 900) -> Calibration:
-    cal = default_2848_cam().copy()
+    cal = default_864_cam().copy()
     dist = cal.getDistortion().astype(np.float64, copy=True)
     # dist[:2] *= 8.0
     # dist[4] *= 8.0
@@ -277,6 +303,68 @@ def add_panel_label(img: np.ndarray, text: str) -> np.ndarray:
         lineType=cv2.LINE_AA,
     )
     return labeled
+
+
+def build_pixel_grid(*, width: int, height: int) -> np.ndarray:
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float64),
+        np.arange(height, dtype=np.float64),
+        indexing="xy",
+    )
+    return np.column_stack((grid_x.ravel(), grid_y.ravel()))
+
+
+def remap_image(image: np.ndarray, sample_points: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    map_x = sample_points[:, 0].reshape(height, width).astype(np.float32)
+    map_y = sample_points[:, 1].reshape(height, width).astype(np.float32)
+    return cv2.remap(
+        image,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
+
+
+def interpolate_distortion_calibration(calibration: Calibration, t: float) -> Calibration:
+    interpolated = calibration.copy()
+    interpolated.setDistortion(calibration.getDistortion() * float(np.clip(t, 0.0, 1.0)))
+    return interpolated
+
+
+def distort_demo_image(
+        calibration: Calibration,
+        image: np.ndarray,
+        *,
+        pixel_grid: np.ndarray | None = None,
+) -> np.ndarray:
+    if pixel_grid is None:
+        pixel_grid = build_pixel_grid(width=calibration.width, height=calibration.height)
+    source_points = undistort_points_px(calibration, pixel_grid, fp_steps=11, newton_steps=3)
+    return remap_image(image, source_points)
+
+
+def undistort_demo_image(
+        calibration: Calibration,
+        image: np.ndarray,
+        *,
+        pixel_grid: np.ndarray | None = None,
+) -> np.ndarray:
+    if pixel_grid is None:
+        pixel_grid = build_pixel_grid(width=calibration.width, height=calibration.height)
+    source_points = distort_points_px(calibration, pixel_grid)
+    return remap_image(image, source_points)
+
+
+def load_demo_image(image_path: Path, *, width: int, height: int) -> np.ndarray:
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+    if image.shape[1] != width or image.shape[0] != height:
+        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+    return image
 
 
 def render_comparison_frame(
@@ -514,11 +602,109 @@ def write_demo_video(
     return output_path
 
 
+def write_image_demo_video(
+        output_path: Path,
+        *,
+        calibration: Calibration,
+        clean_image: np.ndarray,
+        fps: int = FPS,
+        pause_time_s: float = PAUSE_TIME,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    frame_size = (clean_image.shape[1], clean_image.shape[0])
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        frame_size,
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {output_path}")
+
+    add_text = partial(
+        cv2.putText,
+        org=(int(0.06 * clean_image.shape[1]), int(0.9 * clean_image.shape[0])),
+        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+        fontScale=1.0,
+        color=(255, 255, 255),
+        thickness=2,
+        lineType=cv2.LINE_AA,
+    )
+    pixel_grid = build_pixel_grid(width=calibration.width, height=calibration.height)
+    distorted_image = distort_demo_image(calibration, clean_image, pixel_grid=pixel_grid)
+    restored_image = undistort_demo_image(calibration, distorted_image, pixel_grid=pixel_grid)
+
+    def labeled_frame(image: np.ndarray, overlay_text: str, interpolation: float, label: str) -> np.ndarray:
+        frame = add_panel_label(image, label)
+        add_text(img=frame, text=f"{overlay_text}: {interpolation * 100.0:.2f}%")
+        return frame
+
+    def write_distortion_transition(
+            *,
+            duration_s: float,
+            overlay_text: str,
+            frame_builder,
+            right_label: str,
+    ) -> None:
+        frame_count = max(1, int(round(duration_s * fps)))
+        for idx in range(frame_count):
+            interpolation = 1.0 if frame_count == 1 else idx / (frame_count - 1)
+            writer.write(labeled_frame(frame_builder(interpolation), overlay_text, interpolation, right_label))
+
+    try:
+        write_distortion_transition(
+            duration_s=DIST_TIME,
+            overlay_text="Forward Distortion",
+            frame_builder=lambda interpolation: distort_demo_image(
+                interpolate_distortion_calibration(calibration, interpolation),
+                clean_image,
+                pixel_grid=pixel_grid,
+            ),
+            right_label="Distorted",
+        )
+        write_distortion_transition(
+            duration_s=DIST_TIME,
+            overlay_text="Inverse Distortion",
+            frame_builder=lambda interpolation: undistort_demo_image(
+                interpolate_distortion_calibration(calibration, interpolation),
+                distorted_image,
+                pixel_grid=pixel_grid,
+            ),
+            right_label="Undistorted",
+        )
+        write_distortion_transition(
+            duration_s=DIST_TIME,
+            overlay_text="Undo Undistortion",
+            frame_builder=lambda interpolation: undistort_demo_image(
+                interpolate_distortion_calibration(calibration, 1.0 - interpolation),
+                distorted_image,
+                pixel_grid=pixel_grid,
+            ),
+            right_label="Distorted",
+        )
+        write_distortion_transition(
+            duration_s=DIST_TIME,
+            overlay_text="Undo Distortion",
+            frame_builder=lambda interpolation: distort_demo_image(
+                interpolate_distortion_calibration(calibration, 1.0 - interpolation),
+                clean_image,
+                pixel_grid=pixel_grid,
+            ),
+            right_label="Clean",
+        )
+
+    finally:
+        writer.release()
+
+    return output_path
+
+
 def render_gui_preview(
         calibration: Calibration,
         *,
-        num_col_lines: int = 21,
-        num_row_lines: int = 21,
+        num_col_lines: int = GUI_DEFAULT_NUM_COL_LINES,
+        num_row_lines: int = GUI_DEFAULT_NUM_ROW_LINES,
         num_line_samples: int = 160,
 ) -> np.ndarray:
     base = np.zeros((calibration.height, calibration.width, 3), dtype=np.uint8)
@@ -580,8 +766,15 @@ class DistortionGui(ctk.CTk):
 
         self.preview_cal = build_preview_calibration()
         self.slider_vars: dict[str, ctk.DoubleVar] = {}
+        self.num_col_lines_var = ctk.StringVar(value=str(GUI_DEFAULT_NUM_COL_LINES))
+        self.num_row_lines_var = ctk.StringVar(value=str(GUI_DEFAULT_NUM_ROW_LINES))
+        self.num_col_lines = GUI_DEFAULT_NUM_COL_LINES
+        self.num_row_lines = GUI_DEFAULT_NUM_ROW_LINES
         self.preview_image = None
         self._render_job = None
+        self._randomizer_job = None
+        self._randomizer_active = False
+        self._randomizer_t0 = 0.0
 
         ctk.set_appearance_mode("dark")
         self.grid_columnconfigure(0, weight=0)
@@ -599,11 +792,21 @@ class DistortionGui(ctk.CTk):
         for row_index, name in enumerate(GUI_PARAM_NAMES, start=1):
             self._build_slider_row(controls, row=row_index, name=name)
 
+        self._build_grid_controls(controls, row=len(GUI_PARAM_NAMES) + 1)
+
         ctk.CTkButton(controls, text="Reset Defaults", command=self.reset_defaults).grid(
-            row=len(GUI_PARAM_NAMES) + 1, column=0, padx=16, pady=(16, 10), sticky="ew"
+            row=len(GUI_PARAM_NAMES) + 2, column=0, padx=16, pady=(16, 10), sticky="ew"
         )
         ctk.CTkButton(controls, text="Set Zeros", command=self.set_zeros).grid(
-            row=len(GUI_PARAM_NAMES) + 2, column=0, padx=16, pady=(16, 10), sticky="ew"
+            row=len(GUI_PARAM_NAMES) + 3, column=0, padx=16, pady=(16, 10), sticky="ew"
+        )
+        self.randomizer_button = ctk.CTkButton(
+            controls,
+            text="Start Randomizer",
+            command=self.toggle_randomizer,
+        )
+        self.randomizer_button.grid(
+            row=len(GUI_PARAM_NAMES) + 4, column=0, padx=16, pady=(16, 10), sticky="ew"
         )
 
         ctk.CTkLabel(
@@ -611,7 +814,7 @@ class DistortionGui(ctk.CTk):
             text="The preview uses the forward Brown-Conrady model with a live distorted mesh.",
             justify="left",
             wraplength=260,
-        ).grid(row=len(GUI_PARAM_NAMES) + 3, column=0, padx=16, pady=(0, 16), sticky="w")
+        ).grid(row=len(GUI_PARAM_NAMES) + 5, column=0, padx=16, pady=(0, 16), sticky="w")
 
         preview_frame = ctk.CTkFrame(self, corner_radius=8)
         preview_frame.grid(row=0, column=1, padx=(0, 16), pady=16, sticky="nsew")
@@ -644,34 +847,126 @@ class DistortionGui(ctk.CTk):
             command=lambda _value, param_name=name: self.on_slider_change(param_name),
         ).grid(row=1, column=0, pady=(6, 0), sticky="ew")
 
+    def _build_grid_controls(self, parent, *, row: int) -> None:
+        grid_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        grid_frame.grid(row=row, column=0, padx=16, pady=(12, 4), sticky="ew")
+        grid_frame.grid_columnconfigure(0, weight=1)
+        grid_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(grid_frame, text="Mesh Grid", anchor="w").grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ctk.CTkLabel(grid_frame, text="Columns", anchor="w").grid(row=1, column=0, pady=(8, 4), sticky="w")
+        ctk.CTkLabel(grid_frame, text="Rows", anchor="w").grid(row=1, column=1, pady=(8, 4), sticky="w")
+
+        col_entry = ctk.CTkEntry(grid_frame, textvariable=self.num_col_lines_var)
+        col_entry.grid(row=2, column=0, padx=(0, 6), sticky="ew")
+        col_entry.bind("<Return>", self.on_grid_entry_commit)
+        col_entry.bind("<FocusOut>", self.on_grid_entry_commit)
+
+        row_entry = ctk.CTkEntry(grid_frame, textvariable=self.num_row_lines_var)
+        row_entry.grid(row=2, column=1, padx=(6, 0), sticky="ew")
+        row_entry.bind("<Return>", self.on_grid_entry_commit)
+        row_entry.bind("<FocusOut>", self.on_grid_entry_commit)
+
+        ctk.CTkButton(grid_frame, text="Apply Grid", command=self.apply_grid_dimensions).grid(
+            row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew"
+        )
+
     @staticmethod
     def _format_label(name: str, value: float) -> str:
         return f"{name}: {value:+.6f}"
 
     def on_slider_change(self, name: str) -> None:
+        self.stop_randomizer()
         value = float(self.slider_vars[name].get())
         getattr(self, f"{name}_label_var").set(self._format_label(name, value))
         setattr(self.preview_cal, name, value)
         self.schedule_render()
 
+    @staticmethod
+    def _parse_grid_dimension(value: str, *, fallback: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = fallback
+        return int(np.clip(parsed, GUI_MIN_GRID_LINES, GUI_MAX_GRID_LINES))
+
+    def on_grid_entry_commit(self, _event=None) -> None:
+        self.apply_grid_dimensions()
+
+    def apply_grid_dimensions(self) -> None:
+        num_col_lines = self._parse_grid_dimension(self.num_col_lines_var.get(), fallback=self.num_col_lines)
+        num_row_lines = self._parse_grid_dimension(self.num_row_lines_var.get(), fallback=self.num_row_lines)
+
+        changed = (num_col_lines != self.num_col_lines) or (num_row_lines != self.num_row_lines)
+        self.num_col_lines = num_col_lines
+        self.num_row_lines = num_row_lines
+        self.num_col_lines_var.set(str(num_col_lines))
+        self.num_row_lines_var.set(str(num_row_lines))
+
+        if changed:
+            self.schedule_render()
+
     def reset_defaults(self) -> None:
+        self.stop_randomizer()
         default_cal = build_preview_calibration()
-        self.preview_cal = default_cal
-        for name in GUI_PARAM_NAMES:
-            value = float(getattr(default_cal, name))
-            self.slider_vars[name].set(value)
-            getattr(self, f"{name}_label_var").set(self._format_label(name, value))
-        self.schedule_render()
+        self.apply_coefficients({name: float(getattr(default_cal, name)) for name in GUI_PARAM_NAMES})
 
     def set_zeros(self):
+        self.stop_randomizer()
         default_cal = build_preview_calibration()
         default_cal.setDistortion(default_cal.getDistortion() * 0.0)
-        self.preview_cal = default_cal
+        self.apply_coefficients({name: float(getattr(default_cal, name)) for name in GUI_PARAM_NAMES})
+
+    def apply_coefficients(self, coefficients: dict[str, float]) -> None:
         for name in GUI_PARAM_NAMES:
-            value = float(getattr(default_cal, name))
+            value = float(coefficients[name])
             self.slider_vars[name].set(value)
             getattr(self, f"{name}_label_var").set(self._format_label(name, value))
+            setattr(self.preview_cal, name, value)
         self.schedule_render()
+
+    def toggle_randomizer(self) -> None:
+        if self._randomizer_active:
+            self.stop_randomizer()
+            return
+        self._randomizer_active = True
+        self._randomizer_t0 = time.perf_counter()
+        self.randomizer_button.configure(text="Stop Randomizer")
+        self.step_randomizer()
+
+    def stop_randomizer(self) -> None:
+        if self._randomizer_job is not None:
+            self.after_cancel(self._randomizer_job)
+            self._randomizer_job = None
+        if self._randomizer_active:
+            self._randomizer_active = False
+            self.randomizer_button.configure(text="Start Randomizer")
+
+    def step_randomizer(self) -> None:
+        self._randomizer_job = None
+        if not self._randomizer_active:
+            return
+
+        elapsed_s = time.perf_counter() - self._randomizer_t0
+        coefficients: dict[str, float] = {}
+        for name in GUI_PARAM_NAMES:
+            lo, hi = GUI_PARAM_RANGES[name]
+            amp_primary, amp_secondary = GUI_RANDOMIZER_MIX[name]
+            period_primary, period_secondary = GUI_RANDOMIZER_PERIODS_S[name]
+            phase_primary, phase_secondary = GUI_RANDOMIZER_PHASES[name]
+
+            primary = math.sin((2.0 * math.pi * elapsed_s / period_primary) + phase_primary)
+            secondary = math.sin((2.0 * math.pi * elapsed_s / period_secondary) + phase_secondary)
+            combined = amp_primary * primary + amp_secondary * secondary
+            normalized = float(np.clip(combined, -0.98, 0.98))
+            center = 0.5 * (lo + hi)
+            half_span = 0.5 * (hi - lo)
+            coefficients[name] = center + normalized * half_span
+
+        self.apply_coefficients(coefficients)
+        self._randomizer_job = self.after(33, self.step_randomizer)
 
     def schedule_render(self) -> None:
         if self._render_job is not None:
@@ -680,7 +975,11 @@ class DistortionGui(ctk.CTk):
 
     def render_preview(self) -> None:
         self._render_job = None
-        preview_bgr = render_gui_preview(self.preview_cal)
+        preview_bgr = render_gui_preview(
+            self.preview_cal,
+            num_col_lines=self.num_col_lines,
+            num_row_lines=self.num_row_lines,
+        )
         preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(preview_rgb)
         self.preview_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
@@ -699,13 +998,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Open a live Brown-Conrady slider GUI instead of rendering demo videos.",
     )
+    parser.add_argument(
+        "--image",
+        type=Path,
+        help="Render a picture-based distortion demo instead of the mesh comparison videos.",
+    )
     return parser.parse_args()
 
 
-def main():
-    cal = default_2848_cam()
-    cal.setDistortion(8.0 * cal.getDistortion())
+def main(args: argparse.Namespace) -> None:
+    cal = default_864_cam()
+    cal.setDistortion(12.0 * cal.getDistortion())
     cal.p1 = cal.p2 = 0.0
+
+    if args.image is not None:
+        clean_image = load_demo_image(args.image, width=cal.width, height=cal.height)
+
+        products_dir = Path(__file__).with_name("Products")
+        output_path = products_dir / f"distortion_image_demo_{args.image.stem}.mp4"
+        write_image_demo_video(
+            output_path,
+            calibration=cal,
+            clean_image=clean_image,
+        )
+        print(f"Wrote image demo video: {output_path}")
+        return
+
     NUM_COL_LINES = 41
     NUM_ROW_LINES = 41
 
@@ -727,8 +1045,8 @@ def main():
     distorted_points = distort_mesh_points(cal, clean_points)
     undistorted_fp5 = undistort_mesh_grid(cal, distorted_mesh, num_fp_steps=5, num_newton_steps=0)
     undistorted_fp5_points = undistort_mesh_points(cal, distorted_points, num_fp_steps=5, num_newton_steps=0)
-    undistorted_fp10 = undistort_mesh_grid(cal, distorted_mesh, num_fp_steps=10, num_newton_steps=0)
-    undistorted_fp10_points = undistort_mesh_points(cal, distorted_points, num_fp_steps=10, num_newton_steps=0)
+    undistorted_fp11 = undistort_mesh_grid(cal, distorted_mesh, num_fp_steps=11, num_newton_steps=0)
+    undistorted_fp11_points = undistort_mesh_points(cal, distorted_points, num_fp_steps=11, num_newton_steps=0)
     undistorted_opencv = undistort_mesh_grid_opencv(cal, distorted_mesh)
     undistorted_opencv_points = undistort_mesh_points_opencv(cal, distorted_points)
     undistorted_fp2 = undistort_mesh_grid(cal, distorted_mesh, num_fp_steps=2, num_newton_steps=0)
@@ -811,7 +1129,7 @@ def main():
     )
     print(f"Wrote demo video: {output_path_hybrid}")
 
-    output_path_hybrid = products_dir / "distortion_compare_fp10_vs_FP2GN3.mp4"
+    output_path_hybrid = products_dir / "distortion_compare_fp11_vs_FP2GN3.mp4"
     write_demo_video(
         output_path_hybrid,
         base_img=img,
@@ -819,7 +1137,7 @@ def main():
         distorted_mesh=distorted_mesh,
         clean_points=clean_points,
         distorted_points=distorted_points,
-        left_label="FP=10",
+        left_label="FP=11",
         right_label="FP=2, GN=3",
         phases=[
             {
@@ -852,11 +1170,11 @@ def main():
             },
             {
                 "left_start": undistorted_fp5,
-                "left_end": undistorted_fp10,
+                "left_end": undistorted_fp11,
                 "right_start": undistorted_hybrid,
                 "right_end": undistorted_hybrid3,
                 "left_start_points": undistorted_fp5_points,
-                "left_end_points": undistorted_fp10_points,
+                "left_end_points": undistorted_fp11_points,
                 "right_start_points": undistorted_hybrid_points,
                 "right_end_points": undistorted_hybrid3_points,
                 "left_reference_points": clean_points,
@@ -871,10 +1189,10 @@ def main():
 
 def cli() -> None:
     args = parse_args()
-    if args.gui or True:
+    if args.gui:
         run_gui()
         return
-    main()
+    main(args)
 
 
 if __name__ == '__main__':

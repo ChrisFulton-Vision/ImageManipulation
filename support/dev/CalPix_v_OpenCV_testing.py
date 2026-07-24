@@ -1,5 +1,6 @@
 import os
 import time
+import csv
 import numpy as np
 from numpy.typing import NDArray
 import cv2
@@ -27,6 +28,48 @@ METHOD_COLORS = {
     "fwd LUT bilinear (numba)":       "#ff9896",  # light red
     "fwd LUT bilinear (numba ss)":    "#c5b0d5",  # light purple
 }
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def make_output_dir(base_dir: str | None = None) -> str:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    if base_dir is None:
+        base_dir = os.path.join(SCRIPT_DIR, "CalPix_v_OpenCV_testing_outputs")
+    output_dir = os.path.join(base_dir, timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+
+def write_csv_table(path: str, rows: list[dict], fieldnames: list[str] | None = None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if fieldnames is None:
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def flatten_paired_rows(paired_rows: list[dict]) -> list[dict]:
+    flat_rows = []
+    for row in paired_rows:
+        m5 = row["m5"]
+        mH = row["mH"]
+        flat_rows.append({
+            "cal_id": row["cal_id"],
+            "run_id": row["run_id"],
+            "severity": row["severity"],
+            "m5_method": m5["method"],
+            "m5_time_s": m5["time_s"],
+            "m5_rms": m5["rms"],
+            "m5_oob": m5["oob"],
+            "mH_method": mH["method"],
+            "mH_time_s": mH["time_s"],
+            "mH_rms": mH["rms"],
+            "mH_oob": mH["oob"],
+        })
+    return flat_rows
 
 def prejit_undistort_kernels():
     cal = Calibration().randomize(
@@ -58,6 +101,8 @@ def plot_tradeoff_pairs(
     sort_by="severity",          # "severity" or None
     noise_floor=1e-13,           # equivalence floor for RMS
     cmap_name="turbo",
+    output_path: str | None = None,
+    show: bool = False,
 ):
     """
     paired_rows: list of dicts, each corresponds to ONE calibration:
@@ -181,7 +226,12 @@ def plot_tradeoff_pairs(
     )
 
     plt.tight_layout()
-    plt.show()
+    if output_path is not None:
+        plt.savefig(output_path, format="pdf", bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
 
 def err_stats(est: np.ndarray, truth: np.ndarray, mask: np.ndarray | None = None):
@@ -206,7 +256,12 @@ def err_stats(est: np.ndarray, truth: np.ndarray, mask: np.ndarray | None = None
     )
 
 
-def plot_tradeoff(all_results, title_prefix="speed vs precision (across all runs)"):
+def plot_tradeoff(
+    all_results,
+    title_prefix="speed vs precision (across all runs)",
+    output_dir: str | None = None,
+    show: bool = False,
+):
     """
     all_results: list[dict] with keys:
       task: "UNDISTORT" or "DISTORT"
@@ -336,7 +391,13 @@ def plot_tradeoff(all_results, title_prefix="speed vs precision (across all runs
         )
 
         plt.tight_layout()
-        plt.show()
+        if output_dir is not None:
+            output_path = os.path.join(output_dir, f"tradeoff_{task.lower()}.pdf")
+            plt.savefig(output_path, format="pdf", bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close()
 
 
 
@@ -1068,6 +1129,7 @@ def show_tradeoff_pairs_sweep(
     warmup=30,
     connect_every=10,
     seed=123,
+    output_dir: str | None = None,
 ):
     """
     Generates a paired speed-vs-precision plot comparing:
@@ -1169,6 +1231,10 @@ def show_tradeoff_pairs_sweep(
         connect_every=connect_every,
         sort_by="severity",
         title="UNDISTORT: 5FP vs 2FP+N (paired per calibration; sorted by corner distortion)",
+        output_path=(
+            os.path.join(output_dir, "tradeoff_pairs_undistort_5fp_vs_2fpN.pdf")
+            if output_dir is not None else None
+        ),
     )
 
     # If you also want the paired data for later analysis / saving:
@@ -1176,11 +1242,24 @@ def show_tradeoff_pairs_sweep(
 
 
 def main():
-    show_tradeoff_pairs_sweep(
+    output_dir = make_output_dir()
+    print(f"Saving plots and CSV tables to: {output_dir}")
+
+    paired_rows = show_tradeoff_pairs_sweep(
         num_cals=20,          # per (strength,profile) bucket; start small
         iters=10,
         warmup=25,
         connect_every=1,
+        output_dir=output_dir,
+    )
+    write_csv_table(
+        os.path.join(output_dir, "tradeoff_pairs_undistort_5fp_vs_2fpN.csv"),
+        flatten_paired_rows(paired_rows),
+        fieldnames=[
+            "cal_id", "run_id", "severity",
+            "m5_method", "m5_time_s", "m5_rms", "m5_oob",
+            "mH_method", "mH_time_s", "mH_rms", "mH_oob",
+        ],
     )
 
     cv2.setUseOptimized(True)
@@ -1217,7 +1296,12 @@ def main():
             print()
             run_id = f'{strength}|{profile}'
             all_results.extend(test_cal(cal, run_id))
-    plot_tradeoff(all_results)
+    write_csv_table(
+        os.path.join(output_dir, "tradeoff_all_results.csv"),
+        all_results,
+        fieldnames=["run_id", "task", "method", "time_s", "rms", "max", "p99", "p999"],
+    )
+    plot_tradeoff(all_results, output_dir=output_dir)
 
 
 def print_lut_error_block(

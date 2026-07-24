@@ -36,7 +36,7 @@ except Exception:  # pragma: no cover - only matters on unusual Matplotlib insta
 # -----------------------------------------------------------------------------
 
 SPACE_CLOCK_COLORS = [
-    "#030712",
+    # "#030712",
     "#123f73",
     "#1f8ec7",
     "#ffd27a",
@@ -46,8 +46,8 @@ SPACE_CLOCK_COLORS = [
 ]
 
 SPACE_CLOCK_SEQUENTIAL_COLORS = [
-    "#030712",
-    "#0b1f3a",
+    # "#030712",
+    # "#0b1f3a",
     "#123f73",
     "#1f8ec7",
     "#5a224e",

@@ -348,13 +348,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         "source_csv",
         nargs="?",
         default=str(DEFAULT_SOURCE_CSV),
-        help="CSV of source-frame points to transform. Default: <repo>/Data/lidar_data.csv",
+        help="CSV of source-frame points to transform. Default: <repo>/Data/mia_offset.csv",
     )
     parser.add_argument(
         "target_csv",
         nargs="?",
         default=str(DEFAULT_TARGET_CSV),
-        help="CSV of corresponding target-frame points. Default: <repo>/Data/mocap_data.csv",
+        help="CSV of corresponding target-frame points. Default: <repo>/Data/mia_mocap.csv",
     )
     parser.add_argument(
         "--output",
@@ -414,7 +414,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     save_solution_csv(fit, args.output)
 
-    np.set_printoptions(suppress=True, threshold=int(np.inf), precision=5)
+    np.set_printoptions(suppress=True, threshold=np.inf, precision=5)
     print("Transform convention: target ~= R @ source + t")
     print("R:\n", fit.R)
     print("t:", fit.t)
@@ -422,6 +422,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("RMSE:      ", fit.diagnostics.rmse)
     print("Max error: ", fit.diagnostics.max_error)
     print(f"Wrote {args.output}")
+    print("t-norm: ", np.linalg.norm(fit.t))
 
     if not args.no_plot:
         save_gif_path = args.gif if args.gif else None

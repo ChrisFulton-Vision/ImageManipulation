@@ -761,7 +761,12 @@ class PoseRuntime:
             raise ValueError("No YOLO folder selected. Set one in the YOLO queue step or the filepath page.")
 
         requested = self._normalize_dir(yolo_folder.strip())
-        self._validate_yolo_folder(requested)
+        try:
+            self._validate_yolo_folder(requested)
+        except ValueError as e:
+            from support.io.my_logging import LOG
+            LOG.warning(f"Invalid YOLO folder: {yolo_folder} resulting in error:\n{e}")
+            return
 
         switched_model = requested != self._active_yolo_dir
         if force_reload:

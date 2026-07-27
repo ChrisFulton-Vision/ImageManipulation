@@ -1709,84 +1709,351 @@ def robust_seed_ransac_dlt(
         return None, None
     return best
 
-def DLT(object_pts: NDArray,
-        img_pts: NDArray,
-        cal: Calibration,
-        trust_weighting: np.ndarray = None):
+def DLT(
+    object_pts: NDArray,
+    img_pts: NDArray,
+    cal: Calibration,
+    trust_weighting: np.ndarray = None,
+):
     """
-    DLT initializer using *normalized* image coordinates (x~, y~),
-    with correct handling of trust_weighting.
+    Numerically normalized DLT pose initializer.
 
-    - img_pts: (N,2) pixels (u,v)
-    - object_pts: (N,3)
-    - trust_weighting:
-        * None
-        * length N  (one weight per point)  -> expanded to 2N
-        * length 2N (one weight per residual row) used directly
-      (weights are assumed to be sqrt-weights, i.e., multiply rows by w)
+    Processing:
+      1. Convert pixel coordinates into calibrated image coordinates.
+      2. Center and RMS-normalize the 3D object points.
+      3. Solve the homogeneous DLT system in normalized coordinates.
+      4. Denormalize the recovered projection matrix.
+      5. Resolve its arbitrary projective sign and scale.
+      6. Project its rotation block onto SO(3).
+      7. Recompute translation from the original object points.
+
+    Parameters
+    ----------
+    object_pts:
+        Object-space points with shape (N, 3).
+
+    img_pts:
+        Image-space pixel measurements with shape (N, 2).
+
+    cal:
+        Camera calibration providing fx, fy, cx, and cy.
+
+    trust_weighting:
+        Optional square-root weights.
+
+        Supported shapes:
+          - None
+          - N values: one weight per feature
+          - 2N values: one weight per scalar residual row
+
+        N-value weights are repeated for the corresponding x and y rows.
+
+    Returns
+    -------
+    q_init:
+        Initial rotation quaternion.
+
+    t:
+        Initial translation vector.
     """
 
-    object_pts = np.asarray(object_pts, dtype=np.float64)
-    img_pts = np.asarray(img_pts, dtype=np.float64)
+    object_pts = np.asarray(
+        object_pts,
+        dtype=np.float64,
+    )
 
-    num_points = img_pts.shape[0]
+    img_pts = np.asarray(
+        img_pts,
+        dtype=np.float64,
+    )
+
+    if object_pts.ndim != 2 or object_pts.shape[1] != 3:
+        raise ValueError(
+            "object_pts must have shape (N, 3), "
+            f"got {object_pts.shape}"
+        )
+
+    if img_pts.ndim != 2 or img_pts.shape[1] != 2:
+        raise ValueError(
+            "img_pts must have shape (N, 2), "
+            f"got {img_pts.shape}"
+        )
+
+    num_points = object_pts.shape[0]
+
+    if img_pts.shape[0] != num_points:
+        raise ValueError(
+            "object_pts and img_pts must contain the same "
+            f"number of points, got {num_points} and "
+            f"{img_pts.shape[0]}"
+        )
+
     if num_points < 6:
-        raise ValueError(f"DLT needs >= 6 points, got {num_points}")
+        raise ValueError(
+            f"DLT needs at least 6 points, got {num_points}"
+        )
 
-    # --- normalized coordinates ---
-    xtil = (img_pts[:, 0] - cal.cx) / cal.fx
-    ytil = (img_pts[:, 1] - cal.cy) / cal.fy
+    # ---------------------------------------------------------------
+    # Calibrated image coordinates
+    #
+    # [x~, y~, 1]^T = K^-1 [u, v, 1]^T
+    # ---------------------------------------------------------------
+    xtil = (
+        img_pts[:, 0] - cal.cx
+    ) / cal.fx
 
-    # --- build A in normalized space ---
-    # Same structure as your original, but x,y are replaced with xtil,ytil.
-    A = np.zeros((2 * num_points, 12), dtype=np.float64)
+    ytil = (
+        img_pts[:, 1] - cal.cy
+    ) / cal.fy
+
+    # ---------------------------------------------------------------
+    # Hartley-style normalization of the object points.
+    #
+    # Center the points at their centroid and scale their RMS distance
+    # from the origin to sqrt(3).
+    # ---------------------------------------------------------------
+    object_centroid = np.mean(
+        object_pts,
+        axis=0,
+    )
+
+    centered_object_pts = (
+        object_pts - object_centroid
+    )
+
+    mean_squared_distance = np.mean(
+        np.sum(
+            centered_object_pts**2,
+            axis=1,
+        )
+    )
+
+    rms_distance = np.sqrt(
+        mean_squared_distance
+    )
+
+    if not np.isfinite(rms_distance) or rms_distance <= 1e-12:
+        raise ValueError(
+            "Object-point geometry is degenerate: "
+            "RMS distance from the centroid is zero or nonfinite"
+        )
+
+    object_scale = (
+        np.sqrt(3.0) / rms_distance
+    )
+
+    normalized_object_pts = (
+        object_scale *
+        centered_object_pts
+    )
+
+    # Homogeneous object normalization:
+    #
+    # X_normalized = T_object @ X_original
+    object_normalization = np.eye(
+        4,
+        dtype=np.float64,
+    )
+
+    object_normalization[:3, :3] *= (
+        object_scale
+    )
+
+    object_normalization[:3, 3] = (
+        -object_scale *
+        object_centroid
+    )
+
+    # ---------------------------------------------------------------
+    # Construct the homogeneous DLT system using normalized image and
+    # normalized object coordinates.
+    # ---------------------------------------------------------------
+    A = np.zeros(
+        (2 * num_points, 12),
+        dtype=np.float64,
+    )
 
     for i in range(num_points):
-        X, Y, Z = object_pts[i]
+        X, Y, Z = normalized_object_pts[i]
         x = xtil[i]
         y = ytil[i]
 
-        A[2 * i] = [-X, -Y, -Z, -1, 0, 0, 0, 0, x * X, x * Y, x * Z, x]
-        A[2 * i + 1] = [0, 0, 0, 0, -X, -Y, -Z, -1, y * X, y * Y, y * Z, y]
+        A[2 * i] = [
+            -X,
+            -Y,
+            -Z,
+            -1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            x * X,
+            x * Y,
+            x * Z,
+            x,
+        ]
 
-    # --- apply trust weighting correctly ---
+        A[2 * i + 1] = [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            -X,
+            -Y,
+            -Z,
+            -1.0,
+            y * X,
+            y * Y,
+            y * Z,
+            y,
+        ]
+
+    # ---------------------------------------------------------------
+    # Apply optional square-root weights directly to the DLT rows.
+    # ---------------------------------------------------------------
     if trust_weighting is not None:
-        w = np.asarray(trust_weighting, dtype=np.float64).ravel()
+        weights = np.asarray(
+            trust_weighting,
+            dtype=np.float64,
+        ).ravel()
 
-        # Allow N weights (per point) or 2N weights (per row)
-        if w.size == num_points:
-            w = np.repeat(w, 2)
-        elif w.size != 2 * num_points:
+        if weights.size == num_points:
+            weights = np.repeat(
+                weights,
+                2,
+            )
+        elif weights.size != 2 * num_points:
             raise ValueError(
-                f"trust_weighting must have length N={num_points} or 2N={2 * num_points}, got {w.size}"
+                "trust_weighting must have length "
+                f"N={num_points} or 2N={2 * num_points}, "
+                f"got {weights.size}"
             )
 
-        # Row-scale A by w (equivalent to diag(w) @ A, but faster/safer)
-        A = (w[:, None] * A)
+        A *= weights[:, None]
 
-    # --- solve Ap=0 via SVD ---
-    _, _, Vt = np.linalg.svd(A, full_matrices=False)
-    p = Vt[-1, :]
-    P = p.reshape((3, 4))
+    # ---------------------------------------------------------------
+    # Solve:
+    #
+    #     min ||A p||
+    #
+    # subject to ||p|| = 1.
+    # ---------------------------------------------------------------
+    _, _, Vt = np.linalg.svd(
+        A,
+        full_matrices=False,
+    )
 
-    # In normalized form, K = I, so M == P.
-    # We still extract R_init, t_init for completeness.
-    R_init, t_init = P[:, :3], P[:, 3]
+    p = Vt[-1]
 
-    # --- enforce orthogonality on R ---
-    U, _, Vt_r = np.linalg.svd(R_init)
-    R = U @ Vt_r
-    if np.linalg.det(R) < 0:
-        # keep proper rotation
-        U[:, -1] *= -1.0
-        R = U @ Vt_r
-        t_init *= -1.0  # keep projective sign consistent
+    P_normalized = p.reshape(
+        3,
+        4,
+    )
 
-    # --- translation solve (your existing method) ---
-    t = _solve_t_given_R(object_pts, xtil, ytil, R)
+    # ---------------------------------------------------------------
+    # Denormalize the projection matrix.
+    #
+    # Since:
+    #
+    #     X_normalized = T_object @ X_original
+    #
+    # then:
+    #
+    #     P_original = P_normalized @ T_object
+    #
+    # The image measurements were already calibrated, so K^-1 must
+    # not be applied again here.
+    # ---------------------------------------------------------------
+    P = (
+        P_normalized @
+        object_normalization
+    )
 
-    # --- return quaternion + translation ---
+    rotation_scaled = P[:, :3].copy()
+
+    # ---------------------------------------------------------------
+    # Resolve the arbitrary global sign of the homogeneous DLT result.
+    #
+    # For a scaled proper rotation:
+    #
+    #     det(scale * R) = scale^3
+    #
+    # A negative determinant therefore indicates a negative global
+    # projective scale.
+    # ---------------------------------------------------------------
+    if np.linalg.det(rotation_scaled) < 0.0:
+        P = -P
+        rotation_scaled = -rotation_scaled
+
+    # ---------------------------------------------------------------
+    # Estimate and remove the projective scale.
+    #
+    # For an ideal scaled rotation, all three singular values equal
+    # abs(scale). Their mean provides a stable scale estimate.
+    # ---------------------------------------------------------------
+    _, rotation_singular_values, _ = np.linalg.svd(
+        rotation_scaled,
+        full_matrices=False,
+    )
+
+    projective_scale = np.mean(
+        rotation_singular_values
+    )
+
+    if (
+        not np.isfinite(projective_scale)
+        or projective_scale <= 1e-12
+    ):
+        raise ValueError(
+            "DLT produced a degenerate projection scale"
+        )
+
+    rotation_initial = (
+        rotation_scaled /
+        projective_scale
+    )
+
+    # ---------------------------------------------------------------
+    # Project the recovered rotation block onto SO(3).
+    # ---------------------------------------------------------------
+    U, _, Vt_r = np.linalg.svd(
+        rotation_initial,
+        full_matrices=False,
+    )
+
+    determinant_correction = np.eye(
+        3,
+        dtype=np.float64,
+    )
+
+    if np.linalg.det(U @ Vt_r) < 0.0:
+        determinant_correction[-1, -1] = -1.0
+
+    R = (
+        U @
+        determinant_correction @
+        Vt_r
+    )
+
+    # ---------------------------------------------------------------
+    # Recompute translation from:
+    #
+    #   - the proper physical rotation,
+    #   - the original object coordinates, and
+    #   - the calibrated image coordinates.
+    #
+    # This prevents centroid and scale normalization from leaking into
+    # the returned translation.
+    # ---------------------------------------------------------------
+    t = _solve_t_given_R(
+        object_pts,
+        xtil,
+        ytil,
+        R,
+    )
+
     q_init = mat2quat(R)
+
     return q_init, t
 
 

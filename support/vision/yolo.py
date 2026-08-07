@@ -153,6 +153,194 @@ class YOLO:
         output = self.processImage(yoloImage)
         return output
 
+    def inferClassCandidatesOnImage(self,
+                                    image: NDArray,
+                                    target_class: int,
+                                    min_score: float = 0.01
+                                    ) -> tuple[NDArray, NDArray, NDArray, NDArray, float]:
+        """
+        Runs YOLO and returns all raw candidate boxes for one class before the
+        normal best-per-class reduction performed by interpretOutput().
+
+        Returns:
+            boxes
+            objectness
+            classness
+            combined_score = objectness * classness
+            inference_time
+        """
+        yoloImage = self.preprocessImage(image)
+
+        startTime = datetime.datetime.now()
+        if self.session is not None:
+            output = self.session.run(None, {self.input_name: yoloImage})
+        else:
+            output = None
+        endTime = datetime.datetime.now()
+
+        boxes, objectness, classness, combined = self.interpretClassCandidates(
+            output, target_class, min_score
+        )
+
+        return (
+            boxes,
+            objectness,
+            classness,
+            combined,
+            (endTime - startTime).total_seconds()
+        )
+
+    def interpretClassCandidates(self,
+                                 output: NDArray,
+                                 target_class: int,
+                                 min_score: float = 0.01
+                                 ) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+        """
+        Extract every raw proposal's score for one requested class.
+
+        No argmax class assignment and no best-per-class reduction are applied.
+        """
+
+        if output is None:
+            empty_boxes = np.empty((0, 4), dtype=np.float32)
+            empty_scores = np.empty(0, dtype=np.float32)
+            return empty_boxes, empty_scores, empty_scores, empty_scores
+
+        preds = np.squeeze(output[0])
+
+        if preds.ndim != 2 or preds.size == 0:
+            empty_boxes = np.empty((0, 4), dtype=np.float32)
+            empty_scores = np.empty(0, dtype=np.float32)
+            return empty_boxes, empty_scores, empty_scores, empty_scores
+
+        if target_class < 0 or target_class >= preds.shape[1] - 5:
+            raise ValueError(
+                f"target_class {target_class} is outside "
+                f"[0, {preds.shape[1] - 6}]"
+            )
+
+        x = preds[:, 0]
+        y = preds[:, 1]
+        w = preds[:, 2]
+        h = preds[:, 3]
+
+        objectness = preds[:, 4]
+        classness = preds[:, 5 + target_class]
+        combined = objectness * classness
+
+        # Much lower than normal YOLO acceptance threshold.
+        # This only removes essentially meaningless proposals.
+        keep = combined >= min_score
+
+        if not np.any(keep):
+            empty_boxes = np.empty((0, 4), dtype=np.float32)
+            empty_scores = np.empty(0, dtype=np.float32)
+            return empty_boxes, empty_scores, empty_scores, empty_scores
+
+        x = x[keep]
+        y = y[keep]
+        w = w[keep]
+        h = h[keep]
+
+        objectness = objectness[keep]
+        classness = classness[keep]
+        combined = combined[keep]
+
+        boxes = np.column_stack((
+            x - w / 2,
+            y - h / 2,
+            x + w / 2,
+            y + h / 2,
+        ))
+
+        return boxes, objectness, classness, combined
+
+    def buildCandidateHeatmap(self,
+                              boxes: NDArray,
+                              weights: NDArray) -> NDArray:
+        """
+        Build a confidence heatmap by adding each candidate's weight
+        to every pixel contained by its bounding box.
+        """
+
+        height, width = self.yoloSize
+
+        heatmap = np.zeros(
+            (height, width),
+            dtype=np.float32
+        )
+
+        for box, weight in zip(boxes, weights):
+
+            x1 = int(np.floor(np.clip(box[0], 0, width)))
+            y1 = int(np.floor(np.clip(box[1], 0, height)))
+            x2 = int(np.ceil(np.clip(box[2], 0, width)))
+            y2 = int(np.ceil(np.clip(box[3], 0, height)))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            heatmap[y1:y2, x1:x2] += weight
+
+        return heatmap
+
+    def findHeatmapPeakCentroid(self,
+                                heatmap: NDArray
+                                ) -> tuple[float | None,
+                                           float | None,
+    float,
+    int]:
+        """
+        Find the centroid of the largest connected region attaining
+        the maximum heatmap value.
+
+        Returns:
+            centroid_x
+            centroid_y
+            peak_value
+            peak_area
+        """
+
+        peak_value = float(np.max(heatmap))
+
+        if peak_value <= 0.0:
+            return None, None, 0.0, 0
+
+        # The heatmap is piecewise constant, but isclose protects against
+        # insignificant floating-point differences.
+        peak_mask = np.isclose(
+            heatmap,
+            peak_value,
+            rtol=1e-6,
+            atol=1e-8
+        ).astype(np.uint8)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            peak_mask,
+            connectivity=8
+        )
+
+        # label 0 is the background.
+        if num_labels <= 1:
+            return None, None, peak_value, 0
+
+        component_areas = stats[1:, cv2.CC_STAT_AREA]
+
+        largest_label = 1 + int(np.argmax(component_areas))
+
+        centroid_x, centroid_y = centroids[largest_label]
+
+        peak_area = int(
+            stats[largest_label, cv2.CC_STAT_AREA]
+        )
+
+        return (
+            float(centroid_x),
+            float(centroid_y),
+            peak_value,
+            peak_area
+        )
+
     def set_calibration(self, calibration: Calibration) -> None:
         self.calibration = copy.deepcopy(calibration)
 
@@ -278,34 +466,329 @@ class YOLO:
 
 if __name__ == '__main__':
 
-    yolo = YOLO(conf=0.75, iou=0.99, yoloSize=(864, 864),
-                model_path="C:/repos/aburn/usr/hub/palindrome_playground/src/sn_UAS_Guidance/YOLO Models/Atterbury_Cub",
-                numClasses=1)
+    yolo = YOLO(
+        conf=0.75,
+        iou=0.99,
+        yoloSize=(864, 864),
+        model_path="C:/repos/jarvis_submodules/camera_calibration_python/YOLOModels/AtterburyFT_25/Cub_ANT/cub_solo_0924",
+        numClasses=1
+    )
 
     np.set_printoptions(suppress=True)
 
-    # testImage = imread('BoundingBoxCandidates/13608.bmp')
-    # testImage, sol = yolo.inferOnImage(testImage)
+    target_class = 0
+
+    # Separate from yolo.conf intentionally.
+    # We want to see hypotheses far below the normal acceptance threshold.
+    candidate_min_score = 0.45
+
+    # The experiment we originally discussed.
+    heatmap_weight = "classness"
+
+    # Other useful comparisons:
+    # heatmap_weight = "objectness"
+    # heatmap_weight = "combined"
 
     allImages = glob.glob(
-        os.path.join('C:/Users/fulto/Desktop/UAS Flight Test/25_Spring/__Flight 2_25_05_19', f'*.bmp'))
+        os.path.join(
+            'C:/repos/jarvis_submodules/camera_calibration_python/Images/DissertationDatasets/UAS/25SP/C1c/',
+            '*.bmp'
+        )
+    )
 
     from support.io.data_processing import natural_sort
 
     allImages = natural_sort(allImages)
 
     for imgFP in allImages:
+
         img = cv2.imread(imgFP)
-        (newImg, rvec_tvec), sol = yolo.inferOnImage(img)
-        cv2.imshow('YOLO', newImg)
-        # cv2.imwrite('BoundingBoxCandidates/SaveFiles/' + os.path.basename(imgFP), newImg)
+
+        if img is None:
+            continue
+
+        (
+            boxes,
+            objectness,
+            classness,
+            combined,
+            infer_time
+        ) = yolo.inferClassCandidatesOnImage(
+            img,
+            target_class=target_class,
+            min_score=candidate_min_score
+        )
+
+        if heatmap_weight == "classness":
+            weights = classness
+
+        elif heatmap_weight == "objectness":
+            weights = objectness
+
+        else:
+            weights = combined
+
+        heatmap = yolo.buildCandidateHeatmap(
+            boxes,
+            weights
+        )
+
+        # ------------------------------------------------------------
+        # Conventional candidate argmax
+        # ------------------------------------------------------------
+
+        if len(weights) > 0:
+
+            candidate_argmax_idx = int(np.argmax(weights))
+
+            candidate_argmax_box = boxes[candidate_argmax_idx]
+            candidate_argmax_value = float(weights[candidate_argmax_idx])
+
+        else:
+
+            candidate_argmax_idx = None
+            candidate_argmax_box = None
+            candidate_argmax_value = 0.0
+
+        # ------------------------------------------------------------
+        # Heatmap peak-region centroid
+        # ------------------------------------------------------------
+
+        (
+            heatmap_centroid_x,
+            heatmap_centroid_y,
+            heatmap_peak_value,
+            heatmap_peak_area) = yolo.findHeatmapPeakCentroid(heatmap)
+
+        height, width = yolo.yoloSize
+
+        display_img = cv2.resize(
+            img,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR
+        )
+
+        candidate_view = display_img.copy()
+
+        argmax_view = display_img.copy()
+
+        # Show exactly which proposals contributed to the heatmap.
+        for box in boxes:
+
+            x1 = int(np.clip(
+                np.floor(box[0]),
+                0,
+                width - 1
+            ))
+
+            y1 = int(np.clip(
+                np.floor(box[1]),
+                0,
+                height - 1
+            ))
+
+            x2 = int(np.clip(
+                np.ceil(box[2]),
+                0,
+                width - 1
+            ))
+
+            y2 = int(np.clip(
+                np.ceil(box[3]),
+                0,
+                height - 1
+            ))
+
+            cv2.rectangle(
+                candidate_view,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                1
+            )
+
+        if candidate_argmax_box is not None:
+            x1 = int(np.clip(
+                np.floor(candidate_argmax_box[0]),
+                0,
+                width - 1
+            ))
+
+            y1 = int(np.clip(
+                np.floor(candidate_argmax_box[1]),
+                0,
+                height - 1
+            ))
+
+            x2 = int(np.clip(
+                np.ceil(candidate_argmax_box[2]),
+                0,
+                width - 1
+            ))
+
+            y2 = int(np.clip(
+                np.ceil(candidate_argmax_box[3]),
+                0,
+                height - 1
+            ))
+
+            cv2.rectangle(
+                argmax_view,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+            candidate_center_x = int(round((x1 + x2) / 2))
+            candidate_center_y = int(round((y1 + y2) / 2))
+
+            cv2.drawMarker(
+                argmax_view,
+                (candidate_center_x, candidate_center_y),
+                (0, 255, 0),
+                cv2.MARKER_CROSS,
+                20,
+                2
+            )
+
+            cv2.putText(
+                argmax_view,
+                f"candidate argmax = {candidate_argmax_value:.4f}",
+                (15, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+        # Convert the accumulated floating-point heatmap into something
+        # OpenCV can colorize.
+        if heatmap.max() > 0:
+
+            heatmap_u8 = np.round(
+                255.0 * heatmap / heatmap.max()
+            ).astype(np.uint8)
+
+            heatmap_color = cv2.applyColorMap(
+                heatmap_u8,
+                cv2.COLORMAP_TURBO
+            )
+
+            heatmap_view = display_img.copy()
+
+            support_mask = heatmap > 0.0
+
+            heatmap_view[support_mask] = cv2.addWeighted(
+                display_img,
+                0.55,
+                heatmap_color,
+                0.45,
+                0.0
+            )[support_mask]
+
+        else:
+
+            heatmap_view = display_img.copy()
+
+        if heatmap_centroid_x is not None:
+            centroid_x = int(round(heatmap_centroid_x))
+            centroid_y = int(round(heatmap_centroid_y))
+
+            cv2.drawMarker(
+                heatmap_view,
+                (centroid_x, centroid_y),
+                (255, 255, 255),
+                cv2.MARKER_CROSS,
+                24,
+                2
+            )
+
+            cv2.circle(
+                heatmap_view,
+                (centroid_x, centroid_y),
+                8,
+                (255, 255, 255),
+                2
+            )
+
+            cv2.putText(
+                heatmap_view,
+                f"peak={heatmap_peak_value:.4f}, area={heatmap_peak_area}",
+                (15, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA
+            )
+
+        cv2.putText(
+            candidate_view,
+            f"class {target_class}: {len(boxes)} raw candidates",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.putText(
+            heatmap_view,
+            f"weight={heatmap_weight}, max={heatmap.max():.3f}",
+            (15, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        cv2.imshow(
+            'YOLO raw candidates',
+            candidate_view
+        )
+
+        cv2.imshow(
+            'YOLO candidate argmax',
+            argmax_view
+        )
+
+        cv2.imshow(
+            'YOLO feature heatmap',
+            heatmap_view
+        )
+
+        centroid_str = (
+            f"({heatmap_centroid_x:.1f}, {heatmap_centroid_y:.1f})"
+            if heatmap_centroid_x is not None
+            else "None"
+        )
+
+        print(
+            f"{os.path.basename(imgFP)}: "
+            f"{len(boxes)} candidates, "
+            f"candidate argmax={candidate_argmax_value:.4f}, "
+            f"heat peak={heatmap_peak_value:.4f}, "
+            f"heat peak area={heatmap_peak_area}, "
+            f"heat centroid={centroid_str}, "
+            f"inference={infer_time * 1000.0:.2f} ms"
+        )
+
         key = cv2.waitKey(0)
+
         if key == 121:
             print('you hit yes')
             with open("test.txt", "w") as f:
                 f.write("string")
+
         if key == 110:
             print('you hit no')
             os.remove(imgFP)
+
         if key == 27:
             break
+
+    cv2.destroyAllWindows()

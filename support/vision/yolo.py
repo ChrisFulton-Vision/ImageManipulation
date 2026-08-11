@@ -284,6 +284,72 @@ class YOLO:
 
         return heatmap
 
+    def findHeatmapRegions(self,
+                           heatmap: NDArray,
+                           min_region_peak: float = 0.0,
+                           min_region_area: int = 1
+                           ) -> list[dict]:
+        """
+        Split the heatmap into connected positive-support regions and
+        report the peak of each region.
+
+        Returns a list of dicts with:
+            area
+            peak_value
+            peak_x
+            peak_y
+        """
+
+        support_mask = (heatmap > 0.0).astype(np.uint8)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            support_mask,
+            connectivity=8
+        )
+
+        regions = []
+
+        # label 0 is background
+        for label in range(1, num_labels):
+
+            area = int(stats[label, cv2.CC_STAT_AREA])
+
+            if area < min_region_area:
+                continue
+
+            region_mask = (labels == label)
+
+            peak_value = float(np.max(heatmap[region_mask]))
+
+            if peak_value < min_region_peak:
+                continue
+
+            # Find all pixels inside this region that attain the regional peak.
+            peak_mask = np.logical_and(
+                region_mask,
+                np.isclose(heatmap, peak_value, rtol=1e-6, atol=1e-8)
+            )
+
+            peak_ys, peak_xs = np.nonzero(peak_mask)
+
+            if len(peak_xs) == 0:
+                continue
+
+            peak_x = float(np.mean(peak_xs))
+            peak_y = float(np.mean(peak_ys))
+
+            regions.append({
+                "area": area,
+                "peak_value": peak_value,
+                "peak_x": peak_x,
+                "peak_y": peak_y,
+            })
+
+        # Highest-peak regions first
+        regions.sort(key=lambda r: r["peak_value"], reverse=True)
+
+        return regions
+
     def findHeatmapPeakCentroid(self,
                                 heatmap: NDArray
                                 ) -> tuple[float | None,
@@ -468,7 +534,7 @@ if __name__ == '__main__':
 
     yolo = YOLO(
         conf=0.75,
-        iou=0.99,
+        iou=0.999,
         yoloSize=(864, 864),
         model_path="C:/repos/jarvis_submodules/camera_calibration_python/YOLOModels/AtterburyFT_25/Cub_ANT/cub_solo_0924",
         numClasses=1
@@ -483,11 +549,12 @@ if __name__ == '__main__':
     candidate_min_score = 0.45
 
     # The experiment we originally discussed.
-    heatmap_weight = "classness"
-
     # Other useful comparisons:
     # heatmap_weight = "objectness"
-    # heatmap_weight = "combined"
+    heatmap_weight = "combined"
+    # heatmap_weight = "classness"
+
+
 
     allImages = glob.glob(
         os.path.join(
@@ -533,16 +600,22 @@ if __name__ == '__main__':
             weights
         )
 
+        heat_regions = yolo.findHeatmapRegions(
+            heatmap,
+            min_region_peak=candidate_min_score,
+            min_region_area=4
+        )
+
         # ------------------------------------------------------------
         # Conventional candidate argmax
         # ------------------------------------------------------------
 
-        if len(weights) > 0:
+        if len(combined) > 0:
 
-            candidate_argmax_idx = int(np.argmax(weights))
+            candidate_argmax_idx = int(np.argmax(combined))
 
             candidate_argmax_box = boxes[candidate_argmax_idx]
-            candidate_argmax_value = float(weights[candidate_argmax_idx])
+            candidate_argmax_value = float(combined[candidate_argmax_idx])
 
         else:
 
@@ -745,6 +818,52 @@ if __name__ == '__main__':
             2,
             cv2.LINE_AA
         )
+
+        for region in heat_regions:
+            px = int(round(region["peak_x"]))
+            py = int(round(region["peak_y"]))
+            peak_val = region["peak_value"]
+            area = region["area"]
+
+            # Small marker at the regional peak location
+            cv2.drawMarker(
+                heatmap_view,
+                (px, py),
+                (255, 255, 255),
+                cv2.MARKER_TILTED_CROSS,
+                14,
+                2
+            )
+
+            label = f"{peak_val:.2f}"
+
+            # If you want a little more info instead:
+            # label = f"{peak_val:.2f} ({area})"
+
+            text_x = min(px + 6, width - 120)
+            text_y = max(py - 6, 20)
+
+            cv2.putText(
+                heatmap_view,
+                label,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.putText(
+                heatmap_view,
+                label,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
 
         cv2.imshow(
             'YOLO raw candidates',

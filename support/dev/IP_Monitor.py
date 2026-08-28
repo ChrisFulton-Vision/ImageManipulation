@@ -17,10 +17,10 @@ TIME_INPUT_HINT = "Use HH:MM, HH:MM:SS, or YYYY-MM-DD HH:MM"
 
 DEVICES = [
     ("Microhard Antenna", "192.168.168.101"),
-    ("SuperSonic Antenna", "192.168.168.103"),
-    ("SuperSonic Thor", "192.168.168.113"),
-    ("Shadow Antenna", "192.168.168.104"),
-    ("Shadow Thor", "192.168.168.114"),
+    ("SuperSonic Antenna", "192.168.168.104"),
+    ("SuperSonic Thor", "192.168.168.114"),
+    ("Shadow Antenna", "192.168.168.103"),
+    ("Shadow Thor", "192.168.168.113"),
 ]
 
 

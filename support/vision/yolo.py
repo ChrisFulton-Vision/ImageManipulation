@@ -563,9 +563,13 @@ if __name__ == '__main__':
         )
     )
 
-    from support.io.data_processing import natural_sort
+    try:
+        from support.io.data_processing import natural_sort
 
-    allImages = natural_sort(allImages)
+        allImages = natural_sort(allImages)
+    except ImportError as e:
+        print("Can't import natural_sort. Images may be a bit jumbled.")
+
 
     for imgFP in allImages:
 

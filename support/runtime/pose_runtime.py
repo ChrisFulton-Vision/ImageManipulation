@@ -9,7 +9,7 @@ from numpy.typing import NDArray
 from support.core.pixel_kalmanFilter import KalmanFilter as PixelKalmanFilter
 from support.core.enums import ImageSource
 from support.io.attitude_interpreter import CAMERA_RPY_OFFSET_DEG
-import support.gui.UserSelectQueue as GuiQueue
+import support.gui.PySideUserSelectQueue as GuiQueue
 from support.mathHelpers.quaternions import Quaternion as q, mat2quat
 from support.mathHelpers.single_feature_geometry import (
     camera_matrix_from_calibration,

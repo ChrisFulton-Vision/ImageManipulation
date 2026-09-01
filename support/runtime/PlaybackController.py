@@ -6,15 +6,23 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-import customtkinter as ctk
 import cv2
 import numpy as np
-from tkinter import TclError
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+)
 
 import support.gui.utils as utils
 import support.io.data_processing as data
 from support.core.enums import PlaybackSpeed
 from support.io.my_logging import LOG
+from support.gui.qt_scheduler import QtValue
 
 SPEED_STEP = pow(2.0, 1.0 / 3.0)  # 3 presses -> 2×
 SPEED_STEP_INV = 1.0 / SPEED_STEP
@@ -38,7 +46,7 @@ class PlaybackController:
         # Public-ish state used by playback internals
         self.pause_cache = utils.PausedCache()
         self.playback = utils.PlaybackState()
-        self.playback_mode_text = ctk.StringVar(value="Playback Mode: FPS")
+        self.playback_mode_text = QtValue("Playback Mode: FPS", owner)
 
         self.low_pass_fps = 20.0
         self.curr_fps = 20.0
@@ -64,50 +72,51 @@ class PlaybackController:
     def setup_frame(self) -> None:
         """Construct the playback controls section of the GUI."""
         f = self.owner.playback_frame
+        old_layout = f.layout()
+        if old_layout is not None:
+            while old_layout.count():
+                item = old_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
 
-        for w in f.winfo_children():
-            w.destroy()
-
-        row_id = 0
+        layout = QVBoxLayout() if old_layout is None else old_layout
+        if old_layout is None:
+            f.setLayout(layout)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
         self.update_playback_menu()
 
-        playback_label = ctk.CTkLabel(f, textvariable=self.playback_mode_text)
-        playback_label.grid(row=row_id, column=0, sticky="w", padx=8, pady=(8, 4))
-        row_id += 1
+        playback_label = QLabel(str(self.playback_mode_text.get()))
+        playback_label.setWordWrap(True)
+        self.playback_mode_text.changed.connect(playback_label.setText)
+        layout.addWidget(playback_label)
 
-        self._pb_frame_text = ctk.StringVar(value="Frame: — / —")
+        self._pb_frame_text = QtValue("Frame: — / —", self.owner)
         self._pb_slider_dragging = False
 
-        self._pb_frame_label = ctk.CTkLabel(f, textvariable=self._pb_frame_text)
-        self._pb_frame_label.grid(row=row_id, column=0, sticky="w", padx=8, pady=(4, 2))
-        row_id += 1
+        self._pb_frame_label = QLabel(str(self._pb_frame_text.get()))
+        self._pb_frame_text.changed.connect(self._pb_frame_label.setText)
+        layout.addWidget(self._pb_frame_label)
 
-        self._pb_slider = ctk.CTkSlider(
-            f,
-            from_=0,
-            to=1,
-            number_of_steps=1,
-            command=self._on_pb_slider_drag,
+        self._pb_slider = QSlider(Qt.Orientation.Horizontal)
+        self._pb_slider.setRange(0, 1)
+        self._pb_slider.sliderMoved.connect(self._on_pb_slider_drag)
+        self._pb_slider.sliderPressed.connect(
+            lambda: self._set_pb_slider_dragging(True)
         )
-        self._pb_slider.grid(row=row_id, column=0, sticky="ew", padx=8, pady=(0, 8))
-        row_id += 1
+        self._pb_slider.sliderReleased.connect(self._on_pb_slider_release)
+        layout.addWidget(self._pb_slider)
 
-        self._pb_slider.bind("<ButtonPress-1>", lambda *_: self._set_pb_slider_dragging(True))
-        self._pb_slider.bind("<ButtonRelease-1>", self._on_pb_slider_release)
-
-        f.grid_columnconfigure(0, weight=1)
-        row_id += 1
-
-        btn_frame = ctk.CTkFrame(f)
-        btn_frame.grid(row=row_id, column=0, padx=5, pady=5, sticky="nsew")
+        btn_layout = QGridLayout()
+        layout.addLayout(btn_layout)
 
         def mk(text: str, action: str, *args: Any, col: int = 0):
-            b = ctk.CTkButton(
-                btn_frame,
-                text=text,
-                command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
+            b = QPushButton(text)
+            b.clicked.connect(
+                lambda _checked=False, a=action, ar=args: self._enqueue_playback_cmd(a, *ar)
             )
-            b.grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+            btn_layout.addWidget(b, 0, col)
             return b
 
         mk("⟲ Rev (r)", "reverse", col=0)
@@ -116,16 +125,12 @@ class PlaybackController:
         mk("Fwd (c) ⟹", "step_forward", col=3)
         mk("Mode (f)", "toggle_fps_mode", col=4)
 
-        row_id += 1
-        speed_frame = ctk.CTkFrame(f)
-        speed_frame.grid(row=row_id, column=0, padx=5, pady=5, sticky="nsew")
-
         def mk2(text: str, action: str, *args: Any, col: int = 0):
-            ctk.CTkButton(
-                speed_frame,
-                text=text,
-                command=lambda a=action, ar=args: self._enqueue_playback_cmd(a, *ar),
-            ).grid(row=0, column=col, padx=4, pady=4, sticky="nsew")
+            button = QPushButton(text)
+            button.clicked.connect(
+                lambda _checked=False, a=action, ar=args: self._enqueue_playback_cmd(a, *ar)
+            )
+            btn_layout.addWidget(button, 1, col)
 
         mk2("Slower (a)", "speed_down", col=0)
         mk2("Faster (d)", "speed_up", col=1)
@@ -188,7 +193,7 @@ class PlaybackController:
                         int(self.playback.curr_idx),
                         int(num_images),
                     )
-                except TclError:
+                except RuntimeError:
                     pass
 
             self.pause_cache.clear()
@@ -421,7 +426,7 @@ class PlaybackController:
                             int(self.playback.curr_idx),
                             int(num_images),
                         )
-                    except TclError:
+                    except RuntimeError:
                         pass
 
                 pending_keys.extend(self._poll_keys(1))
@@ -435,7 +440,8 @@ class PlaybackController:
                 cv2.destroyWindow(self.owner.windowName)
             except cv2.error:
                 pass
-            self.owner.after(0, self.owner.on_worker_exit)
+            if not self.owner.shutting_down:
+                self.owner.after(0, self.owner.on_worker_exit)
             if loader is not None:
                 loader.stop()
 
@@ -515,7 +521,7 @@ class PlaybackController:
     def _on_pb_slider_release(self, _evt=None) -> None:
         self._set_pb_slider_dragging(False)
         try:
-            v = int(round(float(self._pb_slider.get())))
+            v = int(self._pb_slider.value())
         except (AttributeError, TypeError, ValueError):
             return
         self._enqueue_playback_cmd("seek_idx", v)
@@ -523,11 +529,11 @@ class PlaybackController:
     def _pb_ui_set_slider_range(self, n: int) -> None:
         n = int(n)
         if n <= 1:
-            self._pb_slider.configure(from_=0, to=1, number_of_steps=1)
+            self._pb_slider.setRange(0, 1)
             self._pb_frame_text.set("Frame: — / —")
             return
 
-        self._pb_slider.configure(from_=0, to=n - 1, number_of_steps=n - 1)
+        self._pb_slider.setRange(0, n - 1)
         self._pb_frame_text.set(f"Frame: 0 / {n - 1}")
 
     def _pb_ui_set_slider_pos(self, idx: int, n: int) -> None:
@@ -537,7 +543,7 @@ class PlaybackController:
             return
 
         idx = int(max(0, min(int(idx), int(n) - 1)))
-        self._pb_slider.set(idx)
+        self._pb_slider.setValue(idx)
         self._pb_frame_text.set(f"Frame: {idx} / {int(n) - 1}")
 
     # ------------------------------------------------------------------
@@ -831,11 +837,11 @@ class PlaybackController:
         self.owner.camConfig.start_export_idx = curr_idx
         if self.owner.camConfig.end_export_idx < self.owner.camConfig.start_export_idx:
             self.owner.camConfig.end_export_idx = self.owner.camConfig.start_export_idx + 1
-        self.owner.exportStartFrame.configure(
-            text=f"Start Frame: {self.owner.camConfig.start_export_idx}"
+        self.owner.exportStartFrame.setText(
+            f"Start Frame: {self.owner.camConfig.start_export_idx}"
         )
-        self.owner.exportEndFrame.configure(
-            text=f"End Frame: {self.owner.camConfig.end_export_idx}"
+        self.owner.exportEndFrame.setText(
+            f"End Frame: {self.owner.camConfig.end_export_idx}"
         )
         self.owner.saveToCache()
 
@@ -843,11 +849,11 @@ class PlaybackController:
         self.owner.camConfig.end_export_idx = curr_idx
         if self.owner.camConfig.end_export_idx < self.owner.camConfig.start_export_idx:
             self.owner.camConfig.end_export_idx = max(0, self.owner.camConfig.end_export_idx - 1)
-        self.owner.exportStartFrame.configure(
-            text=f"Start Frame: {self.owner.camConfig.start_export_idx}"
+        self.owner.exportStartFrame.setText(
+            f"Start Frame: {self.owner.camConfig.start_export_idx}"
         )
-        self.owner.exportEndFrame.configure(
-            text=f"End Frame: {self.owner.camConfig.end_export_idx}"
+        self.owner.exportEndFrame.setText(
+            f"End Frame: {self.owner.camConfig.end_export_idx}"
         )
         self.owner.saveToCache()
 

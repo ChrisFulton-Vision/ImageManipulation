@@ -3,16 +3,37 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from tkinter import TclError, filedialog
 from typing import Any, Callable
 
-import customtkinter as ctk
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+)
 
 import support.gui.utils as utils
 import support.io.data_processing as data
-import support.viz.colors as clr
 from support.gui.gpu_monitor import GpuMonitor, GpuSample
 from support.vision.calibration import undistort_points_px
+from support.gui.qt_scheduler import QtValue
+
+
+class GpuUtilSlider(QSlider):
+    """Native Qt GPU indicator with the legacy runtime's narrow value API."""
+
+    def configure(self, *, state: str | None = None, **_ignored: Any) -> None:
+        if state is not None:
+            self.setEnabled(state != "disabled")
+
+    def set(self, value: float) -> None:
+        self.setValue(int(round(float(value))))
 
 
 class BatchController:
@@ -83,150 +104,148 @@ class BatchController:
         try:
             if self.gpu_slider is not None:
                 enabled = bool(getattr(cam, "dp_gpu", False))
-                self.gpu_slider.configure(state="normal" if enabled else "disabled")
+                self.gpu_slider.setEnabled(enabled)
                 if not enabled:
-                    self.gpu_slider.set(0.0)
+                    self.gpu_slider.setValue(0)
         except Exception:
             pass
 
     def setup_frame(self) -> None:
         """Build the batch-processing page for folder-based offline analysis."""
         f = self.owner.data_frame
-        for w in f.winfo_children():
-            w.destroy()
+        old_layout = f.layout()
+        if old_layout is not None:
+            while old_layout.count():
+                item = old_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+        layout = QGridLayout() if old_layout is None else old_layout
+        if old_layout is None:
+            f.setLayout(layout)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(8)
 
-        f.grid_rowconfigure(99, weight=1)
-        f.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(f, text="Batch YOLO over image folder", font=("Segoe UI", 16, "bold")).grid(
-            row=0, column=0, columnspan=3, padx=12, pady=(16, 8), sticky="w"
-        )
+        heading = QLabel("Batch YOLO over image folder")
+        heading_font = heading.font()
+        heading_font.setPointSize(12)
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading, 0, 0, 1, 3)
 
         img_dir_default = (
             getattr(self.owner.camConfig, "dp_img_dir", None)
             or self.owner.camConfig.imageFilepath
             or ""
         )
-        self._img_dir_var = ctk.StringVar(value=str(img_dir_default))
+        self._img_dir_var = QtValue(str(img_dir_default), self.owner)
         self._mirror_runtime_refs()
 
         def _choose_dir():
-            d = filedialog.askdirectory(title="Select image folder")
+            d = QFileDialog.getExistingDirectory(
+                f,
+                "Select image folder",
+                str(self._current_img_dir()),
+            )
             if d:
                 self._img_dir_var.set(d)
 
-        ctk.CTkLabel(f, text="Folder:").grid(row=1, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._img_dir_var).grid(row=1, column=1, padx=12, pady=6, sticky="ew")
-        ctk.CTkButton(f, text="Browse…", command=_choose_dir).grid(row=1, column=2, padx=12, pady=6)
+        folder_edit = QLineEdit(str(self._img_dir_var.get()))
+        folder_edit.textChanged.connect(self._img_dir_var.set)
+        self._img_dir_var.changed.connect(folder_edit.setText)
+        browse_button = QPushButton("Browse…")
+        browse_button.clicked.connect(_choose_dir)
+        layout.addWidget(QLabel("Folder:"), 1, 0)
+        layout.addWidget(folder_edit, 1, 1)
+        layout.addWidget(browse_button, 1, 2)
 
         conf_default = getattr(self.owner.camConfig, "dp_conf_list", "0.80")
-        self._conf_list = ctk.StringVar(value=str(conf_default))
+        self._conf_list = QtValue(str(conf_default), self.owner)
         self._mirror_runtime_refs()
-
-        ctk.CTkLabel(f, text="YOLO conf values (comma-separated):").grid(
-            row=3, column=0, padx=12, pady=6, sticky="w"
-        )
-        ctk.CTkEntry(f, textvariable=self._conf_list).grid(
-            row=3, column=1, padx=12, pady=6, sticky="ew"
-        )
-
-        ctk.CTkLabel(
-            f,
-            text="Example: 0.50, 0.65, 0.80   (defaults to 0.80 on bad input)",
-            font=("Segoe UI", 10, "italic"),
-        ).grid(
-            row=4, column=0, columnspan=3, padx=12, pady=(0, 6), sticky="w"
-        )
+        conf_edit = QLineEdit(str(self._conf_list.get()))
+        conf_edit.textChanged.connect(self._conf_list.set)
+        self._conf_list.changed.connect(conf_edit.setText)
+        layout.addWidget(QLabel("YOLO conf values (comma-separated):"), 3, 0)
+        layout.addWidget(conf_edit, 3, 1, 1, 2)
+        hint = QLabel("Example: 0.50, 0.65, 0.80 (defaults to 0.80 on bad input)")
+        hint_font = hint.font()
+        hint_font.setItalic(True)
+        hint.setFont(hint_font)
+        layout.addWidget(hint, 4, 0, 1, 3)
 
         ckpt_default = getattr(self.owner.camConfig, "dp_ckptN", 200)
-        self._ckpt_n = ctk.StringVar(value=str(ckpt_default))
+        self._ckpt_n = QtValue(str(ckpt_default), self.owner)
         self._mirror_runtime_refs()
-        ctk.CTkLabel(f, text="Checkpoint every N images:").grid(row=5, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._ckpt_n, width=100).grid(row=5, column=1, padx=12, pady=6, sticky="w")
+        checkpoint_edit = QLineEdit(str(self._ckpt_n.get()))
+        checkpoint_edit.setMaximumWidth(140)
+        checkpoint_edit.textChanged.connect(self._ckpt_n.set)
+        self._ckpt_n.changed.connect(checkpoint_edit.setText)
+        layout.addWidget(QLabel("Checkpoint every N images:"), 5, 0)
+        layout.addWidget(checkpoint_edit, 5, 1)
 
         prefetch_default = getattr(self.owner.camConfig, "dp_prefetch", 32)
-        self._prefetch = ctk.StringVar(value=str(prefetch_default))
+        self._prefetch = QtValue(str(prefetch_default), self.owner)
         self._mirror_runtime_refs()
-        ctk.CTkLabel(f, text="Prefetch images (count):").grid(row=6, column=0, padx=12, pady=6, sticky="w")
-        ctk.CTkEntry(f, textvariable=self._prefetch, width=100).grid(row=6, column=1, padx=12, pady=6, sticky="w")
+        prefetch_edit = QLineEdit(str(self._prefetch.get()))
+        prefetch_edit.setMaximumWidth(140)
+        prefetch_edit.textChanged.connect(self._prefetch.set)
+        self._prefetch.changed.connect(prefetch_edit.setText)
+        layout.addWidget(QLabel("Prefetch images (count):"), 6, 0)
+        layout.addWidget(prefetch_edit, 6, 1)
 
-        self._progress_label = ctk.CTkLabel(f, text="Idle")
-        self._progress_label.grid(row=20, column=0, columnspan=3, padx=12, pady=(8, 4), sticky="w")
-
-        self._progress = ctk.CTkProgressBar(f)
-        self._progress.grid(row=21, column=0, columnspan=3, padx=12, pady=(0, 8), sticky="ew")
-        self._progress.set(0.0)
+        self._progress_label = QLabel("Idle")
+        layout.addWidget(self._progress_label, 20, 0, 1, 3)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1000)
+        self._progress.setValue(0)
+        layout.addWidget(self._progress, 21, 0, 1, 3)
 
         gpu_display = bool(getattr(self.owner.camConfig, "dp_gpu", False))
-        self._gpu_var = ctk.BooleanVar(value=gpu_display)
+        self._gpu_var = QtValue(gpu_display, self.owner)
         self._mirror_runtime_refs()
+        gpu_checkbox = QCheckBox("Show GPU Util")
+        gpu_checkbox.setChecked(gpu_display)
+        gpu_checkbox.toggled.connect(self._gpu_var.set)
+        self._gpu_var.changed.connect(lambda _value: self.toggle_show_gpu())
+        layout.addWidget(gpu_checkbox, 25, 0)
 
-        gpu_checkbox = ctk.CTkCheckBox(
-            f,
-            text="Show GPU Util",
-            variable=self._gpu_var,
-            command=self.toggle_show_gpu,
-        )
-        gpu_checkbox.grid(row=25, column=0, columnspan=1, padx=5, pady=5, sticky="ew")
-
-        self.gpu_slider = ctk.CTkSlider(f, from_=0, to=100)
-        self.gpu_slider.grid(row=25, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
-        self.gpu_slider.configure(state="disabled")
-        self.gpu_slider.set(0)
+        self.gpu_slider = GpuUtilSlider(Qt.Orientation.Horizontal)
+        self.gpu_slider.setRange(0, 100)
+        self.gpu_slider.setEnabled(gpu_display)
+        self.gpu_slider.setValue(0)
+        layout.addWidget(self.gpu_slider, 25, 1, 1, 2)
         self._mirror_runtime_refs()
-
-        # Preserve current behavior exactly: the page builder toggles this twice.
-        self.toggle_show_gpu()
-        self.toggle_show_gpu()
 
         self._bind_dp_str(self._img_dir_var, "dp_img_dir")
         self._bind_dp_str(self._conf_list, "dp_conf_list")
         self._bind_dp_str(self._ckpt_n, "dp_ckptN")
         self._bind_dp_str(self._prefetch, "dp_prefetch")
 
-        self._run_btn = ctk.CTkButton(
-            f,
-            text="Run YOLO Batch",
-            fg_color=clr.CTK_BUTTON_GREEN,
-            command=self.run_yolo_batch_start,
-        )
-        self._run_btn.grid(row=10, column=0, padx=12, pady=(16, 12), sticky="ew")
+        self._run_btn = QPushButton("Run YOLO Batch")
+        self._run_btn.clicked.connect(self.run_yolo_batch_start)
+        self._kalman_btn = QPushButton("Kalman Batch")
+        self._kalman_btn.clicked.connect(self.run_kalman_batch_start)
+        self._pnp_btn = QPushButton("SolvePnP/QnP Batch")
+        self._pnp_btn.clicked.connect(self.run_pnp_qnp_on_folders_threaded)
+        layout.addWidget(self._run_btn, 10, 0)
+        layout.addWidget(self._kalman_btn, 10, 1)
+        layout.addWidget(self._pnp_btn, 10, 2)
 
-        self._kalman_btn = ctk.CTkButton(
-            f,
-            text="Kalman Batch",
-            command=self.run_kalman_batch_start,
-        )
-        self._kalman_btn.grid(row=10, column=1, padx=12, pady=(16, 12), sticky="ew")
+        self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self.cancel)
+        self._plot_btn = QPushButton("Plot")
+        self._plot_btn.clicked.connect(self.plot_sequential_threaded)
+        close_plot_button = QPushButton("Close Plots")
+        close_plot_button.clicked.connect(self.close_plots)
+        layout.addWidget(self._cancel_btn, 11, 0)
+        layout.addWidget(self._plot_btn, 11, 1)
+        layout.addWidget(close_plot_button, 11, 2)
+        layout.setColumnStretch(1, 1)
+        layout.setRowStretch(99, 1)
 
-        self._pnp_btn = ctk.CTkButton(
-            f,
-            text="SolvePnP/QnP Batch",
-            command=self.run_pnp_qnp_on_folders_threaded,
-        )
-        self._pnp_btn.grid(row=10, column=2, padx=12, pady=(16, 12), sticky="ew")
-
-        self._cancel_btn = ctk.CTkButton(
-            f,
-            text="Cancel",
-            command=self.cancel,
-            state="disabled",
-        )
-        self._cancel_btn.grid(row=11, column=0, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
-
-        self._plot_btn = ctk.CTkButton(
-            f,
-            text="Plot",
-            command=self.plot_sequential_threaded,
-        )
-        self._plot_btn.grid(row=11, column=1, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
-
-        dp_close_plot_btn = ctk.CTkButton(
-            f,
-            text="Close Plots",
-            command=self.close_plots,
-        )
-        dp_close_plot_btn.grid(row=11, column=2, columnspan=1, padx=12, pady=(0, 12), sticky="ew")
+        self.toggle_show_gpu()
 
         self._mirror_runtime_refs()
 
@@ -235,7 +254,7 @@ class BatchController:
         if sample.err:
             return
         if sample.util is not None and self.gpu_slider is not None:
-            self.gpu_slider.set(sample.util)
+            self.gpu_slider.setValue(int(round(sample.util)))
 
     def toggle_show_gpu(self) -> None:
         """Enable or disable GPU utilization monitoring from the UI."""
@@ -244,9 +263,9 @@ class BatchController:
         self.owner.saveToCache()
 
         if self.gpu_slider is not None:
-            self.gpu_slider.configure(state="normal" if enabled else "disabled")
+            self.gpu_slider.setEnabled(enabled)
             if not enabled:
-                self.gpu_slider.set(0.0)
+                self.gpu_slider.setValue(0)
 
         if self.gpu_monitor is None:
             self.gpu_monitor = GpuMonitor(
@@ -347,9 +366,9 @@ class BatchController:
 
         self._set_status("Canceling… (finishing current step)")
         if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="disabled")
+            self._cancel_btn.setEnabled(False)
         if self._run_btn is not None:
-            self._run_btn.configure(state="disabled")
+            self._run_btn.setEnabled(False)
 
     def run_yolo_batch_start(self) -> None:
         """Start a YOLO confidence sweep over the selected image folder."""
@@ -467,7 +486,9 @@ class BatchController:
         for var in parse_vars:
             self.owner.plotter.plot(var, img_dir, False, True)
             try:
-                self.owner.winfo_exists()
+                if getattr(self.owner, "shutting_down", False):
+                    self.close_plots()
+                    return
             except Exception:
                 self.close_plots()
                 return
@@ -576,8 +597,8 @@ class BatchController:
         if getattr(self.owner, "shutting_down", False):
             return
         try:
-            self.owner.after(0, lambda *_: fn(), ())
-        except TclError:
+            self.owner.after(0, fn)
+        except RuntimeError:
             pass
 
     def _current_img_dir(self) -> Path:
@@ -616,32 +637,30 @@ class BatchController:
 
     def _set_status(self, text: str) -> None:
         if self._progress_label is not None:
-            self._progress_label.configure(text=text)
+            self._progress_label.setText(text)
 
     def _set_progress(self, frac: float, text: str | None = None) -> None:
         if self._progress is not None:
-            self._progress.set(float(frac))
+            self._progress.setValue(int(round(max(0.0, min(1.0, float(frac))) * 1000)))
         if text is not None:
             self._set_status(text)
 
     def _set_plot_button_state(self, *, running: bool) -> None:
         if self._plot_btn is not None:
-            self._plot_btn.configure(
-                text="Plotting" if running else "Plot",
-                state="disabled" if running else "normal",
-            )
+            self._plot_btn.setText("Plotting" if running else "Plot")
+            self._plot_btn.setEnabled(not running)
 
     def _set_run_button_state(self, running: bool) -> None:
         if self._run_btn is not None:
-            self._run_btn.configure(state="disabled" if running else "normal")
+            self._run_btn.setEnabled(not running)
         if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="normal" if running else "normal")
+            self._cancel_btn.setEnabled(running)
 
     def _enable_run_buttons_after_finish(self) -> None:
         if self._run_btn is not None:
-            self._run_btn.configure(state="normal")
+            self._run_btn.setEnabled(True)
         if self._cancel_btn is not None:
-            self._cancel_btn.configure(state="normal")
+            self._cancel_btn.setEnabled(False)
 
     def _finish_run(self, text: str) -> None:
         self._set_status(text)

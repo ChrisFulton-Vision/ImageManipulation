@@ -5,7 +5,7 @@ from typing import Any
 
 from numpy.typing import NDArray
 
-import support.gui.UserSelectQueue as GuiQueue
+import support.gui.PySideUserSelectQueue as GuiQueue
 import support.viz.colors as clr
 from support.viz.CVFontScaling import small_text
 

@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from support.core.enums import ImageSource
-import support.gui.UserSelectQueue as GuiQueue
+import support.gui.PySideUserSelectQueue as GuiQueue
 import support.viz.colors as clr
 from support.viz.CVFontScaling import med_thick
 
@@ -46,11 +46,41 @@ class FrameProcessor:
         else:
             np.copyto(markup_frame, frame)
 
-        for func, args in self.owner.list_of_image_process_functors:
+        # Geometric correction must happen before screen-space annotations.
+        # Otherwise undistort remaps HUD/YOLO text as if it were image data and
+        # clips the warped overlay at the frame edges.
+        steps = list(self.owner.list_of_image_process_functors)
+        calibration_steps = []
+        undistort_steps = []
+        remaining_steps = []
+
+        for step in steps:
+            func, _args = step
+            func_name = getattr(func, "__name__", "")
+            if func_name == "adjust_calibration":
+                calibration_steps.append(step)
+            elif func_name == "undistort":
+                undistort_steps.append(step)
+            else:
+                remaining_steps.append(step)
+
+        for func, args in (*calibration_steps, *undistort_steps, *remaining_steps):
             step_args = args if isinstance(args, dict) else {}
             if not bool(step_args.get("state", True)):
                 continue
-            func(frame, markup_frame, ctx, step_args)
+
+            # Once the displayed image has been undistorted, YOLO must infer in
+            # that same pixel coordinate system.  Using the original distorted
+            # frame here produces valid detections whose boxes/feature centers
+            # are nevertheless displaced when drawn on ``markup_frame``.
+            step_frame = frame
+            if (
+                getattr(func, "__name__", "") == "run_yolo"
+                and bool(ctx.undistorted.get_or(False))
+            ):
+                step_frame = markup_frame
+
+            func(step_frame, markup_frame, ctx, step_args)
 
         if box_around and not self.owner.screenshot_impending:
             self.draw_box_around(frame, markup_frame, ctx, ())
@@ -89,7 +119,7 @@ class FrameProcessor:
             )
             self.owner.img_idx += 1
             self.owner.lastImageTime = time.time()
-            self.owner.recordButton.configure(text=f"Saving Imagery: #{self.owner.img_idx}")
+            self.owner.recordButton.setText(f"Saving Imagery: #{self.owner.img_idx}")
             self.owner.screenshot_impending = False
 
     def potential_resize(self, markup_frame: NDArray) -> None:

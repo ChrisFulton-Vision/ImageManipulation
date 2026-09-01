@@ -12,7 +12,7 @@ import cv2
 from math import sin, cos, radians
 import support.viz.colors as clr
 from support.core.enums import PlaybackSpeed
-from support.gui.UserSelectQueue import HudOpts
+from support.gui.PySideUserSelectQueue import HudOpts
 
 MINIMAP_TRI = np.array([[0, 5, -5, 0], [0, 12, 12, 0]])
 

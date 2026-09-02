@@ -7,7 +7,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Qt, Signal, QMimeData
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -311,10 +311,25 @@ class PingMonitorApp(QMainWindow):
         group_layout.setContentsMargins(8, 8, 8, 8)
         group_layout.setSpacing(5)
 
+        control_row = QHBoxLayout()
+
         hint = QLabel(f"{TIME_INPUT_HINT}. Use Now buttons to stamp current local time.")
         hint.setFont(QFont("Segoe UI", 9))
         hint.setWordWrap(True)
-        group_layout.addWidget(hint)
+
+        reset_button = QPushButton("Reset")
+        reset_button.setMaximumWidth(65)
+        reset_button.clicked.connect(self.reset_aircraft_stats)
+
+        copy_button = QPushButton("Copy")
+        copy_button.setMaximumWidth(65)
+        copy_button.clicked.connect(self.copy_aircraft_stats)
+
+        control_row.addWidget(hint, 1)
+        control_row.addWidget(reset_button)
+        control_row.addWidget(copy_button)
+
+        group_layout.addLayout(control_row)
 
         for aircraft in AIRCRAFT:
             aircraft_frame = QFrame()
@@ -453,6 +468,80 @@ class PingMonitorApp(QMainWindow):
     def stamp_aircraft_time(self, aircraft, field_name):
         self.aircraft_stats[aircraft][field_name].setText(datetime.now().strftime("%H:%M:%S"))
         self.update_aircraft_stats()
+
+    def reset_aircraft_stats(self):
+        for aircraft in AIRCRAFT:
+            stats = self.aircraft_stats[aircraft]
+
+            stats["engine_start_edit"].clear()
+            stats["takeoff_edit"].clear()
+            stats["land_edit"].clear()
+
+        self.update_aircraft_stats()
+
+    def copy_aircraft_stats(self):
+        headers = [
+            "Aircraft",
+            "Engine Start",
+            "Take-off",
+            "Land",
+            "Engine Time",
+            "Flight Time",
+        ]
+
+        rows = []
+
+        for aircraft in AIRCRAFT:
+            stats = self.aircraft_stats[aircraft]
+
+            rows.append([
+                aircraft,
+                stats["engine_start_edit"].text().strip(),
+                stats["takeoff_edit"].text().strip(),
+                stats["land_edit"].text().strip(),
+                stats["engine_time_label"].text(),
+                stats["flight_time_label"].text(),
+            ])
+
+        # Plain-text fallback: useful for Excel, Notepad, etc.
+        text_rows = [headers] + rows
+        plain_text = "\n".join(
+            "\t".join(row)
+            for row in text_rows
+        )
+
+        # Rich HTML version: OneNote should recognize this as a real table.
+        html = """
+        <table border="1" cellspacing="0" cellpadding="4">
+            <thead>
+                <tr>
+        """
+
+        for header in headers:
+            html += f"<th>{header}</th>"
+
+        html += """
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        for row in rows:
+            html += "<tr>"
+            for value in row:
+                html += f"<td>{value}</td>"
+            html += "</tr>"
+
+        html += """
+            </tbody>
+        </table>
+        """
+
+        mime_data = QMimeData()
+        mime_data.setText(plain_text)
+        mime_data.setHtml(html)
+
+        QApplication.clipboard().setMimeData(mime_data)
 
     def update_aircraft_stats(self):
         now = datetime.now()

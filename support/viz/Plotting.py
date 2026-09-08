@@ -293,13 +293,14 @@ class Plotter:
         # s2 over time (key “whitened residual sanity” plot)
         if have_qnp_stats or have_qnp_kf_stats:
             plt.figure()
-            if have_qnp_stats:
-                plt.plot(t, merged["qnp_s2"], label="QnP s2")
+            # if have_qnp_stats:
+            #     plt.plot(t, merged["qnp_s2"], label="QnP s2")
             if have_qnp_kf_stats:
                 plt.plot(t, merged["qnp_kf_s2"], label="QnP-KF s2")
             plt.axhline(1.0, linestyle="--", label="target ~1 (whitened)")
             plt.xlabel("Time [s]")
             plt.ylabel("s2 = SSE_w / dof")
+            plt.ylim((0.0, 6.0))
             # plt.title("SolveQnP Residual Scale (s2) vs Time")
             plt.grid(True)
             plt.legend()
@@ -867,6 +868,16 @@ class Plotter:
             # NEW FIGURES: Region-summary stats (NIS + Gain + Rejection)
             # ============================================================
 
+
+            # ---- ROI time base: elapsed seconds from first frame ----
+            t_roi = pd.to_numeric(merged_kf["image_time"], errors="coerce").to_numpy(dtype=float)
+
+            finite_t = np.flatnonzero(np.isfinite(t_roi))
+            if finite_t.size == 0:
+                raise ValueError("No valid image_time values available for ROI analysis.")
+
+            t_roi = t_roi - t_roi[finite_t[0]]
+
             # ---- configure windows (seconds) ----
             roi_windows = [
                 ("Early gain (1.5–3.0s)", 1.5, 3.0),
@@ -898,12 +909,20 @@ class Plotter:
                 rej_frac = 1.0 - merged_kf["kf_used_rate"].to_numpy(dtype=float)
 
             def _collect_used_nis(t0, t1):
-                m = (t >= t0) & (t <= t1)
+                m = (t_roi >= t0) & (t_roi <= t1)
+
                 if len(nis_cols) == 0 or len(used_cols) == 0:
                     return np.array([], dtype=float), int(np.count_nonzero(m))
+
                 nisM = merged_kf.loc[m, nis_cols].to_numpy(dtype=float)
                 useM = merged_kf.loc[m, used_cols].to_numpy(dtype=float)
-                x = nisM[(useM > 0.5) & np.isfinite(nisM) & (nisM >= 0.0)]
+
+                x = nisM[
+                    (useM > 0.5)
+                    & np.isfinite(nisM)
+                    & (nisM >= 0.0)
+                    ]
+
                 return x, int(np.count_nonzero(m))
 
             def _roi_stat(arr):
@@ -927,9 +946,11 @@ class Plotter:
             def _roi_rej_stat(t0, t1):
                 if rej_frac is None:
                     return np.nan
-                m = (t >= t0) & (t <= t1)
+
+                m = (t_roi >= t0) & (t_roi <= t1)
                 r = rej_frac[m]
                 r = r[np.isfinite(r)]
+
                 return float(np.mean(r)) if r.size else np.nan
 
             # ---- collect region datasets ----
@@ -952,7 +973,11 @@ class Plotter:
             # FIG 1: Boxplot of used-feature NIS by window
             # ============================================================
             plt.figure(figsize=(8, 5))
-            plt.boxplot(nis_used_sets, labels=labels, showfliers=False)
+            plt.boxplot(
+                nis_used_sets,
+                tick_labels=labels,
+                showfliers=False,
+            )
             plt.ylabel("Per-feature NIS (used measurements only)")
             plt.xlabel("Time window")
             plt.grid(True, axis="y")

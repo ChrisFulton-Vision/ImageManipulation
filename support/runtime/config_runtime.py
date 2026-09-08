@@ -2,9 +2,10 @@ import copy
 from pathlib import Path
 from typing import Any
 
-import customtkinter as ctk
+from PySide6.QtCore import QSignalBlocker
 
 from support.core.enums import ExportQuality, check_if_enum
+from support.gui.qt_scheduler import QtValue
 from support.io.attitude_interpreter import AttitudeReader
 from support.io.my_logging import LOG
 
@@ -21,13 +22,13 @@ class ConfigRuntime:
             if not hasattr(self.owner.camConfig, name):
                 setattr(self.owner.camConfig, name, 1.0 if name in double_vars else False)
 
-            if name in double_vars:
-                var = ctk.DoubleVar(value=getattr(self.owner.camConfig, name, 1.0))
-            else:
-                var = ctk.BooleanVar(value=bool(getattr(self.owner.camConfig, name, False)))
-
-            var.trace_add("write", lambda var_name, index, op, n=name: self.on_flag_changed(n))
-            self.owner._flag_vars[name] = var
+            value = getattr(self.owner.camConfig, name, 1.0 if name in double_vars else False)
+            value = float(value) if name in double_vars else bool(value)
+            observable = QtValue(value, self.owner)
+            observable.changed.connect(
+                lambda _value, flag_name=name: self.on_flag_changed(flag_name)
+            )
+            self.owner._flag_vars[name] = observable
 
     def on_flag_changed(self, name: str) -> None:
         if name in ("yolo_conf", "yolo_iou"):
@@ -40,10 +41,16 @@ class ConfigRuntime:
 
     def sync_flags_from_model(self) -> None:
         for name in self.owner._flags:
+            observable = self.owner._flag_vars[name]
             if name in ("yolo_conf", "yolo_iou"):
-                self.owner._flag_vars[name].set(float(getattr(self.owner.camConfig, name, 1.0)))
+                value = float(getattr(self.owner.camConfig, name, 1.0))
             else:
-                self.owner._flag_vars[name].set(bool(getattr(self.owner.camConfig, name, False)))
+                value = bool(getattr(self.owner.camConfig, name, False))
+
+            # Model-to-view synchronization is not a user edit and must not
+            # bounce through changed() into another cache write.
+            with QSignalBlocker(observable):
+                observable.set(value)
 
     def sync_dp_from_model(self) -> None:
         self.owner.batch_controller.sync_from_model()
@@ -205,10 +212,6 @@ class ConfigRuntime:
         return True
 
     def update_post_new_config(self) -> None:
-        iou = copy.deepcopy(self.owner.camConfig.yolo_iou)
-        self.owner._flag_vars["yolo_conf"].set(float(self.owner.camConfig.yolo_conf))
-        self.owner._flag_vars["yolo_iou"].set(float(iou))
-
         self.update_log_file()
         self.ingest_calibration()
         self.update_yolo_model()
@@ -219,20 +222,22 @@ class ConfigRuntime:
         self.sync_dp_from_model()
         self.sync_queue_from_model()
 
-        try:
-            if hasattr(self.owner, "gpu_slider"):
-                self.owner.gpu_slider.configure(
-                    state="normal" if bool(getattr(self.owner.camConfig, "dp_gpu", False)) else "disabled"
-                )
-            if not bool(getattr(self.owner.camConfig, "dp_gpu", False)):
-                self.owner.gpu_slider.set(0.0)
-        except TypeError:
-            pass
+        gpu_slider = getattr(self.owner, "gpu_slider", None)
+        if gpu_slider is not None:
+            gpu_enabled = bool(getattr(self.owner.camConfig, "dp_gpu", False))
+            gpu_slider.setEnabled(gpu_enabled)
+            if not gpu_enabled:
+                with QSignalBlocker(gpu_slider):
+                    gpu_slider.setValue(0)
 
         if self.owner.exportStartFrame is not None:
-            self.owner.exportStartFrame.configure(text=f"Start Frame: {self.owner.camConfig.start_export_idx}")
+            self.owner.exportStartFrame.setText(
+                f"Start Frame: {self.owner.camConfig.start_export_idx}"
+            )
         if self.owner.exportEndFrame is not None:
-            self.owner.exportEndFrame.configure(text=f"End Frame: {self.owner.camConfig.end_export_idx}")
+            self.owner.exportEndFrame.setText(
+                f"End Frame: {self.owner.camConfig.end_export_idx}"
+            )
 
         if hasattr(self.owner, "filepath_page") and self.owner.filepath_page is not None:
             self.owner.filepath_page.sync_labels()
@@ -241,7 +246,10 @@ class ConfigRuntime:
             self.owner.playback_controller.update_playback_menu()
 
         if hasattr(self.owner, "exportQualityCombo") and self.owner.exportQualityCombo is not None:
-            self.owner.exportQualityCombo.set(self.owner.camConfig.export_quality.value)
+            with QSignalBlocker(self.owner.exportQualityCombo):
+                self.owner.exportQualityCombo.setCurrentText(
+                    self.owner.camConfig.export_quality.value
+                )
 
         self.save_to_cache()
 
@@ -313,23 +321,18 @@ class ConfigRuntime:
             and not self.owner.calibration.fromFile(self.owner.camConfig.calibFilepath)
         ):
             if self.owner.selectCalibLabel is not None:
-                self.owner.selectCalibLabel.configure(text="No Calibration Found")
-                self.owner.after(10, self.owner.update_idletasks)  # type: ignore[call-arg]
+                self.owner.selectCalibLabel.setText("No Calibration Found")
             return
 
         if not self.owner.calibration.validCal:
             return
 
         if self.owner.selectCalibLabel is not None:
-            self.owner.selectCalibLabel.configure(
-                text="../" + Path(self.owner.camConfig.calibFilepath).name if self.owner.camConfig.calibFilepath else "../",
-                bg_color=self.owner.selectCalibLabel.cget("bg_color"),
+            self.owner.selectCalibLabel.setText(
+                "../" + Path(self.owner.camConfig.calibFilepath).name
+                if self.owner.camConfig.calibFilepath
+                else "../"
             )
-            self.owner.filepath_page.update_idletasks()
-            self.owner.update_idletasks()
-            self.owner.selectCalibLabel.update_idletasks()
-            self.owner.filepath_page.update_idletasks()
-            self.owner.update_idletasks()
 
         if self.owner.yoloSession is not None:
             self.owner.yoloSession.set_calibration(self.owner.calibration)

@@ -7,8 +7,22 @@ from functools import partial
 import time
 from pathlib import Path
 
-import customtkinter as ctk
-from PIL import Image
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QImage, QPixmap, QResizeEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QDoubleSpinBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 DIST_TIME = 5
 FPS = 30
@@ -757,154 +771,212 @@ def render_gui_preview(
     return preview
 
 
-class DistortionGui(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title("Brown-Conrady Distortion Viewer")
-        self.geometry("1320x980")
-        self.minsize(1180, 900)
+class _ParameterControl(QWidget):
+    """A precise float editor backed by a slider and a spin box."""
+
+    valueChanged = Signal(float)
+    _SLIDER_SCALE = 1_000_000
+
+    def __init__(self, name: str, minimum: float, maximum: float, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.name = name
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+
+        self.name_label = QLabel(name)
+        self.name_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.name_label, 0, 0)
+
+        self.spin_box = QDoubleSpinBox()
+        self.spin_box.setDecimals(6)
+        self.spin_box.setRange(minimum, maximum)
+        self.spin_box.setSingleStep(0.0001 if max(abs(minimum), abs(maximum)) <= 0.1 else 0.01)
+        self.spin_box.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.spin_box.setFixedWidth(130)
+        layout.addWidget(self.spin_box, 0, 1)
+        layout.setColumnStretch(0, 1)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(
+            round(minimum * self._SLIDER_SCALE),
+            round(maximum * self._SLIDER_SCALE),
+        )
+        layout.addWidget(self.slider, 1, 0, 1, 2)
+
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        self.spin_box.valueChanged.connect(self._on_spin_changed)
+
+    def value(self) -> float:
+        return float(self.spin_box.value())
+
+    def setValue(self, value: float) -> None:
+        value = float(value)
+        with QSignalBlocker(self.slider), QSignalBlocker(self.spin_box):
+            self.slider.setValue(round(value * self._SLIDER_SCALE))
+            self.spin_box.setValue(value)
+
+    def _on_slider_changed(self, slider_value: int) -> None:
+        value = slider_value / self._SLIDER_SCALE
+        with QSignalBlocker(self.spin_box):
+            self.spin_box.setValue(value)
+        self.valueChanged.emit(value)
+
+    def _on_spin_changed(self, value: float) -> None:
+        with QSignalBlocker(self.slider):
+            self.slider.setValue(round(value * self._SLIDER_SCALE))
+        self.valueChanged.emit(float(value))
+
+
+class DistortionGui(QWidget):
+    """Native PySide6 viewer for the Brown-Conrady distortion model."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Brown-Conrady Distortion Viewer")
+        self.resize(1320, 980)
+        self.setMinimumSize(1180, 900)
 
         self.preview_cal = build_preview_calibration()
-        self.slider_vars: dict[str, ctk.DoubleVar] = {}
-        self.num_col_lines_var = ctk.StringVar(value=str(GUI_DEFAULT_NUM_COL_LINES))
-        self.num_row_lines_var = ctk.StringVar(value=str(GUI_DEFAULT_NUM_ROW_LINES))
+        self.parameter_controls: dict[str, _ParameterControl] = {}
         self.num_col_lines = GUI_DEFAULT_NUM_COL_LINES
         self.num_row_lines = GUI_DEFAULT_NUM_ROW_LINES
-        self.preview_image = None
-        self._render_job = None
-        self._randomizer_job = None
+        self.preview_pixmap: QPixmap | None = None
         self._randomizer_active = False
         self._randomizer_t0 = 0.0
 
-        ctk.set_appearance_mode("dark")
-        self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self.render_preview)
 
-        controls = ctk.CTkFrame(self, corner_radius=8)
-        controls.grid(row=0, column=0, padx=16, pady=16, sticky="ns")
-        controls.grid_columnconfigure(0, weight=1)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._fit_preview)
 
-        ctk.CTkLabel(controls, text="Distortion Parameters", font=("Segoe UI", 20, "bold")).grid(
-            row=0, column=0, padx=16, pady=(16, 12), sticky="w"
-        )
+        self._randomizer_timer = QTimer(self)
+        self._randomizer_timer.setInterval(33)
+        self._randomizer_timer.timeout.connect(self.step_randomizer)
 
-        for row_index, name in enumerate(GUI_PARAM_NAMES, start=1):
-            self._build_slider_row(controls, row=row_index, name=name)
-
-        self._build_grid_controls(controls, row=len(GUI_PARAM_NAMES) + 1)
-
-        ctk.CTkButton(controls, text="Reset Defaults", command=self.reset_defaults).grid(
-            row=len(GUI_PARAM_NAMES) + 2, column=0, padx=16, pady=(16, 10), sticky="ew"
-        )
-        ctk.CTkButton(controls, text="Set Zeros", command=self.set_zeros).grid(
-            row=len(GUI_PARAM_NAMES) + 3, column=0, padx=16, pady=(16, 10), sticky="ew"
-        )
-        self.randomizer_button = ctk.CTkButton(
-            controls,
-            text="Start Randomizer",
-            command=self.toggle_randomizer,
-        )
-        self.randomizer_button.grid(
-            row=len(GUI_PARAM_NAMES) + 4, column=0, padx=16, pady=(16, 10), sticky="ew"
-        )
-
-        ctk.CTkLabel(
-            controls,
-            text="The preview uses the forward Brown-Conrady model with a live distorted mesh.",
-            justify="left",
-            wraplength=260,
-        ).grid(row=len(GUI_PARAM_NAMES) + 5, column=0, padx=16, pady=(0, 16), sticky="w")
-
-        preview_frame = ctk.CTkFrame(self, corner_radius=8)
-        preview_frame.grid(row=0, column=1, padx=(0, 16), pady=16, sticky="nsew")
-        preview_frame.grid_rowconfigure(0, weight=1)
-        preview_frame.grid_columnconfigure(0, weight=1)
-
-        self.preview_label = ctk.CTkLabel(preview_frame, text="")
-        self.preview_label.grid(row=0, column=0, padx=12, pady=12, sticky="nsew")
-
+        self._build_ui()
         self.reset_defaults()
 
-    def _build_slider_row(self, parent, *, row: int, name: str) -> None:
-        current = float(getattr(self.preview_cal, name))
-        var = ctk.DoubleVar(value=current)
-        self.slider_vars[name] = var
-
-        row_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        row_frame.grid(row=row, column=0, padx=16, pady=8, sticky="ew")
-        row_frame.grid_columnconfigure(0, weight=1)
-
-        label_var = ctk.StringVar(value=self._format_label(name, current))
-        setattr(self, f"{name}_label_var", label_var)
-
-        ctk.CTkLabel(row_frame, textvariable=label_var, anchor="w").grid(row=0, column=0, sticky="ew")
-        ctk.CTkSlider(
-            row_frame,
-            from_=GUI_PARAM_RANGES[name][0],
-            to=GUI_PARAM_RANGES[name][1],
-            variable=var,
-            command=lambda _value, param_name=name: self.on_slider_change(param_name),
-        ).grid(row=1, column=0, pady=(6, 0), sticky="ew")
-
-    def _build_grid_controls(self, parent, *, row: int) -> None:
-        grid_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        grid_frame.grid(row=row, column=0, padx=16, pady=(12, 4), sticky="ew")
-        grid_frame.grid_columnconfigure(0, weight=1)
-        grid_frame.grid_columnconfigure(1, weight=1)
-
-        ctk.CTkLabel(grid_frame, text="Mesh Grid", anchor="w").grid(
-            row=0, column=0, columnspan=2, sticky="w"
-        )
-        ctk.CTkLabel(grid_frame, text="Columns", anchor="w").grid(row=1, column=0, pady=(8, 4), sticky="w")
-        ctk.CTkLabel(grid_frame, text="Rows", anchor="w").grid(row=1, column=1, pady=(8, 4), sticky="w")
-
-        col_entry = ctk.CTkEntry(grid_frame, textvariable=self.num_col_lines_var)
-        col_entry.grid(row=2, column=0, padx=(0, 6), sticky="ew")
-        col_entry.bind("<Return>", self.on_grid_entry_commit)
-        col_entry.bind("<FocusOut>", self.on_grid_entry_commit)
-
-        row_entry = ctk.CTkEntry(grid_frame, textvariable=self.num_row_lines_var)
-        row_entry.grid(row=2, column=1, padx=(6, 0), sticky="ew")
-        row_entry.bind("<Return>", self.on_grid_entry_commit)
-        row_entry.bind("<FocusOut>", self.on_grid_entry_commit)
-
-        ctk.CTkButton(grid_frame, text="Apply Grid", command=self.apply_grid_dimensions).grid(
-            row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew"
+    def _build_ui(self) -> None:
+        self.setStyleSheet(
+            """
+            DistortionGui { background: #16191d; color: #f1f3f5; }
+            QFrame#panel { background: #20242a; border: 1px solid #343a42; border-radius: 8px; }
+            QLabel { color: #f1f3f5; }
+            QPushButton { background: #2f6fed; color: white; border: 0; border-radius: 5px;
+                          min-height: 30px; padding: 3px 10px; font-weight: 600; }
+            QPushButton:hover { background: #397af5; }
+            QPushButton:pressed { background: #255dcc; }
+            QSpinBox, QDoubleSpinBox { background: #171a1f; color: #f1f3f5;
+                                      border: 1px solid #4a515b; border-radius: 4px;
+                                      padding: 3px; padding-right: 22px; }
+            QSlider::groove:horizontal { background: #3c424b; height: 5px; border-radius: 2px; }
+            QSlider::sub-page:horizontal { background: #2f6fed; border-radius: 2px; }
+            QSlider::handle:horizontal { background: #f1f3f5; width: 14px; margin: -5px 0;
+                                         border-radius: 7px; }
+            """
         )
 
-    @staticmethod
-    def _format_label(name: str, value: float) -> str:
-        return f"{name}: {value:+.6f}"
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(16)
 
-    def on_slider_change(self, name: str) -> None:
+        controls = QFrame()
+        controls.setObjectName("panel")
+        controls.setFixedWidth(310)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(16, 16, 16, 16)
+        controls_layout.setSpacing(12)
+
+        title = QLabel("Distortion Parameters")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        controls_layout.addWidget(title)
+
+        for name in GUI_PARAM_NAMES:
+            self._build_slider_row(controls_layout, name=name)
+
+        controls_layout.addLayout(self._build_grid_controls())
+
+        reset_button = QPushButton("Reset Defaults")
+        reset_button.clicked.connect(self.reset_defaults)
+        controls_layout.addWidget(reset_button)
+
+        zero_button = QPushButton("Set Zeros")
+        zero_button.clicked.connect(self.set_zeros)
+        controls_layout.addWidget(zero_button)
+
+        self.randomizer_button = QPushButton("Start Randomizer")
+        self.randomizer_button.clicked.connect(self.toggle_randomizer)
+        controls_layout.addWidget(self.randomizer_button)
+
+        description = QLabel(
+            "The preview uses the forward Brown-Conrady model with a live distorted mesh."
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet("color: #b7bec8;")
+        controls_layout.addWidget(description)
+        controls_layout.addStretch(1)
+        root_layout.addWidget(controls)
+
+        preview_frame = QFrame()
+        preview_frame.setObjectName("panel")
+        preview_layout = QVBoxLayout(preview_frame)
+        preview_layout.setContentsMargins(12, 12, 12, 12)
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.preview_label.setMinimumSize(640, 480)
+        self.preview_label.setStyleSheet("background: #050607; border-radius: 4px;")
+        preview_layout.addWidget(self.preview_label)
+        root_layout.addWidget(preview_frame, 1)
+
+    def _build_slider_row(self, parent_layout: QVBoxLayout, *, name: str) -> None:
+        minimum, maximum = GUI_PARAM_RANGES[name]
+        control = _ParameterControl(name, minimum, maximum)
+        control.valueChanged.connect(lambda value, param_name=name: self.on_slider_change(param_name, value))
+        self.parameter_controls[name] = control
+        parent_layout.addWidget(control)
+
+    def _build_grid_controls(self) -> QGridLayout:
+        layout = QGridLayout()
+        layout.setContentsMargins(0, 8, 0, 4)
+        layout.setHorizontalSpacing(10)
+        layout.addWidget(QLabel("Mesh Grid"), 0, 0, 1, 2)
+        layout.addWidget(QLabel("Columns"), 1, 0)
+        layout.addWidget(QLabel("Rows"), 1, 1)
+
+        self.num_col_lines_spin = QSpinBox()
+        self.num_col_lines_spin.setRange(GUI_MIN_GRID_LINES, GUI_MAX_GRID_LINES)
+        self.num_col_lines_spin.setValue(GUI_DEFAULT_NUM_COL_LINES)
+        self.num_col_lines_spin.setMinimumWidth(100)
+        layout.addWidget(self.num_col_lines_spin, 2, 0)
+
+        self.num_row_lines_spin = QSpinBox()
+        self.num_row_lines_spin.setRange(GUI_MIN_GRID_LINES, GUI_MAX_GRID_LINES)
+        self.num_row_lines_spin.setValue(GUI_DEFAULT_NUM_ROW_LINES)
+        self.num_row_lines_spin.setMinimumWidth(100)
+        layout.addWidget(self.num_row_lines_spin, 2, 1)
+
+        self.num_col_lines_spin.valueChanged.connect(self.apply_grid_dimensions)
+        self.num_row_lines_spin.valueChanged.connect(self.apply_grid_dimensions)
+        return layout
+
+    def on_slider_change(self, name: str, value: float) -> None:
         self.stop_randomizer()
-        value = float(self.slider_vars[name].get())
-        getattr(self, f"{name}_label_var").set(self._format_label(name, value))
-        setattr(self.preview_cal, name, value)
+        setattr(self.preview_cal, name, float(value))
         self.schedule_render()
 
-    @staticmethod
-    def _parse_grid_dimension(value: str, *, fallback: int) -> int:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            parsed = fallback
-        return int(np.clip(parsed, GUI_MIN_GRID_LINES, GUI_MAX_GRID_LINES))
-
-    def on_grid_entry_commit(self, _event=None) -> None:
-        self.apply_grid_dimensions()
-
-    def apply_grid_dimensions(self) -> None:
-        num_col_lines = self._parse_grid_dimension(self.num_col_lines_var.get(), fallback=self.num_col_lines)
-        num_row_lines = self._parse_grid_dimension(self.num_row_lines_var.get(), fallback=self.num_row_lines)
-
+    def apply_grid_dimensions(self, _value: int | None = None) -> None:
+        num_col_lines = self.num_col_lines_spin.value()
+        num_row_lines = self.num_row_lines_spin.value()
         changed = (num_col_lines != self.num_col_lines) or (num_row_lines != self.num_row_lines)
         self.num_col_lines = num_col_lines
         self.num_row_lines = num_row_lines
-        self.num_col_lines_var.set(str(num_col_lines))
-        self.num_row_lines_var.set(str(num_row_lines))
-
         if changed:
             self.schedule_render()
 
@@ -913,17 +985,14 @@ class DistortionGui(ctk.CTk):
         default_cal = build_preview_calibration()
         self.apply_coefficients({name: float(getattr(default_cal, name)) for name in GUI_PARAM_NAMES})
 
-    def set_zeros(self):
+    def set_zeros(self) -> None:
         self.stop_randomizer()
-        default_cal = build_preview_calibration()
-        default_cal.setDistortion(default_cal.getDistortion() * 0.0)
-        self.apply_coefficients({name: float(getattr(default_cal, name)) for name in GUI_PARAM_NAMES})
+        self.apply_coefficients({name: 0.0 for name in GUI_PARAM_NAMES})
 
     def apply_coefficients(self, coefficients: dict[str, float]) -> None:
         for name in GUI_PARAM_NAMES:
             value = float(coefficients[name])
-            self.slider_vars[name].set(value)
-            getattr(self, f"{name}_label_var").set(self._format_label(name, value))
+            self.parameter_controls[name].setValue(value)
             setattr(self.preview_cal, name, value)
         self.schedule_render()
 
@@ -933,19 +1002,17 @@ class DistortionGui(ctk.CTk):
             return
         self._randomizer_active = True
         self._randomizer_t0 = time.perf_counter()
-        self.randomizer_button.configure(text="Stop Randomizer")
+        self.randomizer_button.setText("Stop Randomizer")
         self.step_randomizer()
+        self._randomizer_timer.start()
 
     def stop_randomizer(self) -> None:
-        if self._randomizer_job is not None:
-            self.after_cancel(self._randomizer_job)
-            self._randomizer_job = None
+        self._randomizer_timer.stop()
         if self._randomizer_active:
             self._randomizer_active = False
-            self.randomizer_button.configure(text="Start Randomizer")
+            self.randomizer_button.setText("Start Randomizer")
 
     def step_randomizer(self) -> None:
-        self._randomizer_job = None
         if not self._randomizer_active:
             return
 
@@ -966,29 +1033,58 @@ class DistortionGui(ctk.CTk):
             coefficients[name] = center + normalized * half_span
 
         self.apply_coefficients(coefficients)
-        self._randomizer_job = self.after(33, self.step_randomizer)
 
     def schedule_render(self) -> None:
-        if self._render_job is not None:
-            self.after_cancel(self._render_job)
-        self._render_job = self.after(1, self.render_preview)
+        self._render_timer.start(1)
 
     def render_preview(self) -> None:
-        self._render_job = None
         preview_bgr = render_gui_preview(
             self.preview_cal,
             num_col_lines=self.num_col_lines,
             num_row_lines=self.num_row_lines,
         )
-        preview_rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(preview_rgb)
-        self.preview_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
-        self.preview_label.configure(image=self.preview_image)
+        preview_rgb = np.ascontiguousarray(cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB))
+        height, width, channels = preview_rgb.shape
+        image = QImage(
+            preview_rgb.data,
+            width,
+            height,
+            channels * width,
+            QImage.Format.Format_RGB888,
+        ).copy()
+        self.preview_pixmap = QPixmap.fromImage(image)
+        self._fit_preview()
+
+    def _fit_preview(self) -> None:
+        if self.preview_pixmap is None or self.preview_label.width() <= 1 or self.preview_label.height() <= 1:
+            return
+        self.preview_label.setPixmap(
+            self.preview_pixmap.scaled(
+                self.preview_label.contentsRect().size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._resize_timer.start(0)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self.stop_randomizer()
+        self._render_timer.stop()
+        self._resize_timer.stop()
+        super().closeEvent(event)
 
 
-def run_gui() -> None:
-    app = DistortionGui()
-    app.mainloop()
+def run_gui() -> int:
+    app = QApplication.instance()
+    owns_application = app is None
+    if app is None:
+        app = QApplication([])
+    window = DistortionGui()
+    window.show()
+    return app.exec() if owns_application else 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -1008,8 +1104,8 @@ def parse_args() -> argparse.Namespace:
 
 def main(args: argparse.Namespace) -> None:
     cal = default_864_cam()
-    cal.setDistortion(12.0 * cal.getDistortion())
-    cal.p1 = cal.p2 = 0.0
+    cal.setDistortion(8.0 * cal.getDistortion())
+    # cal.p1 = cal.p2 = 0.0
 
     if args.image is not None:
         clean_image = load_demo_image(args.image, width=cal.width, height=cal.height)

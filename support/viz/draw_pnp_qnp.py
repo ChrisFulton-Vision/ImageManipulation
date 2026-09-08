@@ -946,7 +946,10 @@ class pnp_qnp_draw:
                         eigvals = np.maximum(eigvals, 0.0)
                         gate_msq = 1.0
                         if feature_gate_mahal_sq is not None and idx < len(feature_gate_mahal_sq):
-                            gate_msq = max(float(feature_gate_mahal_sq[idx]), 0.0)
+                            raw_gate_msq = float(feature_gate_mahal_sq[idx])
+                            if np.isfinite(raw_gate_msq):
+                                gate_msq = max(raw_gate_msq, 0.0)
+
                         major = max(1, int(round(np.sqrt(gate_msq * eigvals[1]))))
                         minor = max(1, int(round(np.sqrt(gate_msq * eigvals[0]))))
                         angle = float(np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1])))
@@ -1023,7 +1026,9 @@ class pnp_qnp_draw:
                     eigvals = np.maximum(eigvals, 0.0)
                     gate_msq = 1.0
                     if kfest_gate_mahal_sq is not None and idx < len(kfest_gate_mahal_sq):
-                        gate_msq = max(float(kfest_gate_mahal_sq[idx]), 0.0)
+                        raw_gate_msq = float(kfest_gate_mahal_sq[idx])
+                        if np.isfinite(raw_gate_msq):
+                            gate_msq = max(raw_gate_msq, 0.0)
                     major = max(1, int(round(np.sqrt(gate_msq * eigvals[1]))))
                     minor = max(1, int(round(np.sqrt(gate_msq * eigvals[0]))))
                     angle = float(np.degrees(np.arctan2(eigvecs[1, 1], eigvecs[0, 1])))

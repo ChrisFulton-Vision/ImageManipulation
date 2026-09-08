@@ -110,7 +110,7 @@ class AccessibleCheckBoxStyle(QProxyStyle):
 class FooterAction:
     text: str
     callback: Callable[[], None]
-    bind: Callable[[QPushButton], None] | None = None
+    bind: Callable[[QPushButton], Callable[[], None] | None] | None = None
 
 
 class SectionedPage(QWidget):
@@ -177,6 +177,59 @@ class SectionedPage(QWidget):
         pass
 
 
+class CalibrationPage(SectionedPage):
+    title = "Calibrate"
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent=parent)
+        from calibrateGUI_pyside import CalibrateGui
+
+        self.calPage = CalibrateGui(self)
+        self.set_sections({
+            "Configuration": self.calPage.config_frame,
+            "Images": self.calPage.image_frame,
+            "Config": self.calPage.advanced_frame,
+            "Cal Result": self.calPage.cal_frame,
+        })
+
+    def footer_action(self) -> FooterAction:
+        def start_calibration() -> None:
+            self.calPage.calibrate_buttonCallback()
+
+        def bind(button: QPushButton) -> Callable[[], None]:
+            def render(calculating: bool) -> None:
+                button.setText("Calibrating…" if calculating else "Start Calibration")
+                button.setEnabled(not calculating)
+
+            self.calPage.calibrationStateChanged.connect(render)
+            render(bool(self.calPage.calculating))
+
+            def unbind() -> None:
+                try:
+                    self.calPage.calibrationStateChanged.disconnect(render)
+                except (RuntimeError, TypeError):
+                    pass
+
+            return unbind
+
+        return FooterAction("Start Calibration", start_calibration, bind)
+
+    def on_show(self) -> None:
+        self.calPage.set_ui_active(True)
+
+    def on_hide(self) -> None:
+        self.calPage.set_ui_active(False)
+
+    def on_section_show(self, name: str) -> None:
+        self.calPage.on_section_show(name)
+
+    def on_section_hide(self, name: str) -> None:
+        self.calPage.on_section_hide(name)
+
+    def shutdown(self) -> None:
+        self.calPage.on_app_close()
+
+
 class CameraPage(SectionedPage):
     title = "Camera"
 
@@ -199,7 +252,7 @@ class CameraPage(SectionedPage):
             running = self.camGui.startStreamToggle()
             self.camGui.filepath_page.update_buttonsForStream(running)
 
-        def bind(button: QPushButton) -> None:
+        def bind(button: QPushButton) -> Callable[[], None]:
             def render(value=None) -> None:
                 running = bool(
                     self.camGui.stream_running_var.get()
@@ -211,6 +264,14 @@ class CameraPage(SectionedPage):
 
             self.camGui.stream_running_var.changed.connect(render)
             render()
+
+            def unbind() -> None:
+                try:
+                    self.camGui.stream_running_var.changed.disconnect(render)
+                except (RuntimeError, TypeError):
+                    pass
+
+            return unbind
 
         return FooterAction("Start Camera", toggle, bind)
 
@@ -240,11 +301,17 @@ class NavigationPane(QFrame):
         self.layout.addStretch(1)
 
     def clear(self) -> None:
-        while self.layout.count() > 1:
+        # Footer actions are intentionally placed after the stretch so they sit
+        # at the bottom of the navigation pane.  Consequently, the last layout
+        # item is not guaranteed to be the stretch.  Remove everything and
+        # rebuild that spacer instead of preserving the final item.
+        while self.layout.count():
             item = self.layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()
                 widget.deleteLater()
+        self.layout.addStretch(1)
 
     def add_heading(self, text: str) -> None:
         label = QLabel(text)
@@ -275,6 +342,7 @@ class App(QMainWindow):
         self._active_page_name: str | None = None
         self._main_buttons: dict[str, QPushButton] = {}
         self._section_buttons: dict[str, QPushButton] = {}
+        self._footer_unbind: Callable[[], None] | None = None
 
         self.setWindowTitle("Camera Utilities by Jarvis")
         self.resize(1280, 800)
@@ -313,6 +381,7 @@ class App(QMainWindow):
         if self._active_page_name == name:
             return
         if self._active_page_name is not None:
+            self._unbind_footer()
             self.pages[self._active_page_name].on_hide()
 
         self._active_page_name = name
@@ -325,6 +394,7 @@ class App(QMainWindow):
         self._build_subnav(page)
 
     def _build_subnav(self, page: SectionedPage) -> None:
+        self._unbind_footer()
         self.sub_nav.clear()
         self.sub_nav.add_heading(page.title)
         self._section_buttons = {}
@@ -340,7 +410,7 @@ class App(QMainWindow):
             footer = QPushButton(action.text)
             footer.clicked.connect(action.callback)
             if action.bind is not None:
-                action.bind(footer)
+                self._footer_unbind = action.bind(footer)
             self.sub_nav.layout.addWidget(footer)
 
         self._show_section(page, page._active_section_name)
@@ -350,7 +420,14 @@ class App(QMainWindow):
         for section_name, button in self._section_buttons.items():
             button.setChecked(section_name == name)
 
+    def _unbind_footer(self) -> None:
+        unbind = self._footer_unbind
+        self._footer_unbind = None
+        if unbind is not None:
+            unbind()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        self._unbind_footer()
         for page in self.pages.values():
             page.shutdown()
         event.accept()
@@ -359,7 +436,14 @@ class App(QMainWindow):
 def run(pages: Mapping[str, SectionedPage] | None = None) -> int:
     application = QApplication.instance() or QApplication(sys.argv)
     application.setStyle(AccessibleCheckBoxStyle("Fusion"))
-    resolved_pages = dict(pages) if pages is not None else {"Camera": CameraPage()}
+    resolved_pages = (
+        dict(pages)
+        if pages is not None
+        else {
+            "Camera": CameraPage(),
+            "Calibrate": CalibrationPage(),
+        }
+    )
     window = App(resolved_pages)
     window.show()
     return application.exec()

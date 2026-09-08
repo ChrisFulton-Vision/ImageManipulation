@@ -1,6 +1,8 @@
+import csv
 import ipaddress
 import json
 import threading
+from collections import deque
 from pathlib import Path
 import re
 import subprocess
@@ -31,6 +33,8 @@ from PySide6.QtWidgets import (
 REFRESH_MS = 2000
 PING_TIMEOUT_MS = 800
 CUSTOM_DEVICES_FILE = Path(__file__).with_name("IP_Monitor.custom_devices.json")
+SESSION_LOG_DIR = Path(__file__).with_name("flight_test_logs")
+DROPOUT_WINDOW_SECONDS = 5 * 60
 AIRCRAFT = ("Shadow", "Supersonic")
 TIME_INPUT_HINT = "Use HH:MM, HH:MM:SS, or YYYY-MM-DD HH:MM"
 
@@ -85,6 +89,52 @@ def format_duration(total_seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+def parse_duration(value):
+    """Parse a flight-time duration.
+
+    Accepted forms:
+      - M or MM          -> minutes
+      - MM:SS
+      - HH:MM:SS
+    """
+    value = value.strip()
+    if not value:
+        return None
+
+    parts = value.split(":")
+
+    try:
+        if len(parts) == 1:
+            minutes = int(parts[0])
+            seconds = minutes * 60
+        elif len(parts) == 2:
+            minutes, secs = (int(part) for part in parts)
+            if not 0 <= secs < 60:
+                raise ValueError
+            seconds = minutes * 60 + secs
+        elif len(parts) == 3:
+            hours, minutes, secs = (int(part) for part in parts)
+            if not 0 <= minutes < 60 or not 0 <= secs < 60:
+                raise ValueError
+            seconds = hours * 3600 + minutes * 60 + secs
+        else:
+            raise ValueError
+    except ValueError:
+        raise ValueError("Unsupported duration format")
+
+    if seconds < 0:
+        raise ValueError("Duration must be non-negative")
+
+    return seconds
+
+
+def format_countdown(limit_seconds, elapsed_seconds):
+    remaining = int(limit_seconds - elapsed_seconds)
+    if remaining >= 0:
+        return format_duration(remaining)
+    return "EXCEEDED " + format_duration(abs(remaining))
+
+
 def run_command(cmd):
     creationflags = 0
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
@@ -108,11 +158,33 @@ def get_local_subnet_ip():
 
 
 def ping_host(ip):
+    """Return (reachable, latency_ms) using the existing single Windows ping."""
     try:
         result = run_command(["ping", "-n", "1", "-w", str(PING_TIMEOUT_MS), ip])
-        return result.returncode == 0
+        if result.returncode != 0:
+            return False, None
+
+        # Typical Windows forms are time=12ms and time<1ms.
+        match = re.search(r"time\s*([=<])\s*(\d+)\s*ms", result.stdout, re.IGNORECASE)
+        if match:
+            comparator, value = match.groups()
+            latency_ms = float(value)
+            if comparator == "<" and latency_ms <= 1:
+                latency_ms = 0.5
+            return True, latency_ms
+
+        # Host answered, but Windows output was not in a form we recognize.
+        return True, None
     except Exception:
-        return False
+        return False, None
+
+
+def format_latency(latency_ms):
+    if latency_ms is None:
+        return "--"
+    if latency_ms < 1:
+        return "<1 ms"
+    return f"{latency_ms:.0f} ms"
 
 
 class RefreshSignals(QObject):
@@ -145,8 +217,8 @@ class RefreshWorker(QRunnable):
             if self.shutdown_event.is_set():
                 return
 
-            up = ping_host(ip)
-            results.append((device_id, name, ip, up))
+            up, latency_ms = ping_host(ip)
+            results.append((device_id, name, ip, up, latency_ms))
 
         if self.shutdown_event.is_set():
             return
@@ -163,9 +235,9 @@ class PingMonitorApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("192.168.168 Network Monitor")
-        self.resize(620, 650)
-        self.setMinimumSize(560, 460)
+        self.setWindowTitle("Flight Test Network Monitor")
+        self.resize(1040, 760)
+        self.setMinimumSize(760, 560)
 
         self.running = True
         self.poll_in_progress = False
@@ -176,7 +248,15 @@ class PingMonitorApp(QMainWindow):
         self.next_device_id = 1
         self.devices = []
         self.device_rows = {}
+        self.device_history = {}
         self.aircraft_stats = {}
+
+        self.run_number = 0
+        self.last_logged_flight_number = ""
+
+        self.session_log_path = None
+        self.session_log_file = None
+        self.session_log_writer = None
 
         for name, ip in DEVICES:
             self.devices.append(self.make_device(name, ip, custom=False))
@@ -202,6 +282,7 @@ class PingMonitorApp(QMainWindow):
         self.refresh_anim_timer.timeout.connect(self.animate_refresh_text)
 
         self.build_ui()
+        self.start_session_log()
         self.stats_timer.start()
         self.update_aircraft_stats()
         self.schedule_refresh()
@@ -224,11 +305,27 @@ class PingMonitorApp(QMainWindow):
         main.setContentsMargins(10, 10, 10, 10)
         main.setSpacing(7)
 
-        header = QLabel("Device Status Monitor")
+        header_row = QHBoxLayout()
+
+        header = QLabel("Flight Test Network Monitor")
         header_font = QFont("Segoe UI", 14)
         header_font.setBold(True)
         header.setFont(header_font)
-        main.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch(1)
+
+        clock_title = QLabel("Mission Clock")
+        clock_title.setFont(QFont("Segoe UI", 9))
+        self.mission_clock_label = QLabel("--:--:--")
+        mission_clock_font = QFont("Consolas", 16)
+        mission_clock_font.setBold(True)
+        self.mission_clock_label.setFont(mission_clock_font)
+        self.mission_clock_label.setMinimumWidth(100)
+        self.mission_clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        header_row.addWidget(clock_title)
+        header_row.addWidget(self.mission_clock_label)
+        main.addLayout(header_row)
 
         self.status_label = QLabel("Checking local subnet...")
         self.status_label.setFont(QFont("Segoe UI", 10))
@@ -238,11 +335,14 @@ class PingMonitorApp(QMainWindow):
         self.last_update_label.setFont(QFont("Segoe UI", 9))
         main.addWidget(self.last_update_label)
 
+        main.addWidget(self.build_mission_test_panel())
         main.addWidget(self.build_custom_ip_panel())
         main.addWidget(self.build_aircraft_stats_panel())
 
-        self.device_table = QTableWidget(0, 4)
-        self.device_table.setHorizontalHeaderLabels(("Device", "IP Address", "Status", "Action"))
+        self.device_table = QTableWidget(0, 6)
+        self.device_table.setHorizontalHeaderLabels(
+            ("Device", "IP Address", "Status", "Latency", "Connection History", "Action")
+        )
         self.device_table.verticalHeader().setVisible(False)
         self.device_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.device_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -253,8 +353,10 @@ class PingMonitorApp(QMainWindow):
         header_view = self.device_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
 
         main.addWidget(self.device_table, 1)
         self.render_device_table()
@@ -272,6 +374,148 @@ class PingMonitorApp(QMainWindow):
 
         if self.pending_form_status:
             self.set_form_status(self.pending_form_status)
+
+    def build_mission_test_panel(self):
+        group = QGroupBox("Mission / Test")
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
+        layout.setColumnStretch(4, 1)
+
+        layout.addWidget(QLabel("Flight #"), 0, 0)
+        self.flight_number_edit = QLineEdit()
+        self.flight_number_edit.setMaximumWidth(90)
+        self.flight_number_edit.setPlaceholderText("e.g. 3")
+        self.flight_number_edit.editingFinished.connect(self.flight_number_changed)
+        layout.addWidget(self.flight_number_edit, 0, 1)
+
+        self.current_run_label = QLabel("Current Run: --")
+        run_font = QFont("Segoe UI", 10)
+        run_font.setBold(True)
+        self.current_run_label.setFont(run_font)
+        layout.addWidget(self.current_run_label, 0, 2)
+
+        self.begin_run_button = QPushButton("Begin Run 1")
+        self.begin_run_button.setMinimumWidth(105)
+        self.begin_run_button.clicked.connect(self.begin_run)
+        layout.addWidget(self.begin_run_button, 0, 3)
+
+        self.session_log_label = QLabel("Session log: initializing...")
+        self.session_log_label.setFont(QFont("Segoe UI", 9))
+        self.session_log_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.session_log_label, 0, 4)
+
+        return group
+
+    def begin_run(self):
+        self.run_number += 1
+        now = datetime.now()
+        self.current_run_label.setText(
+            f"Current Run: {self.run_number}  (began {now.strftime('%H:%M:%S')})"
+        )
+        self.begin_run_button.setText(f"Begin Run {self.run_number + 1}")
+        self.update_window_title()
+
+        limits = []
+        for aircraft in AIRCRAFT:
+            stats = self.aircraft_stats.get(aircraft)
+            if not stats:
+                continue
+            joker = stats["joker_edit"].text().strip() or "--"
+            bingo = stats["bingo_edit"].text().strip() or "--"
+            limits.append(f"{aircraft} Joker={joker}, Bingo={bingo}")
+
+        self.log_session_event(
+            "BEGIN_RUN",
+            detail="; ".join(limits),
+        )
+
+    def flight_number_changed(self):
+        flight_number = self.flight_number_edit.text().strip()
+        self.update_window_title()
+        if flight_number != self.last_logged_flight_number:
+            self.last_logged_flight_number = flight_number
+            self.log_session_event("FLIGHT_NUMBER", detail=flight_number or "cleared")
+
+    def update_window_title(self):
+        flight_number = self.flight_number_edit.text().strip() if hasattr(self, "flight_number_edit") else ""
+        parts = ["Flight Test Network Monitor"]
+        if flight_number:
+            parts.append(f"Flight {flight_number}")
+        if self.run_number:
+            parts.append(f"Run {self.run_number}")
+        self.setWindowTitle(" — ".join(parts))
+
+    def start_session_log(self):
+        try:
+            SESSION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            self.session_log_path = SESSION_LOG_DIR / (
+                f"flight_test_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            self.session_log_file = self.session_log_path.open(
+                "w", newline="", encoding="utf-8"
+            )
+            self.session_log_writer = csv.writer(self.session_log_file)
+            self.session_log_writer.writerow([
+                "timestamp",
+                "event_type",
+                "flight",
+                "run",
+                "aircraft",
+                "device",
+                "ip",
+                "status",
+                "latency_ms",
+                "detail",
+            ])
+            self.session_log_file.flush()
+            self.session_log_label.setText(f"Session log: {self.session_log_path.name}")
+            self.log_session_event("SESSION_START")
+        except OSError as exc:
+            self.session_log_path = None
+            self.session_log_file = None
+            self.session_log_writer = None
+            self.session_log_label.setText(f"Session log unavailable: {exc}")
+
+    def log_session_event(
+        self,
+        event_type,
+        *,
+        aircraft="",
+        device="",
+        ip="",
+        status="",
+        latency_ms=None,
+        detail="",
+    ):
+        if self.session_log_writer is None or self.session_log_file is None:
+            return
+
+        flight_number = (
+            self.flight_number_edit.text().strip()
+            if hasattr(self, "flight_number_edit")
+            else ""
+        )
+        latency_value = "" if latency_ms is None else f"{latency_ms:.3f}"
+
+        try:
+            self.session_log_writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                event_type,
+                flight_number,
+                self.run_number if self.run_number else "",
+                aircraft,
+                device,
+                ip,
+                status,
+                latency_value,
+                detail,
+            ])
+            self.session_log_file.flush()
+        except OSError:
+            # Keep the monitor alive even if the log destination disappears.
+            pass
 
     def build_custom_ip_panel(self):
         group = QGroupBox("Add Custom IP")
@@ -313,7 +557,9 @@ class PingMonitorApp(QMainWindow):
 
         control_row = QHBoxLayout()
 
-        hint = QLabel(f"{TIME_INPUT_HINT}. Use Now buttons to stamp current local time.")
+        hint = QLabel(
+            f"{TIME_INPUT_HINT}. Joker/Bingo accept minutes, MM:SS, or HH:MM:SS."
+        )
         hint.setFont(QFont("Segoe UI", 9))
         hint.setWordWrap(True)
 
@@ -345,7 +591,7 @@ class PingMonitorApp(QMainWindow):
             name_label.setFont(name_font)
             name_label.setMinimumWidth(80)
             name_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            aircraft_layout.addWidget(name_label, 0, 0, 4, 1)
+            aircraft_layout.addWidget(name_label, 0, 0, 6, 1)
 
             engine_edit = QLineEdit()
             engine_edit.setMaximumWidth(135)
@@ -362,6 +608,18 @@ class PingMonitorApp(QMainWindow):
             land_now = QPushButton("Now")
             land_now.setMaximumWidth(50)
 
+            joker_edit = QLineEdit()
+            joker_edit.setMaximumWidth(90)
+            joker_edit.setPlaceholderText("e.g. 35:00")
+            joker_countdown_label = QLabel("--")
+            joker_countdown_label.setMinimumWidth(125)
+
+            bingo_edit = QLineEdit()
+            bingo_edit.setMaximumWidth(90)
+            bingo_edit.setPlaceholderText("e.g. 45:00")
+            bingo_countdown_label = QLabel("--")
+            bingo_countdown_label.setMinimumWidth(125)
+
             aircraft_layout.addWidget(QLabel("Engine Start"), 0, 1)
             aircraft_layout.addWidget(engine_edit, 0, 2)
             aircraft_layout.addWidget(engine_now, 0, 3)
@@ -373,6 +631,14 @@ class PingMonitorApp(QMainWindow):
             aircraft_layout.addWidget(QLabel("Land"), 2, 1)
             aircraft_layout.addWidget(land_edit, 2, 2)
             aircraft_layout.addWidget(land_now, 2, 3)
+
+            aircraft_layout.addWidget(QLabel("Joker"), 3, 1)
+            aircraft_layout.addWidget(joker_edit, 3, 2)
+            aircraft_layout.addWidget(joker_countdown_label, 3, 3)
+
+            aircraft_layout.addWidget(QLabel("Bingo"), 4, 1)
+            aircraft_layout.addWidget(bingo_edit, 4, 2)
+            aircraft_layout.addWidget(bingo_countdown_label, 4, 3)
 
             metric_row = QHBoxLayout()
             metric_row.setContentsMargins(0, 0, 0, 0)
@@ -399,13 +665,17 @@ class PingMonitorApp(QMainWindow):
             metric_row.addSpacing(6)
             metric_row.addWidget(status_label, 1)
 
-            aircraft_layout.addLayout(metric_row, 3, 1, 1, 3)
+            aircraft_layout.addLayout(metric_row, 5, 1, 1, 3)
             group_layout.addWidget(aircraft_frame)
 
             self.aircraft_stats[aircraft] = {
                 "engine_start_edit": engine_edit,
                 "takeoff_edit": takeoff_edit,
                 "land_edit": land_edit,
+                "joker_edit": joker_edit,
+                "bingo_edit": bingo_edit,
+                "joker_countdown_label": joker_countdown_label,
+                "bingo_countdown_label": bingo_countdown_label,
                 "engine_time_label": engine_time_label,
                 "flight_time_label": flight_time_label,
                 "status_label": status_label,
@@ -424,49 +694,167 @@ class PingMonitorApp(QMainWindow):
             engine_edit.returnPressed.connect(self.update_aircraft_stats)
             takeoff_edit.returnPressed.connect(self.update_aircraft_stats)
             land_edit.returnPressed.connect(self.update_aircraft_stats)
+            joker_edit.returnPressed.connect(self.update_aircraft_stats)
+            bingo_edit.returnPressed.connect(self.update_aircraft_stats)
 
         return group
+
+    def ensure_device_history(self, device_id):
+        history = self.device_history.get(device_id)
+        if history is None:
+            history = {
+                "is_up": None,
+                "up_since": None,
+                "last_dropout": None,
+                "dropouts": deque(),
+                "last_latency_ms": None,
+            }
+            self.device_history[device_id] = history
+        return history
 
     def render_device_table(self):
         self.device_table.setRowCount(len(self.devices))
         self.device_rows = {}
 
         for row, device in enumerate(self.devices):
+            self.ensure_device_history(device["id"])
+
             name_item = QTableWidgetItem(device["name"])
             ip_item = QTableWidgetItem(device["ip"])
             status_item = QTableWidgetItem("--")
+            latency_item = QTableWidgetItem("--")
+            history_item = QTableWidgetItem(
+                "up for --   |   last dropout --   |   0 drops in last 5min"
+            )
+
             status_item.setForeground(QColor("black"))
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            latency_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             self.device_table.setItem(row, 0, name_item)
             self.device_table.setItem(row, 1, ip_item)
             self.device_table.setItem(row, 2, status_item)
+            self.device_table.setItem(row, 3, latency_item)
+            self.device_table.setItem(row, 4, history_item)
 
             if device["custom"]:
                 action = QPushButton("Remove")
                 action.clicked.connect(
                     lambda _checked=False, device_id=device["id"]: self.remove_custom_device(device_id)
                 )
-                self.device_table.setCellWidget(row, 3, action)
+                self.device_table.setCellWidget(row, 5, action)
             else:
                 built_in = QLabel("Built-in")
                 built_in.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.device_table.setCellWidget(row, 3, built_in)
+                self.device_table.setCellWidget(row, 5, built_in)
 
-            self.device_rows[device["id"]] = status_item
+            self.device_rows[device["id"]] = {
+                "status": status_item,
+                "latency": latency_item,
+                "history": history_item,
+            }
 
+        self.update_connection_history_labels()
         self.device_table.resizeRowsToContents()
 
-    def set_device_status(self, device_id, text, color):
-        item = self.device_rows.get(device_id)
-        if item is None:
+    def set_device_status(self, device_id, up, latency_ms):
+        row_items = self.device_rows.get(device_id)
+        if row_items is None:
             return
 
-        item.setText(text)
-        item.setForeground(QColor(color))
+        row_items["status"].setText("UP" if up else "DOWN")
+        row_items["status"].setForeground(QColor("green" if up else "red"))
+        row_items["latency"].setText(format_latency(latency_ms) if up else "--")
+
+    def update_device_connection(self, device_id, name, ip, up, latency_ms, now):
+        history = self.ensure_device_history(device_id)
+        previous = history["is_up"]
+
+        if previous is True and not up:
+            history["up_since"] = None
+            history["last_dropout"] = now
+            history["dropouts"].append(now)
+            self.log_session_event(
+                "NETWORK_DROPOUT",
+                device=name,
+                ip=ip,
+                status="DOWN",
+                detail="Connection transitioned from UP to DOWN",
+            )
+        elif previous is False and up:
+            history["up_since"] = now
+            self.log_session_event(
+                "NETWORK_RECOVERY",
+                device=name,
+                ip=ip,
+                status="UP",
+                latency_ms=latency_ms,
+                detail="Connection transitioned from DOWN to UP",
+            )
+        elif previous is None:
+            # Record the first observed state without counting an initially-down
+            # device as a dropout event.
+            if up:
+                history["up_since"] = now
+            self.log_session_event(
+                "NETWORK_INITIAL",
+                device=name,
+                ip=ip,
+                status="UP" if up else "DOWN",
+                latency_ms=latency_ms if up else None,
+                detail="Initial observed network state",
+            )
+
+        history["is_up"] = up
+        history["last_latency_ms"] = latency_ms if up else None
+
+        cutoff = now.timestamp() - DROPOUT_WINDOW_SECONDS
+        while history["dropouts"] and history["dropouts"][0].timestamp() < cutoff:
+            history["dropouts"].popleft()
+
+        self.set_device_status(device_id, up, latency_ms)
+
+    def update_connection_history_labels(self, now=None):
+        now = now or datetime.now()
+        cutoff = now.timestamp() - DROPOUT_WINDOW_SECONDS
+
+        for device_id, row_items in self.device_rows.items():
+            history = self.ensure_device_history(device_id)
+
+            while history["dropouts"] and history["dropouts"][0].timestamp() < cutoff:
+                history["dropouts"].popleft()
+
+            up_for = "--"
+            if history["is_up"] is True and history["up_since"] is not None:
+                seconds = max(0, int((now - history["up_since"]).total_seconds()))
+                up_for = format_duration(seconds)
+
+            last_dropout = (
+                history["last_dropout"].strftime("%H:%M:%S")
+                if history["last_dropout"] is not None
+                else "--"
+            )
+
+            row_items["history"].setText(
+                f"up for {up_for}   |   last dropout {last_dropout}   |   "
+                f"{len(history['dropouts'])} drops in last 5min"
+            )
 
     def stamp_aircraft_time(self, aircraft, field_name):
-        self.aircraft_stats[aircraft][field_name].setText(datetime.now().strftime("%H:%M:%S"))
+        stamp = datetime.now()
+        value = stamp.strftime("%H:%M:%S")
+        self.aircraft_stats[aircraft][field_name].setText(value)
+
+        event_type = {
+            "engine_start_edit": "ENGINE_START",
+            "takeoff_edit": "TAKEOFF",
+            "land_edit": "LAND",
+        }.get(field_name, "AIRCRAFT_TIME")
+        self.log_session_event(
+            event_type,
+            aircraft=aircraft,
+            detail=value,
+        )
         self.update_aircraft_stats()
 
     def reset_aircraft_stats(self):
@@ -476,17 +864,26 @@ class PingMonitorApp(QMainWindow):
             stats["engine_start_edit"].clear()
             stats["takeoff_edit"].clear()
             stats["land_edit"].clear()
+            stats["joker_edit"].clear()
+            stats["bingo_edit"].clear()
 
+        self.log_session_event("FLIGHT_STATS_RESET")
         self.update_aircraft_stats()
 
     def copy_aircraft_stats(self):
         headers = [
+            "Flight",
+            "Run",
             "Aircraft",
             "Engine Start",
             "Take-off",
             "Land",
             "Engine Time",
             "Flight Time",
+            "Joker",
+            "Joker Remaining",
+            "Bingo",
+            "Bingo Remaining",
         ]
 
         rows = []
@@ -495,12 +892,18 @@ class PingMonitorApp(QMainWindow):
             stats = self.aircraft_stats[aircraft]
 
             rows.append([
+                self.flight_number_edit.text().strip(),
+                str(self.run_number) if self.run_number else "",
                 aircraft,
                 stats["engine_start_edit"].text().strip(),
                 stats["takeoff_edit"].text().strip(),
                 stats["land_edit"].text().strip(),
                 stats["engine_time_label"].text(),
                 stats["flight_time_label"].text(),
+                stats["joker_edit"].text().strip(),
+                stats["joker_countdown_label"].text(),
+                stats["bingo_edit"].text().strip(),
+                stats["bingo_countdown_label"].text(),
             ])
 
         # Plain-text fallback: useful for Excel, Notepad, etc.
@@ -545,6 +948,8 @@ class PingMonitorApp(QMainWindow):
 
     def update_aircraft_stats(self):
         now = datetime.now()
+        self.mission_clock_label.setText(now.strftime("%H:%M:%S"))
+        self.update_connection_history_labels(now)
 
         for aircraft in AIRCRAFT:
             stats = self.aircraft_stats[aircraft]
@@ -568,6 +973,18 @@ class PingMonitorApp(QMainWindow):
                 land = None
                 status_messages.append("Invalid land")
 
+            try:
+                joker_seconds = parse_duration(stats["joker_edit"].text())
+            except ValueError:
+                joker_seconds = None
+                status_messages.append("Invalid Joker duration")
+
+            try:
+                bingo_seconds = parse_duration(stats["bingo_edit"].text())
+            except ValueError:
+                bingo_seconds = None
+                status_messages.append("Invalid Bingo duration")
+
             elapsed_end = land if land is not None else now
 
             stats["engine_time_label"].setText(
@@ -584,7 +1001,39 @@ class PingMonitorApp(QMainWindow):
             if takeoff and land and land < takeoff:
                 status_messages.append("Land before take-off")
 
+            flight_elapsed_seconds = None
+            if takeoff is not None:
+                flight_elapsed_seconds = max(0, int((elapsed_end - takeoff).total_seconds()))
+
+            self.update_fuel_countdown(
+                stats["joker_countdown_label"],
+                joker_seconds,
+                flight_elapsed_seconds,
+            )
+            self.update_fuel_countdown(
+                stats["bingo_countdown_label"],
+                bingo_seconds,
+                flight_elapsed_seconds,
+            )
+
             stats["status_label"].setText("; ".join(status_messages))
+
+    @staticmethod
+    def update_fuel_countdown(label, limit_seconds, elapsed_seconds):
+        if limit_seconds is None or elapsed_seconds is None:
+            label.setText("--")
+            label.setStyleSheet("")
+            return
+
+        remaining = int(limit_seconds - elapsed_seconds)
+        label.setText(format_countdown(limit_seconds, elapsed_seconds))
+
+        if remaining < 0:
+            label.setStyleSheet("color: #cc0000; font-weight: bold;")
+        elif remaining <= 5 * 60:
+            label.setStyleSheet("color: #d4a000; font-weight: bold;")
+        else:
+            label.setStyleSheet("")
 
     def load_custom_devices(self):
         try:
@@ -655,6 +1104,7 @@ class PingMonitorApp(QMainWindow):
 
     def remove_custom_device(self, device_id):
         self.devices = [device for device in self.devices if device["id"] != device_id]
+        self.device_history.pop(device_id, None)
         self.save_custom_devices()
         self.set_form_status("")
         self.render_device_table()
@@ -724,8 +1174,12 @@ class PingMonitorApp(QMainWindow):
         else:
             self.status_label.setText("No local 192.168.168.x address detected")
 
-        for device_id, _, _, up in results:
-            self.set_device_status(device_id, "UP" if up else "DOWN", "green" if up else "red")
+        refresh_time = datetime.now()
+        for device_id, name, ip, up, latency_ms in results:
+            self.update_device_connection(
+                device_id, name, ip, up, latency_ms, refresh_time
+            )
+        self.update_connection_history_labels(refresh_time)
 
         self.last_update_label.setText(
             f"Last update: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -736,6 +1190,15 @@ class PingMonitorApp(QMainWindow):
         self.refresh_timer.start(REFRESH_MS)
 
     def closeEvent(self, event):
+        self.log_session_event("SESSION_END")
+        if self.session_log_file is not None:
+            try:
+                self.session_log_file.close()
+            except OSError:
+                pass
+            self.session_log_file = None
+            self.session_log_writer = None
+
         self.running = False
         self.shutdown_event.set()
 

@@ -2,8 +2,13 @@ from typing import Protocol, TypeVar, Generic, Literal
 import numpy as np
 from dataclasses import dataclass
 from copy import deepcopy
+from time import perf_counter
+
+from support.mathHelpers.Linalg import call_backend as linalg_call_backend
+from support.mathHelpers.Linalg import NUMBA_AVAILABLE as LINALG_NUMBA_AVAILABLE
 
 StateT = TypeVar("StateT")
+LinearSolverBackend = Literal["numpy", "linalg_numpy", "linalg_numba", "linalg_spd_numpy", "linalg_spd_numba"]
 
 
 class LeastSquaresProblem(Protocol[StateT]):
@@ -39,10 +44,15 @@ class LevenbergMarquardt(Generic[StateT]):
     numerical_check: bool = False
     store_y_mags: bool = True
     store_states: bool = False
+    linear_solver_backend: LinearSolverBackend = "linalg_spd_numpy"
 
     def __post_init__(self):
         if self.robust_scale <= 0.0:
             raise ValueError(f"robust_scale must be positive, got {self.robust_scale}")
+        if self.linear_solver_backend in {"linalg_numba", "linalg_spd_numba"} and not LINALG_NUMBA_AVAILABLE:
+            raise ValueError(
+                f"linear_solver_backend={self.linear_solver_backend!r} requires numba-backed Linalg support."
+            )
 
         self.idx: int = 0
         self.reject_count: int = 0
@@ -229,6 +239,26 @@ class LevenbergMarquardt(Generic[StateT]):
         self.damping *= self.damping_up
         self.reject_count += 1
 
+    def _solve_step_system(self, h: np.ndarray, g: np.ndarray) -> np.ndarray:
+        rhs = -np.asarray(g, dtype=np.float64).reshape(-1, 1)
+
+        if self.linear_solver_backend == "numpy":
+            return np.linalg.solve(h, rhs).reshape(-1)
+
+        if self.linear_solver_backend == "linalg_numpy":
+            return np.asarray(linalg_call_backend("solve", "numpy", h, rhs)).reshape(-1)
+
+        if self.linear_solver_backend == "linalg_numba":
+            return np.asarray(linalg_call_backend("solve", "numba", h, rhs)).reshape(-1)
+
+        if self.linear_solver_backend == "linalg_spd_numpy":
+            return np.asarray(linalg_call_backend("solve_spd", "numpy", h, rhs)).reshape(-1)
+
+        if self.linear_solver_backend == "linalg_spd_numba":
+            return np.asarray(linalg_call_backend("solve_spd", "numba", h, rhs)).reshape(-1)
+
+        raise ValueError(f"Unknown linear_solver_backend {self.linear_solver_backend!r}")
+
     def optimize(self):
         create_y = self.problem.residual
         create_L = self.problem.jacobian
@@ -250,12 +280,12 @@ class LevenbergMarquardt(Generic[StateT]):
                     D = np.eye(H.shape[0], dtype=np.float64)
 
                 H += self.damping * D
-                dx = -np.linalg.solve(H, g)
+                dx = self._solve_step_system(H, g)
                 pred_improve = 0.5 * float(dx.T @ (self.damping * D @ dx - g))
 
                 return dx, pred_improve
 
-            dx = -np.linalg.solve(H, g)
+            dx = self._solve_step_system(H, g)
             pred_improve = -0.5 * float(dx.T @ g)
             return dx, pred_improve
 
@@ -320,84 +350,365 @@ class LevenbergMarquardt(Generic[StateT]):
         return x
 
 
-def main() -> None:
+@dataclass
+class LinearRegressionProblem:
+    x_data: np.ndarray
+    y_data: np.ndarray
+
+    def residual(self, state: np.ndarray) -> np.ndarray:
+        slope, intercept = np.asarray(state, dtype=np.float64).reshape(2)
+        return slope * self.x_data + intercept - self.y_data
+
+    def jacobian(self, state: np.ndarray) -> np.ndarray:
+        _ = state
+        return np.column_stack((self.x_data, np.ones_like(self.x_data)))
+
+    @staticmethod
+    def retract(state: np.ndarray, dx: np.ndarray) -> np.ndarray:
+        return np.asarray(state, dtype=np.float64).reshape(2) + np.asarray(dx, dtype=np.float64).reshape(2)
+
+
+@dataclass
+class ExponentialFitProblem:
+    x_data: np.ndarray
+    y_data: np.ndarray
+
+    def residual(self, state: np.ndarray) -> np.ndarray:
+        amplitude, decay, bias = np.asarray(state, dtype=np.float64).reshape(3)
+        model = amplitude * np.exp(decay * self.x_data) + bias
+        return model - self.y_data
+
+    def jacobian(self, state: np.ndarray) -> np.ndarray:
+        amplitude, decay, _bias = np.asarray(state, dtype=np.float64).reshape(3)
+        exp_term = np.exp(decay * self.x_data)
+        return np.column_stack((exp_term, amplitude * self.x_data * exp_term, np.ones_like(self.x_data)))
+
+    @staticmethod
+    def retract(state: np.ndarray, dx: np.ndarray) -> np.ndarray:
+        return np.asarray(state, dtype=np.float64).reshape(3) + np.asarray(dx, dtype=np.float64).reshape(3)
+
+
+@dataclass
+class CircleFitProblem:
+    points: np.ndarray
+
+    def residual(self, state: np.ndarray) -> np.ndarray:
+        cx, cy, radius = np.asarray(state, dtype=np.float64).reshape(3)
+        dx = self.points[:, 0] - cx
+        dy = self.points[:, 1] - cy
+        return np.sqrt(dx * dx + dy * dy) - radius
+
+    def jacobian(self, state: np.ndarray) -> np.ndarray:
+        cx, cy, _radius = np.asarray(state, dtype=np.float64).reshape(3)
+        dx = self.points[:, 0] - cx
+        dy = self.points[:, 1] - cy
+        dist = np.sqrt(dx * dx + dy * dy)
+        dist = np.maximum(dist, 1e-12)
+        return np.column_stack((-dx / dist, -dy / dist, -np.ones_like(dist)))
+
+    @staticmethod
+    def retract(state: np.ndarray, dx: np.ndarray) -> np.ndarray:
+        return np.asarray(state, dtype=np.float64).reshape(3) + np.asarray(dx, dtype=np.float64).reshape(3)
+
+
+@dataclass
+class DenseNonlinearLeastSquaresProblem:
+    design_matrix: np.ndarray
+    coupling_matrix: np.ndarray
+    observations: np.ndarray
+    nonlinearity_scale: float = 0.05
+
+    def residual(self, state: np.ndarray) -> np.ndarray:
+        state = np.asarray(state, dtype=np.float64).reshape(-1)
+        linear_term = self.design_matrix @ state
+        coupled_arg = self.coupling_matrix @ state
+        nonlinear_term = self.nonlinearity_scale * np.sin(coupled_arg)
+        return linear_term + nonlinear_term - self.observations
+
+    def jacobian(self, state: np.ndarray) -> np.ndarray:
+        state = np.asarray(state, dtype=np.float64).reshape(-1)
+        coupled_arg = self.coupling_matrix @ state
+        row_scale = self.nonlinearity_scale * np.cos(coupled_arg)
+        return self.design_matrix + row_scale[:, None] * self.coupling_matrix
+
+    @staticmethod
+    def retract(state: np.ndarray, dx: np.ndarray) -> np.ndarray:
+        return np.asarray(state, dtype=np.float64).reshape(-1) + np.asarray(dx, dtype=np.float64).reshape(-1)
+
+
+@dataclass
+class BenchmarkCase:
+    name: str
+    initial_state: StateT
+    problem: LeastSquaresProblem[StateT]
+    solver_kwargs: dict
+    error_fn: callable
+    repeats: int = 10
+
+
+def _copy_benchmark_state(state):
+    copy_method = getattr(state, "copy", None)
+    if callable(copy_method):
+        return copy_method()
+    return deepcopy(state)
+
+
+def make_benchmark_cases():
     from support.mathHelpers.SE3 import SE3_q
-    from support.mathHelpers.quaternions import Quaternion, skew
+    from support.mathHelpers.quaternions import Quaternion
     from support.mathHelpers.SE3PointAlignmentProblem import SE3PointAlignmentProblem
+    rng = np.random.default_rng(42)
 
-    from support.io.my_logging import LOG
+    x_line = np.linspace(-3.0, 3.0, 200)
+    true_line = np.array([2.5, -0.8], dtype=np.float64)
+    y_line = true_line[0] * x_line + true_line[1] + 0.05 * rng.standard_normal(x_line.shape[0])
+    line_problem = LinearRegressionProblem(x_data=x_line, y_data=y_line)
+    line_initial = np.array([-1.5, 2.0], dtype=np.float64)
 
-    np.set_printoptions(precision=6, suppress=True)
+    x_exp = np.linspace(0.0, 2.0, 160)
+    true_exp = np.array([1.8, -1.4, 0.35], dtype=np.float64)
+    y_exp = true_exp[0] * np.exp(true_exp[1] * x_exp) + true_exp[2] + 0.02 * rng.standard_normal(x_exp.shape[0])
+    exp_problem = ExponentialFitProblem(x_data=x_exp, y_data=y_exp)
+    exp_initial = np.array([0.8, -0.2, 0.0], dtype=np.float64)
 
-    body_points = np.array([
-        [-1.0, -1.0, -0.5],
-        [ 1.0, -1.0, -0.5],
-        [ 1.0,  1.0, -0.5],
-        [-1.0,  1.0, -0.5],
-        [-0.8, -0.6,  0.7],
-        [ 0.9, -0.5,  0.8],
-        [ 0.7,  0.8,  0.9],
-        [-0.6,  0.7,  0.6],
-        [ 0.2, -0.1,  1.4],
-    ], dtype=np.float64)
+    angles = np.linspace(0.0, 2.0 * np.pi, 180, endpoint=False)
+    true_circle = np.array([1.25, -0.65, 2.1], dtype=np.float64)
+    circle_points = np.column_stack(
+        (
+            true_circle[0] + true_circle[2] * np.cos(angles),
+            true_circle[1] + true_circle[2] * np.sin(angles),
+        )
+    )
+    circle_points += 0.03 * rng.standard_normal(circle_points.shape)
+    circle_problem = CircleFitProblem(points=circle_points)
+    circle_initial = np.array([0.3, 0.2, 1.3], dtype=np.float64)
 
-    true_state = SE3_q(
+    body_points = np.array(
+        [
+            [-1.0, -1.0, -0.5],
+            [1.0, -1.0, -0.5],
+            [1.0, 1.0, -0.5],
+            [-1.0, 1.0, -0.5],
+            [-0.8, -0.6, 0.7],
+            [0.9, -0.5, 0.8],
+            [0.7, 0.8, 0.9],
+            [-0.6, 0.7, 0.6],
+            [0.2, -0.1, 1.4],
+        ],
+        dtype=np.float64,
+    )
+    true_se3 = SE3_q(
         quat=Quaternion.exp_so3(np.deg2rad(np.array([18.0, -11.0, 27.0]))),
         tvec=np.array([1.2, -0.7, 2.4], dtype=np.float64),
     )
-
-    initial_state = SE3_q(
+    initial_se3 = SE3_q(
         quat=Quaternion.exp_so3(np.deg2rad(np.array([-22.0, 16.0, -18.0]))),
         tvec=np.array([-1.0, 0.9, 0.4], dtype=np.float64),
     )
+    measured_points = true_se3 * body_points + 0.05 * rng.standard_normal(size=body_points.shape)
+    se3_problem = SE3PointAlignmentProblem(body_points=body_points, measured_points=measured_points)
 
-    np.random.seed(42)
-    measured_points = true_state * body_points + 0.05 * np.random.normal(size=body_points.shape)
-
-    problem = SE3PointAlignmentProblem(
-        body_points=body_points,
-        measured_points=measured_points,
+    medium_param_dim = 48
+    medium_residual_dim = 2400
+    medium_design = rng.standard_normal((medium_residual_dim, medium_param_dim))
+    medium_design += 0.25 * rng.standard_normal((medium_residual_dim, 1)) @ np.ones((1, medium_param_dim))
+    medium_coupling = 0.15 * rng.standard_normal((medium_residual_dim, medium_param_dim))
+    medium_true = rng.standard_normal(medium_param_dim) * 0.2
+    medium_obs = (
+        medium_design @ medium_true
+        + 0.05 * np.sin(medium_coupling @ medium_true)
+        + 0.01 * rng.standard_normal(medium_residual_dim)
+    )
+    medium_initial = medium_true + 0.15 * rng.standard_normal(medium_param_dim)
+    medium_problem = DenseNonlinearLeastSquaresProblem(
+        design_matrix=medium_design,
+        coupling_matrix=medium_coupling,
+        observations=medium_obs,
+        nonlinearity_scale=0.05,
     )
 
-    initial_residual = problem.residual(initial_state)
-
-    LOG.info(f"Initial residual norm: {np.linalg.norm(initial_residual)}")
-    LOG.info(f"Initial rotation error [deg]: {initial_state.quat.angle_betweenD(true_state.quat)}")
-    LOG.info(f"Initial translation error: {np.linalg.norm(initial_state.tvec - true_state.tvec)}\n")
-
-    solver = LevenbergMarquardt(
-        state=initial_state,
-        problem=problem,
-        damping_enabled=True,
-        damping=1e-2,
-        use_diagonal_damping=True,
-        numerical_check=True,
-        max_steps=30,
-        max_iter=20,
-        tolerance=1e-12,
-        store_y_mags=True,
-        store_states=True,
+    large_param_dim = 96
+    large_residual_dim = 6000
+    large_design = rng.standard_normal((large_residual_dim, large_param_dim))
+    large_design += 0.2 * rng.standard_normal((large_residual_dim, 1)) @ np.ones((1, large_param_dim))
+    large_coupling = 0.12 * rng.standard_normal((large_residual_dim, large_param_dim))
+    large_true = rng.standard_normal(large_param_dim) * 0.15
+    large_obs = (
+        large_design @ large_true
+        + 0.04 * np.sin(large_coupling @ large_true)
+        + 0.01 * rng.standard_normal(large_residual_dim)
+    )
+    large_initial = large_true + 0.12 * rng.standard_normal(large_param_dim)
+    large_problem = DenseNonlinearLeastSquaresProblem(
+        design_matrix=large_design,
+        coupling_matrix=large_coupling,
+        observations=large_obs,
+        nonlinearity_scale=0.04,
     )
 
-    final_state = solver.state
-    final_residual = problem.residual(final_state)
+    return [
+        BenchmarkCase(
+            name="linear_regression",
+            initial_state=line_initial,
+            problem=line_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=12,
+                max_iter=10,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(np.linalg.norm(np.asarray(state) - true_line)),
+        ),
+        BenchmarkCase(
+            name="exponential_fit",
+            initial_state=exp_initial,
+            problem=exp_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=20,
+                max_iter=15,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(np.linalg.norm(np.asarray(state) - true_exp)),
+        ),
+        BenchmarkCase(
+            name="circle_fit",
+            initial_state=circle_initial,
+            problem=circle_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=20,
+                max_iter=15,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(np.linalg.norm(np.asarray(state) - true_circle)),
+        ),
+        BenchmarkCase(
+            name="se3_point_alignment",
+            initial_state=initial_se3,
+            problem=se3_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=30,
+                max_iter=20,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(
+                state.quat.angle_betweenD(true_se3.quat) + np.linalg.norm(state.tvec - true_se3.tvec)
+            ),
+        ),
+        BenchmarkCase(
+            name="dense_nonlinear_medium_48x2400",
+            initial_state=medium_initial,
+            problem=medium_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=12,
+                max_iter=10,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(np.linalg.norm(np.asarray(state) - medium_true)),
+            repeats=5,
+        ),
+        BenchmarkCase(
+            name="dense_nonlinear_large_96x6000",
+            initial_state=large_initial,
+            problem=large_problem,
+            solver_kwargs=dict(
+                damping_enabled=True,
+                damping=1e-2,
+                use_diagonal_damping=True,
+                max_steps=10,
+                max_iter=8,
+                tolerance=1e-12,
+                store_y_mags=False,
+                store_states=False,
+            ),
+            error_fn=lambda state: float(np.linalg.norm(np.asarray(state) - large_true)),
+            repeats=3,
+        ),
+    ]
 
-    LOG.info(f"\nFinal residual norm: {np.linalg.norm(final_residual)}")
-    LOG.info(f"Final rotation error [deg]: {final_state.quat.angle_betweenD(true_state.quat)}")
-    LOG.info(f"Final translation error: {np.linalg.norm(final_state.tvec - true_state.tvec)}\n")
 
-    LOG.info(f"True q: {true_state.quat}")
-    LOG.info(f"Final q: {final_state.quat}")
-    LOG.info(f"True t: {true_state.tvec}")
-    LOG.info(f"Final t: {final_state.tvec}\n")
+def run_solver_benchmarks() -> None:
+    np.set_printoptions(precision=6, suppress=True)
 
-    LOG.info("Residual history:")
-    LOG.info(solver.y_mag_hist)
+    backend_order: list[LinearSolverBackend] = [
+        "numpy",
+        "linalg_numpy",
+        "linalg_spd_numpy",
+    ]
+    if LINALG_NUMBA_AVAILABLE:
+        backend_order.extend(["linalg_numba", "linalg_spd_numba"])
 
-    LOG.info("\nNumber of stored states:")
-    LOG.info(len(solver.states_hist))
-    for state in solver.states_hist:
-        LOG.info(state)
+    cases = make_benchmark_cases()
+    print("Levenberg-Marquardt backend comparisons")
+    print(f"Numba-backed Linalg available: {LINALG_NUMBA_AVAILABLE}")
+
+    for case in cases:
+        print(f"\n{case.name}")
+        repeats = case.repeats
+        reference_cost = None
+        reference_error = None
+
+        for backend in backend_order:
+            elapsed_total = 0.0
+            final_cost = None
+            final_error = None
+            final_iterations = None
+            converged = None
+
+            for _ in range(repeats):
+                start = perf_counter()
+                solver = LevenbergMarquardt(
+                    state=_copy_benchmark_state(case.initial_state),
+                    problem=case.problem,
+                    linear_solver_backend=backend,
+                    **case.solver_kwargs,
+                )
+                elapsed_total += perf_counter() - start
+                final_cost = solver.final_cost
+                final_error = case.error_fn(solver.state)
+                final_iterations = solver.idx
+                converged = solver.converged
+
+            avg_ms = elapsed_total * 1000.0 / repeats
+            if reference_cost is None:
+                reference_cost = final_cost
+                reference_error = final_error
+
+            cost_delta = abs(float(final_cost) - float(reference_cost))
+            error_delta = abs(float(final_error) - float(reference_error))
+            print(
+                f"  {backend}: {avg_ms:.3f} ms avg over {repeats} run(s), "
+                f"iters={final_iterations}, converged={converged}, "
+                f"final_cost={float(final_cost):.6e}, cost_delta={cost_delta:.3e}, "
+                f"state_error={float(final_error):.6e}, error_delta={error_delta:.3e}"
+            )
+
+
+def main() -> None:
+    run_solver_benchmarks()
 
 
 if __name__ == "__main__":

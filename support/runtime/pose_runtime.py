@@ -231,7 +231,11 @@ class PoseRuntime:
             if center_curr is None or not np.all(np.isfinite(center_curr)):
                 return None
             center_px = center_curr
-        return pos_cov_px, gate_cov_px, float(kf.max_mahalanobis_sq), bool(kf.last_used_measurement), center_px
+        return (pos_cov_px,
+                gate_cov_px,
+                float(kf.last_nis),
+                bool(kf.last_used_measurement),
+                center_px)
 
     def _build_feature_kf_metadata(self, prepared, frame_time_s: float, width_px: float, height_px: float, idsNamesLocs):
         if prepared is None:
@@ -326,14 +330,32 @@ class PoseRuntime:
             feature_gate_mahal_sq[idx] = gate_mahal_sq
             feature_used[idx] = used
 
+
+
         for idx, cid in enumerate(prepared_pose_ids):
-            stat = tracker_stats.get(int(cid))
-            if stat is None:
+            cid = int(cid)
+
+            # Every detected pose feature should already have a KF because active_ids
+            # above includes all measured class IDs.
+            kf = self._feature_kfs.get(cid)
+            if kf is None:
+                from support.io.my_logging import LOG
+                LOG.info(f"YOLO cid={cid}: NO KF FOUND")
                 continue
-            _pos_cov_px, gate_cov_px, _gate_mahal_sq, used, _center_px = stat
-            sigmas = np.sqrt(np.maximum(np.diag(gate_cov_px), 1e-6))
+
+            # Raw YOLO uncertainty = detector measurement model R.
+            sigmas = np.array([
+                float(kf.sigma_meas_px),
+                float(kf.sigma_meas_py),
+            ], dtype=np.float64)
+
+            # KF metadata is useful only for the optional rejected-measurement heuristic.
+            stat = tracker_stats.get(cid)
+            used = True if stat is None else bool(stat[3])
+
             if not used:
                 sigmas *= 2.0
+
             sigma_yolo_2N[2 * idx: 2 * idx + 2] = sigmas
 
         kfest_object_points: list[list[float]] = []
@@ -361,7 +383,7 @@ class PoseRuntime:
             kfest_gate_covs.append(np.asarray(gate_cov_px, dtype=np.float64))
             kfest_gate_mahal_sq.append(float(_gate_mahal_sq))
             kfest_used.append(bool(used))
-            sigmas = np.sqrt(np.maximum(np.diag(gate_cov_px), 1e-6))
+            sigmas = np.sqrt(np.maximum(np.diag(pos_cov_px), 1e-6))
             if not used:
                 sigmas *= 2.0
             kfest_sigma_2N.extend([float(sigmas[0]), float(sigmas[1])])

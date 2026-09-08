@@ -49,9 +49,27 @@ np.set_printoptions(suppress=True, precision=4, threshold=maxsize)
 class QnPStats:
     N: int
     dof: int
-    sse_w: float
-    s2: float
+
+    # Statistical consistency diagnostic:
+    # measurement whitening only, NO robust downweighting.
+    sse_w_whitened: float
+    s2_whitened: float
+
+    # Actual robust objective used by the optimizer.
+    sse_w_robust: float
+    s2_robust: float
+
     cov6: np.ndarray
+
+    # Backward compatibility: existing code using stats.s2 / stats.sse_w
+    # now gets the statistically meaningful whitened quantity.
+    @property
+    def sse_w(self) -> float:
+        return self.sse_w_whitened
+
+    @property
+    def s2(self) -> float:
+        return self.s2_whitened
 
 @dataclass
 class SeedConfig:
@@ -104,7 +122,10 @@ def _project_accum_irls_numba(object_pts, meas_2N,
 
     LtL = np.zeros((6, 6), dtype=np.float64)
     Lty = np.zeros(6, dtype=np.float64)
-    y2 = 0.0
+
+    # Two separate SSEs:
+    y2_robust = 0.0
+    y2_whitened = 0.0
 
     front = 0
 
@@ -146,12 +167,17 @@ def _project_accum_irls_numba(object_pts, meas_2N,
             iu = inv_sigma_2N[r2 + 0]
             iv = inv_sigma_2N[r2 + 1]
 
-        # robust sw per feature from whitened magnitude (same as your robust kernel)
+        # Pure measurement-whitened residuals.
+        # This is the quantity whose expected variance should be ~1.
+        rwu = du * iu
+        rwv = dv * iv
+
+        y2_whitened += rwu * rwu + rwv * rwv
+
+        # Robust weighting operates ON TOP of measurement whitening.
         if kind_int == 0:
             sw = 1.0
         else:
-            rwu = du * iu
-            rwv = dv * iv
             rmag = np.sqrt(rwu * rwu + rwv * rwv)
 
             if rmag < eps:
@@ -179,7 +205,7 @@ def _project_accum_irls_numba(object_pts, meas_2N,
         ru = wu * du
         rv = wv * dv
 
-        y2 += ru * ru + rv * rv
+        y2_robust += ru * ru + rv * rv
 
         # Jacobian row algebra (same as your _project_and_jacobian_numba)
         uX = fx * invz
@@ -293,7 +319,7 @@ def _project_accum_irls_numba(object_pts, meas_2N,
     LtL[5, 4] = LtL[4, 5]
 
     front_frac = front / float(max(1, N))
-    return LtL, Lty, y2, front_frac
+    return LtL, Lty, y2_robust, y2_whitened, front_frac
 
 
 # --- Small helpers --------------------------------------------------------------
@@ -841,7 +867,7 @@ def opt(
         robust_kind: robust_cost = robust_cost.none,
         robust_param: float = 2.0,
         sigma_2N=None,
-        sigma_floor_px: float = 1.0,
+        sigma_floor_px: float = 0.001,
         max_iters: int = 20):
     """
     Refine pose to minimize ||meas_pix - h(q,t)|| using weighted GN/LM.
@@ -885,7 +911,7 @@ def opt(
 
     # ================= GN/LM LOOP =================
     for iter_num in range(1, max_iters + 1):
-        LtL, Lty, old_y2, front_frac = _project_accum_irls_numba(
+        LtL, Lty, old_y2, _old_y2_whitened, front_frac = _project_accum_irls_numba(
             object_pts64, meas_pix,
             qw, qx, qy, qz, tx, ty, tz,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
@@ -914,7 +940,7 @@ def opt(
         tqw, tqx, tqy, tqz = _apply_delta_q(qw, qx, qy, qz, drx, dry, drz)
         ttx, tty, ttz = tx + dtx, ty + dty, tz + dtz
 
-        _LtL2, _Lty2, new_y2, front2 = _project_accum_irls_numba(
+        _LtL2, _Lty2, new_y2, _new_y2_whitened, front2 = _project_accum_irls_numba(
             object_pts64, meas_pix,
             tqw, tqx, tqy, tqz, ttx, tty, ttz,
             float(cal.fx), float(cal.fy), float(cal.cx), float(cal.cy),
@@ -957,7 +983,7 @@ def opt(
         return est_q, est_t
 
     # Final stats at converged pose
-    LtL, _Lty, y2, _front = _project_accum_irls_numba(
+    LtL, _Lty, sse_robust, sse_whitened, _front = _project_accum_irls_numba(
         object_pts64, meas_pix,
         float(est_q.s), float(est_q.vec[0]), float(est_q.vec[1]), float(est_q.vec[2]),
         float(est_t[0]), float(est_t[1]), float(est_t[2]),
@@ -969,17 +995,30 @@ def opt(
     dof = 2 * N - 6
     if dof < 1:
         dof = 1
-    s2 = float(y2) / float(dof)
+
+    s2_whitened = float(sse_whitened) / float(dof)
+    s2_robust = float(sse_robust) / float(dof)
 
     I = np.eye(6, dtype=np.float64)
-    cov6 = s2 * np.linalg.solve(LtL, I)
+    cov6_base = np.linalg.solve(LtL, I)
+
+    if inv_sigma_2N is None:
+        # Unweighted case has no externally supplied absolute noise scale.
+        # Estimate the common measurement variance from the NON-ROBUST
+        # residual energy, then scale the local covariance.
+        cov6 = s2_whitened * cov6_base
+    else:
+        # Weighted case already has an absolute measurement scale through sigma_2N.
+        cov6 = cov6_base
 
     return est_q, est_t, QnPStats(
         N=int(N),
         dof=int(dof),
-        sse_w=float(y2),
-        s2=float(s2),
-        cov6=cov6
+        sse_w_whitened=float(sse_whitened),
+        s2_whitened=float(s2_whitened),
+        sse_w_robust=float(sse_robust),
+        s2_robust=float(s2_robust),
+        cov6=cov6,
     )
 
 ############################################ REGULAR OPT PATH, NO ONLINE CAL END ######################################
@@ -1586,7 +1625,7 @@ def opt_pose_and_intrinsics(
     s2 = float(meas_y2) / float(dof)
 
     I15 = np.eye(15, dtype=np.float64)
-    cov15 = s2 * np.linalg.solve(Htot, I15)
+    cov15 = np.linalg.solve(Htot, I15)
     cov9 = cov15[6:15, 6:15].copy()
 
     return est_q, est_t, cal_out, JointPnPStats(
@@ -2320,7 +2359,7 @@ def _robust_seed_fast(
                     sigma_2N=sigma_2N,
                     robust_kind=robust_kind_for_refine,
                     robust_param=robust_param_for_refine,
-                    sigma_floor_px=1.0,
+                    sigma_floor_px=0.001,
                     max_iters=int(cfg.refine_max_iters),
                 )
             except Exception:
@@ -2348,7 +2387,7 @@ def solveQnP(
     user_seed_q=None,
     user_seed_t=None,
     robust_kind: robust_cost = robust_cost.huber,
-    robust_param: float = 2.0,
+    robust_param: float = 2.00,
     seed_cfg: SeedConfig | None = None,
     use_solvePnP_as_seed: bool = False,
     online_calibration: bool = False,
@@ -2415,7 +2454,7 @@ def solveQnP(
             sigma_2N=sigma_2N,
             robust_kind=robust_kind,
             robust_param=robust_param,
-            sigma_floor_px=1.0,
+            sigma_floor_px=0.001,
             max_iters=20,
         )
 

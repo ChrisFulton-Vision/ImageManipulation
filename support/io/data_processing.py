@@ -319,15 +319,17 @@ class DataProcessorRunner:
                         p = rp
 
                 img = cv2.imread(str(p), cv2.IMREAD_COLOR)
+
                 if img is None:
                     item = (name, None, (0, 0))
                 else:
                     H, W = img.shape[:2]
-                    try:
-                        tensor = yolo_session.preprocessImage(img)
-                        item = (name, tensor, (W, H))
-                    except Exception:
-                        item = (name, None, (W, H))
+
+                    # IMPORTANT:
+                    # Queue the raw image, not a tensor produced by yolo_session.
+                    # preprocessImage() uses shared reusable buffers and is therefore
+                    # not safe to call concurrently from producer threads.
+                    item = (name, img, (W, H))
 
                 while not self.cancel_event.is_set():
                     try:
@@ -352,7 +354,7 @@ class DataProcessorRunner:
                         break
 
                     try:
-                        name, tensor, (W, H) = que.get(timeout=0.1)
+                        name, img, (W, H) = que.get(timeout=0.1)
                     except queue.Empty:
                         # heartbeat
                         eta_txt = fmt_mmss(sweep_timer.eta_from_fraction(overall_done / max(1, overall_total)))
@@ -362,7 +364,10 @@ class DataProcessorRunner:
                         )
                         continue
 
-                    if tensor is not None:
+                    if img is not None:
+                        # Both preprocessing and inference occur serially on the consumer
+                        # thread because yolo_session reuses internal buffers.
+                        tensor = yolo_session.preprocessImage(img)
                         centers, boxes, scores, classes, _dt = yolo_session.runOneSession(tensor)
 
                         rec = {c: -1.0 for cid in range(n_cls) for c in _feat_cols(cid)}
@@ -580,16 +585,25 @@ class DataProcessorRunner:
 
         inv_w = 1.0 / max(width, 1.0)
         inv_h = 1.0 / max(height, 1.0)
+
+        # Validate in the original pixel domain BEFORE normalization.
+        valid = (
+                np.isfinite(Xraw)
+                & np.isfinite(Yraw)
+                & (Xraw >= 0.0)
+                & (Yraw >= 0.0)
+        )
+
+        valid_u8 = valid.astype(np.uint8, copy=False)
+
+        # Normalize only after validity has been established.
         Xmeas = Xraw * inv_w
         Ymeas = Yraw * inv_h
-
-        valid = np.isfinite(Xmeas) & np.isfinite(Ymeas) & (Xmeas != -1.0) & (Ymeas != -1.0)
-        valid_u8 = valid.astype(np.uint8, copy=False)
 
         # --- KF parameter seed ---
         kf0 = PixelKalmanFilter()
         kf0.set_image_size(width, height)
-        kf0.set_sigma_meas_px(0.001, 0.001)
+        kf0.set_sigma_meas_px(0.5, 0.5)
         kf0.set_max_pixel_jump_px(100.0)
         kf0.max_mahalanobis_sq = 9.21
 
@@ -1056,6 +1070,21 @@ class DataProcessorRunner:
         t_qnp_kf = 0.0
         n_pose = 0
 
+        # Publication-quality steady-state timing. Each solver is intentionally
+        # warmed once on the first eligible frame; warm-up calls are discarded
+        # and are NOT included in the timing distributions below.
+        pnp_warmed = False
+        qnp_warmed = False
+        qnp_kf_warmed = False
+
+        n_pnp_calls = 0
+        n_qnp_calls = 0
+        n_qnp_kf_calls = 0
+
+        pnp_times_ms: list[float] = []
+        qnp_times_ms: list[float] = []
+        qnp_kf_times_ms: list[float] = []
+
         import pandas as pd
         # -------------------- sanity --------------------
         if not getattr(calibration, "validCal", False):
@@ -1260,9 +1289,19 @@ class DataProcessorRunner:
             [0., -1., 0.],
         ], dtype=float))
 
-        resid_stats = {"pnp_unw": [], "pnp_wt": [], "qnp_unw": [], "qnp_kf": []}
+        resid_stats = {
+            "pnp_unw": [],
+            "pnp_wt": [],
+            "qnp_unw": [],
+            "qnp_gate": [],
+            "qnp_kfpos": [],
+            "qnp_kf": [],
+        }
 
+        # Independent previous-frame seeds for each ablation branch.
         prev_qnp_q = prev_qnp_t = None
+        prev_qnp_gate_q = prev_qnp_gate_t = None
+        prev_qnp_kfpos_q = prev_qnp_kfpos_t = None
         prev_qnp_kf_q = prev_qnp_kf_t = None
 
         for idx, (_, row) in enumerate(df.iterrows(), start=1):
@@ -1433,13 +1472,14 @@ class DataProcessorRunner:
             sigma_2N = None
             kf_img_pts = []
             kf_obj_pts = []
+            accepted_indices: list[int] = []
+
             qnp_kf_used_n = np.nan
             width, height = calibration.width, calibration.height
 
             if kalman_available:
                 row_kf = df_kf.iloc[idx - 1]
                 sig_2N_list: list[float] = []
-                accepted_indices: list[int] = []
 
                 for j, fid in enumerate(kept_ids):
                     px_name = f"feat_{fid}_kf_x"
@@ -1478,7 +1518,16 @@ class DataProcessorRunner:
 
                     accepted_indices.append(j)
                     kf_img_pts.append([float(kf_u * width), float(kf_v * height)])
-                    sig_2N_list.extend([sx, sy])
+                    row_sig_x = float(row_kf.get("kf_sigma_meas_px", np.nan))
+                    row_sig_y = float(row_kf.get("kf_sigma_meas_py", np.nan))
+                    nis_p95 = float(row_kf.get("kf_nis_p95_used", np.nan))
+
+                    sigma_model_px = 6.0  # Tuning Parameter
+
+                    sx_eff = np.sqrt(sx * sx + sigma_model_px * sigma_model_px)
+                    sy_eff = np.sqrt(sy * sy + sigma_model_px * sigma_model_px)
+
+                    sig_2N_list.extend([sx_eff, sy_eff])
 
                 qnp_kf_used_n = int(len(accepted_indices))
                 if accepted_indices:
@@ -1488,8 +1537,44 @@ class DataProcessorRunner:
                         dtype=np.float64,
                     )
 
+            if sigma_2N is not None and sigma_2N.size > 0:
+                try:
+                    nis_p95 = float(row_kf.get("kf_nis_p95_used", np.nan))
+                except Exception:
+                    nis_p95 = np.nan
+
+                try:
+                    sig_meas_x = float(row_kf.get("kf_sigma_meas_px", np.nan))
+                    sig_meas_y = float(row_kf.get("kf_sigma_meas_py", np.nan))
+                except Exception:
+                    sig_meas_x = np.nan
+                    sig_meas_y = np.nan
+
             kf_img_pts = np.asarray(kf_img_pts, dtype=np.float32)
             kf_obj_pts = np.asarray(kf_obj_pts, dtype=np.float32)
+
+            # --------------------------------------------------------------
+            # Ablation point sets
+            #
+            # A: obj_pts / img_pts
+            #       raw YOLO, all detected features, uniform weighting
+            #
+            # B: gated_obj_pts / raw_gated_img_pts
+            #       raw YOLO positions, KF-accepted subset, uniform weighting
+            #
+            # C: kf_obj_pts / kf_img_pts
+            #       KF-filtered positions, KF-accepted subset, uniform weighting
+            #
+            # D: kf_obj_pts / kf_img_pts + sigma_2N
+            #       KF-filtered positions, KF-accepted subset, KF weighting
+            # --------------------------------------------------------------
+            if accepted_indices:
+                _ab_idx = np.asarray(accepted_indices, dtype=int)
+                gated_obj_pts = obj_pts[_ab_idx]
+                raw_gated_img_pts = img_pts[_ab_idx]
+            else:
+                gated_obj_pts = np.empty((0, 3), dtype=np.float32)
+                raw_gated_img_pts = np.empty((0, 2), dtype=np.float32)
 
             # ----------------- PnP (OpenCV, RANSAC) -----------------
             distCoeffs = np.zeros((5, 1), dtype=np.float32) if use_ud else D_full
@@ -1500,6 +1585,24 @@ class DataProcessorRunner:
             inliers = None
             pnp_solver = "RANSAC_ITERATIVE"
 
+            # Warm OpenCV's PnP path once, but do not include the warm-up call
+            # in reported steady-state timing.
+            if not pnp_warmed:
+                try:
+                    cv2.solvePnPRansac(
+                        objectPoints=obj_pts,
+                        imagePoints=img_pts,
+                        cameraMatrix=K,
+                        distCoeffs=distCoeffs,
+                        iterationsCount=100,
+                        reprojectionError=2.0,
+                        confidence=0.99,
+                        flags=cv2.SOLVEPNP_ITERATIVE,
+                    )
+                except cv2.error:
+                    pass
+                pnp_warmed = True
+
             t0 = time.perf_counter()
             try:
                 ret, rvec, tvec, inliers = cv2.solvePnPRansac(
@@ -1507,15 +1610,18 @@ class DataProcessorRunner:
                     imagePoints=img_pts,
                     cameraMatrix=K,
                     distCoeffs=distCoeffs,
-                    iterationsCount=1000,
+                    iterationsCount=100,
                     reprojectionError=2.0,
-                    confidence=0.9999,
+                    confidence=0.99,
                     flags=cv2.SOLVEPNP_ITERATIVE,
                 )
             except cv2.error as e:
                 LOG.error("solvePnPRansac failed for %s: %s", image_name, e)
                 ret = False
-            t_pnp += time.perf_counter() - t0
+            dt_pnp = time.perf_counter() - t0
+            t_pnp += dt_pnp
+            n_pnp_calls += 1
+            pnp_times_ms.append(1000.0 * dt_pnp)
 
             pnp_used_n = int(len(obj_pts))
 
@@ -1596,6 +1702,23 @@ class DataProcessorRunner:
             pnp_resid = float("nan")
             qnp_resid = float("nan")
             qnp_kf_resid = float("nan")
+            # Warm the QnP/Numba path once. The discarded solve exercises the
+            # same unweighted code path without affecting the estimator history.
+            if not qnp_warmed:
+                try:
+                    solveQnP(
+                        obj_pts,
+                        img_pts,
+                        calibration,
+                        True,
+                        None,
+                        user_seed_q=prev_qnp_q,
+                        user_seed_t=prev_qnp_t,
+                    )
+                except Exception:
+                    pass
+                qnp_warmed = True
+
             t0 = time.perf_counter()
             try:
                 quatQ, vectQ, stats = solveQnP(
@@ -1609,14 +1732,93 @@ class DataProcessorRunner:
                     # user_seed_q=None,
                     # user_seed_t=None,
                 )
-                t_qnp += time.perf_counter() - t0
+                dt_qnp = time.perf_counter() - t0
+                t_qnp += dt_qnp
+                n_qnp_calls += 1
+                qnp_times_ms.append(1000.0 * dt_qnp)
 
                 prev_qnp_q, prev_qnp_t = quatQ, vectQ
 
+                # ==============================================================
+                # ABLATION B: KF gating only
+                # Raw YOLO locations, KF-accepted subset, uniform QnP weighting.
+                # ==============================================================
+                quatQ_gate = vectQ_gate = None
+                gate_stats = None
+
+                if len(gated_obj_pts) >= 6 and len(raw_gated_img_pts) >= 6:
+                    try:
+                        quatQ_gate, vectQ_gate, gate_stats = solveQnP(
+                            gated_obj_pts,
+                            raw_gated_img_pts,
+                            calibration,
+                            True,
+                            None,
+                            user_seed_q=prev_qnp_gate_q,
+                            user_seed_t=prev_qnp_gate_t,
+                        )
+                        prev_qnp_gate_q, prev_qnp_gate_t = quatQ_gate, vectQ_gate
+                    except Exception as e_gate:
+                        LOG.error(
+                            "solveQnP (gating-only ablation) failed for %s: %s",
+                            image_name, e_gate
+                        )
+                        quatQ_gate = vectQ_gate = None
+                        gate_stats = None
+
+                # ==============================================================
+                # ABLATION C: KF position filtering
+                # KF-accepted subset + KF-filtered positions, uniform weighting.
+                # ==============================================================
+                quatQ_kfpos = vectQ_kfpos = None
+                kfpos_stats = None
+
+                if len(kf_obj_pts) >= 6 and len(kf_img_pts) >= 6:
+                    try:
+                        quatQ_kfpos, vectQ_kfpos, kfpos_stats = solveQnP(
+                            kf_obj_pts,
+                            kf_img_pts,
+                            calibration,
+                            True,
+                            None,
+                            user_seed_q=prev_qnp_kfpos_q,
+                            user_seed_t=prev_qnp_kfpos_t,
+                        )
+                        prev_qnp_kfpos_q, prev_qnp_kfpos_t = quatQ_kfpos, vectQ_kfpos
+                    except Exception as e_kfpos:
+                        LOG.error(
+                            "solveQnP (KF-position ablation) failed for %s: %s",
+                            image_name, e_kfpos
+                        )
+                        quatQ_kfpos = vectQ_kfpos = None
+                        kfpos_stats = None
+
+                # ==============================================================
+                # ABLATION D / proposed method:
+                # KF-filtered positions + KF covariance weighting.
+                # Existing implementation continues below.
+                # ==============================================================
                 quatQ_kf = vectQ_kf = None
                 kf_stats = None
                 if sigma_2N is not None and len(kf_obj_pts) >= 6 and len(kf_img_pts) >= 6:
                     try:
+                        # Warm the KF-weighted QnP path separately because the
+                        # sigma-whitened/robust path may compile different kernels.
+                        if not qnp_kf_warmed:
+                            try:
+                                solveQnP(
+                                    kf_obj_pts,
+                                    kf_img_pts,
+                                    calibration,
+                                    True,
+                                    sigma_2N,
+                                    user_seed_q=prev_qnp_kf_q,
+                                    user_seed_t=prev_qnp_kf_t,
+                                )
+                            except Exception:
+                                pass
+                            qnp_kf_warmed = True
+
                         t0 = time.perf_counter()
                         quatQ_kf, vectQ_kf, kf_stats = solveQnP(
                             kf_obj_pts,
@@ -1629,7 +1831,10 @@ class DataProcessorRunner:
                             # user_seed_q=None,
                             # user_seed_t=None,
                         )
-                        t_qnp_kf += time.perf_counter() - t0
+                        dt_qnp_kf = time.perf_counter() - t0
+                        t_qnp_kf += dt_qnp_kf
+                        n_qnp_kf_calls += 1
+                        qnp_kf_times_ms.append(1000.0 * dt_qnp_kf)
                         prev_qnp_kf_q, prev_qnp_kf_t = quatQ_kf, vectQ_kf
                     except Exception as e_kf:
                         LOG.error("solveQnP (Kalman-weighted) failed for %s: %s", image_name, e_kf)
@@ -1672,6 +1877,112 @@ class DataProcessorRunner:
                         "qnp_kf_sig_tx": np.nan, "qnp_kf_sig_ty": np.nan, "qnp_kf_sig_tz": np.nan,
                     }
 
+                # --------------------------------------------------------------
+                # Package ablation B: gating only
+                # --------------------------------------------------------------
+                if quatQ_gate is not None and vectQ_gate is not None and gate_stats is not None:
+                    quatQ_gate_aftr = q_aftr_from_cv * quatQ_gate
+                    vectQ_gate_aftr = q_aftr_from_cv * vectQ_gate
+
+                    X_cam_gate = quatQ_gate * gated_obj_pts + vectQ_gate
+                    Z_gate = np.where(X_cam_gate[:, 2] > 1e-6, X_cam_gate[:, 2], 1e-6)
+                    u_gate = calibration.fx * (X_cam_gate[:, 0] / Z_gate) + calibration.cx
+                    v_gate = calibration.fy * (X_cam_gate[:, 1] / Z_gate) + calibration.cy
+
+                    gate_rmse_px = _reproj_metrics_from_proj_meas(
+                        np.column_stack([u_gate, v_gate]),
+                        raw_gated_img_pts.reshape(-1, 2),
+                        None,
+                        "rms_px",
+                    )
+
+                    gate_fields = {
+                        "qnp_gate_used_n": int(gate_stats.N),
+                        "qnp_gate_qw": float(quatQ_gate_aftr.s),
+                        "qnp_gate_qx": float(quatQ_gate_aftr.vec[0]),
+                        "qnp_gate_qy": float(quatQ_gate_aftr.vec[1]),
+                        "qnp_gate_qz": float(quatQ_gate_aftr.vec[2]),
+                        "qnp_gate_x": float(vectQ_gate_aftr[0]),
+                        "qnp_gate_y": float(vectQ_gate_aftr[1]),
+                        "qnp_gate_z": float(vectQ_gate_aftr[2]),
+                        "qnp_gate_rmse_px": float(gate_rmse_px),
+                        "qnp_gate_s2": float(gate_stats.s2),
+                        "qnp_gate_sig_rx": float(np.sqrt(gate_stats.cov6[0, 0])),
+                        "qnp_gate_sig_ry": float(np.sqrt(gate_stats.cov6[1, 1])),
+                        "qnp_gate_sig_rz": float(np.sqrt(gate_stats.cov6[2, 2])),
+                        "qnp_gate_sig_tx": float(np.sqrt(gate_stats.cov6[3, 3])),
+                        "qnp_gate_sig_ty": float(np.sqrt(gate_stats.cov6[4, 4])),
+                        "qnp_gate_sig_tz": float(np.sqrt(gate_stats.cov6[5, 5])),
+                    }
+
+                    resid_stats["qnp_gate"].append(float(gate_rmse_px))
+                else:
+                    gate_fields = {
+                        "qnp_gate_used_n": np.nan,
+                        "qnp_gate_qw": np.nan, "qnp_gate_qx": np.nan,
+                        "qnp_gate_qy": np.nan, "qnp_gate_qz": np.nan,
+                        "qnp_gate_x": np.nan, "qnp_gate_y": np.nan, "qnp_gate_z": np.nan,
+                        "qnp_gate_rmse_px": np.nan,
+                        "qnp_gate_s2": np.nan,
+                        "qnp_gate_sig_rx": np.nan, "qnp_gate_sig_ry": np.nan,
+                        "qnp_gate_sig_rz": np.nan,
+                        "qnp_gate_sig_tx": np.nan, "qnp_gate_sig_ty": np.nan,
+                        "qnp_gate_sig_tz": np.nan,
+                    }
+
+                # --------------------------------------------------------------
+                # Package ablation C: KF positions, uniform weighting
+                # --------------------------------------------------------------
+                if quatQ_kfpos is not None and vectQ_kfpos is not None and kfpos_stats is not None:
+                    quatQ_kfpos_aftr = q_aftr_from_cv * quatQ_kfpos
+                    vectQ_kfpos_aftr = q_aftr_from_cv * vectQ_kfpos
+
+                    X_cam_kfpos = quatQ_kfpos * kf_obj_pts + vectQ_kfpos
+                    Z_kfpos = np.where(X_cam_kfpos[:, 2] > 1e-6, X_cam_kfpos[:, 2], 1e-6)
+                    u_kfpos = calibration.fx * (X_cam_kfpos[:, 0] / Z_kfpos) + calibration.cx
+                    v_kfpos = calibration.fy * (X_cam_kfpos[:, 1] / Z_kfpos) + calibration.cy
+
+                    kfpos_rmse_px = _reproj_metrics_from_proj_meas(
+                        np.column_stack([u_kfpos, v_kfpos]),
+                        kf_img_pts.reshape(-1, 2),
+                        None,
+                        "rms_px",
+                    )
+
+                    kfpos_fields = {
+                        "qnp_kfpos_used_n": int(kfpos_stats.N),
+                        "qnp_kfpos_qw": float(quatQ_kfpos_aftr.s),
+                        "qnp_kfpos_qx": float(quatQ_kfpos_aftr.vec[0]),
+                        "qnp_kfpos_qy": float(quatQ_kfpos_aftr.vec[1]),
+                        "qnp_kfpos_qz": float(quatQ_kfpos_aftr.vec[2]),
+                        "qnp_kfpos_x": float(vectQ_kfpos_aftr[0]),
+                        "qnp_kfpos_y": float(vectQ_kfpos_aftr[1]),
+                        "qnp_kfpos_z": float(vectQ_kfpos_aftr[2]),
+                        "qnp_kfpos_rmse_px": float(kfpos_rmse_px),
+                        "qnp_kfpos_s2": float(kfpos_stats.s2),
+                        "qnp_kfpos_sig_rx": float(np.sqrt(kfpos_stats.cov6[0, 0])),
+                        "qnp_kfpos_sig_ry": float(np.sqrt(kfpos_stats.cov6[1, 1])),
+                        "qnp_kfpos_sig_rz": float(np.sqrt(kfpos_stats.cov6[2, 2])),
+                        "qnp_kfpos_sig_tx": float(np.sqrt(kfpos_stats.cov6[3, 3])),
+                        "qnp_kfpos_sig_ty": float(np.sqrt(kfpos_stats.cov6[4, 4])),
+                        "qnp_kfpos_sig_tz": float(np.sqrt(kfpos_stats.cov6[5, 5])),
+                    }
+
+                    resid_stats["qnp_kfpos"].append(float(kfpos_rmse_px))
+                else:
+                    kfpos_fields = {
+                        "qnp_kfpos_used_n": np.nan,
+                        "qnp_kfpos_qw": np.nan, "qnp_kfpos_qx": np.nan,
+                        "qnp_kfpos_qy": np.nan, "qnp_kfpos_qz": np.nan,
+                        "qnp_kfpos_x": np.nan, "qnp_kfpos_y": np.nan, "qnp_kfpos_z": np.nan,
+                        "qnp_kfpos_rmse_px": np.nan,
+                        "qnp_kfpos_s2": np.nan,
+                        "qnp_kfpos_sig_rx": np.nan, "qnp_kfpos_sig_ry": np.nan,
+                        "qnp_kfpos_sig_rz": np.nan,
+                        "qnp_kfpos_sig_tx": np.nan, "qnp_kfpos_sig_ty": np.nan,
+                        "qnp_kfpos_sig_tz": np.nan,
+                    }
+
                 row_qnp = {
                     "image_name": image_name, "image_time": image_time,
                     "qnp_qw": float(quatQ_aftr.s),
@@ -1691,6 +2002,8 @@ class DataProcessorRunner:
                     "qnp_sig_tx": float(np.sqrt(stats.cov6[3, 3])),
                     "qnp_sig_ty": float(np.sqrt(stats.cov6[4, 4])),
                     "qnp_sig_tz": float(np.sqrt(stats.cov6[5, 5])),
+                    **gate_fields,
+                    **kfpos_fields,
                     **kf_fields,
                 }
 
@@ -1712,6 +2025,13 @@ class DataProcessorRunner:
                 u = calibration.fx * (X_cam[:, 0] / Z) + calibration.cx
                 v = calibration.fy * (X_cam[:, 1] / Z) + calibration.cy
                 qnp_resid = _reproj_metrics_from_proj_meas(np.column_stack([u, v]), img_pts.reshape(-1, 2), None, "chi")
+                qnp_rmse_px = _reproj_metrics_from_proj_meas(
+                    np.column_stack([u, v]),
+                    img_pts.reshape(-1, 2),
+                    None,
+                    "rms_px",
+                )
+                row_qnp["qnp_rmse_px"] = float(qnp_rmse_px)
 
                 resid_stats["pnp_unw"].append(pnp_resid)
                 resid_stats["qnp_unw"].append(qnp_resid)
@@ -1722,6 +2042,13 @@ class DataProcessorRunner:
                     Zk = np.where(X_cam_kf[:, 2] > 1e-6, X_cam_kf[:, 2], 1e-6)
                     uk = calibration.fx * (X_cam_kf[:, 0] / Zk) + calibration.cx
                     vk = calibration.fy * (X_cam_kf[:, 1] / Zk) + calibration.cy
+                    qnp_kf_rmse_px = _reproj_metrics_from_proj_meas(
+                        np.column_stack([uk, vk]),
+                        kf_img_pts.reshape(-1, 2),
+                        None,
+                        "rms_px",
+                    )
+                    row_qnp["qnp_kf_rmse_px"] = float(qnp_kf_rmse_px)
                     qnp_kf_resid = _reproj_metrics_from_proj_meas(
                         np.column_stack([uk, vk]), kf_img_pts.reshape(-1, 2), sigma_2N, "chi"
                     )
@@ -1742,6 +2069,7 @@ class DataProcessorRunner:
                         pnp_resid_w = float("nan")
                 else:
                     pnp_resid_w = float("nan")
+                    row_qnp["qnp_kf_rmse_px"] = np.nan
                 resid_stats["pnp_wt"].append(pnp_resid_w)
 
             except Exception as e:
@@ -1802,17 +2130,37 @@ class DataProcessorRunner:
             LOG.info("Reproj norm summary (weighted PnP):    %s", _summ(resid_stats["pnp_wt"]))
         if resid_stats["qnp_unw"]:
             LOG.info("Reproj norm summary (unweighted QnP):  %s", _summ(resid_stats["qnp_unw"]))
+        if resid_stats["qnp_gate"]:
+            LOG.info(
+                "Ablation RMSE (KF gate only):            %s",
+                _summ(resid_stats["qnp_gate"])
+            )
+
+        if resid_stats["qnp_kfpos"]:
+            LOG.info(
+                "Ablation RMSE (KF positions, uniform):   %s",
+                _summ(resid_stats["qnp_kfpos"])
+            )
         if resid_stats["qnp_kf"]:
             LOG.info("Reproj norm summary (KF-weighted QnP): %s", _summ(resid_stats["qnp_kf"]))
 
         LOG.info("run_pnp_qnp_from_detection_csv: finished (%s -> %s, %s)", csv_path, out_pnp, out_qnp)
 
-        if n_pose > 0:
-            LOG.info(
-                "Pose solve timing (avg per frame): "
-                "PnP=%.3f ms | QnP=%.3f ms | QnP-KF=%.3f ms",
-                1000.0 * t_pnp / n_pose,
-                1000.0 * t_qnp / n_pose,
-                1000.0 * t_qnp_kf / max(1, n_pose),
+        def _timing_summary(times_ms: list[float]) -> str:
+            arr = np.asarray(times_ms, dtype=np.float64)
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
+                return "n=0"
+            return (
+                f"n={arr.size}, "
+                f"mean={np.mean(arr):.3f} ms, "
+                f"median={np.median(arr):.3f} ms, "
+                f"p95={np.percentile(arr, 95.0):.3f} ms, "
+                f"min={np.min(arr):.3f} ms, "
+                f"max={np.max(arr):.3f} ms"
             )
 
+        LOG.info("Pose solve steady-state timing (warm-up excluded):")
+        LOG.info("  PnP:    %s", _timing_summary(pnp_times_ms))
+        LOG.info("  QnP:    %s", _timing_summary(qnp_times_ms))
+        LOG.info("  QnP-KF: %s", _timing_summary(qnp_kf_times_ms))

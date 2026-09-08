@@ -1,18 +1,8 @@
 import numpy as np
 from time import perf_counter
 
-try:
-    from numba import njit
-
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        def decorator(func):
-            return func
-
-        return decorator
+from support.mathHelpers.include_numba import _HAVE_NUMBA as NUMBA_AVAILABLE
+from support.mathHelpers.include_numba import _njit as njit
 
 
 np.set_printoptions(precision=4, suppress=True)
@@ -108,9 +98,44 @@ def solve_lu_numba(lu, pivots, b):
 
 
 @njit(cache=True)
+def solve_lu_numba_multi_rhs(lu, pivots, b):
+    n = lu.shape[0]
+    rhs_count = b.shape[1]
+    pb = np.empty((n, rhs_count), dtype=lu.dtype)
+    y = np.empty((n, rhs_count), dtype=lu.dtype)
+    x = np.empty((n, rhs_count), dtype=lu.dtype)
+
+    for i in range(n):
+        pivot_index = pivots[i]
+        for rhs_idx in range(rhs_count):
+            pb[i, rhs_idx] = b[pivot_index, rhs_idx]
+
+    for rhs_idx in range(rhs_count):
+        for i in range(n):
+            rhs = pb[i, rhs_idx]
+            for j in range(i):
+                rhs -= lu[i, j] * y[j, rhs_idx]
+            y[i, rhs_idx] = rhs
+
+        for i in range(n - 1, -1, -1):
+            rhs = y[i, rhs_idx]
+            for j in range(i + 1, n):
+                rhs -= lu[i, j] * x[j, rhs_idx]
+            x[i, rhs_idx] = rhs / lu[i, i]
+
+    return x
+
+
+@njit(cache=True)
 def solve_linear_system_numba(a, b):
     lu, pivots = lu_factorize_numba(a)
     return lu, pivots, solve_lu_numba(lu, pivots, b)
+
+
+@njit(cache=True)
+def solve_linear_system_numba_multi_rhs(a, b):
+    lu, pivots = lu_factorize_numba(a)
+    return lu, pivots, solve_lu_numba_multi_rhs(lu, pivots, b)
 
 
 @njit(cache=True)
@@ -132,6 +157,62 @@ def cholesky_manual_numba(a):
                 l[i, j] = numerator / l[j, j]
 
     return l
+
+
+@njit(cache=True)
+def solve_cholesky_numba(l, b):
+    n = l.shape[0]
+    y = np.empty(n, dtype=l.dtype)
+    x = np.empty(n, dtype=l.dtype)
+
+    for i in range(n):
+        rhs = b[i]
+        for j in range(i):
+            rhs -= l[i, j] * y[j]
+        y[i] = rhs / l[i, i]
+
+    for i in range(n - 1, -1, -1):
+        rhs = y[i]
+        for j in range(i + 1, n):
+            rhs -= l[j, i] * x[j]
+        x[i] = rhs / l[i, i]
+
+    return x
+
+
+@njit(cache=True)
+def solve_cholesky_numba_multi_rhs(l, b):
+    n = l.shape[0]
+    rhs_count = b.shape[1]
+    y = np.empty((n, rhs_count), dtype=l.dtype)
+    x = np.empty((n, rhs_count), dtype=l.dtype)
+
+    for rhs_idx in range(rhs_count):
+        for i in range(n):
+            rhs = b[i, rhs_idx]
+            for j in range(i):
+                rhs -= l[i, j] * y[j, rhs_idx]
+            y[i, rhs_idx] = rhs / l[i, i]
+
+        for i in range(n - 1, -1, -1):
+            rhs = y[i, rhs_idx]
+            for j in range(i + 1, n):
+                rhs -= l[j, i] * x[j, rhs_idx]
+            x[i, rhs_idx] = rhs / l[i, i]
+
+    return x
+
+
+@njit(cache=True)
+def solve_spd_system_numba(a, b):
+    l = cholesky_manual_numba(a)
+    return l, solve_cholesky_numba(l, b)
+
+
+@njit(cache=True)
+def solve_spd_system_numba_multi_rhs(a, b):
+    l = cholesky_manual_numba(a)
+    return l, solve_cholesky_numba_multi_rhs(l, b)
 
 
 @njit(cache=True)
@@ -260,6 +341,11 @@ def solve_linear_system_manual(a, b):
     return lu, pivots, solve_lu_manual(lu, pivots, b)
 
 
+def solve_linear_system_manual_multi_rhs(a, b):
+    lu, pivots = lu_factorize_manual(a)
+    return lu, pivots, solve_lu_manual_multi_rhs(lu, pivots, b)
+
+
 def least_squares_normal_equations_manual(a, b):
     b = as_column(b)
     normal_matrix = adjoint(a) @ a
@@ -278,6 +364,51 @@ def least_squares_normal_equations_numba(a, b):
 
 def solve_linear_system_numpy(a, b):
     return np.linalg.solve(a, as_column(b))
+
+
+def solve_cholesky_manual(l, b):
+    b = as_column(b).astype(working_dtype(l, b))
+    n = l.shape[0]
+    y = np.zeros((n, b.shape[1]), dtype=working_dtype(l, b))
+    x = np.zeros((n, b.shape[1]), dtype=working_dtype(l, b))
+
+    for rhs_idx in range(b.shape[1]):
+        for i in range(n):
+            y[i, rhs_idx] = (b[i, rhs_idx] - np.dot(l[i, :i], y[:i, rhs_idx])) / l[i, i]
+
+        for i in range(n - 1, -1, -1):
+            x[i, rhs_idx] = (y[i, rhs_idx] - np.dot(l[i + 1 :, i], x[i + 1 :, rhs_idx])) / l[i, i]
+
+    return x
+
+
+def solve_lu_manual_multi_rhs(lu, pivots, b):
+    b = np.asarray(b, dtype=working_dtype(lu, b))
+    if b.ndim == 1:
+        b = b.reshape(-1, 1)
+    pb = b[pivots]
+    n, rhs_count = pb.shape
+    y = np.zeros((n, rhs_count), dtype=working_dtype(lu, b))
+    x = np.zeros((n, rhs_count), dtype=working_dtype(lu, b))
+
+    for rhs_idx in range(rhs_count):
+        for i in range(n):
+            y[i, rhs_idx] = pb[i, rhs_idx] - np.dot(lu[i, :i], y[:i, rhs_idx])
+
+        for i in range(n - 1, -1, -1):
+            x[i, rhs_idx] = (y[i, rhs_idx] - np.dot(lu[i, i + 1 :], x[i + 1 :, rhs_idx])) / lu[i, i]
+
+    return x
+
+
+def solve_spd_system_manual(a, b):
+    l = cholesky_manual(a)
+    return l, solve_cholesky_manual(l, b)
+
+
+def solve_spd_system_numpy(a, b):
+    l = np.linalg.cholesky(a)
+    return solve_cholesky_manual(l, b)
 
 
 def least_squares_numpy(a, b):
@@ -562,6 +693,12 @@ def dominant_eigenpair_numpy(a, steps=None):
     return eigenvalues[idx], eigenvectors[:, idx]
 
 
+def dominant_eigenpair_numpy_largest_algebraic(a, steps=None):
+    eigenvalues, eigenvectors = np.linalg.eigh(a)
+    idx = np.argmax(eigenvalues)
+    return eigenvalues[idx], eigenvectors[:, idx]
+
+
 def matrix_exponential_via_eig_numpy(a, terms=None):
     eigenvalues, eigenvectors = np.linalg.eig(a)
     inverse = np.linalg.inv(eigenvectors)
@@ -571,6 +708,9 @@ def matrix_exponential_via_eig_numpy(a, terms=None):
 BACKEND_IMPLEMENTATIONS = {
     "python": {
         "solve": lambda a, b: solve_linear_system_manual(a, b)[2],
+        "solve_spd": lambda a, b: solve_spd_system_manual(a, b)[1],
+        "solve_multi_rhs": lambda a, b: solve_linear_system_manual_multi_rhs(a, b)[2],
+        "solve_spd_multi_rhs": lambda a, b: solve_spd_system_manual(a, b)[1],
         "least_squares": lambda a, b: least_squares_normal_equations_manual(a, b)[4],
         "cholesky": cholesky_manual,
         "power_iteration": power_iteration_no_print,
@@ -578,6 +718,9 @@ BACKEND_IMPLEMENTATIONS = {
     },
     "numpy": {
         "solve": solve_linear_system_numpy,
+        "solve_spd": solve_spd_system_numpy,
+        "solve_multi_rhs": solve_linear_system_numpy,
+        "solve_spd_multi_rhs": solve_spd_system_numpy,
         "least_squares": least_squares_numpy,
         "cholesky": np.linalg.cholesky,
         "power_iteration": dominant_eigenpair_numpy,
@@ -588,6 +731,9 @@ BACKEND_IMPLEMENTATIONS = {
 if NUMBA_AVAILABLE:
     BACKEND_IMPLEMENTATIONS["numba"] = {
         "solve": lambda a, b: solve_linear_system_numba(a, as_column(b)[:, 0])[2].reshape(-1, 1),
+        "solve_spd": lambda a, b: solve_spd_system_numba(a, as_column(b)[:, 0])[1].reshape(-1, 1),
+        "solve_multi_rhs": lambda a, b: solve_linear_system_numba_multi_rhs(a, np.asarray(b))[2],
+        "solve_spd_multi_rhs": lambda a, b: solve_spd_system_numba_multi_rhs(a, np.asarray(b))[1],
         "least_squares": lambda a, b: least_squares_normal_equations_numba(a, b)[4],
         "cholesky": cholesky_manual_numba,
         "power_iteration": power_iteration_numba,
@@ -615,6 +761,9 @@ def warm_up_numba_backend(a_solve, b_solve, m_ls, b_ls, spd, symmetric, matrix_e
         return
 
     call_backend("solve", "numba", a_solve, b_solve)
+    call_backend("solve_spd", "numba", spd, b_solve[: spd.shape[0]])
+    call_backend("solve_multi_rhs", "numba", a_solve, np.eye(a_solve.shape[0], dtype=a_solve.dtype))
+    call_backend("solve_spd_multi_rhs", "numba", spd, np.eye(spd.shape[0], dtype=spd.dtype))
     call_backend("least_squares", "numba", m_ls, b_ls)
     call_backend("cholesky", "numba", spd)
     call_backend("power_iteration", "numba", symmetric, 20)
@@ -762,20 +911,27 @@ def run_comparisons():
         a_solve = rng.standard_normal((120, 120))
         a_solve += 5.0 * np.eye(120)
         b_solve = rng.standard_normal((120, 1))
+        b_solve_multi_rhs = np.eye(120)
 
         m_ls = rng.standard_normal((240, 12))
         b_ls = rng.standard_normal((240, 1))
 
         m_chol = rng.standard_normal((140, 140))
         spd = m_chol.T @ m_chol + 1e-3 * np.eye(140)
+        b_spd = rng.standard_normal((140, 1))
+        b_spd_multi_rhs = np.eye(140)
 
         m_power = rng.standard_normal((160, 160))
         symmetric = 0.5 * (m_power + m_power.T)
+        symmetric += 20.0 * np.eye(160)
 
         matrix_exp = rng.standard_normal((20, 20)) * 0.05
 
         return {
             "solve": (a_solve, b_solve),
+            "solve_multi_rhs": (a_solve, b_solve_multi_rhs),
+            "solve_spd": (spd, b_spd),
+            "solve_spd_multi_rhs": (spd, b_spd_multi_rhs),
             "least_squares": (m_ls, b_ls),
             "cholesky": (spd,),
             "power_iteration": (symmetric, POWER_ITERATION_STEPS),
@@ -824,6 +980,38 @@ def run_comparisons():
         if vector_error > 1e-4:
             raise AssertionError(f"{name} eigenvectors diverged: error={vector_error:.3e}")
 
+    def assert_power_iteration_result(name, matrix, result):
+        eigenvalue, eigenvector = result
+        eigenvector = np.asarray(eigenvector).reshape(-1)
+        vector_norm = np.linalg.norm(eigenvector)
+        if not np.isfinite(eigenvalue):
+            raise AssertionError(f"{name} eigenvalue is not finite")
+        if not np.isfinite(vector_norm) or vector_norm == 0.0:
+            raise AssertionError(f"{name} eigenvector is invalid")
+
+        normalized_vector = eigenvector / vector_norm
+        residual = np.linalg.norm(matrix @ normalized_vector - eigenvalue * normalized_vector)
+        matrix_norm = np.linalg.norm(matrix, ord=2)
+        relative_residual = residual / max(matrix_norm, 1e-12)
+        if relative_residual > 1e-4:
+            raise AssertionError(
+                f"{name} residual too large: residual={residual:.3e}, relative={relative_residual:.3e}"
+            )
+
+    def validate_power_iteration(name, numpy_result, linalg_result, matrix):
+        assert_power_iteration_result(f"{name} numpy", matrix, numpy_result)
+        assert_power_iteration_result(f"{name} linalg", matrix, linalg_result)
+
+        numpy_eigenvalue, _ = numpy_result
+        linalg_eigenvalue, _ = linalg_result
+        np.testing.assert_allclose(
+            linalg_eigenvalue,
+            numpy_eigenvalue,
+            atol=1e-6,
+            rtol=1e-4,
+            err_msg=f"{name} eigenvalues diverged",
+        )
+
     def benchmark_operation(name, numpy_fn, linalg_fn, args, repeats, validator):
         numpy_result = None
         linalg_result = None
@@ -863,6 +1051,33 @@ def run_comparisons():
     )
 
     benchmark_operation(
+        name="solve_spd",
+        numpy_fn=lambda a, b: solve_linear_system_numpy(a, b),
+        linalg_fn=lambda a, b: call_backend("solve_spd", backend, a, b),
+        args=inputs["solve_spd"],
+        repeats=50,
+        validator=assert_allclose,
+    )
+
+    benchmark_operation(
+        name="solve_multi_rhs",
+        numpy_fn=lambda a, b: solve_linear_system_numpy(a, b),
+        linalg_fn=lambda a, b: call_backend("solve_multi_rhs", backend, a, b),
+        args=inputs["solve_multi_rhs"],
+        repeats=20,
+        validator=assert_allclose,
+    )
+
+    benchmark_operation(
+        name="solve_spd_multi_rhs",
+        numpy_fn=lambda a, b: solve_linear_system_numpy(a, b),
+        linalg_fn=lambda a, b: call_backend("solve_spd_multi_rhs", backend, a, b),
+        args=inputs["solve_spd_multi_rhs"],
+        repeats=20,
+        validator=assert_allclose,
+    )
+
+    benchmark_operation(
         name="least_squares",
         numpy_fn=lambda a, b: least_squares_numpy(a, b),
         linalg_fn=lambda a, b: call_backend("least_squares", backend, a, b),
@@ -882,11 +1097,13 @@ def run_comparisons():
 
     benchmark_operation(
         name="power_iteration",
-        numpy_fn=lambda a, steps: dominant_eigenpair_numpy(a),
+        numpy_fn=lambda a, steps: dominant_eigenpair_numpy_largest_algebraic(a),
         linalg_fn=lambda a, steps: call_backend("power_iteration", backend, a, steps),
         args=inputs["power_iteration"],
         repeats=100,
-        validator=assert_eigenpair_close,
+        validator=lambda name, numpy_result, linalg_result: validate_power_iteration(
+            name, numpy_result, linalg_result, inputs["power_iteration"][0]
+        ),
     )
 
     benchmark_operation(

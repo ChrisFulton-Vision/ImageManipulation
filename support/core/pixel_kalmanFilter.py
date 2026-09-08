@@ -301,7 +301,7 @@ class KalmanFilter:
         self.height_px = float(height_px)
 
         # ---------- Process noise (normalized units/sec^2-ish for CV discretization) ----------
-        self.sigma_proc: float = 0.5
+        self.sigma_proc: float = 3.0
         self.var_proc: float = self.sigma_proc ** 2.0
 
         # --- Image size used for px<->normalized conversions (state lives in normalized coords) ---
@@ -469,8 +469,8 @@ class KalmanFilter:
         cov_norm = self.position_covariance_norm()
         if cov_norm is None:
             return None
-        scale = np.diag([float(self.width_px) ** 2, float(self.height_px) ** 2])
-        return scale @ cov_norm
+        D = np.diag([float(self.width_px), float(self.height_px)])
+        return D @ cov_norm @ D.T
 
     def _build_F_Q(self, dt: float) -> tuple[np.ndarray, np.ndarray]:
         F = np.eye(4, dtype=np.float64)

@@ -1957,3 +1957,6 @@ if __name__ == "__main__":
     benchmark_undistort(cal_std,  N=200_000, seed=1)
     benchmark_undistort(cal_fish, N=200_000, seed=2)
 
+    cal_1440 = default_864_cam()
+    cal_1440.scaleCalibration(1440)
+    print(cal_1440)
